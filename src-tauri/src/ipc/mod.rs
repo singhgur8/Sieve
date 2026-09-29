@@ -1,0 +1,6 @@
+//! IPC contract: types, commands, events and errors exposed to the frontend.
+
+pub mod commands;
+pub mod error;
+pub mod events;
+pub mod types;

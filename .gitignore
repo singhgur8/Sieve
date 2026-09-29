@@ -5,3 +5,9 @@ src-tauri/target/
 *.tar.gz
 *.DS_Store
 .env
+dist-ssr/
+*.local
+*.log
+.vscode/*
+!.vscode/extensions.json
+.idea/

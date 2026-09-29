@@ -33,10 +33,19 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 - [Frontend Dev]: Focuses on `src/`, 60fps virtualized filmstrip, dual-pane loupe comparison, and slider controls.
 
 ## Milestone Roadmap
-- [ ] Phase 1: Tauri v2 Scaffold + Core IPC Data Contracts (Image, CullTags, EditParams, CatalogState)
+- [x] Phase 1: Tauri v2 Scaffold + Core IPC Data Contracts (Image, CullTags, EditParams, CatalogState)
 - [ ] Phase 2: Ultra-fast embedded thumbnail extraction pipeline (Sony, Fuji, Canon)
 - [ ] Phase 3: Culling & Burst detection worker with tag emission
 - [ ] Phase 4: Virtualized Photo Grid + Tag Filter + Loupe Zoom View
 - [ ] Phase 5: Parametric Slider Engine, .CUBE LUT Parser & XMP Exporter
 - [ ] Phase 6: Full RAW internal demosaic & JPEG export engine
 - [ ] Phase 7: Anchor-photo scene matching (One-Shot relative grading)
+
+## Development
+- Toolchain: Rust stable (rustup), Node 24, pnpm (via corepack).
+- Run app: `pnpm tauri dev` (set `LUMENRAW_CATALOG=/tmp/x.sqlite` for a scratch catalog).
+- Rust tests/lint: `cd src-tauri && cargo test && cargo clippy --all-targets && cargo fmt --check`.
+- Frontend type check + build: `pnpm build`.
+- IPC contract: Rust types in `src-tauri/src/ipc/` are the source of truth; `src/ipc/bindings.ts` is generated
+  (never edit it). Regenerate with `UPDATE_BINDINGS=1 cargo test bindings`; log changes in `docs/ipc-changelog.md`.
+- Architecture, ownership map and schema: `docs/architecture.md`.
