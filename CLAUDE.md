@@ -20,6 +20,19 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
    - User grades 1-2 anchor photos in a lighting scenario.
    - System normalizes histograms and white point deltas, automatically applying relative adjustments across all matching frames in that burst/scene.
 
+## User Workflow (drives priorities)
+1. Import a project folder (a new folder per shoot; one catalog holds many).
+2. Auto-cull, then review/override: pass/fail flags + 0–5 stars.
+3. Culling results are written to XMP sidecars next to the RAWs (Lightroom/Bridge-readable):
+   reject = `xmp:Rating -1`; stars = `xmp:Rating 0–5`; pick = `xmp:Label "Pick"`;
+   auto tags = `lr:hierarchicalSubject` `LumenRAW|<tag>`. Never clobber unrelated XMP fields.
+4. Edit keepers in-app (no export needed until culling + editing are done).
+5. Export client deliverables with Lightroom-style presets: JPEG (quality), TIFF 8/16, PNG, optional
+   WebP/HEIC; resize; sRGB / Display P3 / Adobe RGB with ICC; output sharpening; filename template;
+   metadata options; saved presets.
+- Primary shoot types: Wedding/Couples and Portrait (eyes open + eye sharpness dominate scoring).
+- Platform: macOS (Apple Silicon, CoreML). Windows is out of scope until a test machine exists.
+
 ## Tech Stack
 - Host: Tauri v2
 - Backend: Rust (`libraw-rs` for decoding/export, `onnxruntime` via CoreML/DirectML, `rayon` for thread pooling)
@@ -33,6 +46,7 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 - [Frontend Dev]: Focuses on `src/`, 60fps virtualized filmstrip, dual-pane loupe comparison, and slider controls.
 
 ## Milestone Roadmap
+Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of truth). Summary:
 - [x] Phase 1: Tauri v2 Scaffold + Core IPC Data Contracts (Image, CullTags, EditParams, CatalogState)
 - [ ] Phase 2: Ultra-fast embedded thumbnail extraction pipeline (Sony, Fuji, Canon)
 - [ ] Phase 3: Culling & Burst detection worker with tag emission
@@ -49,3 +63,23 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 - IPC contract: Rust types in `src-tauri/src/ipc/` are the source of truth; `src/ipc/bindings.ts` is generated
   (never edit it). Regenerate with `UPDATE_BINDINGS=1 cargo test bindings`; log changes in `docs/ipc-changelog.md`.
 - Architecture, ownership map and schema: `docs/architecture.md`.
+
+## Autonomous Orchestration
+The main session is the orchestrator. It runs `docs/roadmap.md` to completion without checking in with the user.
+1. Read `docs/roadmap.md`; the first unchecked task is next. Work on branch `phase-N-<slug>`.
+2. Contract/schema changes go to the `architect` agent first. Then spawn specialists (`rust-engine-dev`,
+   `vision-ml-dev`, `frontend-dev`) — in parallel with `isolation: "worktree"` when they touch disjoint paths —
+   and merge their work. If a custom agent type is unavailable, spawn `general-purpose` with the contents of
+   its `.claude/agents/<name>.md` as the role prompt.
+3. After each task, `qa-engineer` runs the baseline gate + the phase's acceptance checks and reports pass/fail per
+   task with the owning agent for each failure. Route failures back to the owner; max 3 fix rounds per task.
+4. On pass: tick the task, append to the Status Log in `docs/roadmap.md`, commit. At phase end, fast-forward
+   merge the phase branch into `main` and continue with the next phase immediately.
+5. Make judgment calls yourself and record them in `docs/decisions.md` (date, decision, why, alternatives).
+   Only stop for true external blockers (missing hardware, credentials, paid services, or 3 failed fix rounds):
+   write `docs/BLOCKED.md` with what is needed, then stop.
+6. Never modify anything under `/Users/gurjotsingh/Pictures/`. Copy sample files into `test-data/` (gitignored)
+   before any test that writes XMP or exports.
+7. Verify with evidence: run the commands, view screenshots/previews, inspect outputs. Never tick a task on
+   assumption. Do not push (no remote configured) unless the user adds one.
+8. Items under "Future phases" in the roadmap are notes only; do not start them unless the user asks.

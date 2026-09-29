@@ -11,3 +11,8 @@ dist-ssr/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# Local test data & tooling artifacts
+test-data/
+playwright-report/
+test-results/
