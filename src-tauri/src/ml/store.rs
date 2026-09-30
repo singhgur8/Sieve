@@ -78,6 +78,13 @@ pub fn queue_scope(conn: &mut Connection, scope: &AnalysisScope) -> AppResult<()
             }
             tx.execute(&UPSERT.replace("{W}", "folder_id = ?1"), [folder_id])?;
         }
+        AnalysisScope::Project { project_id } => {
+            crate::db::projects::require_project(&tx, *project_id)?;
+            tx.execute(
+                &UPSERT.replace("{W}", "folder_id IN (SELECT id FROM folders WHERE project_id = ?1)"),
+                [project_id],
+            )?;
+        }
         AnalysisScope::All => {
             tx.execute(&UPSERT.replace("{W}", "1"), [])?;
         }

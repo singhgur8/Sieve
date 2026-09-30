@@ -6,6 +6,7 @@ import { DEFAULT_ADJUSTMENTS, DEFAULT_ADJUSTMENTS_NON_RAW, DEFAULT_LOCAL_ADJUSTM
 import type {
   AdjustmentField,
   AppError,
+  AutoToneValues,
   ColorGrading,
   ColorWheel,
   CropSettings,
@@ -13,6 +14,7 @@ import type {
   HslChannels,
   ImageFormat,
   ImageQuery,
+  KeeperRule,
   LocalAdjustments,
   MaskComponent,
   MaskGroup,
@@ -20,8 +22,11 @@ import type {
   MatchOptions,
   NormPoint,
   ParametricAdjustments,
+  PickFlag,
   PointCurves,
   ProfileSettings,
+  RawImageEntry,
+  StyleProfile,
   WhiteBalance,
 } from "./bindings";
 
@@ -103,6 +108,7 @@ export const DEFAULT_QUERY: ImageQuery = {
   sceneId: null,
   collapseBursts: false,
   folderId: null,
+  projectId: null,
   sort: "capture_time",
   sortDescending: false,
   offset: 0,
@@ -138,6 +144,9 @@ const ADJUSTMENT_FIELD_SET: Record<AdjustmentField, true> = {
   crop: true,
   profile: true,
   masks: true,
+  noise_reduction_luminance: true,
+  noise_reduction_color: true,
+  process_version: true,
 };
 
 /** Every `AdjustmentField`, in panel order (fields mask "select all"). */
@@ -172,6 +181,9 @@ export const ADJUSTMENT_FIELD_LABELS: Record<AdjustmentField, string> = {
   crop: "Crop",
   profile: "Profile",
   masks: "Masking",
+  noise_reduction_luminance: "Luminance noise reduction",
+  noise_reduction_color: "Color noise reduction",
+  process_version: "Process version",
 };
 
 /**
@@ -217,6 +229,31 @@ export function copyAdjustmentFields(
       case "noise_reduction":
         out.detail.noiseReduction = s.detail.noiseReduction;
         break;
+      case "noise_reduction_luminance": {
+        const d = out.detail.noiseReduction;
+        const n = s.detail.noiseReduction;
+        out.detail.noiseReduction = {
+          ...d,
+          luminance: n.luminance,
+          luminanceDetail: n.luminanceDetail,
+          luminanceContrast: n.luminanceContrast,
+        };
+        break;
+      }
+      case "noise_reduction_color": {
+        const d = out.detail.noiseReduction;
+        const n = s.detail.noiseReduction;
+        out.detail.noiseReduction = {
+          ...d,
+          color: n.color,
+          colorDetail: n.colorDetail,
+          colorSmoothness: n.colorSmoothness,
+        };
+        break;
+      }
+      case "process_version":
+        out.processVersion = s.processVersion;
+        break;
       case "vignette":
         out.effects.vignette = s.effects.vignette;
         break;
@@ -242,11 +279,85 @@ export function copyAdjustmentFields(
   return out;
 }
 
+/** Subsets of a wider field (Copy Settings items, v14); never part of the default selections. */
+const SUBSET_FIELDS: readonly AdjustmentField[] = ["noise_reduction_luminance", "noise_reduction_color"];
+
 /**
- * Everything except `crop` and `masks` (mirror of Rust `AdjustmentField::DEFAULT_SYNC`): the
- * default selection for Sync / Copy Settings and scene matching (per-frame geometry).
+ * Everything except `crop`, `masks` and the noise-reduction subsets (mirror of Rust
+ * `AdjustmentField::DEFAULT_SYNC`): the default selection for Sync / Copy Settings and scene
+ * matching (per-frame geometry).
  */
-export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter((f) => f !== "crop" && f !== "masks");
+export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter(
+  (f) => f !== "crop" && f !== "masks" && !SUBSET_FIELDS.includes(f),
+);
+
+// ---------------------------------------------------------------------------
+// IPC v14 mirrors (keep in sync with the Rust doc comments that name them)
+// ---------------------------------------------------------------------------
+
+/**
+ * `adj` with `profile` selected at `amount` percent (0..=200; 100 unless `supportsAmount`).
+ * Mirror of Rust `StyleProfile::apply_to`.
+ */
+export function applyStyleProfile(
+  adj: ParametricAdjustments,
+  profile: StyleProfile,
+  amount = 100,
+): CompleteAdjustments {
+  const out = structuredClone(completeAdjustments(adj));
+  const pct = profile.supportsAmount && Number.isFinite(amount) ? Math.min(200, Math.max(0, amount)) : 100;
+  switch (profile.kind) {
+    case "look":
+      if (profile.lookUuid) {
+        out.profile = { ...out.profile, look: { name: profile.name, uuid: profile.lookUuid, amount: pct / 100 } };
+      }
+      if (profile.cameraProfile) out.profile = { ...out.profile, cameraProfile: profile.cameraProfile };
+      out.lut = null;
+      break;
+    case "camera_profile":
+      out.profile = { cameraProfile: profile.cameraProfile ?? profile.name, look: null };
+      out.lut = null;
+      break;
+    case "lut":
+      if (profile.lutId) out.lut = { id: profile.lutId, amount: pct };
+      break;
+  }
+  return out;
+}
+
+/** `adj` with every non-null value of `auto` set. Mirror of Rust `AutoToneValues::apply_to`. */
+export function applyAutoTone(adj: ParametricAdjustments, auto: AutoToneValues): CompleteAdjustments {
+  const out = structuredClone(completeAdjustments(adj));
+  const keys = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "vibrance", "saturation"] as const;
+  for (const k of keys) {
+    const v = auto[k];
+    if (v !== null && v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+/** Keeper rule on culling values. Mirror of Rust `KeeperRule::is_keeper_values`. */
+export function isKeeperValues(
+  rule: KeeperRule,
+  pick: PickFlag,
+  rating: number,
+  suggestedPick: PickFlag | null | undefined,
+): boolean {
+  switch (pick) {
+    case "reject":
+      return false;
+    case "pick":
+      return true;
+    default:
+      if (rating >= rule.minRating) return true;
+      return rating === 0 && rule.useSuggestions && suggestedPick === "pick";
+  }
+}
+
+/** Keeper rule on an image. Mirror of Rust `KeeperRule::is_keeper`. */
+export function isKeeper(rule: KeeperRule, e: RawImageEntry): boolean {
+  return isKeeperValues(rule, e.pick, e.rating, e.quality?.suggestedPick);
+}
 
 /** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */
 export const EXPORT_FILENAME_TOKENS: { token: string; description: string }[] = [

@@ -13,6 +13,7 @@
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::{DetectFrame, MatchImage, SceneFeatures, FEATURES_VERSION};
+use crate::db::projects::FolderScope;
 use crate::db::{now_ms, repo};
 use crate::develop::SourceImage;
 use crate::ipc::error::{AppError, AppResult};
@@ -96,16 +97,29 @@ pub fn get_scene(conn: &Connection, id: SceneId) -> AppResult<Scene> {
     load(conn, id)?.ok_or_else(|| AppError::not_found(format!("scene {id}")))
 }
 
-/// Scenes with at least one member in `folder_id` (all scenes for `None`), in capture order
-/// (scenes without capture times last).
-pub fn list_scenes(conn: &Connection, folder_id: Option<FolderId>) -> AppResult<Vec<Scene>> {
+/// SQL predicate on `s.id`: scenes with a member in `scope`.
+fn scene_scope(scope: &FolderScope) -> String {
+    match scope.is_all() {
+        true => "1".into(),
+        false => format!(
+            "s.id IN (SELECT scene_id FROM images WHERE {} AND scene_id IS NOT NULL)",
+            scope.predicate("folder_id")
+        ),
+    }
+}
+
+/// Scenes with at least one member in `scope` (a folder, a project's folders, or all scenes),
+/// in capture order (scenes without capture times last).
+pub fn list_scenes(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<Vec<Scene>> {
+    let scope: FolderScope = scope.into();
     let ids: Vec<SceneId> = {
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT s.id FROM scenes s
-             WHERE ?1 IS NULL OR s.id IN (SELECT scene_id FROM images WHERE folder_id = ?1 AND scene_id IS NOT NULL)
+             WHERE {}
              ORDER BY s.started_at_ms IS NULL, s.started_at_ms, s.id",
-        )?;
-        let rows = stmt.query_map([folder_id], |r| r.get(0))?;
+            scene_scope(&scope)
+        ))?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
     ids.into_iter().filter_map(|id| load(conn, id).transpose()).collect()
@@ -333,15 +347,16 @@ pub fn delete_scene(conn: &mut Connection, id: SceneId) -> AppResult<()> {
     Ok(())
 }
 
-/// Images scene detection considers in `folder_id` (all folders for `None`), in detection
-/// order, with current features (stale/missing -> `None`). Members of manual scenes are
-/// excluded unless `replace_manual`. `preview_path` only for ready thumbnails.
+/// Images scene detection considers in `scope` (a folder, a project's folders, or all), in
+/// detection order, with current features (stale/missing -> `None`). Members of manual scenes
+/// are excluded unless `replace_manual`. `preview_path` only for ready thumbnails.
 pub fn detection_frames(
     conn: &Connection,
-    folder_id: Option<FolderId>,
+    scope: impl Into<FolderScope>,
     replace_manual: bool,
 ) -> AppResult<Vec<DetectFrame>> {
-    let mut stmt = conn.prepare_cached(
+    let scope: FolderScope = scope.into();
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT i.id, i.folder_id, i.captured_at_ms, i.file_name, i.burst_group_id,
                 CASE WHEN t.status = 'ready' THEN t.preview_path END,
                 CASE WHEN f.version = ?3 AND (t.extracted_at IS NULL OR f.computed_at >= t.extracted_at)
@@ -350,10 +365,11 @@ pub fn detection_frames(
          LEFT JOIN thumbnails t ON t.image_id = i.id
          LEFT JOIN scene_features f ON f.image_id = i.id
          LEFT JOIN scenes s ON s.id = i.scene_id
-         WHERE (?1 IS NULL OR i.folder_id = ?1) AND (?2 OR s.method IS NULL OR s.method <> 'manual')
+         WHERE ({}) AND (?2 OR s.method IS NULL OR s.method <> 'manual')
          ORDER BY i.folder_id, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-    )?;
-    let rows = stmt.query_map(params![folder_id, replace_manual, FEATURES_VERSION], |r| {
+        scope.predicate("i.folder_id")
+    ))?;
+    let rows = stmt.query_map(params![Option::<i64>::None, replace_manual, FEATURES_VERSION], |r| {
         let features: Option<String> = r.get(6)?;
         Ok(DetectFrame {
             id: r.get(0)?,
@@ -390,15 +406,16 @@ pub fn save_features(conn: &mut Connection, items: &[(ImageId, SceneFeatures)]) 
 }
 
 /// Detection result writer. In one transaction: deletes the `auto` scenes (and `manual` ones
-/// if `replace_manual`) with a member in `folder_id` (all for `None`), then creates one `auto`
-/// scene per group. Anchor flags of regrouped images survive (up to `Scene::MAX_ANCHORS` per
-/// new scene, capture order). Returns `list_scenes(folder_id)`.
+/// if `replace_manual`) with a member in `scope`, then creates one `auto` scene per group.
+/// Anchor flags of regrouped images survive (up to `Scene::MAX_ANCHORS` per new scene, capture
+/// order). Returns `list_scenes(scope)`.
 pub fn replace_scenes(
     conn: &mut Connection,
-    folder_id: Option<FolderId>,
+    scope: impl Into<FolderScope>,
     groups: &[Vec<ImageId>],
     replace_manual: bool,
 ) -> AppResult<Vec<Scene>> {
+    let scope: FolderScope = scope.into();
     let tx = conn.savepoint()?;
     let now = now_ms();
     let all: Vec<ImageId> = groups.iter().flatten().copied().collect();
@@ -417,12 +434,12 @@ pub fn replace_scenes(
         out
     };
     let doomed: Vec<SceneId> = {
-        let mut stmt = tx.prepare_cached(
+        let mut stmt = tx.prepare_cached(&format!(
             "SELECT s.id FROM scenes s
-             WHERE (?2 OR s.method = 'auto')
-               AND (?1 IS NULL OR s.id IN (SELECT scene_id FROM images WHERE folder_id = ?1 AND scene_id IS NOT NULL))",
-        )?;
-        let rows = stmt.query_map(params![folder_id, replace_manual], |r| r.get(0))?;
+             WHERE (?1 OR s.method = 'auto') AND ({})",
+            scene_scope(&scope)
+        ))?;
+        let rows = stmt.query_map(params![replace_manual], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
     for chunk in doomed.chunks(500) {
@@ -445,7 +462,7 @@ pub fn replace_scenes(
         write_anchors(&tx, id, &keep)?;
         refresh(&tx, id, true, now)?;
     }
-    let out = list_scenes(&tx, folder_id)?;
+    let out = list_scenes(&tx, &scope)?;
     tx.commit()?;
     Ok(out)
 }

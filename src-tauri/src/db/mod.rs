@@ -17,6 +17,7 @@
 //!   file that is not a database at all is moved aside (`<catalog>.corrupt-<ms>`) and a
 //!   new catalog is created. [`stage_restore`] + the next launch put a backup back.
 
+pub mod projects;
 pub mod repo;
 pub mod schema;
 
@@ -911,5 +912,82 @@ mod tests {
         conn.execute("DELETE FROM images WHERE id = 1", []).unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM mask_cache", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "cascade with the image");
+    }
+
+    #[test]
+    fn v12_one_project_per_folder_and_workflow_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, sql) in schema::MIGRATIONS[..11].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(
+                r#"UPDATE catalog_meta SET value = 'wedding' WHERE key = 'shoot_type';
+                 INSERT INTO catalog_meta (key, value) VALUES ('xmp_auto_sync', '0')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                 INSERT INTO folders (id, path, added_at) VALUES (4, '/Users/me/Shoots/Smith Wedding', 10),
+                                                                (7, '/Volumes/Card/Jones', 20);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at, pick)
+                 VALUES (1, 4, '/Users/me/Shoots/Smith Wedding/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0, 'pick'),
+                        (2, 4, '/Users/me/Shoots/Smith Wedding/b.arw', 'b.arw', 'arw', 'sony', 1, 0, 0, 'reject'),
+                        (3, 7, '/Volumes/Card/Jones/c.arw', 'c.arw', 'arw', 'sony', 1, 0, 0, 'unflagged');
+                 INSERT INTO presets (id, name, params_json, fields_json, created_at, updated_at)
+                     VALUES (5, 'Warm', '{}', '["exposure"]', 0, 0);"#,
+            )
+            .unwrap();
+        }
+        let mut conn = open(&path).unwrap();
+        let rows: Vec<(i64, String, String, String, i64)> = conn
+            .prepare("SELECT id, name, shoot_type, workflow_step, created_at FROM projects ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (4, "Smith Wedding".into(), "wedding".into(), "cull".into(), 10),
+                (7, "Jones".into(), "wedding".into(), "cull".into(), 20)
+            ]
+        );
+        let folders: Vec<(i64, i64)> = conn
+            .prepare("SELECT id, project_id FROM folders ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(folders, vec![(4, 4), (7, 7)]);
+        // Scoped reads see one project each; the catalog view keeps both.
+        let p = projects::get_project(&conn, 4).unwrap();
+        assert_eq!((p.photo_count, p.picked_count, p.rejected_count, p.keeper_count), (2, 1, 1, 1));
+        assert_eq!(p.folders.len(), 1);
+        assert!(!p.folders[0].exists, "folder not on this machine");
+        assert_eq!(projects::list_projects(&conn).unwrap().len(), 2);
+        let state = repo::catalog_state(&conn, "", "").unwrap();
+        assert_eq!(state.folders.iter().map(|f| (f.id, f.project_id)).collect::<Vec<_>>(), vec![(4, 4), (7, 7)]);
+        // XMP auto-sync flipped on once; presets kept as User Presets; keeper rule seeded.
+        assert!(state.xmp_auto_sync);
+        assert_eq!(state.keeper_rule, crate::ipc::types::KeeperRule::default());
+        let g: i64 = conn.query_row("SELECT group_id FROM presets WHERE id = 5", [], |r| r.get(0)).unwrap();
+        assert_eq!(g, crate::ipc::types::USER_PRESETS_GROUP_ID);
+        // Removing a project cascades to its images only.
+        projects::remove_project(&mut conn, 4).unwrap();
+        let left: Vec<i64> = conn
+            .prepare("SELECT id FROM images")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec![3]);
     }
 }

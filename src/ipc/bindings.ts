@@ -16,8 +16,13 @@ export const commands = {
 	 *  externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 	 *  returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 	 *  (and `analysis*`) events.
+	 * 
+	 *  Project (v14): `projectId` adds the folder to that project ("Add folder to project"; a
+	 *  folder already in another project -> `invalid_argument`); `null` = the folder's project
+	 *  if it (or a folder containing it) is in the catalog, else a new project named after it.
+	 *  `create_project` is the home page's "New project".
 	 */
-	importFolder: (path: string, options: ImportOptions) => typedError<ImportSummary, AppError>(__TAURI_INVOKE("import_folder", { path, options })),
+	importFolder: (path: string, options: ImportOptions, projectId: number | null) => typedError<ImportSummary, AppError>(__TAURI_INVOKE("import_folder", { path, options, projectId })),
 	listImages: (query: ImageQuery) => typedError<ImagePage, AppError>(__TAURI_INVOKE("list_images", { query })),
 	getImage: (id: number) => typedError<RawImageEntry, AppError>(__TAURI_INVOKE("get_image", { id })),
 	setRating: (ids: number[], rating: number) => typedError<null, AppError>(__TAURI_INVOKE("set_rating", { ids, rating })),
@@ -87,8 +92,11 @@ export const commands = {
 } | null) => typedError<null, AppError>(__TAURI_INVOKE("set_cull_thresholds", { shootType, thresholds })),
 	/**  Faces from the last analysis (empty if unanalyzed); for face-crop zoom. */
 	getFaces: (id: number) => typedError<FaceInfo[], AppError>(__TAURI_INVOKE("get_faces", { id })),
-	/**  Burst groups with members, optionally limited to groups touching `folderId`. */
-	listBurstGroups: (folderId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId })),
+	/**
+	 *  Burst groups with members, optionally limited to groups touching `folderId` AND
+	 *  `projectId` (v14).
+	 */
+	listBurstGroups: (folderId: number | null, projectId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId, projectId })),
 	/**
 	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
 	 *  Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
@@ -106,8 +114,11 @@ export const commands = {
 	 *  (select-all, loupe navigation, batch actions over a filter).
 	 */
 	listImageIds: (query: ImageQuery) => typedError<number[], AppError>(__TAURI_INVOKE("list_image_ids", { query })),
-	/**  Filter-bar facet counts for `folderId` (`null` = whole catalog). */
-	getFilterCounts: (folderId: number | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId })),
+	/**
+	 *  Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
+	 *  inside a project pass its id). Unknown project -> `not_found`.
+	 */
+	getFilterCounts: (folderId: number | null, projectId: number | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId })),
 	/**
 	 *  Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
 	 *  preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
@@ -188,7 +199,11 @@ export const commands = {
 	syncSettings: (sourceId: number, targetIds: number[], fields: AdjustmentField[]) => typedError<null, AppError>(__TAURI_INVOKE("sync_settings", { sourceId, targetIds, fields })),
 	/**  Resets `ids` to neutral adjustments ("Reset" history entry). Atomic. */
 	resetAdjustments: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("reset_adjustments", { ids })),
-	/**  Applies preset `presetId` (its `fields` only) to `ids` ("Preset: <name>"). Atomic. */
+	/**
+	 *  Applies preset `presetId` to `ids` ("Preset: <name>" entry per changed image). Atomic.
+	 *  Sieve presets copy their `fields` groups; imported Lightroom presets (v14) set exactly the
+	 *  `crs:` settings they contain and leave every other setting alone (`styles::resolve_preset`).
+	 */
 	applyPreset: (ids: number[], presetId: number) => typedError<null, AppError>(__TAURI_INVOKE("apply_preset", { ids, presetId })),
 	/**  Presets sorted by name. */
 	listPresets: () => typedError<Preset[], AppError>(__TAURI_INVOKE("list_presets")),
@@ -238,14 +253,15 @@ export const commands = {
 	/**  Queued/running jobs first, then recent finished jobs (newest first, max 50). */
 	getExportJobs: () => typedError<ExportJob[], AppError>(__TAURI_INVOKE("get_export_jobs")),
 	/**
-	 *  Groups the images of `folderId` (all folders for `null`) into scenes by capture-time gaps
+	 *  Groups the images of `folderId` AND `projectId` (v14; both `null` = all folders; scenes
+	 *  never span folders) into scenes by capture-time gaps
 	 *  and appearance similarity (`options` `null` = defaults). Replaces the `auto` scenes in scope
 	 *  (and `manual` ones if `replaceManual`); members of kept manual scenes are not regrouped;
 	 *  anchor flags survive regrouping. Blocking until done (first run computes preview features,
 	 *  ~10 ms/image in parallel; later runs reuse them); progress via `sceneProgress {task:
 	 *  "detect"}`. Returns `list_scenes(folderId)`.
 	 */
-	detectScenes: (folderId: number | null, options: {
+	detectScenes: (folderId: number | null, projectId: number | null, options: {
 	/**  A capture-time gap longer than this always starts a new scene. 1000..=86_400_000 ms. */
 	maxGapMs: number,
 	/**
@@ -255,9 +271,12 @@ export const commands = {
 	similarity: number,
 	/**  Also replace manual scenes in scope (default: they and their members are left alone). */
 	replaceManual: boolean,
-} | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("detect_scenes", { folderId, options })),
-	/**  Scenes with a member in `folderId` (all for `null`), in capture order. */
-	listScenes: (folderId: number | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("list_scenes", { folderId })),
+} | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("detect_scenes", { folderId, projectId, options })),
+	/**
+	 *  Scenes with a member in `folderId` AND `projectId` (v14; both `null` = all), in capture
+	 *  order.
+	 */
+	listScenes: (folderId: number | null, projectId: number | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("list_scenes", { folderId, projectId })),
 	getScene: (id: number) => typedError<Scene, AppError>(__TAURI_INVOKE("get_scene", { id })),
 	/**
 	 *  New `manual` scene from `imageIds` (non-empty; moved out of their current scenes; scenes
@@ -374,7 +393,9 @@ export const commands = {
 	/**
 	 *  Profile browser contents for image `id`: camera profiles (DCPs) installed for its camera
 	 *  and the installed looks (read in place from the user's Adobe installation; empty lists
-	 *  when none are installed). Select one by saving `adjustments.profile`.
+	 *  when none are installed), plus (v14) the style library's imported looks / DCPs for this
+	 *  camera (`styleId` set, `group` = style group name) and every LUT profile (`luts`).
+	 *  Select one by saving `adjustments.profile` / `adjustments.lut` (`applyStyleProfile`).
 	 */
 	listProfiles: (id: number) => typedError<ProfileCatalog, AppError>(__TAURI_INVOKE("list_profiles", { id })),
 	/**
@@ -450,6 +471,271 @@ export const commands = {
 	 *  `not_found` (no such backup), `invalid_argument` (the backup is damaged too).
 	 */
 	restoreCatalogBackup: (index: number) => typedError<CatalogHealth, AppError>(__TAURI_INVOKE("restore_catalog_backup", { index })),
+	/**
+	 *  Imports every Lightroom develop preset (`.xmp` `crs:PresetType="Normal"`, legacy
+	 *  `.lrtemplate`), creative profile (`.xmp` `crs:PresetType="Look"`), camera profile (`.dcp`)
+	 *  and `.cube` LUT under `path` (recursive), one style group per source folder; re-importing a
+	 *  folder replaces its group. Looks/DCPs are read in place later (never copied); LUTs are
+	 *  copied into the LUT library. Errors: `not_found` (no such folder), `invalid_argument`
+	 *  (nothing importable found). Body: rust-engine-dev (`styles::import_folder`).
+	 */
+	importStyleFolder: (path: string) => typedError<ImportStyleReport, AppError>(__TAURI_INVOKE("import_style_folder", { path })),
+	/**
+	 *  The whole style library (every project sees every group): "User Presets", imported groups
+	 *  by name, "LUTs" (the pre-v14 LUT library, registered on first listing).
+	 */
+	listStyles: () => typedError<StyleLibrary, AppError>(__TAURI_INVOKE("list_styles")),
+	/**
+	 *  Removes an imported style group and its presets/profiles (source files untouched; images
+	 *  using them keep their settings). Built-in groups -> `invalid_argument`.
+	 */
+	removeStyleGroup: (groupId: number) => typedError<null, AppError>(__TAURI_INVOKE("remove_style_group", { groupId })),
+	/**
+	 *  What `apply_preset(presetId)` would make of image `id`'s settings (`adjustments` = the live
+	 *  settings, `null` = stored ones), for hover previews (`renderPreview` with slot
+	 *  `navigator`). Nothing is saved.
+	 */
+	resolvePreset: (id: number, presetId: number, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
+} | null) => typedError<ParametricAdjustments, AppError>(__TAURI_INVOKE("resolve_preset", { id, presetId, adjustments })),
+	/**
+	 *  Lightroom's Basic "Auto": absolute values for the tone + presence sliders in `keys`
+	 *  (`null` = all of `AdjustmentField::AUTO_TONE`; Shift-double-click a slider = just that one)
+	 *  given the live `adjustments` (`null` = stored). Nothing is saved: the UI merges the values
+	 *  (`applyAutoTone`) and saves one "Auto Tone" history entry. Body: rust-engine-dev.
+	 */
+	autoTone: (id: number, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
+} | null, keys: AdjustmentField[] | null) => typedError<AutoToneValues, AppError>(__TAURI_INVOKE("auto_tone", { id, adjustments, keys })),
+	/**
+	 *  Lightroom's "Auto" white balance: temperature/tint for the live `adjustments` (`null` =
+	 *  stored). Nothing is saved: the UI commits `whiteBalance: custom` ("Auto White Balance").
+	 *  Body: rust-engine-dev.
+	 */
+	autoWhiteBalance: (id: number, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
+} | null) => typedError<WhiteBalanceValues, AppError>(__TAURI_INVOKE("auto_white_balance", { id, adjustments })),
+	/**  Guided-workflow step of project `projectId` (also `Project.workflowStep`). */
+	getWorkflowStep: (projectId: number) => typedError<WorkflowStep, AppError>(__TAURI_INVOKE("get_workflow_step", { projectId })),
+	setWorkflowStep: (projectId: number, step: WorkflowStep) => typedError<null, AppError>(__TAURI_INVOKE("set_workflow_step", { projectId, step })),
+	/**  Changes which images count as keepers (`CatalogState.keeperRule`). `minRating` 1..=5. */
+	setKeeperRule: (rule: KeeperRule) => typedError<null, AppError>(__TAURI_INVOKE("set_keeper_rule", { rule })),
+	/**
+	 *  The Edit step of project `projectId`: keepers, their scenes, one representative per scene
+	 *  and the checklist status. Proposes (and remembers) representatives for scenes without one.
+	 *  Keepers outside every scene are listed in `unassignedKeeperIds` (run `detect_scenes`).
+	 */
+	getEditPlan: (projectId: number) => typedError<EditPlan, AppError>(__TAURI_INVOKE("get_edit_plan", { projectId })),
+	/**
+	 *  Chooses scene `sceneId`'s representative (`imageId` must be a keeper member) or hands the
+	 *  choice back to Sieve (`null`).
+	 */
+	setSceneRepresentative: (sceneId: number, imageId: number | null) => typedError<SceneEditEntry, AppError>(__TAURI_INVOKE("set_scene_representative", { sceneId, imageId })),
+	/**
+	 *  "Apply to scene": copies the representative's edit to the scene's other keepers (and
+	 *  non-keepers with `includeNonKeepers`) with relative matching (exposure / white balance
+	 *  normalised per frame, `SceneApplyOptions.matchOptions`), skipping frames the user retouched
+	 *  after the last apply (`skipUserEdited`). One undoable batch (`undo_edit_batch`); one "Apply
+	 *  to Scene" history entry per changed image. Blocking until done (`sceneProgress` task
+	 *  `apply`). Representative without edits -> `invalid_argument`.
+	 */
+	applySceneEdit: (sceneId: number, options: {
+	/**
+	 *  Relative matching of every target to the representative (the representative is the
+	 *  single anchor of `match_scene`). Default `MatchOptions::default()` (exposure + WB
+	 *  matched, strength 1, `DEFAULT_SYNC` groups copied).
+	 */
+	matchOptions: MatchOptions,
+	/**  Also edit the scene's non-keepers (default `false`). */
+	includeNonKeepers: boolean,
+	/**
+	 *  Leave targets alone whose adjustments the user changed after this scene's last apply
+	 *  (their current settings differ from what that apply wrote) (default `true`).
+	 */
+	skipUserEdited: boolean,
+} | null) => typedError<ApplyScenesResult, AppError>(__TAURI_INVOKE("apply_scene_edit", { sceneId, options })),
+	/**
+	 *  `apply_scene_edit` for every scene of `projectId` whose status is `edited` or `outdated`,
+	 *  as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
+	 */
+	applyAllEditedScenes: (projectId: number, options: {
+	/**
+	 *  Relative matching of every target to the representative (the representative is the
+	 *  single anchor of `match_scene`). Default `MatchOptions::default()` (exposure + WB
+	 *  matched, strength 1, `DEFAULT_SYNC` groups copied).
+	 */
+	matchOptions: MatchOptions,
+	/**  Also edit the scene's non-keepers (default `false`). */
+	includeNonKeepers: boolean,
+	/**
+	 *  Leave targets alone whose adjustments the user changed after this scene's last apply
+	 *  (their current settings differ from what that apply wrote) (default `true`).
+	 */
+	skipUserEdited: boolean,
+} | null) => typedError<ApplyScenesResult, AppError>(__TAURI_INVOKE("apply_all_edited_scenes", { projectId, options })),
+	/**
+	 *  Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
+	 *  `apply_style_prediction`): images still carrying what the batch wrote get their previous
+	 *  settings back ("Undo <label>" entry each); images edited since are left alone
+	 *  (`skippedIds`). Unknown batch -> `not_found`; already undone -> `invalid_argument`.
+	 */
+	undoEditBatch: (batchId: number) => typedError<UndoBatchResult, AppError>(__TAURI_INVOKE("undo_edit_batch", { batchId })),
+	/**
+	 *  Lightroom's "Previous" / Paste from previous (Cmd+Alt+V): copies the stored settings of
+	 *  `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
+	 *  `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
+	 *  `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+	 */
+	pastePrevious: (targetIds: number[], previousId: number, fields: AdjustmentField[] | null) => typedError<null, AppError>(__TAURI_INVOKE("paste_previous", { targetIds, previousId, fields })),
+	/**  State of the personal style model ("Auto edit (my style)"). */
+	styleModelStatus: () => typedError<StyleModelStatus, AppError>(__TAURI_INVOKE("style_model_status")),
+	/**
+	 *  Trains the style model from every edited photo in the catalog, in the background
+	 *  (`styleModelProgress`, then exactly one `styleModelFinished`). Already training ->
+	 *  `invalid_argument`. Body: vision-ml-dev.
+	 */
+	trainStyleModel: () => typedError<null, AppError>(__TAURI_INVOKE("train_style_model")),
+	/**  Stops a running training (no-op when idle); `styleModelFinished {cancelled: true}` follows. */
+	cancelStyleTraining: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_style_training")),
+	/**
+	 *  Predicted settings in the user's style for `imageIds` (given order; nothing is saved).
+	 *  No trained model -> `invalid_argument`. Body: vision-ml-dev.
+	 */
+	predictStyle: (imageIds: number[]) => typedError<StylePrediction[], AppError>(__TAURI_INVOKE("predict_style", { imageIds })),
+	/**
+	 *  Predicts and commits the user's style for `imageIds` as one undoable batch ("Auto Edit (My
+	 *  Style)" entry per changed image; `undo_edit_batch`).
+	 */
+	applyStylePrediction: (imageIds: number[]) => typedError<EditBatchResult, AppError>(__TAURI_INVOKE("apply_style_prediction", { imageIds })),
+	/**
+	 *  Every project, most recently opened first, then newest (the home page sorts/searches
+	 *  client-side).
+	 */
+	listProjects: () => typedError<Project[], AppError>(__TAURI_INVOKE("list_projects")),
+	/**  One project. Unknown id -> `not_found`. */
+	getProject: (projectId: number) => typedError<Project, AppError>(__TAURI_INVOKE("get_project", { projectId })),
+	/**
+	 *  Home page "New project": imports `path` (like `import_folder`) as a new project named
+	 *  `name` (`null` = the folder's name) with `shootType` (`null` = `CatalogState.shootType`).
+	 *  If the folder (or a folder containing it) is already in the catalog, its project is
+	 *  re-scanned and returned with `existing: true` instead. Errors as `import_folder`; bad name
+	 *  -> `invalid_argument`.
+	 */
+	createProject: (path: string, name: string | null, shootType: "wedding" | "portrait" | "sports" | "event" | "landscape" | "general" | null, options: ImportOptions) => typedError<CreateProjectResult, AppError>(__TAURI_INVOKE("create_project", { path, name, shootType, options })),
+	/**
+	 *  Entering a project: stamps `lastOpenedAtMs` and returns it. The app always starts on the
+	 *  home page (the last project is not reopened automatically).
+	 */
+	openProject: (projectId: number) => typedError<Project, AppError>(__TAURI_INVOKE("open_project", { projectId })),
+	/**  Renames a project (trimmed, 1..=200 characters; the folder on disk is not renamed). */
+	renameProject: (projectId: number, name: string) => typedError<Project, AppError>(__TAURI_INVOKE("rename_project", { projectId, name })),
+	/**
+	 *  Sets the cover photo (`imageId` must be in the project) or returns to the automatic
+	 *  cover (`null`).
+	 */
+	setProjectCover: (projectId: number, imageId: number | null) => typedError<Project, AppError>(__TAURI_INVOKE("set_project_cover", { projectId, imageId })),
+	/**
+	 *  Sets the project's shoot type and rescores (tags/scores/suggestions of its photos follow
+	 *  the new type's thresholds).
+	 */
+	setProjectShootType: (projectId: number, shootType: ShootType) => typedError<null, AppError>(__TAURI_INVOKE("set_project_shoot_type", { projectId, shootType })),
+	/**
+	 *  Removes a project from the catalog: its folders, photos and everything Sieve stored about
+	 *  them (ratings, tags, edits, scenes, history) and their cached thumbnails/previews. Never
+	 *  deletes or modifies originals, sidecars or exports; re-importing the folder brings the
+	 *  photos back with what the sidecars hold. Unknown id -> `not_found`.
+	 */
+	removeProject: (projectId: number) => typedError<RemoveProjectResult, AppError>(__TAURI_INVOKE("remove_project", { projectId })),
 };
 
 /** Events */
@@ -464,6 +750,8 @@ export const events = {
 	modelDownloadFinished: makeEvent<ModelDownloadFinished>("model-download-finished"),
 	modelDownloadProgress: makeEvent<ModelDownloadProgress>("model-download-progress"),
 	sceneProgress: makeEvent<SceneProgress>("scene-progress"),
+	styleModelFinished: makeEvent<StyleModelFinished>("style-model-finished"),
+	styleModelProgress: makeEvent<StyleModelProgress>("style-model-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
 	xmpSynced: makeEvent<XmpSynced>("xmp-synced"),
@@ -471,13 +759,27 @@ export const events = {
 };
 
 /* Constants */
+export const AUTO_TONE_FIELDS = ["exposure","contrast","highlights","shadows","whites","blacks","vibrance","saturation"] as const;
+
+export const COPY_SETTINGS_GROUPS = [{"id":"white_balance","items":[{"fields":["white_balance"],"label":"White Balance","supported":true}],"label":"White Balance"},{"id":"basic_tone","items":[{"fields":["exposure"],"label":"Exposure","supported":true},{"fields":["contrast"],"label":"Contrast","supported":true},{"fields":["highlights"],"label":"Highlights","supported":true},{"fields":["shadows"],"label":"Shadows","supported":true},{"fields":["whites"],"label":"White Clipping","supported":true},{"fields":["blacks"],"label":"Black Clipping","supported":true}],"label":"Basic Tone"},{"id":"tone_curve","items":[{"fields":["tone_curve"],"label":"Tone Curve","supported":true}],"label":"Tone Curve"},{"id":"presence","items":[{"fields":["texture"],"label":"Texture","supported":true},{"fields":["clarity"],"label":"Clarity","supported":true},{"fields":["dehaze"],"label":"Dehaze","supported":true},{"fields":["vibrance"],"label":"Vibrance","supported":true},{"fields":["saturation"],"label":"Saturation","supported":true}],"label":"Presence"},{"id":"color","items":[{"fields":["hsl_hue"],"label":"Hue","supported":true},{"fields":["hsl_saturation"],"label":"Saturation","supported":true},{"fields":["hsl_luminance"],"label":"Luminance","supported":true}],"label":"Color Adjustments"},{"id":"color_grading","items":[{"fields":["color_grading"],"label":"Color Grading","supported":true}],"label":"Color Grading"},{"id":"detail","items":[{"fields":["sharpening"],"label":"Sharpening","supported":true},{"fields":["noise_reduction_luminance"],"label":"Luminance Noise Reduction","supported":true},{"fields":["noise_reduction_color"],"label":"Color Noise Reduction","supported":true}],"label":"Detail"},{"id":"treatment_profile","items":[{"fields":["black_and_white"],"label":"Treatment & B&W Mix","supported":true},{"fields":["profile","lut"],"label":"Profile","supported":true}],"label":"Treatment & Profile"},{"id":"lens_corrections","items":[{"fields":[],"label":"Lens Profile Corrections","supported":false},{"fields":[],"label":"Chromatic Aberration","supported":false},{"fields":[],"label":"Lens Distortion","supported":false},{"fields":[],"label":"Lens Vignetting","supported":false}],"label":"Lens Corrections"},{"id":"transform","items":[{"fields":[],"label":"Upright & Transform","supported":false}],"label":"Transform"},{"id":"effects","items":[{"fields":["vignette"],"label":"Post-Crop Vignetting","supported":true},{"fields":["grain"],"label":"Grain","supported":true}],"label":"Effects"},{"id":"calibration","items":[{"fields":["calibration"],"label":"Calibration","supported":true}],"label":"Calibration"},{"id":"masking","items":[{"fields":["masks"],"label":"Masks","supported":true}],"label":"Masking"},{"id":"spot_removal","items":[{"fields":[],"label":"Spot Removal","supported":false}],"label":"Spot Removal"},{"id":"crop","items":[{"fields":["crop"],"label":"Crop, Straighten Angle & Aspect Ratio","supported":true}],"label":"Crop"},{"id":"process_version","items":[{"fields":["process_version"],"label":"Process Version","supported":true}],"label":"Process Version"}] as const;
+
 export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
 export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
+export const DEFAULT_KEEPER_RULE = {"minRating":1,"useSuggestions":true} as const;
+
 export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"hue":0.0,"saturation":0.0},"contrast":0.0,"curveRefineSaturation":100.0,"defringe":0.0,"dehaze":0.0,"exposure":0.0,"highlights":0.0,"hue":0.0,"moire":0.0,"noise":0.0,"saturation":0.0,"shadows":0.0,"sharpness":0.0,"temperature":0.0,"texture":0.0,"tint":0.0,"toneCurve":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]},"whites":0.0} as const;
 
+export const DEFAULT_SCENE_APPLY_OPTIONS = {"includeNonKeepers":false,"matchOptions":{"copyFields":["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","process_version"],"matchExposure":true,"matchTone":false,"matchWhiteBalance":true,"strength":1.0},"skipUserEdited":true} as const;
+
+export const LUT_LIBRARY_GROUP_ID = 2 as const;
+
 export const MODEL_GROUP_SEGMENTATION = "segmentation" as const;
+
+export const PASTE_PREVIOUS_FIELDS = ["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","crop","profile","process_version"] as const;
+
+export const USER_PRESETS_GROUP_ID = 1 as const;
 
 /* Types */
 /**
@@ -519,7 +821,19 @@ export type AdjustmentField =
  *  `masks` (all mask groups; AI mattes are recomputed on the target) (v10). Not in
  *  [`AdjustmentField::DEFAULT_SYNC`].
  */
-"masks";
+"masks" | 
+/**
+ *  `detail.noiseReduction` luminance, luminanceDetail, luminanceContrast only (v14,
+ *  Lightroom's "Luminance Noise Reduction" copy item). Subset of `noise_reduction`.
+ */
+"noise_reduction_luminance" | 
+/**
+ *  `detail.noiseReduction` color, colorDetail, colorSmoothness only (v14, "Color
+ *  Noise Reduction"). Subset of `noise_reduction`.
+ */
+"noise_reduction_color" | 
+/**  `processVersion` (v14, Lightroom's "Process Version" copy item). */
+"process_version";
 
 /**
  *  Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
@@ -710,6 +1024,8 @@ export type AnalysisScope =
 { kind: "images"; ids: number[] } | 
 /**  Re-measure every image in this folder. */
 { kind: "folder"; folderId: number } | 
+/**  Re-measure every image of this project (v14). */
+{ kind: "project"; projectId: number } | 
 /**  Re-measure the whole catalog. */
 { kind: "all" } | 
 /**
@@ -742,12 +1058,33 @@ export type AppError = {
 	message: string,
 };
 
+/**  Result of `apply_scene_edit` / `apply_all_edited_scenes`: one batch for the whole call. */
+export type ApplyScenesResult = {
+	batch: EditBatchResult,
+	scenes: SceneApplyOutcome[],
+};
+
 /**  Result of `apply_suggestions`. */
 export type ApplySuggestionsResult = {
 	/**  Images whose rating/pick were set from the suggestions. */
 	applied: number,
 	/**  Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated. */
 	skipped: number,
+};
+
+/**
+ *  Values of Lightroom's Basic "Auto" (`auto_tone`): absolute slider values for the
+ *  requested sliders, `null` for sliders not requested.
+ */
+export type AutoToneValues = {
+	exposure: number | null,
+	contrast: number | null,
+	highlights: number | null,
+	shadows: number | null,
+	whites: number | null,
+	blacks: number | null,
+	vibrance: number | null,
+	saturation: number | null,
 };
 
 /**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
@@ -832,9 +1169,14 @@ export type CameraProfileInfo = {
 	name: string,
 	/**
 	 *  Profile browser group: "Adobe Raw" (Adobe Standard), "Camera Matching" (`Camera/<model>/`),
-	 *  else "Other".
+	 *  else "Other"; for imported DCPs (v14) the style group's name.
 	 */
 	group: string,
+	/**
+	 *  Style-library profile this entry comes from (imported with `import_style_folder`, v14);
+	 *  `null` = installed by Adobe software.
+	 */
+	styleId: number | null,
 };
 
 /**
@@ -898,6 +1240,10 @@ export type CatalogHealthStatus =
 export type CatalogState = {
 	catalogPath: string,
 	imageCount: number,
+	/**
+	 *  Catalog default shoot type: new projects start with it (v14; each project has its own,
+	 *  `Project.shootType`, which is what culling scores with).
+	 */
 	shootType: ShootType,
 	/**  Max gap between consecutive frames in one burst. */
 	burstWindowMs: number,
@@ -912,12 +1258,18 @@ export type CatalogState = {
 	/**  Analysis starts automatically after import / on launch (`set_auto_analyze`). */
 	autoAnalyze: boolean,
 	/**
-	 *  Sidecars are written automatically after rating/pick/label/tag changes
-	 *  (`set_xmp_auto_sync`). Default off.
+	 *  Sidecars are written automatically (debounced) after rating/pick/label/tag and develop
+	 *  changes (`set_xmp_auto_sync`). Default **on** since v14 (migration 0012 turned it on for
+	 *  catalogs whose setting was never changed by the user).
 	 */
 	xmpAutoSync: boolean,
 	/**  Integrity of the catalog as found at launch, and its backups (IPC v13). */
 	health: CatalogHealth,
+	/**
+	 *  Which images count as keepers (edit plan, export step, project counts) (v14;
+	 *  `set_keeper_rule`).
+	 */
+	keeperRule: KeeperRule,
 };
 
 /**  JPEG chroma subsampling. `444` keeps full colour resolution (larger files). */
@@ -984,6 +1336,18 @@ export type ColorWheel = {
 	hue: number,
 	saturation: number,
 	luminance: number,
+};
+
+/**  Result of `create_project`. */
+export type CreateProjectResult = {
+	project: Project,
+	/**  The import that ran (new photos are `pending` until the ingest pipeline extracts them). */
+	import: ImportSummary,
+	/**
+	 *  The folder was already in the catalog: its existing project was returned (and the folder
+	 *  re-scanned) instead of creating a new one; `name` / `shootType` were not applied.
+	 */
+	existing: boolean,
 };
 
 /**
@@ -1157,6 +1521,30 @@ export type DevelopWarningCode =
  */
 "source_color_assumed";
 
+/**  An undoable multi-image edit (`undo_edit_batch`). */
+export type EditBatchResult = {
+	/**  `null` when nothing changed (nothing to undo). */
+	batchId: number | null,
+	/**  History label of every entry of the batch, e.g. "Apply to Scene", "Auto Edit (My Style)". */
+	label: string,
+	changedIds: number[],
+};
+
+/**  `get_edit_plan(projectId)`: the Edit step of one project. */
+export type EditPlan = {
+	projectId: number,
+	keeperRule: KeeperRule,
+	/**  Every keeper of the project, capture order (the Export step's default selection). */
+	keeperIds: number[],
+	/**
+	 *  Keepers that belong to no scene. Non-empty = run `detect_scenes(null, projectId, null)`
+	 *  (or create scenes) and fetch the plan again.
+	 */
+	unassignedKeeperIds: number[],
+	/**  Scenes with at least one keeper in the project, capture order. */
+	scenes: SceneEditEntry[],
+};
+
 /**  Adjustments + history after an undo/redo/jump. */
 export type EditState = {
 	adjustments: ParametricAdjustments,
@@ -1287,6 +1675,11 @@ export type ExportJob = {
 	skipped: number,
 	/**  Resolved destination incl. subfolder; `null` for `source_folder`. */
 	outputDir: string | null,
+	/**
+	 *  The project every image of the job belongs to (v14; `null` = images of several
+	 *  projects, or a job from before v14). Drives the Export step's "Exported N".
+	 */
+	projectId: number | null,
 	failures: ExportFailure[],
 	createdAtMs: number,
 	finishedAtMs: number | null,
@@ -1433,6 +1826,8 @@ export type FolderEntry = {
 	id: number,
 	path: string,
 	imageCount: number,
+	/**  Project this folder belongs to (v14; every folder belongs to exactly one). */
+	projectId: number,
 };
 
 /**
@@ -1542,6 +1937,11 @@ export type ImageQuery = {
 	/**  Only images whose original is missing (`missingSinceMs` set; IPC v13). */
 	missingOnly?: boolean,
 	folderId: number | null,
+	/**
+	 *  Only images of this project (v14). Inside a project the UI always sets it; combined
+	 *  with `folderId` (AND) a folder of another project matches nothing.
+	 */
+	projectId?: number | null,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -1643,8 +2043,28 @@ export type ImportStatus = {
 	running: boolean,
 };
 
+/**  Result of `import_style_folder`. */
+export type ImportStyleReport = {
+	/**  The folder that was imported (absolute). */
+	root: string,
+	/**  Groups created or replaced (one per folder containing at least one importable file). */
+	groupIds: number[],
+	presets: number,
+	profiles: number,
+	/**
+	 *  Files with a supported extension that could not be imported (other files are ignored
+	 *  silently).
+	 */
+	skipped: StyleImportSkip[],
+};
+
 export type ImportSummary = {
 	folderId: number,
+	/**
+	 *  Project the folder belongs to (v14; a new folder gets a new project unless
+	 *  `import_folder` was given one).
+	 */
+	projectId: number,
 	/**  New images added to the catalog. */
 	added: number,
 	/**  Supported files already in the catalog. */
@@ -1661,6 +2081,26 @@ export type ImportSummary = {
 	sidecarsRead: number,
 	/**  JPEG/HEIC siblings recorded as a RAW's `companionPath` instead of being added (v9). */
 	companions: number,
+};
+
+/**
+ *  Which images are keepers (Edit step scenes, Export step selection). One definition for
+ *  the whole app ([`KeeperRule::is_keeper`], TS mirror `isKeeper`):
+ *  1. rejected by the user -> never;
+ *  2. picked by the user -> keeper;
+ *  3. rated `>= minRating` stars by the user -> keeper;
+ *  4. untouched by the user (unflagged and 0 stars) and `useSuggestions` -> keeper iff the
+ *     culling engine suggests `pick` (`QualityScore.suggestedPick`; burst non-keepers are never
+ *     suggested `pick`).
+ * 
+ *  Otherwise (unflagged with 1..minRating-1 stars, or untouched without a pick suggestion)
+ *  not a keeper.
+ */
+export type KeeperRule = {
+	/**  1..=5. Default 1 (any star keeps, Lightroom convention). */
+	minRating: number,
+	/**  Default `true`. */
+	useSuggestions: boolean,
 };
 
 /**  Landscape categories of an AI "Landscape" selection (Lightroom 13; sky is `AiTarget::Sky`). */
@@ -1767,9 +2207,14 @@ export type LookProfileInfo = {
 	cameraProfile: string | null,
 	/**
 	 *  Usable for this image (`crs:CameraModelRestriction` empty or matching; RAW-only looks
-	 *  are unavailable for non-RAW sources).
+	 *  are unavailable for non-RAW sources; v14: imported file still readable).
 	 */
 	available: boolean,
+	/**
+	 *  Style-library profile this entry comes from (imported creative profile, v14); `null` =
+	 *  installed by Adobe software. For imported looks `group` is the style group's name.
+	 */
+	styleId: number | null,
 };
 
 /**
@@ -1837,8 +2282,24 @@ export type LutKind =
 "lut_3d";
 
 /**
+ *  A `.cube` LUT offered as a profile in the profile browser (IPC v14). Selecting it sets
+ *  `ParametricAdjustments.lut = { id: lutId, amount: 100 }` (see `StyleProfile`).
+ */
+export type LutProfileInfo = {
+	styleId: number,
+	lutId: string,
+	name: string,
+	/**  Style group name (source folder name, or "LUTs" for the pre-v14 LUT library). */
+	group: string,
+	/**  The library copy exists. */
+	available: boolean,
+};
+
+/**
  *  A `.cube` LUT from the LUT library, applied after the parametric stage
  *  (on display-referred sRGB-encoded values, before output encoding).
+ *  Since IPC v14 the UI presents LUTs as profiles (`StyleProfileKind::Lut`, profile browser
+ *  with an Amount slider); this field is where a LUT profile lives in the adjustments.
  */
 export type LutRef = {
 	/**
@@ -1846,7 +2307,11 @@ export type LutRef = {
 	 *  `RenderedPreview.lutMissing`.
 	 */
 	id: string,
-	/**  Blend amount 0..=100 (100 = full LUT output). */
+	/**
+	 *  Amount 0..=200 (100 = full LUT output; v14: above 100 extrapolates
+	 *  `in + (lut - in) * amount / 100`, clamped to the output range, like Lightroom's
+	 *  profile Amount). Was 0..=100 before v14.
+	 */
 	amount: number,
 };
 
@@ -2318,16 +2783,37 @@ export type PostCropVignette = {
 	style: VignetteStyle,
 };
 
-/**  A saved develop preset: applies `adjustments` restricted to `fields`. */
+/**
+ *  A develop preset: a user preset saved in Sieve (`save_preset`, group
+ *  [`USER_PRESETS_GROUP_ID`]) or one imported from Lightroom (`import_style_folder`, v14).
+ *  Applying a Sieve preset copies `adjustments` restricted to `fields`; applying an imported
+ *  preset sets exactly the `crs:` settings it contains (`settingKeys`, Lightroom semantics).
+ */
 export type Preset = {
 	id: number,
-	/**  Unique (case-insensitive), 1..=100 chars. */
+	/**  Unique (case-insensitive) within its group, 1..=100 chars. */
 	name: string,
+	/**
+	 *  Defaults overlaid with the preset's settings (for imported presets: display only; use
+	 *  `resolve_preset` for what applying it to an image gives).
+	 */
 	adjustments: ParametricAdjustments,
-	/**  Non-empty; groups outside it are ignored when applying. */
+	/**
+	 *  Non-empty; groups outside it are ignored when applying. For imported presets: the
+	 *  groups its `settingKeys` touch.
+	 */
 	fields: AdjustmentField[],
 	createdAtMs: number,
 	updatedAtMs: number,
+	/**  Style group (v14): [`USER_PRESETS_GROUP_ID`] for presets saved in Sieve. */
+	groupId: number,
+	/**  v14: `sieve` for presets saved in Sieve. */
+	sourceFormat: StyleSourceFormat,
+	/**
+	 *  `crs:` property names the preset sets (imported presets, v14; e.g. "Exposure2012",
+	 *  "ToneCurvePV2012", "Look"); empty for Sieve presets.
+	 */
+	settingKeys: string[],
 };
 
 /**  Hue / saturation shift of one camera primary, each -100..=100. */
@@ -2347,6 +2833,8 @@ export type ProfileCatalog = {
 	/**  DCPs for this camera (empty for non-RAW sources or when none are installed). */
 	cameraProfiles: CameraProfileInfo[],
 	looks: LookProfileInfo[],
+	/**  `.cube` LUTs of the style library, as profiles (v14; every group, library order). */
+	luts: LutProfileInfo[],
 	/**  Directories scanned (for the "no Adobe profiles found" hint). */
 	searchDirs: string[],
 };
@@ -2368,6 +2856,63 @@ export type ProfileSettings = {
 	 */
 	cameraProfile: string | null,
 	look: LookSettings | null,
+};
+
+/**
+ *  A project (one shoot): what the Projects home page card and the TopBar switcher show.
+ *  Counts are over all images of the project's folders.
+ */
+export type Project = {
+	id: number,
+	/**  Defaults to the (first) folder's name; `rename_project`. */
+	name: string,
+	/**  Source folders, by path. Non-empty. */
+	folders: ProjectFolder[],
+	/**
+	 *  Cover photo: the user's choice (`coverChosen`, `set_project_cover`), else automatic
+	 *  (best non-rejected photo: picked first, then most stars, then earliest capture);
+	 *  `null` for an empty project.
+	 */
+	coverImageId: number | null,
+	/**  `coverImageId` was chosen by the user. */
+	coverChosen: boolean,
+	/**
+	 *  Ready grid thumbnail (512 px) of the cover, absolute path (asset protocol, like
+	 *  `ThumbnailState.ready.path`); `null` while pending / failed / no cover.
+	 */
+	coverThumbnailPath: string | null,
+	/**  Culling profile of this shoot (`set_project_shoot_type`). */
+	shootType: ShootType,
+	/**  Guided-workflow step (`set_workflow_step`). */
+	workflowStep: WorkflowStep,
+	createdAtMs: number,
+	/**  Last `open_project` (`null` = never opened). */
+	lastOpenedAtMs: number | null,
+	photoCount: number,
+	/**  Keepers by `CatalogState.keeperRule` (same rule as the Edit step). */
+	keeperCount: number,
+	/**  Photos with edits (`RawImageEntry.hasEdits`). */
+	editedCount: number,
+	pickedCount: number,
+	rejectedCount: number,
+	/**  Photos whose original is missing (`RawImageEntry.missingSinceMs` set). */
+	missingCount: number,
+	/**  Earliest / latest capture time of the project's photos (`null` = none known). */
+	capturedFromMs: number | null,
+	capturedToMs: number | null,
+};
+
+/**  One source folder of a project. */
+export type ProjectFolder = {
+	id: number,
+	/**  Absolute path on disk. */
+	path: string,
+	imageCount: number,
+	/**
+	 *  The folder is on disk now. `false` = moved, renamed or on an unmounted drive: offer
+	 *  "Locate folder..." (`relocate_folder(id, newPath)`).
+	 */
+	exists: boolean,
 };
 
 /**  Culling-engine scores. All scores are normalized to 0..=1, higher is better. */
@@ -2483,6 +3028,13 @@ export type RelocateResult = {
 	stillMissing: number,
 };
 
+/**  Result of `remove_project`. */
+export type RemoveProjectResult = {
+	/**  Catalog images removed (their files, sidecars and exports are untouched). */
+	removedImages: number,
+	removedFolders: number,
+};
+
 /**  How to render a preview. */
 export type RenderOptions = {
 	/**
@@ -2511,7 +3063,12 @@ export type RenderSlot =
  *  Mask overlays (`render_mask_overlay`, v10): grayscale JPEG mattes. Not accepted
  *  by `render_preview`.
  */
-"mask";
+"mask" | 
+/**
+ *  Navigator panel + preset/profile hover previews (v14): independent of `main`, so a
+ *  hover never supersedes the loupe render.
+ */
+"navigator";
 
 /**
  *  A rendered overlay: an 8-bit **grayscale JPEG** of the mask (white = 1) served on the
@@ -2554,6 +3111,13 @@ export type RenderedPreview = {
 	/**  `adjustments.lut` refers to a LUT not in the library; rendered without it. */
 	lutMissing: boolean,
 };
+
+/**  Who chose a scene's representative. */
+export type RepresentativeSource = 
+/**  Proposed by Sieve (best keeper with the most typical lighting of the scene). */
+"auto" | 
+/**  Chosen with `set_scene_representative`; kept while it is a keeper member. */
+"user";
 
 /**
  *  Output size. Sizes refer to the orientation-corrected image; the aspect ratio is always
@@ -2602,6 +3166,40 @@ export type Scene = {
 	updatedAtMs: number,
 };
 
+/**  Options of `apply_scene_edit` / `apply_all_edited_scenes`. `null` on the wire = default. */
+export type SceneApplyOptions = {
+	/**
+	 *  Relative matching of every target to the representative (the representative is the
+	 *  single anchor of `match_scene`). Default `MatchOptions::default()` (exposure + WB
+	 *  matched, strength 1, `DEFAULT_SYNC` groups copied).
+	 */
+	matchOptions: MatchOptions,
+	/**  Also edit the scene's non-keepers (default `false`). */
+	includeNonKeepers: boolean,
+	/**
+	 *  Leave targets alone whose adjustments the user changed after this scene's last apply
+	 *  (their current settings differ from what that apply wrote) (default `true`).
+	 */
+	skipUserEdited: boolean,
+};
+
+/**  Per-scene result of an apply. */
+export type SceneApplyOutcome = {
+	sceneId: number,
+	representativeId: number,
+	/**  Targets whose adjustments changed. */
+	changedIds: number[],
+	/**  Targets left alone (`skipUserEdited`). */
+	skippedIds: number[],
+	/**
+	 *  Targets whose match did not converge within tolerance (`MatchPreview.converged`); their
+	 *  settings were still applied. Show them for review.
+	 */
+	notConvergedIds: number[],
+	/**  User-facing caveats (clamped slider, no neutral found, ...). */
+	notes: string[],
+};
+
 /**  Parameters of `detect_scenes`. `null` on the wire = `SceneDetectOptions::default()`. */
 export type SceneDetectOptions = {
 	/**  A capture-time gap longer than this always starts a new scene. 1000..=86_400_000 ms. */
@@ -2614,6 +3212,38 @@ export type SceneDetectOptions = {
 	/**  Also replace manual scenes in scope (default: they and their members are left alone). */
 	replaceManual: boolean,
 };
+
+/**  One scene of the Edit step (`EditPlan.scenes`). */
+export type SceneEditEntry = {
+	sceneId: number,
+	/**  The scene's keepers, capture order (non-empty: scenes without keepers are omitted). */
+	imageIds: number[],
+	/**  All members incl. non-keepers. */
+	memberCount: number,
+	/**  The frame to edit (a keeper of `imageIds`). */
+	representativeId: number,
+	representativeSource: RepresentativeSource,
+	/**  User-facing, e.g. "Sharpest keeper, typical light for this scene" or "Chosen by you". */
+	representativeReason: string,
+	/**  The representative has edits (`hasEdits`). */
+	edited: boolean,
+	/**  Time of the representative's latest history entry (`null` = never edited). */
+	editedAtMs: number | null,
+	/**  Last `apply_scene_edit` / `apply_all_edited_scenes` of this scene (`null` = never). */
+	appliedAtMs: number | null,
+	status: SceneEditStatus,
+};
+
+/**  Progress of one scene in the Edit step checklist. */
+export type SceneEditStatus = 
+/**  The representative has no edits yet. */
+"to_edit" | 
+/**  The representative is edited; not applied to the rest of the scene yet. */
+"edited" | 
+/**  Applied, and the representative has not changed since. */
+"applied" | 
+/**  Applied, but the representative was edited again since (apply again). */
+"outdated";
 
 /**  How a scene's membership was decided. */
 export type SceneMethod = 
@@ -2637,7 +3267,9 @@ export type SceneProgress = {
 };
 
 /**  Long-running scene operation reported by the `sceneProgress` event. */
-export type SceneTask = "detect" | "match";
+export type SceneTask = "detect" | "match" | 
+/**  `apply_scene_edit` / `apply_all_edited_scenes` (v14); `total` = target images. */
+"apply";
 
 /**
  *  Relative weights of the score components in `QualityScore.overall`.
@@ -2676,6 +3308,243 @@ export type Sharpening = {
 
 /**  Shoot context; biases subject prioritization and tag thresholds. */
 export type ShootType = "wedding" | "portrait" | "sports" | "event" | "landscape" | "general";
+
+/**
+ *  A folder of presets/profiles (grouped by source folder name, Lightroom-style), the user
+ *  presets, or the LUT library. Catalog-wide: every project sees every group.
+ */
+export type StyleGroup = {
+	id: number,
+	/**  Source folder name ("User Presets" / "LUTs" for the built-in groups). */
+	name: string,
+	kind: StyleGroupKind,
+	/**
+	 *  Absolute source folder (imported groups; re-importing the same folder replaces the
+	 *  group's items); `null` for the built-in groups.
+	 */
+	sourcePath: string | null,
+	importedAtMs: number | null,
+	/**  By name (case-insensitive). */
+	presets: StylePreset[],
+	/**  By name (case-insensitive). */
+	profiles: StyleProfile[],
+};
+
+/**  Kind of a style group. */
+export type StyleGroupKind = 
+/**  "User Presets" ([`USER_PRESETS_GROUP_ID`]): presets saved in Sieve. Not removable. */
+"user" | 
+/**  One source folder of an `import_style_folder` run. Removable. */
+"imported" | 
+/**  "LUTs" ([`LUT_LIBRARY_GROUP_ID`]): the pre-v14 LUT library. Not removable. */
+"luts";
+
+/**  A file `import_style_folder` did not import. */
+export type StyleImportSkip = {
+	path: string,
+	/**
+	 *  User-facing, e.g. "not a develop preset (External Editor preset)", "unreadable DCP",
+	 *  "invalid .cube: LUT_3D_SIZE missing".
+	 */
+	reason: string,
+};
+
+/**
+ *  `list_styles()`: every group. Order: "User Presets", imported groups by name, "LUTs".
+ *  Empty built-in groups are included (the UI may hide them).
+ */
+export type StyleLibrary = {
+	groups: StyleGroup[],
+};
+
+/**
+ *  A `train_style_model` run ended (IPC v14). Emitted exactly once per accepted call.
+ *  `status` is `style_model_status()` after the run.
+ */
+export type StyleModelFinished = {
+	ok: boolean,
+	/**  Stopped by `cancel_style_training` (the previous model, if any, stays in use). */
+	cancelled: boolean,
+	/**  User-facing reason when not `ok` (e.g. "Edit at least 20 photos first"). */
+	error: string | null,
+	status: StyleModelStatus,
+};
+
+/**  Progress of `train_style_model` (IPC v14). Throttled (~5/s, plus one per phase change). */
+export type StyleModelProgress = {
+	phase: StyleTrainPhase,
+	done: number,
+	total: number,
+};
+
+export type StyleModelState = 
+/**  No model yet (or not enough edited photos). */
+"untrained" | "training" | "ready" | 
+/**
+ *  The last training failed (`error`); a previous model, if any, stays in use
+ *  (`trainedAtMs` set).
+ */
+"failed";
+
+/**  `style_model_status()`. */
+export type StyleModelStatus = {
+	state: StyleModelState,
+	/**  Identifies features + model family, e.g. "style-gbt@1". */
+	modelVersion: string,
+	/**  Current model's training time (`null` = none). */
+	trainedAtMs: number | null,
+	/**  Edited photos the current model learned from. */
+	trainingExamples: number,
+	/**  Edited photos in the catalog now (training candidates). */
+	availableExamples: number,
+	/**  Training needs at least this many edited photos. */
+	minExamples: number,
+	/**  0..=1 while `training`, else `null`. */
+	progress: number | null,
+	/**  User-facing reason of the last failure. */
+	error: string | null,
+	validation: StyleValidation | null,
+};
+
+/**  `predict_style` result for one image (nothing is saved). */
+export type StylePrediction = {
+	imageId: number,
+	/**
+	 *  The image's current adjustments with the predicted `fields` replaced (crop, masks and
+	 *  other per-frame groups are kept). Render it for a preview; `apply_style_prediction`
+	 *  commits the same values.
+	 */
+	adjustments: ParametricAdjustments,
+	/**  Groups the model predicts. */
+	fields: AdjustmentField[],
+	/**  0..=1 (distance of the frame to the training data). */
+	confidence: number,
+	notes: string[],
+};
+
+/**
+ *  A preset in the style library (summary; `resolve_preset` gives its effect on an image,
+ *  `apply_preset` applies it).
+ */
+export type StylePreset = {
+	/**  `Preset.id` (same id space as `list_presets` / `apply_preset`). */
+	id: number,
+	groupId: number,
+	/**
+	 *  `crs:Name` (imported), else the file name without extension; unique within the group
+	 *  (duplicates get " (2)", " (3)"...).
+	 */
+	name: string,
+	sourceFormat: StyleSourceFormat,
+	/**
+	 *  File it was imported from (absolute; informational, the settings are stored in the
+	 *  catalog); `null` for Sieve presets.
+	 */
+	sourcePath: string | null,
+	/**  Groups the preset touches (drives the Copy/preset checkboxes and search). */
+	fields: AdjustmentField[],
+	/**  `crs:` properties it sets (empty for Sieve presets). */
+	settingKeys: string[],
+	/**  `crs:SupportsAmount` of the preset file (informational; v14 applies presets at 100%). */
+	supportsAmount: boolean,
+	/**
+	 *  Settings found in the file that Sieve ignores (unsupported keys such as lens profiles,
+	 *  retouch, local corrections of pre-2021 presets), user-facing.
+	 */
+	warnings: string[],
+};
+
+/**
+ *  A profile in the style library: an imported creative profile, camera profile or LUT.
+ *  Imported `.xmp` looks and `.dcp` files are **read in place** at `sourcePath` (never copied,
+ *  see `profiles` module docs); `.cube` files are copied into the LUT library (`lutId`).
+ */
+export type StyleProfile = {
+	id: number,
+	groupId: number,
+	kind: StyleProfileKind,
+	/**  Look `crs:Name`, DCP `ProfileName`, LUT `TITLE` or file name. */
+	name: string,
+	sourceFormat: StyleSourceFormat,
+	/**  Look/DCP: the file read in place; LUT: the library copy. */
+	sourcePath: string,
+	/**
+	 *  The file is readable now (a removed drive or deleted folder makes it `false`; images
+	 *  using it render without it and report `look_unavailable` / `profile_unavailable` /
+	 *  `lutMissing`).
+	 */
+	available: boolean,
+	/**  The Amount slider applies (looks with `crs:SupportsAmount`, every LUT); range 0..=200%. */
+	supportsAmount: boolean,
+	/**  Converts to monochrome (look with `crs:ConvertToGrayscale`). */
+	monochrome: boolean,
+	/**
+	 *  Look: `crs:CameraProfile` it is built on (selecting it sets `profile.cameraProfile`);
+	 *  DCP: its `ProfileName` (= `crs:CameraProfile` value). `null` for LUTs / looks without one.
+	 */
+	cameraProfile: string | null,
+	/**
+	 *  DCP `UniqueCameraModel` / look `crs:CameraModelRestriction` (Adobe model name, e.g.
+	 *  "Sony ILCE-7M4"); `null` = any camera. Per-image availability: `list_profiles(id)`.
+	 */
+	cameraModel: string | null,
+	/**  Look: `crs:UUID` (= `LookSettings.uuid`). */
+	lookUuid: string | null,
+	/**  LUT: library id (= `LutRef.id`). */
+	lutId: string | null,
+};
+
+/**  What selecting a [`StyleProfile`] changes (see [`StyleProfile::apply_to`]). */
+export type StyleProfileKind = 
+/**
+ *  Creative / look profile (`.xmp` with `crs:PresetType="Look"`: RGB/Look tables,
+ *  optional Amount): sets `profile.look` (+ `profile.cameraProfile` when the look names
+ *  one) and clears `lut`.
+ */
+"look" | 
+/**  Camera profile (`.dcp`): sets `profile.cameraProfile`, clears `profile.look` and `lut`. */
+"camera_profile" | 
+/**
+ *  `.cube` LUT: sets `lut = { id, amount }`; the camera profile and look stay (a LUT
+ *  expects a rendered image).
+ */
+"lut";
+
+/**  File type a preset or profile was read from. */
+export type StyleSourceFormat = 
+/**  Saved in Sieve (`save_preset`) or a LUT imported with `import_lut`. */
+"sieve" | 
+/**  Lightroom / Camera Raw develop preset `.xmp` (`crs:PresetType="Normal"`). */
+"xmp_preset" | 
+/**
+ *  Legacy Lightroom Classic develop preset `.lrtemplate` (Lua table `s = { ... value =
+ *  { settings = { ... } } }`).
+ */
+"lrtemplate" | 
+/**  Creative profile `.xmp` (`crs:PresetType="Look"`). */
+"xmp_profile" | 
+/**  DNG camera profile `.dcp`. */
+"dcp" | 
+/**  `.cube` LUT. */
+"cube";
+
+/**  Stage reported by `styleModelProgress`. */
+export type StyleTrainPhase = 
+/**  Measuring the edited photos (develop-source statistics, scene context). */
+"features" | "fit" | 
+/**  Scoring on held-out edits. */
+"validate";
+
+/**  Held-out quality of the current style model (render ΔE2000 vs the user's own edits). */
+export type StyleValidation = {
+	heldOutImages: number,
+	/**  Mean ΔE2000 predicted vs user render. */
+	deltaE: number,
+	/**  Same for `auto_tone` (baseline). */
+	autoToneDeltaE: number,
+	/**  Same for no edit (defaults). */
+	noEditDeltaE: number,
+};
 
 export type TagCount = {
 	tag: CullTag,
@@ -2754,6 +3623,23 @@ export type ToneCurve = {
 export type UiPrefs = {
 	/**  Folder last chosen in the export dialog (absolute path). */
 	lastExportFolder?: string | null,
+	/**
+	 *  Last selection in the Copy... dialog (v14; "remembers last choice"). `null` = default
+	 *  (`DEFAULT_SYNC_FIELDS`).
+	 */
+	copyFields?: AdjustmentField[] | null,
+	/**  The one-time "how Sieve reads and merges XMP sidecars" explanation was shown (v14). */
+	xmpExplainerSeen?: boolean | null,
+	/**  Scene strip visible (v14 scenes toggle); `null` = shown. */
+	sceneStripVisible?: boolean | null,
+};
+
+/**  Result of `undo_edit_batch`. */
+export type UndoBatchResult = {
+	/**  Images put back to their settings before the batch (one "Undo <label>" history entry each). */
+	restoredIds: number[],
+	/**  Images edited again after the batch: left alone. */
+	skippedIds: number[],
 };
 
 /**  See [`MaskShape::Unsupported`]. */
@@ -2777,6 +3663,9 @@ export type WhiteBalanceValues = {
 	/**  -150..=150. */
 	tint: number,
 };
+
+/**  Guided-workflow step of a project: the step bar Cull -> Edit -> Export (v14). */
+export type WorkflowStep = "cull" | "edit" | "export";
 
 export type XmpFailure = {
 	imageId: number,

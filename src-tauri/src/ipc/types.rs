@@ -28,6 +28,14 @@ pub type HistoryEntryId = i64;
 pub type SceneId = i64;
 /// LUT library id: the `.cube` file stem in the LUT directory (`[a-z0-9-]+`).
 pub type LutId = String;
+/// Catalog row id of a style group (preset/profile library folder, IPC v14).
+pub type StyleGroupId = i64;
+/// Catalog row id of a profile in the style library (IPC v14).
+pub type StyleProfileId = i64;
+/// Catalog row id of an undoable multi-image edit (IPC v14).
+pub type EditBatchId = i64;
+/// Catalog row id of a project (one shoot: its source folder(s), IPC v14).
+pub type ProjectId = i64;
 
 /// Declares a fieldless enum that round-trips through the same snake_case string
 /// on the wire (serde) and in SQLite (`as_str` / `parse`).
@@ -439,6 +447,8 @@ pub enum AnalysisScope {
     Images { ids: Vec<ImageId> },
     /// Re-measure every image in this folder.
     Folder { folder_id: FolderId },
+    /// Re-measure every image of this project (v14).
+    Project { project_id: ProjectId },
     /// Re-measure the whole catalog.
     All,
     /// No ML: recompute tags, scores, suggestions and burst groups from stored
@@ -682,13 +692,17 @@ pub struct HslAdjustments {
 
 /// A `.cube` LUT from the LUT library, applied after the parametric stage
 /// (on display-referred sRGB-encoded values, before output encoding).
+/// Since IPC v14 the UI presents LUTs as profiles (`StyleProfileKind::Lut`, profile browser
+/// with an Amount slider); this field is where a LUT profile lives in the adjustments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LutRef {
     /// `LutInfo.id` (library file stem). A missing LUT renders as if absent and sets
     /// `RenderedPreview.lutMissing`.
     pub id: LutId,
-    /// Blend amount 0..=100 (100 = full LUT output).
+    /// Amount 0..=200 (100 = full LUT output; v14: above 100 extrapolates
+    /// `in + (lut - in) * amount / 100`, clamped to the output range, like Lightroom's
+    /// profile Amount). Was 0..=100 before v14.
     #[specta(type = Number)]
     pub amount: f32,
 }
@@ -1221,8 +1235,11 @@ pub struct CameraProfileInfo {
     /// DCP `ProfileName` = `crs:CameraProfile` value, e.g. "Adobe Standard", "Camera ST".
     pub name: String,
     /// Profile browser group: "Adobe Raw" (Adobe Standard), "Camera Matching" (`Camera/<model>/`),
-    /// else "Other".
+    /// else "Other"; for imported DCPs (v14) the style group's name.
     pub group: String,
+    /// Style-library profile this entry comes from (imported with `import_style_folder`, v14);
+    /// `null` = installed by Adobe software.
+    pub style_id: Option<StyleProfileId>,
 }
 
 /// A look / creative profile installed on this Mac (Lightroom's Profile browser entries
@@ -1245,7 +1262,24 @@ pub struct LookProfileInfo {
     /// `ProfileSettings.cameraProfile` to it); `null` = keeps the current camera profile.
     pub camera_profile: Option<String>,
     /// Usable for this image (`crs:CameraModelRestriction` empty or matching; RAW-only looks
-    /// are unavailable for non-RAW sources).
+    /// are unavailable for non-RAW sources; v14: imported file still readable).
+    pub available: bool,
+    /// Style-library profile this entry comes from (imported creative profile, v14); `null` =
+    /// installed by Adobe software. For imported looks `group` is the style group's name.
+    pub style_id: Option<StyleProfileId>,
+}
+
+/// A `.cube` LUT offered as a profile in the profile browser (IPC v14). Selecting it sets
+/// `ParametricAdjustments.lut = { id: lutId, amount: 100 }` (see `StyleProfile`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LutProfileInfo {
+    pub style_id: StyleProfileId,
+    pub lut_id: LutId,
+    pub name: String,
+    /// Style group name (source folder name, or "LUTs" for the pre-v14 LUT library).
+    pub group: String,
+    /// The library copy exists.
     pub available: bool,
 }
 
@@ -1260,6 +1294,8 @@ pub struct ProfileCatalog {
     /// DCPs for this camera (empty for non-RAW sources or when none are installed).
     pub camera_profiles: Vec<CameraProfileInfo>,
     pub looks: Vec<LookProfileInfo>,
+    /// `.cube` LUTs of the style library, as profiles (v14; every group, library order).
+    pub luts: Vec<LutProfileInfo>,
     /// Directories scanned (for the "no Adobe profiles found" hint).
     pub search_dirs: Vec<String>,
 }
@@ -1392,7 +1428,7 @@ impl ParametricAdjustments {
             if !is_valid_lut_id(&lut.id) {
                 return Err(format!("lut.id {:?} is not a valid LUT id", lut.id));
             }
-            check("lut.amount", lut.amount, 0.0, 100.0)?;
+            check("lut.amount", lut.amount, 0.0, 200.0)?;
         }
 
         // Phase 7b groups.
@@ -1525,6 +1561,19 @@ impl ParametricAdjustments {
                 AdjustmentField::Calibration => self.calibration = src.calibration,
                 AdjustmentField::Sharpening => self.detail.sharpening = src.detail.sharpening,
                 AdjustmentField::NoiseReduction => self.detail.noise_reduction = src.detail.noise_reduction,
+                AdjustmentField::NoiseReductionLuminance => {
+                    let (d, s) = (&mut self.detail.noise_reduction, &src.detail.noise_reduction);
+                    d.luminance = s.luminance;
+                    d.luminance_detail = s.luminance_detail;
+                    d.luminance_contrast = s.luminance_contrast;
+                }
+                AdjustmentField::NoiseReductionColor => {
+                    let (d, s) = (&mut self.detail.noise_reduction, &src.detail.noise_reduction);
+                    d.color = s.color;
+                    d.color_detail = s.color_detail;
+                    d.color_smoothness = s.color_smoothness;
+                }
+                AdjustmentField::ProcessVersion => self.process_version = src.process_version,
                 AdjustmentField::Vignette => self.effects.vignette = src.effects.vignette,
                 AdjustmentField::Grain => self.effects.grain = src.effects.grain,
                 AdjustmentField::BlackAndWhite => self.black_and_white = src.black_and_white,
@@ -1764,6 +1813,14 @@ string_enum! {
         /// `masks` (all mask groups; AI mattes are recomputed on the target) (v10). Not in
         /// [`AdjustmentField::DEFAULT_SYNC`].
         Masks => "masks",
+        /// `detail.noiseReduction` luminance, luminanceDetail, luminanceContrast only (v14,
+        /// Lightroom's "Luminance Noise Reduction" copy item). Subset of `noise_reduction`.
+        NoiseReductionLuminance => "noise_reduction_luminance",
+        /// `detail.noiseReduction` color, colorDetail, colorSmoothness only (v14, "Color
+        /// Noise Reduction"). Subset of `noise_reduction`.
+        NoiseReductionColor => "noise_reduction_color",
+        /// `processVersion` (v14, Lightroom's "Process Version" copy item).
+        ProcessVersion => "process_version",
     }
 }
 
@@ -1797,6 +1854,51 @@ impl AdjustmentField {
         AdjustmentField::Grain,
         AdjustmentField::BlackAndWhite,
         AdjustmentField::Profile,
+        AdjustmentField::ProcessVersion,
+    ];
+
+    /// Sliders `auto_tone` can set (Lightroom's Basic "Auto": tone + presence) (v14).
+    pub const AUTO_TONE: &'static [AdjustmentField] = &[
+        AdjustmentField::Exposure,
+        AdjustmentField::Contrast,
+        AdjustmentField::Highlights,
+        AdjustmentField::Shadows,
+        AdjustmentField::Whites,
+        AdjustmentField::Blacks,
+        AdjustmentField::Vibrance,
+        AdjustmentField::Saturation,
+    ];
+
+    /// `paste_previous` with `fields = null` (v14): everything but `masks` (AI mattes and
+    /// brush strokes belong to one frame). Lightroom's "Previous" copies all settings.
+    pub const PASTE_PREVIOUS: &'static [AdjustmentField] = &[
+        AdjustmentField::WhiteBalance,
+        AdjustmentField::Exposure,
+        AdjustmentField::Contrast,
+        AdjustmentField::Highlights,
+        AdjustmentField::Shadows,
+        AdjustmentField::Whites,
+        AdjustmentField::Blacks,
+        AdjustmentField::Texture,
+        AdjustmentField::Clarity,
+        AdjustmentField::Dehaze,
+        AdjustmentField::Vibrance,
+        AdjustmentField::Saturation,
+        AdjustmentField::HslHue,
+        AdjustmentField::HslSaturation,
+        AdjustmentField::HslLuminance,
+        AdjustmentField::Lut,
+        AdjustmentField::ToneCurve,
+        AdjustmentField::ColorGrading,
+        AdjustmentField::Calibration,
+        AdjustmentField::Sharpening,
+        AdjustmentField::NoiseReduction,
+        AdjustmentField::Vignette,
+        AdjustmentField::Grain,
+        AdjustmentField::BlackAndWhite,
+        AdjustmentField::Crop,
+        AdjustmentField::Profile,
+        AdjustmentField::ProcessVersion,
     ];
 }
 
@@ -1817,6 +1919,9 @@ string_enum! {
         /// Mask overlays (`render_mask_overlay`, v10): grayscale JPEG mattes. Not accepted
         /// by `render_preview`.
         Mask => "mask",
+        /// Navigator panel + preset/profile hover previews (v14): independent of `main`, so a
+        /// hover never supersedes the loupe render.
+        Navigator => "navigator",
     }
 }
 
@@ -1973,18 +2078,31 @@ pub struct EditState {
     pub history: AdjustmentHistory,
 }
 
-/// A saved develop preset: applies `adjustments` restricted to `fields`.
+/// A develop preset: a user preset saved in Sieve (`save_preset`, group
+/// [`USER_PRESETS_GROUP_ID`]) or one imported from Lightroom (`import_style_folder`, v14).
+/// Applying a Sieve preset copies `adjustments` restricted to `fields`; applying an imported
+/// preset sets exactly the `crs:` settings it contains (`settingKeys`, Lightroom semantics).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Preset {
     pub id: PresetId,
-    /// Unique (case-insensitive), 1..=100 chars.
+    /// Unique (case-insensitive) within its group, 1..=100 chars.
     pub name: String,
+    /// Defaults overlaid with the preset's settings (for imported presets: display only; use
+    /// `resolve_preset` for what applying it to an image gives).
     pub adjustments: ParametricAdjustments,
-    /// Non-empty; groups outside it are ignored when applying.
+    /// Non-empty; groups outside it are ignored when applying. For imported presets: the
+    /// groups its `settingKeys` touch.
     pub fields: Vec<AdjustmentField>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Style group (v14): [`USER_PRESETS_GROUP_ID`] for presets saved in Sieve.
+    pub group_id: StyleGroupId,
+    /// v14: `sieve` for presets saved in Sieve.
+    pub source_format: StyleSourceFormat,
+    /// `crs:` property names the preset sets (imported presets, v14; e.g. "Exposure2012",
+    /// "ToneCurvePV2012", "Look"); empty for Sieve presets.
+    pub setting_keys: Vec<String>,
 }
 
 string_enum! {
@@ -2096,6 +2214,10 @@ pub struct ImageQuery {
     #[serde(default)]
     pub missing_only: bool,
     pub folder_id: Option<FolderId>,
+    /// Only images of this project (v14). Inside a project the UI always sets it; combined
+    /// with `folderId` (AND) a folder of another project matches nothing.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2123,6 +2245,7 @@ impl Default for ImageQuery {
             collapse_bursts: false,
             missing_only: false,
             folder_id: None,
+            project_id: None,
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
@@ -2171,6 +2294,9 @@ impl ImportOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ImportSummary {
     pub folder_id: FolderId,
+    /// Project the folder belongs to (v14; a new folder gets a new project unless
+    /// `import_folder` was given one).
+    pub project_id: ProjectId,
     /// New images added to the catalog.
     pub added: u32,
     /// Supported files already in the catalog.
@@ -2191,6 +2317,8 @@ pub struct FolderEntry {
     pub id: FolderId,
     pub path: String,
     pub image_count: u32,
+    /// Project this folder belongs to (v14; every folder belongs to exactly one).
+    pub project_id: ProjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -2224,6 +2352,8 @@ pub struct FilterCounts {
 pub struct CatalogState {
     pub catalog_path: String,
     pub image_count: u32,
+    /// Catalog default shoot type: new projects start with it (v14; each project has its own,
+    /// `Project.shootType`, which is what culling scores with).
     pub shoot_type: ShootType,
     /// Max gap between consecutive frames in one burst.
     pub burst_window_ms: u32,
@@ -2235,11 +2365,15 @@ pub struct CatalogState {
     pub cache_dir: String,
     /// Analysis starts automatically after import / on launch (`set_auto_analyze`).
     pub auto_analyze: bool,
-    /// Sidecars are written automatically after rating/pick/label/tag changes
-    /// (`set_xmp_auto_sync`). Default off.
+    /// Sidecars are written automatically (debounced) after rating/pick/label/tag and develop
+    /// changes (`set_xmp_auto_sync`). Default **on** since v14 (migration 0012 turned it on for
+    /// catalogs whose setting was never changed by the user).
     pub xmp_auto_sync: bool,
     /// Integrity of the catalog as found at launch, and its backups (IPC v13).
     pub health: CatalogHealth,
+    /// Which images count as keepers (edit plan, export step, project counts) (v14;
+    /// `set_keeper_rule`).
+    pub keeper_rule: KeeperRule,
 }
 
 string_enum! {
@@ -2942,6 +3076,9 @@ pub struct ExportJob {
     pub skipped: u32,
     /// Resolved destination incl. subfolder; `null` for `source_folder`.
     pub output_dir: Option<String>,
+    /// The project every image of the job belongs to (v14; `null` = images of several
+    /// projects, or a job from before v14). Drives the Export step's "Exported N".
+    pub project_id: Option<ProjectId>,
     pub failures: Vec<ExportFailure>,
     pub created_at_ms: i64,
     pub finished_at_ms: Option<i64>,
@@ -2967,6 +3104,8 @@ string_enum! {
     pub enum SceneTask {
         Detect => "detect",
         Match => "match",
+        /// `apply_scene_edit` / `apply_all_edited_scenes` (v14); `total` = target images.
+        Apply => "apply",
     }
 }
 
@@ -3270,6 +3409,13 @@ pub struct CullSnapshot {
 pub struct UiPrefs {
     /// Folder last chosen in the export dialog (absolute path).
     pub last_export_folder: Option<String>,
+    /// Last selection in the Copy... dialog (v14; "remembers last choice"). `null` = default
+    /// (`DEFAULT_SYNC_FIELDS`).
+    pub copy_fields: Option<Vec<AdjustmentField>>,
+    /// The one-time "how Sieve reads and merges XMP sidecars" explanation was shown (v14).
+    pub xmp_explainer_seen: Option<bool>,
+    /// Scene strip visible (v14 scenes toggle); `null` = shown.
+    pub scene_strip_visible: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3314,6 +3460,728 @@ pub struct ModelDownloadStatus {
     pub groups: Vec<ModelGroupStatus>,
     /// Group id of the download in flight (at most one at a time); `null` when idle.
     pub downloading: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// IPC v14 (Phase 8b): style library (presets + profiles), auto tone / WB, guided workflow,
+// per-scene edit plan, edit batches, style model, Copy Settings groups.
+// ---------------------------------------------------------------------------
+
+/// Style group of the presets saved in Sieve (`save_preset`). Created by migration 0012.
+pub const USER_PRESETS_GROUP_ID: StyleGroupId = 1;
+/// Style group of the pre-v14 LUT library (`<app_data>/luts`, `import_lut`): LUT files not
+/// imported through a folder appear here. Created by migration 0012.
+pub const LUT_LIBRARY_GROUP_ID: StyleGroupId = 2;
+
+string_enum! {
+    /// Kind of a style group.
+    pub enum StyleGroupKind {
+        /// "User Presets" ([`USER_PRESETS_GROUP_ID`]): presets saved in Sieve. Not removable.
+        User => "user",
+        /// One source folder of an `import_style_folder` run. Removable.
+        Imported => "imported",
+        /// "LUTs" ([`LUT_LIBRARY_GROUP_ID`]): the pre-v14 LUT library. Not removable.
+        Luts => "luts",
+    }
+}
+
+string_enum! {
+    /// What selecting a [`StyleProfile`] changes (see [`StyleProfile::apply_to`]).
+    pub enum StyleProfileKind {
+        /// Creative / look profile (`.xmp` with `crs:PresetType="Look"`: RGB/Look tables,
+        /// optional Amount): sets `profile.look` (+ `profile.cameraProfile` when the look names
+        /// one) and clears `lut`.
+        Look => "look",
+        /// Camera profile (`.dcp`): sets `profile.cameraProfile`, clears `profile.look` and `lut`.
+        CameraProfile => "camera_profile",
+        /// `.cube` LUT: sets `lut = { id, amount }`; the camera profile and look stay (a LUT
+        /// expects a rendered image).
+        Lut => "lut",
+    }
+}
+
+string_enum! {
+    /// File type a preset or profile was read from.
+    pub enum StyleSourceFormat {
+        /// Saved in Sieve (`save_preset`) or a LUT imported with `import_lut`.
+        Sieve => "sieve",
+        /// Lightroom / Camera Raw develop preset `.xmp` (`crs:PresetType="Normal"`).
+        XmpPreset => "xmp_preset",
+        /// Legacy Lightroom Classic develop preset `.lrtemplate` (Lua table `s = { ... value =
+        /// { settings = { ... } } }`).
+        Lrtemplate => "lrtemplate",
+        /// Creative profile `.xmp` (`crs:PresetType="Look"`).
+        XmpProfile => "xmp_profile",
+        /// DNG camera profile `.dcp`.
+        Dcp => "dcp",
+        /// `.cube` LUT.
+        Cube => "cube",
+    }
+}
+
+/// A preset in the style library (summary; `resolve_preset` gives its effect on an image,
+/// `apply_preset` applies it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StylePreset {
+    /// `Preset.id` (same id space as `list_presets` / `apply_preset`).
+    pub id: PresetId,
+    pub group_id: StyleGroupId,
+    /// `crs:Name` (imported), else the file name without extension; unique within the group
+    /// (duplicates get " (2)", " (3)"...).
+    pub name: String,
+    pub source_format: StyleSourceFormat,
+    /// File it was imported from (absolute; informational, the settings are stored in the
+    /// catalog); `null` for Sieve presets.
+    pub source_path: Option<String>,
+    /// Groups the preset touches (drives the Copy/preset checkboxes and search).
+    pub fields: Vec<AdjustmentField>,
+    /// `crs:` properties it sets (empty for Sieve presets).
+    pub setting_keys: Vec<String>,
+    /// `crs:SupportsAmount` of the preset file (informational; v14 applies presets at 100%).
+    pub supports_amount: bool,
+    /// Settings found in the file that Sieve ignores (unsupported keys such as lens profiles,
+    /// retouch, local corrections of pre-2021 presets), user-facing.
+    pub warnings: Vec<String>,
+}
+
+/// A profile in the style library: an imported creative profile, camera profile or LUT.
+/// Imported `.xmp` looks and `.dcp` files are **read in place** at `sourcePath` (never copied,
+/// see `profiles` module docs); `.cube` files are copied into the LUT library (`lutId`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleProfile {
+    pub id: StyleProfileId,
+    pub group_id: StyleGroupId,
+    pub kind: StyleProfileKind,
+    /// Look `crs:Name`, DCP `ProfileName`, LUT `TITLE` or file name.
+    pub name: String,
+    pub source_format: StyleSourceFormat,
+    /// Look/DCP: the file read in place; LUT: the library copy.
+    pub source_path: String,
+    /// The file is readable now (a removed drive or deleted folder makes it `false`; images
+    /// using it render without it and report `look_unavailable` / `profile_unavailable` /
+    /// `lutMissing`).
+    pub available: bool,
+    /// The Amount slider applies (looks with `crs:SupportsAmount`, every LUT); range 0..=200%.
+    pub supports_amount: bool,
+    /// Converts to monochrome (look with `crs:ConvertToGrayscale`).
+    pub monochrome: bool,
+    /// Look: `crs:CameraProfile` it is built on (selecting it sets `profile.cameraProfile`);
+    /// DCP: its `ProfileName` (= `crs:CameraProfile` value). `null` for LUTs / looks without one.
+    pub camera_profile: Option<String>,
+    /// DCP `UniqueCameraModel` / look `crs:CameraModelRestriction` (Adobe model name, e.g.
+    /// "Sony ILCE-7M4"); `null` = any camera. Per-image availability: `list_profiles(id)`.
+    pub camera_model: Option<String>,
+    /// Look: `crs:UUID` (= `LookSettings.uuid`).
+    pub look_uuid: Option<String>,
+    /// LUT: library id (= `LutRef.id`).
+    pub lut_id: Option<LutId>,
+}
+
+impl StyleProfile {
+    /// Default Amount in percent (0..=200) when a profile is selected.
+    pub const DEFAULT_AMOUNT: f32 = 100.0;
+
+    /// `adj` with this profile selected at `amount` percent (0..=200; ignored = 100 unless
+    /// `supportsAmount`). Mirrored by `applyStyleProfile` in `src/ipc/index.ts` (hover preview
+    /// renders use it); keep both in sync.
+    /// - `look`: `profile.look = { name, uuid, amount: amount / 100 }`, `profile.cameraProfile =
+    ///   cameraProfile` when set (else unchanged), `lut = null`.
+    /// - `camera_profile`: `profile.cameraProfile = cameraProfile ?? name`, `profile.look = null`,
+    ///   `lut = null`.
+    /// - `lut`: `lut = { id: lutId, amount }`; `profile` unchanged.
+    pub fn apply_to(&self, adj: &ParametricAdjustments, amount: f32) -> ParametricAdjustments {
+        let mut out = adj.clone();
+        let pct = if self.supports_amount && amount.is_finite() { amount.clamp(0.0, 200.0) } else { 100.0 };
+        match self.kind {
+            StyleProfileKind::Look => {
+                if let Some(uuid) = &self.look_uuid {
+                    out.profile.look =
+                        Some(LookSettings { name: self.name.clone(), uuid: uuid.clone(), amount: pct / 100.0 });
+                }
+                if let Some(cp) = &self.camera_profile {
+                    out.profile.camera_profile = Some(cp.clone());
+                }
+                out.lut = None;
+            }
+            StyleProfileKind::CameraProfile => {
+                out.profile.camera_profile = Some(self.camera_profile.clone().unwrap_or_else(|| self.name.clone()));
+                out.profile.look = None;
+                out.lut = None;
+            }
+            StyleProfileKind::Lut => {
+                if let Some(id) = &self.lut_id {
+                    out.lut = Some(LutRef { id: id.clone(), amount: pct });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A folder of presets/profiles (grouped by source folder name, Lightroom-style), the user
+/// presets, or the LUT library. Catalog-wide: every project sees every group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleGroup {
+    pub id: StyleGroupId,
+    /// Source folder name ("User Presets" / "LUTs" for the built-in groups).
+    pub name: String,
+    pub kind: StyleGroupKind,
+    /// Absolute source folder (imported groups; re-importing the same folder replaces the
+    /// group's items); `null` for the built-in groups.
+    pub source_path: Option<String>,
+    pub imported_at_ms: Option<i64>,
+    /// By name (case-insensitive).
+    pub presets: Vec<StylePreset>,
+    /// By name (case-insensitive).
+    pub profiles: Vec<StyleProfile>,
+}
+
+/// `list_styles()`: every group. Order: "User Presets", imported groups by name, "LUTs".
+/// Empty built-in groups are included (the UI may hide them).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleLibrary {
+    pub groups: Vec<StyleGroup>,
+}
+
+/// A file `import_style_folder` did not import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleImportSkip {
+    pub path: String,
+    /// User-facing, e.g. "not a develop preset (External Editor preset)", "unreadable DCP",
+    /// "invalid .cube: LUT_3D_SIZE missing".
+    pub reason: String,
+}
+
+/// Result of `import_style_folder`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportStyleReport {
+    /// The folder that was imported (absolute).
+    pub root: String,
+    /// Groups created or replaced (one per folder containing at least one importable file).
+    pub group_ids: Vec<StyleGroupId>,
+    pub presets: u32,
+    pub profiles: u32,
+    /// Files with a supported extension that could not be imported (other files are ignored
+    /// silently).
+    pub skipped: Vec<StyleImportSkip>,
+}
+
+/// Values of Lightroom's Basic "Auto" (`auto_tone`): absolute slider values for the
+/// requested sliders, `null` for sliders not requested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoToneValues {
+    #[specta(type = Option<Number>)]
+    pub exposure: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub contrast: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub highlights: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub shadows: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub whites: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub blacks: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub vibrance: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub saturation: Option<f32>,
+}
+
+impl AutoToneValues {
+    /// `adj` with every non-null value set. Mirrored by `applyAutoTone` in `src/ipc/index.ts`.
+    pub fn apply_to(&self, adj: &ParametricAdjustments) -> ParametricAdjustments {
+        let mut out = adj.clone();
+        let set = |slot: &mut f32, v: Option<f32>| {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        };
+        set(&mut out.exposure, self.exposure);
+        set(&mut out.contrast, self.contrast);
+        set(&mut out.highlights, self.highlights);
+        set(&mut out.shadows, self.shadows);
+        set(&mut out.whites, self.whites);
+        set(&mut out.blacks, self.blacks);
+        set(&mut out.vibrance, self.vibrance);
+        set(&mut out.saturation, self.saturation);
+        out
+    }
+}
+
+string_enum! {
+    /// Guided-workflow step of a project: the step bar Cull -> Edit -> Export (v14).
+    pub enum WorkflowStep {
+        Cull => "cull",
+        Edit => "edit",
+        Export => "export",
+    }
+}
+
+/// Which images are keepers (Edit step scenes, Export step selection). One definition for
+/// the whole app ([`KeeperRule::is_keeper`], TS mirror `isKeeper`):
+/// 1. rejected by the user -> never;
+/// 2. picked by the user -> keeper;
+/// 3. rated `>= minRating` stars by the user -> keeper;
+/// 4. untouched by the user (unflagged and 0 stars) and `useSuggestions` -> keeper iff the
+///    culling engine suggests `pick` (`QualityScore.suggestedPick`; burst non-keepers are never
+///    suggested `pick`).
+///
+/// Otherwise (unflagged with 1..minRating-1 stars, or untouched without a pick suggestion)
+/// not a keeper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KeeperRule {
+    /// 1..=5. Default 1 (any star keeps, Lightroom convention).
+    pub min_rating: u8,
+    /// Default `true`.
+    pub use_suggestions: bool,
+}
+
+impl Default for KeeperRule {
+    fn default() -> Self {
+        Self { min_rating: 1, use_suggestions: true }
+    }
+}
+
+impl KeeperRule {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=5).contains(&self.min_rating) {
+            return Err(format!("minRating = {} is outside 1..=5", self.min_rating));
+        }
+        Ok(())
+    }
+
+    /// The rule on the culling values (SQL mirror in `scene::workflow`).
+    pub fn is_keeper_values(&self, pick: PickFlag, rating: u8, suggested_pick: Option<PickFlag>) -> bool {
+        match pick {
+            PickFlag::Reject => false,
+            PickFlag::Pick => true,
+            PickFlag::Unflagged if rating >= self.min_rating => true,
+            PickFlag::Unflagged => rating == 0 && self.use_suggestions && suggested_pick == Some(PickFlag::Pick),
+        }
+    }
+
+    pub fn is_keeper(&self, e: &RawImageEntry) -> bool {
+        self.is_keeper_values(e.pick, e.rating, e.quality.as_ref().map(|q| q.suggested_pick))
+    }
+}
+
+string_enum! {
+    /// Progress of one scene in the Edit step checklist.
+    pub enum SceneEditStatus {
+        /// The representative has no edits yet.
+        ToEdit => "to_edit",
+        /// The representative is edited; not applied to the rest of the scene yet.
+        Edited => "edited",
+        /// Applied, and the representative has not changed since.
+        Applied => "applied",
+        /// Applied, but the representative was edited again since (apply again).
+        Outdated => "outdated",
+    }
+}
+
+string_enum! {
+    /// Who chose a scene's representative.
+    pub enum RepresentativeSource {
+        /// Proposed by Sieve (best keeper with the most typical lighting of the scene).
+        Auto => "auto",
+        /// Chosen with `set_scene_representative`; kept while it is a keeper member.
+        User => "user",
+    }
+}
+
+/// One scene of the Edit step (`EditPlan.scenes`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEditEntry {
+    pub scene_id: SceneId,
+    /// The scene's keepers, capture order (non-empty: scenes without keepers are omitted).
+    pub image_ids: Vec<ImageId>,
+    /// All members incl. non-keepers.
+    pub member_count: u32,
+    /// The frame to edit (a keeper of `imageIds`).
+    pub representative_id: ImageId,
+    pub representative_source: RepresentativeSource,
+    /// User-facing, e.g. "Sharpest keeper, typical light for this scene" or "Chosen by you".
+    pub representative_reason: String,
+    /// The representative has edits (`hasEdits`).
+    pub edited: bool,
+    /// Time of the representative's latest history entry (`null` = never edited).
+    pub edited_at_ms: Option<i64>,
+    /// Last `apply_scene_edit` / `apply_all_edited_scenes` of this scene (`null` = never).
+    pub applied_at_ms: Option<i64>,
+    pub status: SceneEditStatus,
+}
+
+/// `get_edit_plan(projectId)`: the Edit step of one project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditPlan {
+    pub project_id: ProjectId,
+    pub keeper_rule: KeeperRule,
+    /// Every keeper of the project, capture order (the Export step's default selection).
+    pub keeper_ids: Vec<ImageId>,
+    /// Keepers that belong to no scene. Non-empty = run `detect_scenes(null, projectId, null)`
+    /// (or create scenes) and fetch the plan again.
+    pub unassigned_keeper_ids: Vec<ImageId>,
+    /// Scenes with at least one keeper in the project, capture order.
+    pub scenes: Vec<SceneEditEntry>,
+}
+
+/// Options of `apply_scene_edit` / `apply_all_edited_scenes`. `null` on the wire = default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneApplyOptions {
+    /// Relative matching of every target to the representative (the representative is the
+    /// single anchor of `match_scene`). Default `MatchOptions::default()` (exposure + WB
+    /// matched, strength 1, `DEFAULT_SYNC` groups copied).
+    pub match_options: MatchOptions,
+    /// Also edit the scene's non-keepers (default `false`).
+    pub include_non_keepers: bool,
+    /// Leave targets alone whose adjustments the user changed after this scene's last apply
+    /// (their current settings differ from what that apply wrote) (default `true`).
+    pub skip_user_edited: bool,
+}
+
+impl Default for SceneApplyOptions {
+    fn default() -> Self {
+        Self { match_options: MatchOptions::default(), include_non_keepers: false, skip_user_edited: true }
+    }
+}
+
+/// Per-scene result of an apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneApplyOutcome {
+    pub scene_id: SceneId,
+    pub representative_id: ImageId,
+    /// Targets whose adjustments changed.
+    pub changed_ids: Vec<ImageId>,
+    /// Targets left alone (`skipUserEdited`).
+    pub skipped_ids: Vec<ImageId>,
+    /// Targets whose match did not converge within tolerance (`MatchPreview.converged`); their
+    /// settings were still applied. Show them for review.
+    pub not_converged_ids: Vec<ImageId>,
+    /// User-facing caveats (clamped slider, no neutral found, ...).
+    pub notes: Vec<String>,
+}
+
+/// An undoable multi-image edit (`undo_edit_batch`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditBatchResult {
+    /// `null` when nothing changed (nothing to undo).
+    pub batch_id: Option<EditBatchId>,
+    /// History label of every entry of the batch, e.g. "Apply to Scene", "Auto Edit (My Style)".
+    pub label: String,
+    pub changed_ids: Vec<ImageId>,
+}
+
+/// Result of `apply_scene_edit` / `apply_all_edited_scenes`: one batch for the whole call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyScenesResult {
+    pub batch: EditBatchResult,
+    pub scenes: Vec<SceneApplyOutcome>,
+}
+
+/// Result of `undo_edit_batch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoBatchResult {
+    /// Images put back to their settings before the batch (one "Undo <label>" history entry each).
+    pub restored_ids: Vec<ImageId>,
+    /// Images edited again after the batch: left alone.
+    pub skipped_ids: Vec<ImageId>,
+}
+
+string_enum! {
+    pub enum StyleModelState {
+        /// No model yet (or not enough edited photos).
+        Untrained => "untrained",
+        Training => "training",
+        Ready => "ready",
+        /// The last training failed (`error`); a previous model, if any, stays in use
+        /// (`trainedAtMs` set).
+        Failed => "failed",
+    }
+}
+
+string_enum! {
+    /// Stage reported by `styleModelProgress`.
+    pub enum StyleTrainPhase {
+        /// Measuring the edited photos (develop-source statistics, scene context).
+        Features => "features",
+        Fit => "fit",
+        /// Scoring on held-out edits.
+        Validate => "validate",
+    }
+}
+
+/// Held-out quality of the current style model (render ΔE2000 vs the user's own edits).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleValidation {
+    pub held_out_images: u32,
+    /// Mean ΔE2000 predicted vs user render.
+    #[specta(type = Number)]
+    pub delta_e: f32,
+    /// Same for `auto_tone` (baseline).
+    #[specta(type = Number)]
+    pub auto_tone_delta_e: f32,
+    /// Same for no edit (defaults).
+    #[specta(type = Number)]
+    pub no_edit_delta_e: f32,
+}
+
+/// `style_model_status()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleModelStatus {
+    pub state: StyleModelState,
+    /// Identifies features + model family, e.g. "style-gbt@1".
+    pub model_version: String,
+    /// Current model's training time (`null` = none).
+    pub trained_at_ms: Option<i64>,
+    /// Edited photos the current model learned from.
+    pub training_examples: u32,
+    /// Edited photos in the catalog now (training candidates).
+    pub available_examples: u32,
+    /// Training needs at least this many edited photos.
+    pub min_examples: u32,
+    /// 0..=1 while `training`, else `null`.
+    #[specta(type = Option<Number>)]
+    pub progress: Option<f32>,
+    /// User-facing reason of the last failure.
+    pub error: Option<String>,
+    pub validation: Option<StyleValidation>,
+}
+
+/// `predict_style` result for one image (nothing is saved).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StylePrediction {
+    pub image_id: ImageId,
+    /// The image's current adjustments with the predicted `fields` replaced (crop, masks and
+    /// other per-frame groups are kept). Render it for a preview; `apply_style_prediction`
+    /// commits the same values.
+    pub adjustments: ParametricAdjustments,
+    /// Groups the model predicts.
+    pub fields: Vec<AdjustmentField>,
+    /// 0..=1 (distance of the frame to the training data).
+    #[specta(type = Number)]
+    pub confidence: f32,
+    pub notes: Vec<String>,
+}
+
+/// One source folder of a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolder {
+    pub id: FolderId,
+    /// Absolute path on disk.
+    pub path: String,
+    pub image_count: u32,
+    /// The folder is on disk now. `false` = moved, renamed or on an unmounted drive: offer
+    /// "Locate folder..." (`relocate_folder(id, newPath)`).
+    pub exists: bool,
+}
+
+/// A project (one shoot): what the Projects home page card and the TopBar switcher show.
+/// Counts are over all images of the project's folders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: ProjectId,
+    /// Defaults to the (first) folder's name; `rename_project`.
+    pub name: String,
+    /// Source folders, by path. Non-empty.
+    pub folders: Vec<ProjectFolder>,
+    /// Cover photo: the user's choice (`coverChosen`, `set_project_cover`), else automatic
+    /// (best non-rejected photo: picked first, then most stars, then earliest capture);
+    /// `null` for an empty project.
+    pub cover_image_id: Option<ImageId>,
+    /// `coverImageId` was chosen by the user.
+    pub cover_chosen: bool,
+    /// Ready grid thumbnail (512 px) of the cover, absolute path (asset protocol, like
+    /// `ThumbnailState.ready.path`); `null` while pending / failed / no cover.
+    pub cover_thumbnail_path: Option<String>,
+    /// Culling profile of this shoot (`set_project_shoot_type`).
+    pub shoot_type: ShootType,
+    /// Guided-workflow step (`set_workflow_step`).
+    pub workflow_step: WorkflowStep,
+    pub created_at_ms: i64,
+    /// Last `open_project` (`null` = never opened).
+    pub last_opened_at_ms: Option<i64>,
+    pub photo_count: u32,
+    /// Keepers by `CatalogState.keeperRule` (same rule as the Edit step).
+    pub keeper_count: u32,
+    /// Photos with edits (`RawImageEntry.hasEdits`).
+    pub edited_count: u32,
+    pub picked_count: u32,
+    pub rejected_count: u32,
+    /// Photos whose original is missing (`RawImageEntry.missingSinceMs` set).
+    pub missing_count: u32,
+    /// Earliest / latest capture time of the project's photos (`null` = none known).
+    pub captured_from_ms: Option<i64>,
+    pub captured_to_ms: Option<i64>,
+}
+
+impl Project {
+    /// Max length of a project name (characters, after trimming).
+    pub const MAX_NAME_LEN: usize = 200;
+
+    /// Trimmed name, or `invalid_argument`-style message when empty / too long / with
+    /// control characters.
+    pub fn validate_name(name: &str) -> Result<String, String> {
+        let n = name.trim();
+        if n.is_empty() {
+            return Err("project name must not be empty".into());
+        }
+        if n.chars().count() > Self::MAX_NAME_LEN {
+            return Err(format!("project name is longer than {} characters", Self::MAX_NAME_LEN));
+        }
+        if n.chars().any(char::is_control) {
+            return Err("project name must not contain control characters".into());
+        }
+        Ok(n.to_owned())
+    }
+}
+
+/// Result of `create_project`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectResult {
+    pub project: Project,
+    /// The import that ran (new photos are `pending` until the ingest pipeline extracts them).
+    pub import: ImportSummary,
+    /// The folder was already in the catalog: its existing project was returned (and the folder
+    /// re-scanned) instead of creating a new one; `name` / `shootType` were not applied.
+    pub existing: bool,
+}
+
+/// Result of `remove_project`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveProjectResult {
+    /// Catalog images removed (their files, sidecars and exports are untouched).
+    pub removed_images: u32,
+    pub removed_folders: u32,
+}
+
+/// One item of Lightroom's Copy Settings dialog (a checkbox).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CopySettingsItem {
+    pub label: String,
+    /// Fields copied when checked; empty when `supported` is false.
+    pub fields: Vec<AdjustmentField>,
+    /// `false`: Sieve preserves these settings in the sidecar but cannot copy them (shown
+    /// disabled so the dialog matches Lightroom's).
+    pub supported: bool,
+}
+
+/// A group of Lightroom's Copy Settings dialog (group checkbox = all its items).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CopySettingsGroup {
+    pub id: String,
+    pub label: String,
+    pub items: Vec<CopySettingsItem>,
+}
+
+/// The Copy... / Sync... / Save Preset dialog layout (Lightroom Classic's groups, in its order);
+/// exported to TS as the constant `COPY_SETTINGS_GROUPS`. Every `AdjustmentField` except the
+/// umbrella `noise_reduction` appears in exactly one item (test); `lut` is copied with `Profile`.
+pub fn copy_settings_groups() -> Vec<CopySettingsGroup> {
+    use AdjustmentField as F;
+    let item = |label: &str, fields: &[AdjustmentField]| CopySettingsItem {
+        label: label.into(),
+        fields: fields.to_vec(),
+        supported: true,
+    };
+    let unsupported = |label: &str| CopySettingsItem { label: label.into(), fields: Vec::new(), supported: false };
+    let group = |id: &str, label: &str, items: Vec<CopySettingsItem>| CopySettingsGroup {
+        id: id.into(),
+        label: label.into(),
+        items,
+    };
+    vec![
+        group("white_balance", "White Balance", vec![item("White Balance", &[F::WhiteBalance])]),
+        group(
+            "basic_tone",
+            "Basic Tone",
+            vec![
+                item("Exposure", &[F::Exposure]),
+                item("Contrast", &[F::Contrast]),
+                item("Highlights", &[F::Highlights]),
+                item("Shadows", &[F::Shadows]),
+                item("White Clipping", &[F::Whites]),
+                item("Black Clipping", &[F::Blacks]),
+            ],
+        ),
+        group("tone_curve", "Tone Curve", vec![item("Tone Curve", &[F::ToneCurve])]),
+        group(
+            "presence",
+            "Presence",
+            vec![
+                item("Texture", &[F::Texture]),
+                item("Clarity", &[F::Clarity]),
+                item("Dehaze", &[F::Dehaze]),
+                item("Vibrance", &[F::Vibrance]),
+                item("Saturation", &[F::Saturation]),
+            ],
+        ),
+        group(
+            "color",
+            "Color Adjustments",
+            vec![
+                item("Hue", &[F::HslHue]),
+                item("Saturation", &[F::HslSaturation]),
+                item("Luminance", &[F::HslLuminance]),
+            ],
+        ),
+        group("color_grading", "Color Grading", vec![item("Color Grading", &[F::ColorGrading])]),
+        group(
+            "detail",
+            "Detail",
+            vec![
+                item("Sharpening", &[F::Sharpening]),
+                item("Luminance Noise Reduction", &[F::NoiseReductionLuminance]),
+                item("Color Noise Reduction", &[F::NoiseReductionColor]),
+            ],
+        ),
+        group(
+            "treatment_profile",
+            "Treatment & Profile",
+            vec![item("Treatment & B&W Mix", &[F::BlackAndWhite]), item("Profile", &[F::Profile, F::Lut])],
+        ),
+        group(
+            "lens_corrections",
+            "Lens Corrections",
+            vec![
+                unsupported("Lens Profile Corrections"),
+                unsupported("Chromatic Aberration"),
+                unsupported("Lens Distortion"),
+                unsupported("Lens Vignetting"),
+            ],
+        ),
+        group("transform", "Transform", vec![unsupported("Upright & Transform")]),
+        group("effects", "Effects", vec![item("Post-Crop Vignetting", &[F::Vignette]), item("Grain", &[F::Grain])]),
+        group("calibration", "Calibration", vec![item("Calibration", &[F::Calibration])]),
+        group("masking", "Masking", vec![item("Masks", &[F::Masks])]),
+        group("spot_removal", "Spot Removal", vec![unsupported("Spot Removal")]),
+        group("crop", "Crop", vec![item("Crop, Straighten Angle & Aspect Ratio", &[F::Crop])]),
+        group("process_version", "Process Version", vec![item("Process Version", &[F::ProcessVersion])]),
+    ]
 }
 
 #[cfg(test)]
@@ -3609,8 +4477,9 @@ mod tests {
         assert_eq!(t.crop, CropSettings::default(), "DEFAULT_SYNC leaves the crop alone");
         t.copy_fields(&e, &[AdjustmentField::Crop]);
         assert_eq!(t, e, "ALL groups together cover every field");
-        // v10: DEFAULT_SYNC = ALL minus crop and masks.
-        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 2, AdjustmentField::ALL.len());
+        // v10: DEFAULT_SYNC = ALL minus crop and masks (v14: and the two noise-reduction
+        // subsets, covered by the `noise_reduction` umbrella).
+        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 4, AdjustmentField::ALL.len());
         assert!(!AdjustmentField::DEFAULT_SYNC.contains(&AdjustmentField::Masks));
 
         // Out-of-range / malformed values.

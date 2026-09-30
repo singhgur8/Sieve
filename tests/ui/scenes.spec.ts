@@ -22,7 +22,7 @@ test.describe("scenes", () => {
     await expect(page.getByTestId("scene-progress")).toBeVisible();
     await expect(page.getByTestId("scene-chip-6")).toBeVisible();
     await expect(page.getByTestId("scene-progress")).toHaveCount(0);
-    expect((await calls(page, "detect_scenes"))[0].args).toEqual({ folderId: null, options: null });
+    expect((await calls(page, "detect_scenes"))[0].args).toEqual({ folderId: null, projectId: null, options: null });
     await expect(page.getByTestId("scene-chips").locator("button")).toHaveCount(7);
     await expect(page.getByTestId("scene-chip-1")).toContainText("Scene 1");
     await expect(page.getByTestId("scene-chip-1")).toContainText("40");

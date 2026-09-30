@@ -11,6 +11,7 @@ use tauri_specta::Event;
 
 use super::error::{AppError, AppResult, ErrorKind};
 use super::types::*;
+use crate::db::projects::{self, FolderScope, ImportTarget};
 use crate::db::{self, repo};
 use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
@@ -18,10 +19,12 @@ use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::masking::Segmenter;
+use crate::ml::style::StyleModel;
 use crate::ml::{self, Analysis};
 use crate::model_fetch::ModelDownloads;
 use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
+use crate::styles;
 use crate::xmp::XmpSync;
 
 /// Managed state: the open catalog.
@@ -105,8 +108,14 @@ pub async fn set_burst_window(
 /// externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 /// returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 /// (and `analysis*`) events.
+///
+/// Project (v14): `projectId` adds the folder to that project ("Add folder to project"; a
+/// folder already in another project -> `invalid_argument`); `null` = the folder's project
+/// if it (or a folder containing it) is in the catalog, else a new project named after it.
+/// `create_project` is the home page's "New project".
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn import_folder(
     app: AppHandle,
     catalog: State<'_, Catalog>,
@@ -115,21 +124,40 @@ pub async fn import_folder(
     xmp: State<'_, XmpSync>,
     path: String,
     options: ImportOptions,
+    project_id: Option<ProjectId>,
 ) -> AppResult<ImportSummary> {
-    let (mut summary, auto) =
-        catalog.run(move |c| Ok((repo::import_folder(c, Path::new(&path), &options)?, repo::auto_analyze(c)?))).await?;
-    let sync = xmp.inner().clone();
+    let target = project_id.map_or(ImportTarget::Auto, ImportTarget::Existing);
+    Ok(run_import(&app, &catalog, &ingest, &analysis, &xmp, path, options, target).await?.0)
+}
+
+/// `import_folder` / `create_project`: registers the files, reads sidecars, starts ingest (and
+/// analysis). Returns the summary and whether the folder was already in the catalog.
+#[allow(clippy::too_many_arguments)]
+async fn run_import(
+    app: &AppHandle,
+    catalog: &Catalog,
+    ingest: &Ingest,
+    analysis: &Analysis,
+    xmp: &XmpSync,
+    path: String,
+    options: ImportOptions,
+    target: ImportTarget,
+) -> AppResult<(ImportSummary, bool)> {
+    let ((mut summary, existing), auto) = catalog
+        .run(move |c| Ok((repo::import_folder_to(c, Path::new(&path), &options, &target)?, repo::auto_analyze(c)?)))
+        .await?;
+    let sync = xmp.clone();
     let folder_id = summary.folder_id;
     summary.sidecars_read = blocking(move || sync.refresh_folder(folder_id)).await?;
     // Re-registered files may have changed on disk: re-resolve develop sources.
     if let Some(develop) = app.try_state::<DevelopCache>() {
         develop.forget_sources(None);
     }
-    ingest.start(&app)?;
+    ingest.start(app)?;
     if auto {
-        analysis.start(&app, AnalysisScope::Pending)?;
+        analysis.start(app, AnalysisScope::Pending)?;
     }
-    Ok(summary)
+    Ok((summary, existing))
 }
 
 /// Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
@@ -191,11 +219,16 @@ pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> A
     catalog.run(move |c| repo::list_image_ids(c, &query)).await
 }
 
-/// Filter-bar facet counts for `folderId` (`null` = whole catalog).
+/// Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
+/// inside a project pass its id). Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_filter_counts(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<FilterCounts> {
-    catalog.run(move |c| repo::filter_counts(c, folder_id)).await
+pub async fn get_filter_counts(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<FilterCounts> {
+    catalog.run(move |c| repo::filter_counts(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 // Culling writes. Each marks changed images `xmp.dirty` (DB triggers) and notifies the
@@ -565,7 +598,9 @@ pub async fn reset_adjustments(
     Ok(())
 }
 
-/// Applies preset `presetId` (its `fields` only) to `ids` ("Preset: <name>"). Atomic.
+/// Applies preset `presetId` to `ids` ("Preset: <name>" entry per changed image). Atomic.
+/// Sieve presets copy their `fields` groups; imported Lightroom presets (v14) set exactly the
+/// `crs:` settings they contain and leave every other setting alone (`styles::resolve_preset`).
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_preset(
@@ -575,13 +610,7 @@ pub async fn apply_preset(
     ids: Vec<ImageId>,
     preset_id: PresetId,
 ) -> AppResult<()> {
-    catalog
-        .run(move |c| {
-            let preset = develop::presets::get(c, preset_id)?;
-            let label = format!("{}{}", develop::history::LABEL_PRESET_PREFIX, preset.name);
-            develop::history::apply_fields(c, &ids, &preset.adjustments, &preset.fields, &label)
-        })
-        .await?;
+    catalog.run(move |c| styles::apply_preset(c, &ids, preset_id)).await?;
     xmp.notify(&app);
     Ok(())
 }
@@ -824,11 +853,16 @@ pub async fn get_faces(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<Ve
     catalog.run(move |c| repo::get_faces(c, id)).await
 }
 
-/// Burst groups with members, optionally limited to groups touching `folderId`.
+/// Burst groups with members, optionally limited to groups touching `folderId` AND
+/// `projectId` (v14).
 #[tauri::command]
 #[specta::specta]
-pub async fn list_burst_groups(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<BurstGroup>> {
-    catalog.run(move |c| repo::list_burst_groups(c, folder_id)).await
+pub async fn list_burst_groups(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<BurstGroup>> {
+    catalog.run(move |c| repo::list_burst_groups(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 /// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
@@ -1074,7 +1108,8 @@ pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>
 // Scenes & scene matching (Phase 7)
 // ---------------------------------------------------------------------------
 
-/// Groups the images of `folderId` (all folders for `null`) into scenes by capture-time gaps
+/// Groups the images of `folderId` AND `projectId` (v14; both `null` = all folders; scenes
+/// never span folders) into scenes by capture-time gaps
 /// and appearance similarity (`options` `null` = defaults). Replaces the `auto` scenes in scope
 /// (and `manual` ones if `replaceManual`); members of kept manual scenes are not regrouped;
 /// anchor flags survive regrouping. Blocking until done (first run computes preview features,
@@ -1086,12 +1121,15 @@ pub async fn detect_scenes(
     app: AppHandle,
     catalog: State<'_, Catalog>,
     folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
     options: Option<SceneDetectOptions>,
 ) -> AppResult<Vec<Scene>> {
     let options = options.unwrap_or_default();
     options.validate().map_err(AppError::invalid)?;
     let replace_manual = options.replace_manual;
-    let mut frames = catalog.run(move |c| scene::store::detection_frames(c, folder_id, replace_manual)).await?;
+    let scope = catalog.run(move |c| FolderScope::resolve(c, folder_id, project_id)).await?;
+    let frames_scope = scope.clone();
+    let mut frames = catalog.run(move |c| scene::store::detection_frames(c, &frames_scope, replace_manual)).await?;
     let progress = scene::progress_emitter(app, SceneTask::Detect);
     let (frames, computed) = blocking(move || {
         let computed = scene::features::compute_missing(&mut frames, &progress);
@@ -1102,16 +1140,21 @@ pub async fn detect_scenes(
         .run(move |c| {
             scene::store::save_features(c, &computed)?;
             let groups = scene::detect::group(&frames, &options);
-            scene::store::replace_scenes(c, folder_id, &groups, options.replace_manual)
+            scene::store::replace_scenes(c, &scope, &groups, options.replace_manual)
         })
         .await
 }
 
-/// Scenes with a member in `folderId` (all for `null`), in capture order.
+/// Scenes with a member in `folderId` AND `projectId` (v14; both `null` = all), in capture
+/// order.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_scenes(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<Scene>> {
-    catalog.run(move |c| scene::store::list_scenes(c, folder_id)).await
+pub async fn list_scenes(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<Scene>> {
+    catalog.run(move |c| scene::store::list_scenes(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 #[tauri::command]
@@ -1291,16 +1334,32 @@ mod tests {
 
 /// Profile browser contents for image `id`: camera profiles (DCPs) installed for its camera
 /// and the installed looks (read in place from the user's Adobe installation; empty lists
-/// when none are installed). Select one by saving `adjustments.profile`.
+/// when none are installed), plus (v14) the style library's imported looks / DCPs for this
+/// camera (`styleId` set, `group` = style group name) and every LUT profile (`luts`).
+/// Select one by saving `adjustments.profile` / `adjustments.lut` (`applyStyleProfile`).
 #[tauri::command]
 #[specta::specta]
 pub async fn list_profiles(
     catalog: State<'_, Catalog>,
     profiles: State<'_, ProfileLibrary>,
+    luts: State<'_, LutLibrary>,
     id: ImageId,
 ) -> AppResult<ProfileCatalog> {
     let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
-    let camera = CameraKey {
+    let camera = camera_key(&entry);
+    let mut listing = profiles.catalog(entry.id, &camera);
+    let luts = luts.inner().clone();
+    catalog
+        .run(move |c| {
+            styles::sync_lut_library(c, &luts)?;
+            styles::extend_profile_catalog(c, &mut listing, &camera)?;
+            Ok(listing)
+        })
+        .await
+}
+
+fn camera_key(entry: &RawImageEntry) -> CameraKey {
+    CameraKey {
         format: entry.format,
         // Adobe's spelling of the makes Sieve identifies ("Sony ILCE-7M4", "Fujifilm X-M5").
         make: match entry.camera.make {
@@ -1310,8 +1369,7 @@ pub async fn list_profiles(
             CameraMake::Other => None,
         },
         model: entry.camera.model.clone(),
-    };
-    Ok(profiles.catalog(entry.id, &camera))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,4 +1555,543 @@ pub async fn download_models(app: AppHandle, downloads: State<'_, ModelDownloads
 pub async fn cancel_model_download(downloads: State<'_, ModelDownloads>) -> AppResult<()> {
     downloads.cancel();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IPC v14 (Phase 8b): style library, auto tone / WB, guided workflow, edit plan, edit
+// batches, style model, paste from previous
+// ---------------------------------------------------------------------------
+
+/// Imports every Lightroom develop preset (`.xmp` `crs:PresetType="Normal"`, legacy
+/// `.lrtemplate`), creative profile (`.xmp` `crs:PresetType="Look"`), camera profile (`.dcp`)
+/// and `.cube` LUT under `path` (recursive), one style group per source folder; re-importing a
+/// folder replaces its group. Looks/DCPs are read in place later (never copied); LUTs are
+/// copied into the LUT library. Errors: `not_found` (no such folder), `invalid_argument`
+/// (nothing importable found). Body: rust-engine-dev (`styles::import_folder`).
+#[tauri::command]
+#[specta::specta]
+pub async fn import_style_folder(
+    catalog: State<'_, Catalog>,
+    luts: State<'_, LutLibrary>,
+    path: String,
+) -> AppResult<ImportStyleReport> {
+    let luts = luts.inner().clone();
+    // rust-engine-dev: also refresh `ProfileLibrary` with `styles::imported_profile_paths`.
+    catalog.run(move |c| styles::import_folder(c, &luts, Path::new(&path))).await
+}
+
+/// The whole style library (every project sees every group): "User Presets", imported groups
+/// by name, "LUTs" (the pre-v14 LUT library, registered on first listing).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_styles(catalog: State<'_, Catalog>, luts: State<'_, LutLibrary>) -> AppResult<StyleLibrary> {
+    let luts = luts.inner().clone();
+    catalog
+        .run(move |c| {
+            styles::sync_lut_library(c, &luts)?;
+            styles::list(c)
+        })
+        .await
+}
+
+/// Removes an imported style group and its presets/profiles (source files untouched; images
+/// using them keep their settings). Built-in groups -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_style_group(catalog: State<'_, Catalog>, group_id: StyleGroupId) -> AppResult<()> {
+    catalog.run(move |c| styles::remove_group(c, group_id)).await
+}
+
+/// What `apply_preset(presetId)` would make of image `id`'s settings (`adjustments` = the live
+/// settings, `null` = stored ones), for hover previews (`renderPreview` with slot
+/// `navigator`). Nothing is saved.
+#[tauri::command]
+#[specta::specta]
+pub async fn resolve_preset(
+    catalog: State<'_, Catalog>,
+    id: ImageId,
+    preset_id: PresetId,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<ParametricAdjustments> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    catalog
+        .run(move |c| {
+            let base = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            styles::resolve_preset(c, preset_id, &base)
+        })
+        .await
+}
+
+/// Lightroom's Basic "Auto": absolute values for the tone + presence sliders in `keys`
+/// (`null` = all of `AdjustmentField::AUTO_TONE`; Shift-double-click a slider = just that one)
+/// given the live `adjustments` (`null` = stored). Nothing is saved: the UI merges the values
+/// (`applyAutoTone`) and saves one "Auto Tone" history entry. Body: rust-engine-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_tone(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+    keys: Option<Vec<AdjustmentField>>,
+) -> AppResult<AutoToneValues> {
+    let keys = keys.unwrap_or_else(|| AdjustmentField::AUTO_TONE.to_vec());
+    if keys.is_empty() {
+        return Err(AppError::invalid("keys must not be empty"));
+    }
+    if let Some(k) = keys.iter().find(|k| !AdjustmentField::AUTO_TONE.contains(k)) {
+        return Err(AppError::invalid(format!("{} has no Auto", k.as_str())));
+    }
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    let adjustments = match adjustments {
+        Some(a) => a,
+        None => catalog.run(move |c| repo::get_adjustments(c, id)).await?,
+    };
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let r = blocking(move || develop::auto::auto_tone(&cache, &src, &adjustments, &keys)).await;
+    note_if_missing(&catalog, id, r).await
+}
+
+/// Lightroom's "Auto" white balance: temperature/tint for the live `adjustments` (`null` =
+/// stored). Nothing is saved: the UI commits `whiteBalance: custom` ("Auto White Balance").
+/// Body: rust-engine-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_white_balance(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<WhiteBalanceValues> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    let adjustments = match adjustments {
+        Some(a) => a,
+        None => catalog.run(move |c| repo::get_adjustments(c, id)).await?,
+    };
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let r = blocking(move || develop::auto::auto_white_balance(&cache, &src, &adjustments)).await;
+    note_if_missing(&catalog, id, r).await
+}
+
+/// Guided-workflow step of project `projectId` (also `Project.workflowStep`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_workflow_step(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<WorkflowStep> {
+    catalog.run(move |c| projects::workflow_step(c, project_id)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_workflow_step(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    step: WorkflowStep,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_workflow_step(c, project_id, step)).await
+}
+
+/// Changes which images count as keepers (`CatalogState.keeperRule`). `minRating` 1..=5.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_keeper_rule(catalog: State<'_, Catalog>, rule: KeeperRule) -> AppResult<()> {
+    catalog.run(move |c| repo::set_keeper_rule(c, &rule)).await
+}
+
+/// The Edit step of project `projectId`: keepers, their scenes, one representative per scene
+/// and the checklist status. Proposes (and remembers) representatives for scenes without one.
+/// Keepers outside every scene are listed in `unassignedKeeperIds` (run `detect_scenes`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_edit_plan(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<EditPlan> {
+    catalog.run(move |c| scene::workflow::edit_plan(c, project_id)).await
+}
+
+/// Chooses scene `sceneId`'s representative (`imageId` must be a keeper member) or hands the
+/// choice back to Sieve (`null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_scene_representative(
+    catalog: State<'_, Catalog>,
+    scene_id: SceneId,
+    image_id: Option<ImageId>,
+) -> AppResult<SceneEditEntry> {
+    catalog.run(move |c| scene::workflow::set_representative(c, scene_id, image_id)).await
+}
+
+/// Matches every job's targets to its representative (`match_scene` machinery) off the
+/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets.
+async fn match_scene_jobs(
+    app: AppHandle,
+    develop: &DevelopCache,
+    luts: &LutLibrary,
+    jobs: Vec<scene::workflow::SceneApplyJob>,
+    options: MatchOptions,
+) -> AppResult<(Vec<scene::workflow::SceneApplyJob>, Vec<Vec<MatchPreview>>)> {
+    let cache = develop.clone();
+    let luts = luts.clone();
+    blocking(move || {
+        let emit = scene::progress_emitter(app, SceneTask::Apply);
+        let total: u32 = jobs.iter().map(|j| j.targets.len() as u32).sum();
+        let mut offset = 0u32;
+        let mut previews = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            if job.targets.is_empty() {
+                previews.push(Vec::new());
+                continue;
+            }
+            let base = offset;
+            let progress = |done: u32, _: u32| emit(base + done, total);
+            let mut out = Vec::with_capacity(job.targets.len());
+            for chunk in job.targets.chunks(MatchOptions::MAX_TARGETS) {
+                out.extend(scene::matching::match_images(
+                    &cache,
+                    &luts,
+                    std::slice::from_ref(&job.representative),
+                    chunk,
+                    &options,
+                    &progress,
+                )?);
+            }
+            offset += job.targets.len() as u32;
+            previews.push(out);
+        }
+        emit(total, total);
+        Ok((jobs, previews))
+    })
+    .await
+}
+
+async fn apply_scenes(
+    app: AppHandle,
+    catalog: &Catalog,
+    develop: &DevelopCache,
+    luts: &LutLibrary,
+    xmp: &XmpSync,
+    scene_ids: SceneIds,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    let options = options.unwrap_or_default();
+    options.match_options.validate().map_err(AppError::invalid)?;
+    let opts = options.clone();
+    let jobs = catalog
+        .run(move |c| {
+            let ids = match scene_ids {
+                SceneIds::One(id) => vec![id],
+                SceneIds::EditedIn(folder) => scene::workflow::edited_scenes(c, folder)?,
+            };
+            scene::workflow::apply_inputs(c, &ids, &opts)
+        })
+        .await?;
+    let (jobs, previews) = match_scene_jobs(app.clone(), develop, luts, jobs, options.match_options).await?;
+    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews)).await?;
+    if !result.batch.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+enum SceneIds {
+    One(SceneId),
+    EditedIn(ProjectId),
+}
+
+/// "Apply to scene": copies the representative's edit to the scene's other keepers (and
+/// non-keepers with `includeNonKeepers`) with relative matching (exposure / white balance
+/// normalised per frame, `SceneApplyOptions.matchOptions`), skipping frames the user retouched
+/// after the last apply (`skipUserEdited`). One undoable batch (`undo_edit_batch`); one "Apply
+/// to Scene" history entry per changed image. Blocking until done (`sceneProgress` task
+/// `apply`). Representative without edits -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_scene_edit(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    xmp: State<'_, XmpSync>,
+    scene_id: SceneId,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::One(scene_id), options).await
+}
+
+/// `apply_scene_edit` for every scene of `projectId` whose status is `edited` or `outdated`,
+/// as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_all_edited_scenes(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    xmp: State<'_, XmpSync>,
+    project_id: ProjectId,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::EditedIn(project_id), options).await
+}
+
+/// Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
+/// `apply_style_prediction`): images still carrying what the batch wrote get their previous
+/// settings back ("Undo <label>" entry each); images edited since are left alone
+/// (`skippedIds`). Unknown batch -> `not_found`; already undone -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn undo_edit_batch(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    batch_id: EditBatchId,
+) -> AppResult<UndoBatchResult> {
+    let r = catalog.run(move |c| develop::batches::undo(c, batch_id)).await?;
+    if !r.restored_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
+}
+
+/// Lightroom's "Previous" / Paste from previous (Cmd+Alt+V): copies the stored settings of
+/// `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
+/// `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
+/// `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+#[tauri::command]
+#[specta::specta]
+pub async fn paste_previous(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    target_ids: Vec<ImageId>,
+    previous_id: ImageId,
+    fields: Option<Vec<AdjustmentField>>,
+) -> AppResult<()> {
+    let fields = fields.unwrap_or_else(|| AdjustmentField::PASTE_PREVIOUS.to_vec());
+    require_fields(&fields)?;
+    let targets: Vec<ImageId> = target_ids.into_iter().filter(|&id| id != previous_id).collect();
+    catalog
+        .run(move |c| {
+            let src = repo::get_adjustments(c, previous_id)?;
+            develop::history::apply_fields(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
+        })
+        .await?;
+    xmp.notify(&app);
+    Ok(())
+}
+
+/// State of the personal style model ("Auto edit (my style)").
+#[tauri::command]
+#[specta::specta]
+pub async fn style_model_status(
+    catalog: State<'_, Catalog>,
+    style: State<'_, StyleModel>,
+) -> AppResult<StyleModelStatus> {
+    let style = style.inner().clone();
+    catalog.run(move |c| style.status(c)).await
+}
+
+/// Trains the style model from every edited photo in the catalog, in the background
+/// (`styleModelProgress`, then exactly one `styleModelFinished`). Already training ->
+/// `invalid_argument`. Body: vision-ml-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn train_style_model(app: AppHandle, style: State<'_, StyleModel>) -> AppResult<()> {
+    style.start_training(&app)
+}
+
+/// Stops a running training (no-op when idle); `styleModelFinished {cancelled: true}` follows.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_style_training(style: State<'_, StyleModel>) -> AppResult<()> {
+    style.cancel();
+    Ok(())
+}
+
+/// Predicted settings in the user's style for `imageIds` (given order; nothing is saved).
+/// No trained model -> `invalid_argument`. Body: vision-ml-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn predict_style(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    style: State<'_, StyleModel>,
+    image_ids: Vec<ImageId>,
+) -> AppResult<Vec<StylePrediction>> {
+    let inputs = catalog.run(move |c| scene::store::match_inputs(c, &image_ids)).await?;
+    let (style, cache, luts) = (style.inner().clone(), develop.inner().clone(), luts.inner().clone());
+    blocking(move || style.predict(&cache, &luts, &inputs)).await
+}
+
+/// Predicts and commits the user's style for `imageIds` as one undoable batch ("Auto Edit (My
+/// Style)" entry per changed image; `undo_edit_batch`).
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_style_prediction(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    style: State<'_, StyleModel>,
+    xmp: State<'_, XmpSync>,
+    image_ids: Vec<ImageId>,
+) -> AppResult<EditBatchResult> {
+    let inputs = catalog.run(move |c| scene::store::match_inputs(c, &image_ids)).await?;
+    let (model, cache, lut_lib) = (style.inner().clone(), develop.inner().clone(), luts.inner().clone());
+    let predictions = blocking(move || model.predict(&cache, &lut_lib, &inputs)).await?;
+    let items: Vec<develop::batches::BatchItem> = predictions
+        .into_iter()
+        .map(|p| develop::batches::BatchItem { image_id: p.image_id, adjustments: p.adjustments, scene_id: None })
+        .collect();
+    let r = catalog
+        .run(move |c| {
+            develop::batches::commit_recorded(
+                c,
+                &items,
+                develop::batches::LABEL_STYLE,
+                develop::batches::BatchKind::StylePrediction,
+            )
+        })
+        .await?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// IPC v14 (Phase 8b): projects (home page). A project is one shoot: name, source folder(s),
+// cover, shoot type, workflow step. Inside a project the UI passes `projectId` to
+// `ImageQuery`, `get_filter_counts`, `list_burst_groups`, `list_scenes`, `detect_scenes`,
+// `get_edit_plan`, `apply_all_edited_scenes` and `AnalysisScope::Project`. "Reveal in Finder"
+// = `reveal_in_finder(project.folders[i].path)`; "Locate folder..." = `relocate_folder`.
+// ---------------------------------------------------------------------------
+
+/// Every project, most recently opened first, then newest (the home page sorts/searches
+/// client-side).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_projects(catalog: State<'_, Catalog>) -> AppResult<Vec<Project>> {
+    catalog.run(|c| projects::list_projects(c)).await
+}
+
+/// One project. Unknown id -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_project(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<Project> {
+    catalog.run(move |c| projects::get_project(c, project_id)).await
+}
+
+/// Home page "New project": imports `path` (like `import_folder`) as a new project named
+/// `name` (`null` = the folder's name) with `shootType` (`null` = `CatalogState.shootType`).
+/// If the folder (or a folder containing it) is already in the catalog, its project is
+/// re-scanned and returned with `existing: true` instead. Errors as `import_folder`; bad name
+/// -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_project(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    analysis: State<'_, Analysis>,
+    xmp: State<'_, XmpSync>,
+    path: String,
+    name: Option<String>,
+    shoot_type: Option<ShootType>,
+    options: ImportOptions,
+) -> AppResult<CreateProjectResult> {
+    if let Some(n) = &name {
+        Project::validate_name(n).map_err(AppError::invalid)?;
+    }
+    let target = ImportTarget::New { name, shoot_type };
+    let (import, existing) = run_import(&app, &catalog, &ingest, &analysis, &xmp, path, options, target).await?;
+    let id = import.project_id;
+    let project = catalog.run(move |c| projects::get_project(c, id)).await?;
+    Ok(CreateProjectResult { project, import, existing })
+}
+
+/// Entering a project: stamps `lastOpenedAtMs` and returns it. The app always starts on the
+/// home page (the last project is not reopened automatically).
+#[tauri::command]
+#[specta::specta]
+pub async fn open_project(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<Project> {
+    catalog.run(move |c| projects::open_project(c, project_id)).await
+}
+
+/// Renames a project (trimmed, 1..=200 characters; the folder on disk is not renamed).
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_project(catalog: State<'_, Catalog>, project_id: ProjectId, name: String) -> AppResult<Project> {
+    catalog.run(move |c| projects::rename_project(c, project_id, &name)).await
+}
+
+/// Sets the cover photo (`imageId` must be in the project) or returns to the automatic
+/// cover (`null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_cover(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    image_id: Option<ImageId>,
+) -> AppResult<Project> {
+    catalog.run(move |c| projects::set_project_cover(c, project_id, image_id)).await
+}
+
+/// Sets the project's shoot type and rescores (tags/scores/suggestions of its photos follow
+/// the new type's thresholds).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_shoot_type(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    project_id: ProjectId,
+    shoot_type: ShootType,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_project_shoot_type(c, project_id, shoot_type)).await?;
+    // vision-ml-dev: the rescore must score each image with its project's shoot type
+    // (`db::projects::shoot_type_of_image`), not the catalog default.
+    analysis.start(&app, AnalysisScope::Rescore)
+}
+
+/// Removes a project from the catalog: its folders, photos and everything Sieve stored about
+/// them (ratings, tags, edits, scenes, history) and their cached thumbnails/previews. Never
+/// deletes or modifies originals, sidecars or exports; re-importing the folder brings the
+/// photos back with what the sidecars hold. Unknown id -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_project(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    project_id: ProjectId,
+) -> AppResult<RemoveProjectResult> {
+    let (result, removed) = catalog.run(move |c| projects::remove_project(c, project_id)).await?;
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(Some(&removed));
+    }
+    // Image ids can be reused by the next import: drop their cached files now.
+    // TODO(rust-engine-dev): also evict other per-image in-memory caches (mask cache, render
+    // cache) and skip removed ids still queued in ingest / analysis / XMP sync.
+    let config = ingest.config().clone();
+    blocking(move || {
+        for id in removed {
+            for p in [config.thumb_path(id), config.preview_path(id)] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(result)
 }

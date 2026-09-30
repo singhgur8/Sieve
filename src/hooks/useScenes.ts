@@ -42,7 +42,7 @@ export function useScenes(
   libRef.current = lib;
 
   const reloadScenes = useCallback(async () => {
-    const list = await unwrap(commands.listScenes(folderId));
+    const list = await unwrap(commands.listScenes(folderId, null));
     setScenes(list);
     return list;
   }, [folderId]);
@@ -86,7 +86,7 @@ export function useScenes(
     setDetecting(true);
     setProgress({ task: "detect", done: 0, total: 0 });
     try {
-      const found = await unwrap(commands.detectScenes(folderId, null));
+      const found = await unwrap(commands.detectScenes(folderId, null, null));
       notify(found.length === 0 ? "No scenes found. Scenes need photos taken close together in similar light; make one from a selection with Scene > New scene from selection." : `Detected ${found.length} scene${found.length === 1 ? "" : "s"}`);
       await sync();
     } catch (e) {
