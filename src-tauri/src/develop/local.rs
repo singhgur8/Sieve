@@ -26,10 +26,10 @@
 //! operator's (monotone-guarded) delta tables at `global + s` and at the global value,
 //! tabulated over (s, adaptation EV) on the pipeline's grid.
 //!
-//! Temperature / Tint: +100 shifts the white balance by [`LOCAL_TEMP_MIRED`] mired (warmer)
-//! / [`LOCAL_TINT`] tint units (magenta); applied as the colour matrix that re-white-balances
-//! the pixel (`M' diag(mul'/mul) M^-1`), interpolated in the local value (provisional scale,
-//! see `docs/decisions.md`). Moire and Defringe are not rendered (no global equivalent).
+//! Temperature / Tint: +-100 re-white-balance the pixel to the ends in [`LOCAL_TEMP_WARM`] /
+//! [`LOCAL_TEMP_COOL`] (mired shift, tint, exposure gain) and [`LOCAL_TINT`] tint units
+//! ([`LOCAL_TINT_EV`]); applied as the colour matrix `g M' diag(mul'/mul) M^-1`, interpolated
+//! in the local value (fitted to Camera Raw, Phase 8). Moire and Defringe are not rendered (no global equivalent).
 
 use rayon::prelude::*;
 
@@ -42,20 +42,55 @@ use super::source::ColorInfo;
 use super::tone::{LocalTone, ToneModel, ToneSliders};
 use super::wb;
 
-/// Mired shift of a +100 local Temperature (negative mired = warmer). Fitted to Camera Raw:
-/// the user's -20 subject masks shift b* by -5.1 in ACR (10 frames, `examples/mask_render`).
-pub const LOCAL_TEMP_MIRED: f64 = 88.0;
+/// Local white balance, fitted to Camera Raw on radial-mask variants of the 10 reference
+/// frames (single local slider each; `examples/local_variants` + `tools/acr-oracle`, Phase 8).
+/// Camera Raw's local Temperature is asymmetric and changes luminance: -20 shifts the masked
+/// area by dL -0.73 da -1.94 db -5.28, +40 by dL +1.21 da +2.95 db +8.51; Tint +30 by
+/// dL -0.40 da +2.65 db -1.04. Each end (+-100) is a white-balance change of the base
+/// temperature by a mired shift plus a tint, times an exposure gain (EV).
+#[derive(Debug, Clone, Copy)]
+pub struct LocalWbEnd {
+    /// Mired shift (towards warmer for the warm end, cooler for the cool end).
+    pub mired: f64,
+    /// Tint units added (warm end) / subtracted (cool end).
+    pub tint: f64,
+    /// Exposure change in EV.
+    pub ev: f64,
+}
+/// Local Temperature +100.
+pub const LOCAL_TEMP_WARM: LocalWbEnd = LocalWbEnd { mired: 160.0, tint: 3.0, ev: -0.08 };
+/// Local Temperature -100.
+pub const LOCAL_TEMP_COOL: LocalWbEnd = LocalWbEnd { mired: 138.0, tint: 15.0, ev: -0.11 };
 /// Tint units of a +100 local Tint.
-pub const LOCAL_TINT: f64 = 40.0;
+pub const LOCAL_TINT: f64 = 44.0;
+/// EV change of a +100 local Tint (magenta darkens, green brightens).
+pub const LOCAL_TINT_EV: f64 = -0.13;
 
-/// Local Clarity / Texture relative to the global sliders: Camera Raw's local detail sliders
-/// act ~2.5x weaker than the global ones (local contrast x0.93 for the user's Clarity -20 /
-/// Texture -15 subject masks vs x0.83 at global strength; 10 frames, `examples/mask_render`).
+/// Local Clarity / Texture relative to the global sliders: a local value `v` acts like the
+/// global slider at `LOCAL_DETAIL_GAIN * c * |v|^p` (sign of `v`). Camera Raw's local detail
+/// response is compressive and weaker than the global one; fitted on radial-mask variants
+/// (micro-contrast change inside the mask: Clarity -20 / -60 = x0.969 / x0.922, Texture
+/// -15 / -60 = x0.945 / x0.817).
 pub const LOCAL_DETAIL_GAIN: f32 = 0.4;
+/// `(c, p)` of the local Clarity response.
+pub const LOCAL_CLARITY_CURVE: (f32, f32) = (1.52, 0.83);
+/// `(c, p)` of the local Texture response.
+pub const LOCAL_TEXTURE_CURVE: (f32, f32) = (1.78, 0.86);
 /// Pipeline scale of the local operators (as `pipeline::develop` scales the global sliders).
 const CLARITY_SCALE: f32 = 0.6 / 100.0 * LOCAL_DETAIL_GAIN;
 const TEXTURE_SCALE: f32 = 0.8 / 100.0 * LOCAL_DETAIL_GAIN;
 const DEHAZE_SCALE: f32 = 1.0 / 100.0;
+
+/// The global Clarity / Texture value a local value `v` corresponds to (before
+/// [`LOCAL_DETAIL_GAIN`]): `c * |v|^p` with `v`'s sign.
+#[inline]
+pub fn local_detail_value(v: f32, (c, p): (f32, f32)) -> f32 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v.signum() * c * v.abs().powf(p)
+    }
+}
 
 /// Function of (local slider value, EV) sampled on a grid, bilinear.
 struct SliderTable {
@@ -295,13 +330,13 @@ impl<'a> LocalOps<'a> {
     /// Clarity amount offset (pipeline scale) at pixel `i`.
     #[inline]
     pub fn clarity(&self, i: usize) -> f32 {
-        self.planes.value(LocalParam::Clarity, i) * CLARITY_SCALE
+        local_detail_value(self.planes.value(LocalParam::Clarity, i), LOCAL_CLARITY_CURVE) * CLARITY_SCALE
     }
 
     /// Texture amount offset (pipeline scale) at pixel `i`.
     #[inline]
     pub fn texture(&self, i: usize) -> f32 {
-        self.planes.value(LocalParam::Texture, i) * TEXTURE_SCALE
+        local_detail_value(self.planes.value(LocalParam::Texture, i), LOCAL_TEXTURE_CURVE) * TEXTURE_SCALE
     }
 
     /// Dehaze amount offset (pipeline scale) at pixel `i`.
@@ -519,7 +554,8 @@ fn wb_deltas(
 ) -> Option<[[[f32; 3]; 3]; 4]> {
     let (t0, n0) = base_wb(adj, color, profile, setup);
     let inv = wb::invert3(&mat3(&setup.m))?;
-    let delta = |t: f64, n: f64| -> Option<[[f32; 3]; 3]> {
+    let delta = |t: f64, n: f64, ev: f64| -> Option<[[f32; 3]; 3]> {
+        let gain = ev.exp2();
         let t = t.clamp(f64::from(wb::MIN_TEMP), f64::from(wb::MAX_TEMP)) as f32;
         let n = n.clamp(f64::from(wb::MIN_TINT), f64::from(wb::MAX_TINT)) as f32;
         let s2 =
@@ -534,15 +570,21 @@ fn wb_deltas(
         let mut d = [[0.0f32; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
-                d[i][j] = (c[i][j] - if i == j { 1.0 } else { 0.0 }) as f32;
+                d[i][j] = (gain * c[i][j] - if i == j { 1.0 } else { 0.0 }) as f32;
             }
         }
         d.iter().flatten().all(|v| v.is_finite()).then_some(d)
     };
     let mired = 1e6 / t0.max(1000.0);
-    let warm = 1e6 / (mired - LOCAL_TEMP_MIRED).max(10.0);
-    let cool = 1e6 / (mired + LOCAL_TEMP_MIRED);
-    Some([delta(warm, n0)?, delta(cool, n0)?, delta(t0, n0 + LOCAL_TINT)?, delta(t0, n0 - LOCAL_TINT)?])
+    let (w, c) = (LOCAL_TEMP_WARM, LOCAL_TEMP_COOL);
+    let warm = 1e6 / (mired - w.mired).max(10.0);
+    let cool = 1e6 / (mired + c.mired);
+    Some([
+        delta(warm, n0 + w.tint, w.ev)?,
+        delta(cool, n0 - c.tint, c.ev)?,
+        delta(t0, n0 + LOCAL_TINT, LOCAL_TINT_EV)?,
+        delta(t0, n0 - LOCAL_TINT, -LOCAL_TINT_EV)?,
+    ])
 }
 
 /// CIE Lab (D50) guide for range masks / brush auto-mask on the render grid: the input after
@@ -728,8 +770,20 @@ mod tests {
             ("blacks", |a, v| a.blacks = v, |a, v| a.blacks = v, 50.0, 2),
             ("shadows", |a, v| a.shadows = v, |a, v| a.shadows = v, 70.0, 2),
             ("highlights", |a, v| a.highlights = v, |a, v| a.highlights = v, -70.0, 2),
-            ("clarity", |a, v| a.clarity = v * LOCAL_DETAIL_GAIN, |a, v| a.clarity = v, 100.0, 1),
-            ("texture", |a, v| a.texture = v * LOCAL_DETAIL_GAIN, |a, v| a.texture = v, 100.0, 1),
+            (
+                "clarity",
+                |a, v| a.clarity = local_detail_value(v, LOCAL_CLARITY_CURVE) * LOCAL_DETAIL_GAIN,
+                |a, v| a.clarity = v,
+                60.0,
+                1,
+            ),
+            (
+                "texture",
+                |a, v| a.texture = local_detail_value(v, LOCAL_TEXTURE_CURVE) * LOCAL_DETAIL_GAIN,
+                |a, v| a.texture = v,
+                -60.0,
+                1,
+            ),
         ];
         for (name, set, set_local, v, tol) in cases {
             let mut global = plain();
