@@ -133,6 +133,22 @@ EAR = (|p2 - p6| + |p3 - p5|) / (2 * |p1 - p4|)
 A 3-vertical variant adding `|40-33|` (and dividing by 3) is slightly more stable. On an open eye in the
 samples EAR is about 0.24; thresholds must be calibrated on `test-data/labels.json`.
 
+The engine (`ml/metrics.rs`) uses the 3-vertical variant per eye; blink = the *more-open* eye below
+`blinkEar` (calibrated 0.15). Open eyes measure 0.20-0.35, squints/laughs 0.15-0.20, downcast gaze
+0.10-0.16, closed < 0.12.
+
+**Mouth** (verified on a frontal sample crop): corners 52 (image-left) and 61 (image-right); inner upper
+lip 62, inner lower lip 60. `mouth_open = |62-60| / |52-61|` (laughing >= ~0.25). Points 52-71 are the
+mouth, 72-86 the nose, 0-32 the jaw contour.
+
+## Rust integration (measured)
+
+`ml/models.rs` builds both sessions with `ort` 2.0.0-rc.13 (ORT 1.28 static), CoreML MLProgram +
+`with_static_input_shapes(true)` + the dimension overrides above; both run on CoreML. Full per-image
+analysis of a 2048 px preview (decode, detector at 640, landmarks per face, sharpness, pHash):
+27.7 ms single-thread, 9.9 ms/image throughput with the 4-thread analysis pool (M3 Max, release);
+CPU EP fallback 86 ms/image.
+
 ---
 
 ## Execution providers and performance (Apple M3 Max, onnxruntime 1.30, Python)
