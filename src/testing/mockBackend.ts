@@ -4,6 +4,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
+import { lerpAdjustments } from "../ipc";
 import type {
   BurstGroup,
   CatalogState,
@@ -18,6 +19,12 @@ import type {
   ExportPreset,
   ExportSettings,
   ImageQuery,
+  ImageStats,
+  MatchApplication,
+  MatchOptions,
+  MatchPreview,
+  Scene,
+  SceneDetectOptions,
   LutInfo,
   ParametricAdjustments,
   Preset,
@@ -43,6 +50,8 @@ declare global {
     __mockExportManual?: boolean;
     /** Advances the running mock export job by n files (default 1); finishes it when done. */
     __mockExportStep?: (n?: number) => void;
+    /** Test hook: ms per progress step of mock `detect_scenes` / `match_scene` (default 30). */
+    __mockSceneDelay?: number;
   }
 }
 
@@ -137,6 +146,8 @@ export function installMockBackend(count: number) {
       colorLabel: null,
       burstGroupId: inBurst ? group : null,
       isBurstKeeper: inBurst && i % 25 === 1,
+      sceneId: null,
+      isSceneAnchor: false,
       tags,
       quality: {
         overall,
@@ -201,6 +212,7 @@ export function installMockBackend(count: number) {
       if (q.maxRating != null && r.rating > q.maxRating) return false;
       if (q.colorLabels.length && (!r.colorLabel || !q.colorLabels.includes(r.colorLabel))) return false;
       if (q.collapseBursts && r.burstGroupId != null && !r.isBurstKeeper) return false;
+      if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
       return true;
     });
     const key: Record<string, (r: RawImageEntry) => number | string> = {
@@ -399,6 +411,117 @@ export function installMockBackend(count: number) {
   window.__mockExportStep = (n = 1) => {
     if (activeRun) stepRun(activeRun, n);
   };
+
+
+  // ---- scenes (v7) emulation ----
+  let scenes: Scene[] = [];
+  let sceneId = 0;
+  const sceneOrder = (imageIds: number[]) =>
+    [...imageIds].sort((a, b) => (byId.get(a)?.capture.capturedAtMs ?? 0) - (byId.get(b)?.capture.capturedAtMs ?? 0) || a - b);
+  function sceneBounds(sc: Scene) {
+    const ts = sc.imageIds.map((i) => byId.get(i)?.capture.capturedAtMs).filter((t): t is number => t != null);
+    sc.startedAtMs = ts.length ? Math.min(...ts) : null;
+    sc.endedAtMs = ts.length ? Math.max(...ts) : null;
+    const f = new Set(sc.imageIds.map((i) => byId.get(i)?.folderId));
+    sc.folderId = f.size === 1 ? ((byId.get(sc.imageIds[0])?.folderId as number) ?? null) : null;
+    sc.updatedAtMs = Date.now();
+  }
+  /** Re-derives images.scene_id / scene_anchor from the scene list (and drops emptied scenes). */
+  function syncScenes() {
+    scenes = scenes.filter((sc) => sc.imageIds.length > 0);
+    rows.forEach((r) => {
+      r.sceneId = null;
+      r.isSceneAnchor = false;
+    });
+    scenes.forEach((sc) => {
+      sc.imageIds = sceneOrder(sc.imageIds);
+      sc.anchorIds = sceneOrder(sc.anchorIds.filter((a) => sc.imageIds.includes(a))).slice(0, 2);
+      sceneBounds(sc);
+      sc.imageIds.forEach((i) => {
+        const r = byId.get(i)!;
+        r.sceneId = sc.id;
+        r.isSceneAnchor = sc.anchorIds.includes(i);
+      });
+    });
+    scenes.sort((a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0) || a.id - b.id);
+  }
+  const sceneOf = (id: number) => {
+    const sc = scenes.find((x) => x.id === id);
+    if (!sc) throw { kind: "not_found", message: `scene ${id}` };
+    return sc;
+  };
+  const newScene = (imageIds: number[], method: Scene["method"]): Scene => {
+    const now = Date.now();
+    const sc: Scene = { id: ++sceneId, folderId: null, startedAtMs: null, endedAtMs: null, imageIds, anchorIds: [], method, createdAtMs: now, updatedAtMs: now };
+    scenes.push(sc);
+    return sc;
+  };
+  const takeFromScenes = (imageIds: number[]) =>
+    scenes.forEach((sc) => {
+      sc.imageIds = sc.imageIds.filter((i) => !imageIds.includes(i));
+    });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  async function progress(task: "detect" | "match", total: number) {
+    const steps = 4;
+    for (let k = 1; k <= steps; k++) {
+      await sleep(window.__mockSceneDelay ?? 30);
+      void emit("scene-progress", { task, done: Math.round((total * k) / steps), total });
+    }
+  }
+  const mockStats = (imageId: number, luma: number, b: number): ImageStats => ({
+    imageId,
+    region: null,
+    width: 640,
+    height: 427,
+    meanLuma: luma,
+    logMeanLuma: Math.log2(luma),
+    percentiles: { p1: 0.02, p10: 0.1, p50: luma, p90: 0.8, p99: 0.95 },
+    clippedHighlights: 0,
+    clippedShadows: 0,
+    meanOklab: { l: luma, a: 0, b },
+    neutral: { x: 0.5, y: 0.5, a: 0, b, coverage: 0.2 },
+    whiteBalance: null,
+    asShot: null,
+    lutMissing: false,
+  });
+  /** Deterministic per-target correction so tests can assert exact values. */
+  function solveMock(anchors: number[], target: number, o: MatchOptions): MatchPreview {
+    const src = getAdj(anchors[0]);
+    const cur = getAdj(target);
+    const base = copyFields(cur, src, o.copyFields);
+    const full = structuredClone(base);
+    const dEv = o.matchExposure ? ((target % 5) - 2) * 0.25 + 0.1 : 0;
+    const dT = o.matchWhiteBalance ? ((target % 3) - 1) * 300 + 150 : 0;
+    const dTint = o.matchWhiteBalance ? (target % 4) - 1.5 : 0;
+    const dCon = o.matchTone ? 6 : 0;
+    full.exposure = base.exposure + dEv;
+    if (o.matchWhiteBalance) {
+      const w = base.whiteBalance;
+      const t0 = w.mode === "custom" ? w.temperatureK : 5200;
+      const tn0 = w.mode === "custom" ? w.tint : 8;
+      base.whiteBalance = { mode: "custom", temperatureK: t0, tint: tn0 };
+      full.whiteBalance = { mode: "custom", temperatureK: t0 + dT, tint: tn0 + dTint };
+    }
+    full.contrast = base.contrast + dCon;
+    const adjustments = lerpAdjustments(base, full, o.strength);
+    const ref = mockStats(anchors[0], 0.5, 0.01);
+    const converged = target % 7 !== 0;
+    const blended = anchors.length > 1 && target % 2 === 0;
+    return {
+      targetId: target,
+      anchorIds: blended ? anchors : [anchors[0]],
+      anchorWeight: blended ? 0.5 : 0,
+      base,
+      full,
+      adjustments,
+      delta: { exposure: dEv, temperatureK: dT, tint: dTint, contrast: dCon, whites: 0, blacks: 0 },
+      reference: ref,
+      before: mockStats(target, 0.5 * 2 ** -dEv, 0.01 + dTint / 100),
+      predicted: mockStats(target, 0.5, 0.01),
+      converged,
+      notes: converged ? [] : ["Exposure correction clamped at +5 EV (mock)"],
+    };
+  }
 
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
 
@@ -618,6 +741,113 @@ export function installMockBackend(count: number) {
         }
         case "get_export_jobs":
           return exportJobs.map((j) => ({ ...j }));
+        case "detect_scenes": {
+          const fid = args.folderId as number | null;
+          const o = args.options as SceneDetectOptions | null;
+          const scope = rows.filter((r) => fid == null || r.folderId === fid);
+          return (async () => {
+            await progress("detect", scope.length);
+            const keepManual = !o?.replaceManual;
+            const kept = new Set(keepManual ? scenes.filter((sc) => sc.method === "manual").flatMap((sc) => sc.imageIds) : []);
+            const oldAnchors = new Set(scenes.flatMap((sc) => sc.anchorIds));
+            scenes = scenes.filter((sc) => (keepManual && sc.method === "manual") || !sc.imageIds.some((i) => scope.some((r) => r.id === i)));
+            // Mock rule: consecutive frames of a folder in chunks of 40 form a scene.
+            const free = scope.filter((r) => !kept.has(r.id));
+            for (let i = 0; i < free.length; ) {
+              const chunk = free.slice(i, i + 40).filter((r) => r.folderId === free[i].folderId);
+              const sc = newScene(chunk.map((r) => r.id), "auto");
+              sc.anchorIds = chunk.map((r) => r.id).filter((x) => oldAnchors.has(x));
+              i += chunk.length;
+            }
+            syncScenes();
+            return scenes.filter((sc) => fid == null || sc.imageIds.some((i) => byId.get(i)?.folderId === fid));
+          })();
+        }
+        case "list_scenes": {
+          const fid = args.folderId as number | null;
+          return scenes.filter((sc) => fid == null || sc.imageIds.some((i) => byId.get(i)?.folderId === fid));
+        }
+        case "get_scene":
+          return sceneOf(args.id as number);
+        case "create_scene": {
+          const list = args.imageIds as number[];
+          if (list.length === 0) throw { kind: "invalid_argument", message: "imageIds must not be empty" };
+          takeFromScenes(list);
+          const sc = newScene([...list], "manual");
+          syncScenes();
+          return sc;
+        }
+        case "set_scene_members": {
+          const sc = sceneOf(args.id as number);
+          const list = args.imageIds as number[];
+          if (list.length === 0) throw { kind: "invalid_argument", message: "imageIds must not be empty" };
+          takeFromScenes(list.filter((i) => !sc.imageIds.includes(i)));
+          sc.imageIds = [...list];
+          sc.method = "manual";
+          syncScenes();
+          return sc;
+        }
+        case "set_scene_anchors": {
+          const sc = sceneOf(args.id as number);
+          const list = args.anchorIds as number[];
+          if (list.length > 2 || list.some((i) => !sc.imageIds.includes(i))) throw { kind: "invalid_argument", message: "anchors must be 0..=2 members" };
+          sc.anchorIds = [...list];
+          syncScenes();
+          return sc;
+        }
+        case "merge_scenes": {
+          const list = args.ids as number[];
+          if (list.length < 2) throw { kind: "invalid_argument", message: "need at least 2 scenes" };
+          const target = sceneOf(list[0]);
+          for (const i of list.slice(1)) {
+            const sc = sceneOf(i);
+            target.imageIds.push(...sc.imageIds);
+            target.anchorIds.push(...sc.anchorIds);
+            sc.imageIds = [];
+          }
+          target.method = "manual";
+          syncScenes();
+          return target;
+        }
+        case "split_scene": {
+          const sc = sceneOf(args.id as number);
+          const at = sc.imageIds.indexOf(args.firstImageId as number);
+          if (at <= 0) throw { kind: "invalid_argument", message: "firstImageId must be a member other than the first" };
+          const tail = sc.imageIds.slice(at);
+          sc.imageIds = sc.imageIds.slice(0, at);
+          sc.method = "manual";
+          const n = newScene(tail, "manual");
+          n.anchorIds = sc.anchorIds.filter((a) => tail.includes(a));
+          syncScenes();
+          return [sc, n];
+        }
+        case "delete_scene":
+          sceneOf(args.id as number).imageIds = [];
+          syncScenes();
+          return null;
+        case "match_scene": {
+          const anchors = [...new Set(args.anchorIds as number[])];
+          const o = args.options as MatchOptions;
+          if (anchors.length < 1 || anchors.length > 2) throw { kind: "invalid_argument", message: "1..=2 anchors" };
+          const targets = [...new Set(args.targetIds as number[])].filter((t) => !anchors.includes(t));
+          if (targets.length === 0) throw { kind: "invalid_argument", message: "no targets" };
+          return (async () => {
+            await progress("match", targets.length);
+            return targets.map((t) => solveMock(anchors, t, o));
+          })();
+        }
+        case "apply_scene_match": {
+          const apps = args.applications as MatchApplication[];
+          if (apps.some((a) => !byId.has(a.imageId))) throw { kind: "not_found", message: "image" };
+          const changed: number[] = [];
+          for (const a of apps) {
+            if (JSON.stringify(getAdj(a.imageId)) !== JSON.stringify(a.adjustments)) changed.push(a.imageId);
+            commit(a.imageId, a.adjustments, (args.label as string | null) ?? "Match Scene");
+          }
+          return changed;
+        }
+        case "get_render_stats":
+          return mockStats(args.id as number, 0.5, 0.01);
         case "plugin:dialog|open":
           return (args.options as { directory?: boolean } | undefined)?.directory ? "/mock/export/Smith Wedding" : "/mock/import/Moody Blue.cube";
         default:

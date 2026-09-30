@@ -13,6 +13,7 @@ src-tauri/
   migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
   migrations/0005_editor.sql   v5: adjustment_history, presets, adjustments.neutral/history_entry_id, develop dirty triggers
   migrations/0006_export.sql   v6: export_presets, export_jobs, export_items
+  migrations/0007_scenes.sql   v7: scenes, images.scene_id/scene_anchor, scene_features
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -51,6 +52,11 @@ src-tauri/
       develop.rs               full-res LibRaw decode + render_full (shared pipeline, resize, sharpen, quantize)
       encode.rs metadata.rs    encoders + ICC; EXIF/XMP selection for exported files
       naming.rs presets.rs     file-name template expansion; export presets (built-ins + catalog SQL)
+    scene/mod.rs               scenes + few-shot matching: constants (STATS_MAX_EDGE, tolerances), SceneFeatures,
+                               DetectFrame, MatchImage, progress_emitter
+      store.rs                 all scene SQL (membership/anchor invariants, detection frames, features, replace)
+      features.rs detect.rs    preview appearance features; time-gap + similarity grouping (pure)
+      stats.rs matching.rs     render-space ImageStats; relative grading (base/solve/lerp, Phase 9 seam)
 src/
   ipc/bindings.ts              GENERATED from Rust. Do not edit.
   ipc/index.ts                 re-exports bindings + unwrap() + DEFAULT_QUERY + ALL_ADJUSTMENT_FIELDS
@@ -66,6 +72,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
 | rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
+| `src-tauri/src/scene/` (surface in `scene/mod.rs` + `store.rs` fixed by the architect) | vision-ml-dev |
 | `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
 | everything, read-only | qa-engineer |
@@ -134,6 +141,18 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `export_images` / `exportImages` | `ids: number[], settings: ExportSettings, presetName: string \| null` | `ExportJob` (queued; background) |
 | `cancel_export` / `cancelExport` | `jobId: number` | `null` |
 | `get_export_jobs` / `getExportJobs` | – | `ExportJob[]` |
+| `detect_scenes` / `detectScenes` | `folderId: number \| null, options: SceneDetectOptions \| null` | `Scene[]` (blocking; replaces auto scenes) |
+| `list_scenes` / `listScenes` | `folderId: number \| null` | `Scene[]` (capture order) |
+| `get_scene` / `getScene` | `id: number` | `Scene` |
+| `create_scene` / `createScene` | `imageIds: number[]` | `Scene` (manual) |
+| `set_scene_members` / `setSceneMembers` | `id: number, imageIds: number[]` | `Scene` (manual) |
+| `set_scene_anchors` / `setSceneAnchors` | `id: number, anchorIds: number[]` (0..=2 members) | `Scene` |
+| `merge_scenes` / `mergeScenes` | `ids: number[]` (>= 2) | `Scene` (into `ids[0]`) |
+| `split_scene` / `splitScene` | `id: number, firstImageId: number` | `Scene[]` (`[id, new]`) |
+| `delete_scene` / `deleteScene` | `id: number` | `null` |
+| `match_scene` / `matchScene` | `anchorIds: number[] (1..=2), targetIds: number[], options: MatchOptions` | `MatchPreview[]` (nothing saved) |
+| `apply_scene_match` / `applySceneMatch` | `applications: MatchApplication[], label: string \| null` | `number[]` (changed ids; history + XMP) |
+| `get_render_stats` / `getRenderStats` | `id: number, adjustments: ParametricAdjustments \| null, region: NormRect \| null` | `ImageStats` |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -146,6 +165,7 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4). Rendered previews use the `sieve` URI scheme (Phase 5).
 `exportProgress {jobId,done,total,failed,skipped,currentFile}`,
 `exportFinished {jobId,succeeded,skipped,failed,cancelled,outputDir,elapsedMs}` (Phase 6).
+`sceneProgress {task: "detect" | "match", done, total}` (Phase 7).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -333,6 +353,44 @@ size without sharpening matches `render_preview` within 2 levels.
   `copyright_only`; `copyright_and_contact`; `none`. Never exported: `crs:` develop settings, `Sieve|*` tags.
   Orientation is written as 1; ICC and resolution are always embedded. `copyright` / `creator` override the source.
 
+## Scenes & matching (Phase 7)
+
+### Scenes
+- A scene = consecutive frames under one lighting scenario, graded from 1-2 anchors. Membership is
+  `images.scene_id` (at most one scene per image); anchors are `images.scene_anchor` on member rows (<= 2).
+  `scenes` stores derived `folder_id` (NULL if members span folders), `started_at_ms` / `ended_at_ms`, and `method`.
+  All writes go through `scene::store` (invariants in its module docs). Grid: `ImageQuery.sceneId`,
+  `RawImageEntry.sceneId` / `isSceneAnchor`.
+- `detect_scenes(folderId, options)`: `store::detection_frames` (folder order, capture time, file name; excludes
+  members of manual scenes unless `replaceManual`) -> `features::compute_missing` off the catalog lock (2048 px
+  previews, rayon, cached in `scene_features` under `FEATURES_VERSION`, stale when the preview is re-extracted) ->
+  `detect::group` (pure: time gap > `maxGapMs` splits; bursts never split; appearance similarity >= `similarity`
+  to stay; never crosses folders) -> `store::replace_scenes` (drops auto scenes in scope, creates new auto scenes,
+  carries anchor flags over).
+- User edits (`create_scene`, `set_scene_members`, `merge_scenes`, `split_scene`) make scenes `manual`; re-detection
+  leaves them alone unless `replaceManual`. `set_scene_anchors` keeps the method.
+
+### Matching (relative grading)
+- Statistics (`ImageStats`) are measured on the **rendered** 8-bit output of the editor pipeline at 640 px
+  (`DevelopCache::render_image`: same cached source, pipeline and LUT as `render_preview`, no tickets / encoding):
+  linear mean / log-mean luminance, percentiles, clipping, mean Oklab, neutral estimate (xy + Oklab a/b), effective
+  and as-shot white balance.
+- Per target T with anchor A: `base` = T's settings with `copyFields` + matched groups copied from A (WB resolved to
+  A's effective `custom` temp/tint); `reference` = A rendered with its settings; `full` = `solve(reference, base,
+  options, measure)` iterating render -> measure -> correct (exposure from log-mean luma EV difference, temp/tint from
+  the rendered neutral difference, optional contrast/whites/blacks from percentiles); `adjustments =
+  ParametricAdjustments::lerp(base, full, strength)`. Two anchors: targets between them in capture time blend both
+  (settings via `lerp`, stats via `blend_stats`), others use the nearest.
+- `solve` only needs a reference `ImageStats`, a base and a measure callback, so Phase 9 (reference-photo matching,
+  e.g. stats of a JPEG) reuses it; a baked LUT output would come from the same fitted correction.
+- Acceptance: at strength 1, |`logMeanLuma` - reference| <= `TOLERANCE_EV` (0.15 EV) and |`neutral.ab` - reference|
+  <= `TOLERANCE_AB` (0.012 Oklab), checked with `get_render_stats(target, preview.full)`.
+- `apply_scene_match(applications, label)` commits per-image adjustments via `develop::history::commit_batch` (atomic,
+  one "Match Scene" entry per changed image, XMP notify); the UI's strength slider recomputes with the TS mirror
+  `lerpAdjustments` and applies what it previews.
+- Cost: first match of an image decodes its RAW into the develop cache (~0.3-0.8 s, shared with the editor); each
+  measurement is a 640 px pipeline run (~10-20 ms). Targets are processed in parallel; `sceneProgress` reports.
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -342,7 +400,7 @@ migrations tracked by `PRAGMA user_version`.
 |---|---|
 | `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON) |
 | `folders` | imported roots |
-| `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`) |
+| `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor` |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
@@ -354,8 +412,8 @@ migrations tracked by `PRAGMA user_version`.
 | `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
 | `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps |
 | `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
-
-Deferred: `scenes` (Phase 7).
+| `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`) |
+| `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.
