@@ -85,23 +85,40 @@ copy subsets into `test-data/` for anything that writes.
   camera JPEG siblings of RAWs, grouped or listed per user setting): ingest/thumbnail/EXIF, develop from decoded sRGB→
   linear, XMP sidecars for JPEG edits (Lightroom writes `<name>.xmp` for RAW, embedded/sidecar for JPEG — decide),
   export.
-- [ ] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): support the crs fields this user's
-  edits rely on — parametric + point tone curve (incl. RGB curves), color grading / split toning, camera calibration
-  (primary hue/sat, shadow tint), sharpening, luminance/color noise reduction, vignette/grain if used; read them from
-  existing XMPs and render them. Adobe Looks/profiles (LookTable) are proprietary: record and warn, approximate only
-  if feasible. Masks are Phase 11.
+- [ ] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): **full parity for every develop
+  setting the user's edits use — Sieve must replace Lightroom, not supplement it (user requirement).** Parametric +
+  point tone curve (master + RGB), color grading / split toning, camera calibration, sharpening, luminance/color noise
+  reduction, vignette, grain, lens-profile-free basics; camera profiles via the Adobe Standard/Camera Matching DCPs
+  installed locally by Adobe DNG Converter/Camera Raw (`/Library/Application Support/Adobe/CameraRaw/CameraProfiles`,
+  read at runtime, never redistributed), and Adobe Looks via the RGB tables embedded in the XMP (`crs:Table_<md5>`)
+  or the locally installed look profiles; fallback approximations only when the data is unavailable. Acceptance: for
+  the user's edited frames, Sieve's render of the imported XMP matches Lightroom's render (ΔE2000 mean ≤ 3 vs a
+  Lightroom-exported reference if the user provides one; otherwise orchestrator visual review) and every crs value
+  round-trips.
 - [ ] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
   (X-Trans + Bayer)/CR3/JPG thumbnails + EXIF + develop + export correct; user XMP ratings + develop settings imported;
   throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
   side-by-side of Sieve renders of the user's edits for visual parity review.
 - [ ] **QA gate**.
 
+## Phase 7c — Local adjustments & masking (moved from Phase 11: user requires an all-in-one Lightroom replacement)
+- [ ] **Contract** (architect): mask groups with per-mask adjustment sets (Lightroom `crs:MaskGroupBasedCorrections`
+  model): brush, linear gradient, radial gradient, luminance/color range, AI masks (subject, sky, background, people
+  incl. face/skin/eyes/lips), add/subtract/intersect, invert, feather/density; XMP read/write parity with Lightroom.
+- [ ] **Segmentation models** (vision-ml-dev): permissively licensed ONNX models for subject, sky and people/face
+  parts (CoreML where possible), cached per image, resolution-independent mask storage.
+- [ ] **Mask rendering** (rust-engine-dev): masks evaluated at any resolution; local adjustments in the shared pipeline
+  (preview + export), within the slider latency budget.
+- [ ] **Masking UI** (frontend-dev): Lightroom-style masks panel, brush with size/feather/flow/auto-mask, gradient
+  handles, AI select buttons, overlay visualization, keyboard shortcuts (O overlay, K brush, M linear, Shift+M radial).
+- [ ] **QA gate**: the user's 95 mask groups import and render plausibly; round trip preserves Lightroom mask data.
+
 ## Phase 8 — Hardening + packaging
 - [ ] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
 - [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
 - [ ] Error states, empty states, crash-safe catalog writes.
 - [ ] `pnpm tauri build` → `.app` / `.dmg`; smoke-test the bundle.
-- [ ] Final report in `docs/final-report.md`: what works, known gaps, how to use; end with the Phase 11 (masking / AI selection) scope + effort estimate and a recommendation (user request).
+- [ ] Final report in `docs/final-report.md`: what works, known gaps, how to use; include remaining Lightroom-parity gaps, if any.
 
 ---
 
@@ -123,9 +140,7 @@ Approach sketch: features from the develop-source stats (Phase 7) + scene contex
 (gradient-boosted trees or small MLP on-device), refined with Phase 7 relative matching; evaluate by ΔE vs the
 user's own renders on held-out shoots. Depends on Phase 7b parity (so predicted settings render like Lightroom).
 
-### Phase 11 — Local adjustments & AI masking (scope estimate to be reported at the end of the run)
-Lightroom-style masks: brush, linear/radial gradients, luminance/color range, and AI Select Subject / Sky /
-Background / People (face/skin/eyes/lips). 95 mask groups appear in the user's sample XMPs (`crs:MaskGroupBasedCorrections`).
+### Phase 11 — (moved into the run as Phase 7c)
 
 ### Other ideas
 - Windows build (DirectML EP) — needs a Windows machine to test.
