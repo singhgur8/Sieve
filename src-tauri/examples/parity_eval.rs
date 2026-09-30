@@ -269,7 +269,12 @@ fn main() {
     for (i, path) in files.iter().enumerate() {
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let format = raw::format_from_extension(path).expect("supported file");
-        let sidecar = xmp::sidecar_path(path);
+        // SIEVE_XMP_DIR: read `<dir>/<stem>.xmp` instead of the sidecar (settings variants
+        // extracted from edited DNG copies; the sources stay untouched).
+        let sidecar = match std::env::var_os("SIEVE_XMP_DIR") {
+            Some(d) => PathBuf::from(d).join(format!("{stem}.xmp")),
+            None => xmp::sidecar_path(path),
+        };
         let (adj, note) = match std::fs::read_to_string(&sidecar) {
             Ok(text) => match xmp::packet::parse_for(&text, format) {
                 Ok(v) => match v.develop {
