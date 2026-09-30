@@ -49,6 +49,10 @@ typedef struct {
   /* Camera WB presets (R, G, B, G2): Daylight (EXIF light source 1) and D65 (21). */
   int wb_daylight[4];
   int wb_d65[4];
+  /* Default crop ("raw inset", = Adobe's DefaultCrop) in raw coordinates and the image
+   * origin in raw coordinates. */
+  unsigned inset[4]; /* left, top, width, height */
+  unsigned margin[2]; /* left, top */
 } sieve_lr_color_t;
 
 /* Colour data after open_file (before processing rewrites pre_mul). */
@@ -75,6 +79,12 @@ void sieve_lr_get_color(libraw_data_t *lr, sieve_lr_color_t *out)
   out->linear_max = lr->color.linear_max[0];
   memcpy(out->wb_daylight, lr->color.WB_Coeffs[LIBRAW_WBI_Daylight], sizeof out->wb_daylight);
   memcpy(out->wb_d65, lr->color.WB_Coeffs[LIBRAW_WBI_D65], sizeof out->wb_d65);
+  out->inset[0] = lr->sizes.raw_inset_crops[0].cleft;
+  out->inset[1] = lr->sizes.raw_inset_crops[0].ctop;
+  out->inset[2] = lr->sizes.raw_inset_crops[0].cwidth;
+  out->inset[3] = lr->sizes.raw_inset_crops[0].cheight;
+  out->margin[0] = lr->sizes.left_margin;
+  out->margin[1] = lr->sizes.top_margin;
 }
 
 /* Clips/scales at `white` (absolute raw units) instead of LibRaw's maximum. Call after

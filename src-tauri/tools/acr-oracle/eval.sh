@@ -5,8 +5,9 @@
 P2="${P2:-/Users/gurjotsingh/Documents/GitHub/Sieve/test-data/p2}"
 B="$(cd "$(dirname "$0")/../.." && pwd)/target/release/examples/parity_eval"
 list="$1"; v="$2"; shift 2
-if [ "$v" = "-" ]; then
-  out="$P2/out/orig"; ref="$P2/ref"
+if [ "$v" = "-" ] || [ "$v" = "hold" ]; then
+  # Original sidecars: `-` = fit-set references ($P2/ref), `hold` = held-out ($P2/hold-ref).
+  if [ "$v" = "-" ]; then out="$P2/out/orig"; ref="$P2/ref"; else out="$P2/out/hold"; ref="$P2/hold-ref"; fi
   SIEVE_LR_REFERENCE="$ref" "$B" --list "$list" --out "$out" "$@"
 else
   out="$P2/out/$v"; ref="$P2/var/$v"

@@ -10,6 +10,7 @@
 //! Shadows/Highlights are evaluated on a local (edge-aware blurred) luminance by the
 //! pipeline; the rest per pixel.
 
+use super::local_tone_data as ld;
 use super::tone_data as d;
 
 /// Linear interpolation in a uniformly sampled table (clamped at the ends).
@@ -47,24 +48,17 @@ struct Step {
     row: Vec<f32>,
     /// Constant EV offset added (exposure).
     offset: f32,
-    /// Domain shift: the table is evaluated at `e + shift` (image-adaptive Highlights).
-    shift: f32,
-    highlights: bool,
 }
 
 impl Step {
     #[inline]
     fn apply(&self, e: f32) -> f32 {
-        e + self.offset + sample(&self.row, d::DELTA_EV0, d::DELTA_STEP, e + self.shift)
+        e + self.offset + sample(&self.row, d::DELTA_EV0, d::DELTA_STEP, e)
     }
 }
 
-/// Mean log2 luminance of the calibration ramp the tables were measured on.
-pub const KEY_CAL: f32 = -6.5;
-
-/// The tone sliders of one render.
+/// The global tone sliders of one render (Whites, Exposure, Contrast, Blacks).
 pub struct ToneModel {
-    local: Vec<Step>,
     global: Vec<Step>,
 }
 
@@ -80,49 +74,17 @@ pub struct ToneSliders {
 }
 
 impl ToneModel {
-    /// `exposure` includes the baseline exposure.
+    /// `exposure` includes the baseline exposure. Shadows/Highlights are ignored here (they
+    /// are the local operator, [`LocalTone`]).
     pub fn new(s: ToneSliders) -> Self {
-        let step = |t: &[[f32; d::DELTA_N]], a: f32| {
-            slider_row(t, a).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: false })
-        };
-        let hl =
-            slider_row(&d::HIGHLIGHTS, s.highlights).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: true });
-        let local = [step(&d::SHADOWS, s.shadows), hl].into_iter().flatten().collect();
+        let step = |t: &[[f32; d::DELTA_N]], a: f32| slider_row(t, a).map(|row| Step { row, offset: 0.0 });
         let mut global: Vec<Step> = step(&d::WHITES, s.whites).into_iter().collect();
         if s.exposure != 0.0 {
-            global.push(Step { row: exposure_row(s.exposure), offset: s.exposure, shift: 0.0, highlights: false });
+            global.push(Step { row: exposure_row(s.exposure), offset: s.exposure });
         }
         global.extend(step(&d::CONTRAST, s.contrast));
         global.extend(step(&d::BLACKS, s.blacks));
-        ToneModel { local, global }
-    }
-
-    /// Image-adaptive Shadows/Highlights (fitted to Camera Raw renders of ramps of different
-    /// ranges): Highlights act relative to the image's key (`key` = mean log2 luminance of
-    /// the frame, pre-exposure EV), Shadows relative to its white (`white` = log2 of the
-    /// brightest content, 0 = the raw clip).
-    pub fn with_key(mut self, key: f32, white: f32) -> Self {
-        let hl = (KEY_CAL - key).clamp(-8.0, 8.0);
-        let sh = (-white).clamp(0.0, 10.0);
-        for s in self.local.iter_mut() {
-            s.shift = if s.highlights { hl } else { sh };
-        }
-        self
-    }
-
-    /// Shadows/Highlights have an effect.
-    pub fn has_local(&self) -> bool {
-        !self.local.is_empty()
-    }
-
-    /// EV delta of the local sliders at local (base) luminance `base_ev`.
-    #[inline]
-    pub fn local_delta(&self, base_ev: f32) -> f32 {
-        let mut e = base_ev;
-        for s in &self.local {
-            e = s.apply(e);
-        }
-        e - base_ev
+        ToneModel { global }
     }
 
     /// Whites, exposure, contrast, blacks: pre-exposure EV -> EV before the base curve.
@@ -133,6 +95,74 @@ impl ToneModel {
             e = s.apply(e);
         }
         e
+    }
+}
+
+/// Camera Raw's Shadows / Highlights as a local operator, fitted on real frames
+/// (`local_tone_data.rs`, `tools/acr-oracle/fit_local.py`): the EV delta of a pixel is a
+/// function of its *adaptation luminance* `m` (an edge-aware, multi-scale base of the
+/// scene log luminance, see `pipeline::ToneContext`) relative to the image's reference
+/// `KEY_WEIGHT * key + (1 - KEY_WEIGHT) * white`. Local detail (pixel - base) is kept, so
+/// textures are not flattened; shadows in large dark areas are lifted more than small
+/// dark details in bright surroundings, and low-key frames (night) are lifted less.
+pub struct LocalTone {
+    shadows: Option<Vec<f32>>,
+    highlights: Option<Vec<f32>>,
+}
+
+fn local_row(table: &[[f32; ld::REL_N]; 5], amount: f32) -> Option<Vec<f32>> {
+    let a = amount.clamp(-100.0, 100.0);
+    if a == 0.0 {
+        return None;
+    }
+    let k = ld::AMOUNTS.iter().position(|&v| v >= a).unwrap_or(ld::AMOUNTS.len() - 1).max(1);
+    let (a0, a1) = (ld::AMOUNTS[k - 1], ld::AMOUNTS[k]);
+    let f = ((a - a0) / (a1 - a0)).clamp(0.0, 1.0);
+    Some((0..ld::REL_N).map(|j| table[k - 1][j] + (table[k][j] - table[k - 1][j]) * f).collect())
+}
+
+impl LocalTone {
+    pub fn new(shadows: f32, highlights: f32) -> Self {
+        LocalTone { shadows: local_row(&ld::SHADOWS, shadows), highlights: local_row(&ld::HIGHLIGHTS, highlights) }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.shadows.is_none() && self.highlights.is_none()
+    }
+
+    /// EV delta at an adaptation luminance `rel_s` / `rel_h` EV relative to the Shadows /
+    /// Highlights references ([`Self::references`]).
+    #[inline]
+    pub fn delta(&self, rel_s: f32, rel_h: f32) -> f32 {
+        let s = self.shadows.as_ref().map_or(0.0, |r| sample(r, ld::REL0, ld::REL_STEP, rel_s));
+        let h = self.highlights.as_ref().map_or(0.0, |r| sample(r, ld::REL0, ld::REL_STEP, rel_h));
+        s + h
+    }
+
+    /// The Shadows and Highlights references (pre-exposure EV) from the source's
+    /// log-luminance statistics (pre-exposure) and the total exposure (slider + baseline).
+    /// Each was fitted in post-exposure EV as a linear mix of statistics plus a clamped
+    /// white; the coefficients need not sum to 1, so a reference can move with exposure.
+    pub fn references(s: &super::pipeline::ToneStats, exposure: f32) -> (f32, f32) {
+        let x = exposure;
+        let (key, p50, p90, p95, p99, white) = (s.key + x, s.p50 + x, s.p90 + x, s.p95 + x, s.p99 + x, s.white + x);
+        let rs = ld::S_ONE
+            + ld::S_KEY * key
+            + ld::S_P50 * p50
+            + ld::S_P90 * p90
+            + ld::S_P95 * p95
+            + ld::S_P99 * p99
+            + ld::S_WHITE * white
+            + ld::S_WCLIP_W * white.min(ld::S_WCLIP);
+        let rh = ld::H_ONE
+            + ld::H_KEY * key
+            + ld::H_P50 * p50
+            + ld::H_P90 * p90
+            + ld::H_P95 * p95
+            + ld::H_P99 * p99
+            + ld::H_WHITE * white
+            + ld::H_WCLIP_W * white.min(ld::H_WCLIP);
+        (rs - x, rh - x)
     }
 }
 
@@ -176,10 +206,11 @@ mod tests {
     #[test]
     fn neutral_model_is_identity_and_curve_is_monotone() {
         let m = ToneModel::new(ToneSliders::default());
-        assert!(!m.has_local());
+        let l = LocalTone::new(0.0, 0.0);
+        assert!(l.is_identity());
         for e in [-12.0f32, -6.0, -2.5, -1.0, -0.2] {
             assert!((m.global(e) - e).abs() < 0.02, "{e} -> {}", m.global(e));
-            assert_eq!(m.local_delta(e), 0.0);
+            assert_eq!(l.delta(e, e), 0.0);
         }
         let mut last = 0.0;
         for i in 1..=2000 {
@@ -196,32 +227,55 @@ mod tests {
 
     #[test]
     fn sliders_move_the_expected_way() {
-        let at = |s: ToneSliders, e: f32| {
-            let m = ToneModel::new(s);
-            m.global(e + m.local_delta(e))
-        };
+        let g = |s: ToneSliders, e: f32| ToneModel::new(s).global(e);
         let base = ToneSliders::default();
-        assert!(at(ToneSliders { exposure: 1.0, ..base }, -4.0) > -3.2);
-        assert!(at(ToneSliders { shadows: 100.0, ..base }, -8.0) > -7.0);
-        assert!(at(ToneSliders { highlights: -100.0, ..base }, -0.5) < -1.0);
-        assert!(at(ToneSliders { blacks: 50.0, ..base }, -9.0) > -8.5);
-        assert!(at(ToneSliders { whites: -50.0, ..base }, -0.3) < -0.4);
+        assert!(g(ToneSliders { exposure: 1.0, ..base }, -4.0) > -3.2);
+        assert!(g(ToneSliders { blacks: 50.0, ..base }, -9.0) > -8.5);
+        assert!(g(ToneSliders { whites: -50.0, ..base }, -0.3) < -0.4);
         let c = ToneSliders { contrast: 50.0, ..base };
-        assert!(at(c, -6.0) < -6.2 && at(c, -1.0) > -0.95);
-        // Monotone in the input for a strong user-like set.
-        let u = ToneSliders {
+        assert!(g(c, -6.0) < -6.2 && g(c, -1.0) > -0.95);
+        // Local: shadows lift dark areas (a few EV below the reference), not bright ones;
+        // highlights darken bright areas.
+        let s = LocalTone::new(100.0, 0.0);
+        assert!(s.delta(-5.0, -5.0) > 1.5, "{}", s.delta(-5.0, -5.0));
+        assert!(s.delta(3.0, 3.0).abs() < 0.05);
+        assert!(LocalTone::new(-100.0, 0.0).delta(-5.0, -5.0) < -1.5);
+        let h = LocalTone::new(0.0, -100.0);
+        assert!(h.delta(3.0, 3.0) < -1.0 && h.delta(-6.0, -6.0).abs() < 0.1);
+        // Half the amount ~ half the effect.
+        let half = LocalTone::new(50.0, 0.0).delta(-5.0, -5.0) / s.delta(-5.0, -5.0);
+        assert!((0.3..0.7).contains(&half), "{half}");
+    }
+
+    /// For a uniform area (adaptation = pixel) the local response keeps the tone order:
+    /// e + delta(e) is monotone for every amount, and the full user-like chain too.
+    #[test]
+    fn local_response_is_monotone() {
+        for sh in [-100.0f32, -50.0, 0.0, 37.0, 64.0, 100.0] {
+            for hl in [-100.0f32, -66.0, 0.0, 23.0, 100.0] {
+                let l = LocalTone::new(sh, hl);
+                let mut last = f32::NEG_INFINITY;
+                for i in 0..400 {
+                    let rel = -14.0 + i as f32 * 0.05;
+                    let y = rel + l.delta(rel, rel);
+                    assert!(y >= last - 1e-4, "S {sh} H {hl} at {rel}: {y} < {last}");
+                    last = y;
+                }
+            }
+        }
+        let m = ToneModel::new(ToneSliders {
             exposure: -0.5,
             contrast: -60.0,
             highlights: -66.0,
             shadows: 51.0,
             whites: -24.0,
             blacks: 63.0,
-        };
-        let m = ToneModel::new(u);
+        });
+        let l = LocalTone::new(51.0, -66.0);
         let mut last = f32::NEG_INFINITY;
         for i in 0..200 {
             let e = -13.0 + i as f32 * 0.065;
-            let y = m.global(e + m.local_delta(e));
+            let y = m.global(e + l.delta(e + 3.0, e + 3.0));
             assert!(y >= last - 1e-4, "{e}: {y} < {last}");
             last = y;
         }

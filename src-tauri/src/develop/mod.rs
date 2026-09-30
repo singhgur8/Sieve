@@ -32,6 +32,7 @@ pub mod presets;
 pub mod source;
 pub mod tone;
 mod tone_data;
+mod local_tone_data;
 pub mod wb;
 
 use std::collections::{HashMap, VecDeque};
@@ -178,6 +179,7 @@ impl Entry {
         profile: &'a Profile,
         seed: ImageId,
         quality: pipeline::Quality,
+        tone: Option<&'a pipeline::ToneContext>,
     ) -> pipeline::RenderInput<'a> {
         pipeline::RenderInput {
             width: prepared.width,
@@ -189,7 +191,25 @@ impl Entry {
             profile,
             seed: seed as u64,
             quality,
+            tone,
         }
+    }
+
+    /// Local tone context of the whole uncropped source (so drafts, previews, zoomed
+    /// regions and exports adapt alike); `None` when Shadows/Highlights are neutral.
+    fn tone_context(
+        &self,
+        orientation: u8,
+        adjustments: &ParametricAdjustments,
+        profile: &Profile,
+    ) -> Option<pipeline::ToneContext> {
+        let look = profile.look.as_ref().map(|l| (l.parameters.shadows, l.parameters.highlights));
+        let (ls, lh) = look.unwrap_or((0.0, 0.0));
+        if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 {
+            return None;
+        }
+        let whole = self.prepared(1, &CropSettings::default(), None, pipeline::TONE_GRID);
+        Some(pipeline::tone_context_prepared(&whole, &self.image, orientation, adjustments, profile))
     }
 }
 
@@ -375,7 +395,8 @@ impl DevelopCache {
             return Ok(None);
         }
         let profile = entry.profile(&adjustments.profile);
-        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge));
+        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
         let img = pipeline::render(&input, adjustments, lut.as_deref());
         if !self.is_current(ticket) {
             return Ok(None);
@@ -505,7 +526,8 @@ impl DevelopCache {
         };
         let lut_missing = adjustments.lut.is_some() && lut.is_none();
         let profile = entry.profile(&adjustments.profile);
-        let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge));
+        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge), tone.as_ref());
         let image = pipeline::render(&input, adjustments, lut.as_deref());
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })

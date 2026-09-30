@@ -69,6 +69,8 @@ struct ShimColor {
     linear_max: c_uint,
     wb_daylight: [c_int; 4],
     wb_d65: [c_int; 4],
+    inset: [c_uint; 4],
+    margin: [c_uint; 2],
 }
 
 impl Default for ShimColor {
@@ -163,7 +165,7 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
         // SAFETY: `pixels` holds w*h*3 values, as passed in `cap`.
         let rc = unsafe { sieve_lr_copy_rgb16(h.0, pixels.as_mut_ptr(), pixels.len(), &mut w, &mut hgt) };
         if rc == 0 {
-            return Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color });
+            return Ok(default_crop(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color }, &c, half_size));
         }
     }
     let mut code: c_int = 0;
@@ -187,7 +189,7 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
                 pixels.as_mut_ptr().cast::<u8>(),
                 pixels.len() * 2,
             );
-            Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color })
+            Ok(default_crop(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color }, &c, half_size))
         }
     };
     // SAFETY: img came from dcraw_make_mem_image and is freed once.
@@ -221,6 +223,43 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
         libraw_dcraw_clear_mem(img);
         Ok(pixels)
     }
+}
+
+/// The default crop of a decode (LibRaw's "raw inset", which equals Adobe's `DefaultCrop`
+/// for Sony and Canon), so crop coordinates and framing match Lightroom's. `ColorData`
+/// `width`/`height` become the cropped full-size dimensions. Fujifilm keeps LibRaw's frame
+/// (Adobe's X-Trans frame is trimmed differently; not verified).
+fn default_crop(img: LinearRgb16, c: &ShimColor, half: bool) -> LinearRgb16 {
+    let make = c_name(&c.make);
+    let supported = make.eq_ignore_ascii_case("sony") || make.eq_ignore_ascii_case("canon");
+    let [il, it, iw, ih] = c.inset;
+    let [ml, mt] = c.margin;
+    if !supported || iw == 0 || ih == 0 || il < ml || it < mt {
+        return img;
+    }
+    let (fx, fy) = ((il - ml) as usize, (it - mt) as usize);
+    let (fw, fh) = (iw as usize, ih as usize);
+    if fx + fw > c.width.max(0) as usize || fy + fh > c.height.max(0) as usize {
+        return img;
+    }
+    let s = if half { 2 } else { 1 };
+    let (x0, y0) = (fx / s, fy / s);
+    let (w, h) = ((fw / s).min(img.width as usize - x0), (fh / s).min(img.height as usize - y0));
+    if (w, h) == (img.width as usize, img.height as usize) {
+        return img;
+    }
+    let src_w = img.width as usize;
+    let mut pixels = img.pixels;
+    // In place: rows move towards the start (destination index <= source index).
+    for y in 0..h {
+        let from = ((y0 + y) * src_w + x0) * 3;
+        pixels.copy_within(from..from + w * 3, y * w * 3);
+    }
+    pixels.truncate(w * h * 3);
+    let mut color = img.color;
+    color.width = fw as u32;
+    color.height = fh as u32;
+    LinearRgb16 { width: w as u32, height: h as u32, pixels, color }
 }
 
 /// White level Adobe's raw pipeline uses when it differs from LibRaw's: for Canon, Camera

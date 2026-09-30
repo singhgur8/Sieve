@@ -328,6 +328,7 @@ fn main() {
         let (img, meta) = source::decode_half_size_meta(path).expect("decode");
         let profile = camera::resolve(&meta, &adj.profile, &lib, Some(&sidecar));
         let prep = source::prepare(&img, o, &adj.crop, None, size);
+        let tone = pipeline::tone_context(&img, o, &adj, &profile);
         let input = pipeline::RenderInput {
             width: prep.width,
             height: prep.height,
@@ -338,6 +339,7 @@ fn main() {
             profile: &profile,
             seed: i as u64 + 1,
             quality: pipeline::Quality::Preview,
+            tone: Some(&tone),
         };
         let t_render = Instant::now();
         let out = pipeline::render(&input, &adj, None);
@@ -376,6 +378,40 @@ fn main() {
         });
         if let Some(r) = &refimg {
             let r = resize(r, sieve.w, sieve.h);
+            if std::env::var_os("SIEVE_DUMP_EV").is_some() {
+                // Scene log2 luminance before the local operators (f32 LE, render size).
+                let ev = pipeline::scene_log_luminance(&input, &adj);
+                let bytes: Vec<u8> = ev.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(out_dir.join(format!("{stem}.ev.f32")), bytes).unwrap();
+                // Adaptation bases (fine, coarse) of the uncropped context at each pixel.
+                let (w, h) = (input.width as usize, input.height as usize);
+                let mut m1 = Vec::with_capacity(w * h * 4);
+                let mut m2 = Vec::with_capacity(w * h * 4);
+                for y in 0..h {
+                    for x in 0..w {
+                        let (f, c) = tone.bases((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                        m1.extend_from_slice(&f.to_le_bytes());
+                        m2.extend_from_slice(&c.to_le_bytes());
+                    }
+                }
+                std::fs::write(out_dir.join(format!("{stem}.m1.f32")), m1).unwrap();
+                std::fs::write(out_dir.join(format!("{stem}.m2.f32")), m2).unwrap();
+                let st = tone.stats;
+                std::fs::write(
+                    out_dir.join(format!("{stem}.stats.txt")),
+                    format!(
+                        "{} {} {} {} {} {} {}\n",
+                        st.key,
+                        st.p50,
+                        st.p90,
+                        st.p95,
+                        st.p99,
+                        st.white,
+                        adj.exposure + profile.baseline_ev
+                    ),
+                )
+                .unwrap();
+            }
             if std::env::var_os("SIEVE_DUMP").is_some() {
                 // Lossless copies for offline analysis (tools/acr-oracle).
                 for (img, tag) in [(&r, "ref"), (&sieve, "sieve")] {

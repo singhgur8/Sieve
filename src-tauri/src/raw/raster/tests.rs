@@ -463,6 +463,7 @@ fn real_jpegs_round_trip_and_neutral_render() {
             profile: &profile,
             seed: 1,
             quality: crate::develop::pipeline::Quality::Preview,
+            tone: None,
         };
         let neutral = ParametricAdjustmentsExt::non_raw();
         let out = crate::develop::pipeline::render(&input, &neutral, None);

@@ -20,7 +20,7 @@ for v in vs:
 print("%-10s" % "image" + "".join("%10s" % v[:10] for v in vs))
 for s in order:
     print("%-10s" % s + "".join("%10s" % ("%.2f" % rows[s][v] if v in rows[s] else "-") for v in vs))
-for fmt in ("AZA", "IMG", "DSCF", ""):
+for fmt in ("AZA", "IMG", "DSC", ""):
     ss = [s for s in order if s.startswith(fmt)]
     if not ss:
         continue
