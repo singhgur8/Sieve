@@ -179,6 +179,9 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `detect_people` / `detectPeople` | `id: number` | `DetectedPerson[]` |
 | `render_mask_overlay` / `renderMaskOverlay` | `id: number, adjustments: ParametricAdjustments, target: MaskOverlayTarget, options: MaskOverlayOptions` | `RenderedMaskOverlay \| null` (`mask` slot, latest-wins) |
 | `get_mask_capabilities` / `getMaskCapabilities` | – | `MaskCapabilities` |
+| `model_downloads_status` / `modelDownloadsStatus` (v12) | – | `ModelDownloadStatus` (groups + installed files + `downloading`) |
+| `download_models` / `downloadModels` (v12) | `group: string` (`MODEL_GROUP_SEGMENTATION`) | `null` (background; `invalid_argument` if unknown / already downloading) |
+| `cancel_model_download` / `cancelModelDownload` (v12) | – | `null` (no-op when idle) |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -192,6 +195,8 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `exportProgress {jobId,done,total,failed,skipped,currentFile}`,
 `exportFinished {jobId,succeeded,skipped,failed,cancelled,outputDir,elapsedMs}` (Phase 6).
 `sceneProgress {task: "detect" | "match", done, total}` (Phase 7).
+`modelDownloadProgress {group,name,fileIndex,fileCount,bytesDone,bytesTotal}`,
+`modelDownloadFinished {group,ok,cancelled,error}` (v12).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -699,9 +704,16 @@ migrations tracked by `PRAGMA user_version`.
   read them from `<app_data_dir>/models` (`~/Library/Application Support/com.sieve.app/models`), where
   `model_fetch::link_bundled` symlinks the bundled face models at startup (people / part masks need them) and
   `model_fetch::fetch` downloads the segmentation set (system `curl`, resumable `.part`, SHA-256 from
-  `models/checksums.sha256`, rename only after verification). Until an IPC command exposes the download, AI
-  masks report "model file ... not installed"; `scripts/fetch-models.sh --dest <that dir>` pre-seeds them.
-  Debug builds and `SIEVE_MODELS` keep using a single directory.
+  `models/checksums.sha256`, rename only after verification). Until installed, AI masks report "model file ...
+  not installed"; `scripts/fetch-models.sh --dest <that dir>` pre-seeds them. Debug builds and `SIEVE_MODELS`
+  keep using a single directory.
+- **In-app download (IPC v12)**: managed state `model_fetch::ModelDownloads` (lib.rs, dir = the segmenter's
+  models dir: `<app_data_dir>/models` release, `src-tauri/models` dev, or `SIEVE_MODELS`). `download_models`
+  runs `model_fetch::fetch` on a `model-download` thread (one at a time), emits `ModelDownloadProgress`
+  (throttled ~5/s + one per completed file) and exactly one `ModelDownloadFinished`; `cancel_model_download`
+  kills curl (the `.part` is kept and resumed next time). `model_downloads_status` is a size check per file.
+  No restart needed: `Segmenter::capabilities` / `available` check the model files on every call and sessions
+  load lazily, so `get_mask_capabilities` flips to available as soon as the verified files are renamed in.
 - **Signing**: ad-hoc (`signingIdentity: "-"`), hardened runtime, `Entitlements.plist` =
   `com.apple.security.cs.disable-library-validation` only (required: without it dyld rejects the ad-hoc
   Frameworks under the hardened runtime — verified). Not sandboxed (user-chosen folders, sidecars, Adobe

@@ -608,3 +608,42 @@ Who updates what
 ## v11.1 — 2026-09-30 (doc-only)
 - `CullThresholds.overexposedClipPct` now means the share of a subject face's skin that is blown (every channel ≥ 250); a frame > 60% blown also counts. Saved overrides from earlier versions are read with the new meaning (stricter).
 - `QualityScore.suggestedPick`: burst non-keepers are capped below the keeper, never rejected for being duplicates. No type changes.
+
+## v12 — 2026-09-30 (Phase 8: in-app model downloads)
+Commands
+- `model_downloads_status() -> ModelDownloadStatus` (TS `commands.modelDownloadsStatus()`): downloadable groups
+  (currently one, `"segmentation"` = the 6 AI-mask models, 559,081,960 bytes) with per-file `installed` (present
+  with the expected size; files are SHA-256 verified before being renamed in) and `downloading` (group id in
+  flight or `null`).
+- `download_models(group: string) -> null` (TS `commands.downloadModels(group)`): starts a background download
+  (thin wrapper over `model_fetch::fetch` into the segmenter's models dir) and resolves immediately.
+  `invalid_argument` for an unknown group or while a download is already running. Installed files are skipped,
+  `.part` files resumed.
+- `cancel_model_download() -> null` (TS `commands.cancelModelDownload()`): no-op when idle.
+
+Types / constants: `ModelDownloadStatus { groups, downloading }`, `ModelGroupStatus { id, label, installed,
+bytesTotal, files }`, `ModelFileStatus { name, installed, bytes }`; generated constant `MODEL_GROUP_SEGMENTATION`.
+
+Events
+- `ModelDownloadProgress { group, name, fileIndex, fileCount, bytesDone, bytesTotal }` (`model-download-progress`),
+  throttled (~5/s, plus one per completed file); bytes cover the whole group.
+- `ModelDownloadFinished { group, ok, cancelled, error }` (`model-download-finished`): exactly once per accepted
+  `download_models`. `cancelled` (not in the original request) lets the UI skip the error toast on user cancel;
+  `error` is the user-facing message (curl error, "<file>: SHA-256 mismatch ...", "model download cancelled").
+- After `ok`, `get_mask_capabilities()` reflects the models immediately (the segmenter checks files per call;
+  no restart; covered by `model_fetch::tests::mask_capabilities_follow_installed_files_without_restart`).
+
+No schema changes. Managed state `model_fetch::ModelDownloads` registered in lib.rs.
+
+Who updates what
+- architect (done): types, events, commands + registration, `ModelDownloads` (thin, in `model_fetch.rs`), Rust
+  tests (status with/without files, cancel against a stalled HTTP endpoint, checksum failure event, busy /
+  unknown group, capabilities flip), bindings, mock backend (`?models=missing` starts uninstalled with AI
+  families unavailable; simulated progress 10 steps/file at `window.__mockModelDelay` ms (default 40);
+  `window.__mockModelFail = "<msg>"` fails at the third file; cancel honoured), `tests/ui/models.spec.ts`.
+- frontend-dev: download UI where AI masks are unavailable (Masks panel "Download AI models (559 MB)" with a
+  progress bar from `modelDownloadProgress`, Cancel, error display on `modelDownloadFinished` unless
+  `cancelled`), then refetch `getMaskCapabilities()` on `ok`. On mount, `modelDownloadsStatus().downloading`
+  restores an in-flight download's progress state.
+- vision-ml-dev (small): the unavailable reason in `Segmenter::available` still says "run
+  scripts/fetch-models.sh"; in the app the remedy is the download button (suggest "model file X not installed").

@@ -3202,6 +3202,50 @@ pub struct UiPrefs {
     pub last_export_folder: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Model downloads (IPC v12)
+// ---------------------------------------------------------------------------
+
+/// Model group id accepted by `download_models`. Currently only `"segmentation"` (the AI-mask
+/// models, ~560 MB); the culling models ship with the app.
+pub const MODEL_GROUP_SEGMENTATION: &str = "segmentation";
+
+/// One model file of a [`ModelGroupStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFileStatus {
+    /// File name in the models directory (e.g. `birefnet_lite.onnx`).
+    pub name: String,
+    /// Present with the expected size (files are checksum-verified before they are moved into place).
+    pub installed: bool,
+    /// Download size in bytes.
+    pub bytes: u64,
+}
+
+/// A downloadable set of models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelGroupStatus {
+    /// Pass to `download_models` (e.g. `"segmentation"`).
+    pub id: String,
+    /// User-facing name (e.g. "AI masking models").
+    pub label: String,
+    /// Every file installed.
+    pub installed: bool,
+    /// Sum of `files[].bytes`.
+    pub bytes_total: u64,
+    pub files: Vec<ModelFileStatus>,
+}
+
+/// `model_downloads_status()`: what is installed and what is downloading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadStatus {
+    pub groups: Vec<ModelGroupStatus>,
+    /// Group id of the download in flight (at most one at a time); `null` when idle.
+    pub downloading: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

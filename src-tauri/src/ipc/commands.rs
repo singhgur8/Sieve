@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 use tauri::{AppHandle, State};
+use tauri_specta::Event;
 
 use super::error::{AppError, AppResult};
 use super::types::*;
@@ -18,6 +19,7 @@ use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::masking::Segmenter;
 use crate::ml::{self, Analysis};
+use crate::model_fetch::ModelDownloads;
 use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
 use crate::xmp::XmpSync;
@@ -1348,4 +1350,48 @@ pub async fn render_mask_overlay(
 pub async fn get_mask_capabilities(segmenter: State<'_, Segmenter>) -> AppResult<MaskCapabilities> {
     let segmenter = segmenter.inner().clone();
     blocking(move || Ok(segmenter.capabilities())).await
+}
+
+// ---------------------------------------------------------------------------
+// Model downloads (IPC v12)
+// ---------------------------------------------------------------------------
+
+/// Downloadable model groups (AI masking), which files are installed, and the download in
+/// flight. Cheap (file sizes only).
+#[tauri::command]
+#[specta::specta]
+pub async fn model_downloads_status(downloads: State<'_, ModelDownloads>) -> AppResult<ModelDownloadStatus> {
+    let downloads = downloads.inner().clone();
+    blocking(move || Ok(downloads.status())).await
+}
+
+/// Starts downloading model group `group` (e.g. `"segmentation"`) in the background and
+/// resolves immediately. Emits `ModelDownloadProgress` and, exactly once, `ModelDownloadFinished`.
+/// Installed files are skipped, partial files resumed, every file SHA-256 verified.
+/// `invalid_argument` for an unknown group or while a download is already running.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_models(app: AppHandle, downloads: State<'_, ModelDownloads>, group: String) -> AppResult<()> {
+    let progress_app = app.clone();
+    downloads.start(
+        &group,
+        move |p| {
+            let _ = p.emit(&progress_app);
+        },
+        move |f| {
+            if let Some(e) = &f.error {
+                eprintln!("model download ({}): {e}", f.group);
+            }
+            let _ = f.emit(&app);
+        },
+    )
+}
+
+/// Cancels the model download in flight (no-op when idle); `ModelDownloadFinished`
+/// (`cancelled: true`) follows.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_model_download(downloads: State<'_, ModelDownloads>) -> AppResult<()> {
+    downloads.cancel();
+    Ok(())
 }

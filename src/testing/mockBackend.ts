@@ -10,6 +10,9 @@ import type {
   AiMaskStatus,
   MaskCapabilities,
   MaskGroup,
+  ModelDownloadFinished,
+  ModelDownloadProgress,
+  ModelDownloadStatus,
   MaskOverlayOptions,
   NormPoint,
   DevelopWarning,
@@ -59,9 +62,23 @@ const MOCK_MASK_CAPABILITIES: MaskCapabilities = {
   landscape: [],
 };
 
+// ---- model downloads (v12) ----
+/** Mirror of Rust `model_fetch::SEGMENTATION` (name, bytes). */
+const MOCK_SEGMENTATION_FILES: [string, number][] = [
+  ["birefnet_lite.onnx", 224_005_088],
+  ["skyseg.onnx", 175_997_079],
+  ["yolox_m.onnx", 101_259_744],
+  ["efficientsam_ti_encoder.onnx", 24_799_761],
+  ["efficientsam_ti_decoder.onnx", 16_565_728],
+  ["selfie_multiclass_256x256.onnx", 16_454_560],
+];
+/** Segmentation models installed in the mock; `?models=missing` starts without them. */
+let mockModelsInstalled = true;
+
 /** Capabilities with the families listed in `?noai=sky,people` (URL of the mock page) switched off. */
 function mockCapabilities(): MaskCapabilities {
   const off = new Set((new URLSearchParams(typeof location === "undefined" ? "" : location.search).get("noai") ?? "").split(",").filter(Boolean));
+  if (!mockModelsInstalled) for (const k of ["subject", "background", "sky", "people", "parts"]) off.add(k);
   return {
     ...MOCK_MASK_CAPABILITIES,
     ai: MOCK_MASK_CAPABILITIES.ai.map((c) => (off.has(c.kind) ? { ...c, available: false, model: null, reason: `mock: ${c.kind} model not installed` } : c)),
@@ -183,6 +200,10 @@ declare global {
     __mockSceneDelay?: number;
     /** Test hook: ms `compute_ai_mask` takes in the mock (default 250). */
     __mockAiDelay?: number;
+    /** Test hook: ms per progress step of mock `download_models` (10 steps per file; default 40). */
+    __mockModelDelay?: number;
+    /** Test hook: when set, mock `download_models` fails with this error at the third file. */
+    __mockModelFail?: string;
   }
 }
 
@@ -679,6 +700,43 @@ export function installMockBackend(count: number) {
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
   let uiPrefs: UiPrefs = {};
 
+  // ---- model downloads (v12): simulated progress, honours cancel ----
+  mockModelsInstalled = new URLSearchParams(location.search).get("models") !== "missing";
+  let modelRun: { cancelled: boolean } | null = null;
+  function modelStatus(): ModelDownloadStatus {
+    const files = MOCK_SEGMENTATION_FILES.map(([name, bytes]) => ({ name, installed: mockModelsInstalled, bytes }));
+    return {
+      groups: [{ id: "segmentation", label: "AI masking models", installed: mockModelsInstalled, bytesTotal: files.reduce((s, f) => s + f.bytes, 0), files }],
+      downloading: modelRun ? "segmentation" : null,
+    };
+  }
+  async function runModelDownload(run: { cancelled: boolean }) {
+    const group = "segmentation";
+    const total = MOCK_SEGMENTATION_FILES.reduce((s, [, b]) => s + b, 0);
+    let before = 0;
+    let error: string | null = null;
+    outer: for (const [i, [name, bytes]] of MOCK_SEGMENTATION_FILES.entries()) {
+      for (let k = 1; k <= 10; k++) {
+        await sleep(window.__mockModelDelay ?? 40);
+        if (run.cancelled) {
+          error = "model download cancelled";
+          break outer;
+        }
+        if (i === 2 && k === 10 && window.__mockModelFail) {
+          error = window.__mockModelFail;
+          break outer;
+        }
+        const payload: ModelDownloadProgress = { group, name, fileIndex: i, fileCount: MOCK_SEGMENTATION_FILES.length, bytesDone: before + Math.round((bytes * k) / 10), bytesTotal: total };
+        void emit("model-download-progress", payload);
+      }
+      before += bytes;
+    }
+    modelRun = null;
+    if (!error) mockModelsInstalled = true;
+    const finished: ModelDownloadFinished = { group, ok: !error, cancelled: run.cancelled, error };
+    void emit("model-download-finished", finished);
+  }
+
   mockIPC(
     (cmd, payload) => {
       const args = (payload ?? {}) as Record<string, unknown>;
@@ -902,6 +960,19 @@ export function installMockBackend(count: number) {
         }
         case "get_mask_capabilities":
           return mockCapabilities();
+        case "model_downloads_status":
+          return modelStatus();
+        case "download_models": {
+          if (args.group !== "segmentation") throw { kind: "invalid_argument", message: `unknown model group \`${String(args.group)}\`` };
+          if (modelRun) throw { kind: "invalid_argument", message: "the segmentation models are already downloading" };
+          const run = { cancelled: false };
+          modelRun = run;
+          void runModelDownload(run);
+          return null;
+        }
+        case "cancel_model_download":
+          if (modelRun) modelRun.cancelled = true;
+          return null;
         case "render_preview":
           return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);
         case "paste_settings":

@@ -147,3 +147,34 @@ pub struct SceneProgress {
     pub done: u32,
     pub total: u32,
 }
+
+/// Progress of the `download_models` download in flight (IPC v12). Throttled (at most ~5 per
+/// second, plus one when each file completes). Byte counts cover the whole group; files
+/// already installed count as done when they are reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadProgress {
+    pub group: String,
+    /// File currently downloading / verifying.
+    pub name: String,
+    /// 0-based index of `name` among `fileCount` files.
+    pub file_index: u32,
+    pub file_count: u32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// A `download_models` run ended. Emitted exactly once per accepted `download_models` call.
+/// On `ok`, every file of the group is installed and verified, and `get_mask_capabilities()`
+/// already reflects it (no restart). On failure `error` is user-facing (network error,
+/// checksum mismatch, "model download cancelled", ...); verified files stay installed and a
+/// partial file is resumed by the next `download_models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadFinished {
+    pub group: String,
+    pub ok: bool,
+    /// Set when `download_models` was stopped by `cancel_model_download`.
+    pub cancelled: bool,
+    pub error: Option<String>,
+}

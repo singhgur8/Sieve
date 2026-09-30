@@ -414,6 +414,23 @@ export const commands = {
 } | null, AppError>(__TAURI_INVOKE("render_mask_overlay", { id, adjustments, target, options })),
 	/**  Which AI mask families can be computed on this Mac (model files present). */
 	getMaskCapabilities: () => typedError<MaskCapabilities, AppError>(__TAURI_INVOKE("get_mask_capabilities")),
+	/**
+	 *  Downloadable model groups (AI masking), which files are installed, and the download in
+	 *  flight. Cheap (file sizes only).
+	 */
+	modelDownloadsStatus: () => typedError<ModelDownloadStatus, AppError>(__TAURI_INVOKE("model_downloads_status")),
+	/**
+	 *  Starts downloading model group `group` (e.g. `"segmentation"`) in the background and
+	 *  resolves immediately. Emits `ModelDownloadProgress` and, exactly once, `ModelDownloadFinished`.
+	 *  Installed files are skipped, partial files resumed, every file SHA-256 verified.
+	 *  `invalid_argument` for an unknown group or while a download is already running.
+	 */
+	downloadModels: (group: string) => typedError<null, AppError>(__TAURI_INVOKE("download_models", { group })),
+	/**
+	 *  Cancels the model download in flight (no-op when idle); `ModelDownloadFinished`
+	 *  (`cancelled: true`) follows.
+	 */
+	cancelModelDownload: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_model_download")),
 };
 
 /** Events */
@@ -425,6 +442,8 @@ export const events = {
 	exportFinished: makeEvent<ExportFinished>("export-finished"),
 	exportProgress: makeEvent<ExportProgress>("export-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
+	modelDownloadFinished: makeEvent<ModelDownloadFinished>("model-download-finished"),
+	modelDownloadProgress: makeEvent<ModelDownloadProgress>("model-download-progress"),
 	sceneProgress: makeEvent<SceneProgress>("scene-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
@@ -438,6 +457,8 @@ export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"a
 export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
 export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"hue":0.0,"saturation":0.0},"contrast":0.0,"curveRefineSaturation":100.0,"defringe":0.0,"dehaze":0.0,"exposure":0.0,"highlights":0.0,"hue":0.0,"moire":0.0,"noise":0.0,"saturation":0.0,"shadows":0.0,"sharpness":0.0,"temperature":0.0,"texture":0.0,"tint":0.0,"toneCurve":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]},"whites":0.0} as const;
+
+export const MODEL_GROUP_SEGMENTATION = "segmentation" as const;
 
 /* Types */
 /**
@@ -1991,6 +2012,67 @@ export type MetadataOptions = {
 	copyright: string | null,
 	/**  Overrides the creator/artist (used by `all` and `copyright_and_contact`), <= 500 chars. */
 	creator: string | null,
+};
+
+/**
+ *  A `download_models` run ended. Emitted exactly once per accepted `download_models` call.
+ *  On `ok`, every file of the group is installed and verified, and `get_mask_capabilities()`
+ *  already reflects it (no restart). On failure `error` is user-facing (network error,
+ *  checksum mismatch, "model download cancelled", ...); verified files stay installed and a
+ *  partial file is resumed by the next `download_models`.
+ */
+export type ModelDownloadFinished = {
+	group: string,
+	ok: boolean,
+	/**  Set when `download_models` was stopped by `cancel_model_download`. */
+	cancelled: boolean,
+	error: string | null,
+};
+
+/**
+ *  Progress of the `download_models` download in flight (IPC v12). Throttled (at most ~5 per
+ *  second, plus one when each file completes). Byte counts cover the whole group; files
+ *  already installed count as done when they are reached.
+ */
+export type ModelDownloadProgress = {
+	group: string,
+	/**  File currently downloading / verifying. */
+	name: string,
+	/**  0-based index of `name` among `fileCount` files. */
+	fileIndex: number,
+	fileCount: number,
+	bytesDone: number,
+	bytesTotal: number,
+};
+
+/**  `model_downloads_status()`: what is installed and what is downloading. */
+export type ModelDownloadStatus = {
+	groups: ModelGroupStatus[],
+	/**  Group id of the download in flight (at most one at a time); `null` when idle. */
+	downloading: string | null,
+};
+
+/**  One model file of a [`ModelGroupStatus`]. */
+export type ModelFileStatus = {
+	/**  File name in the models directory (e.g. `birefnet_lite.onnx`). */
+	name: string,
+	/**  Present with the expected size (files are checksum-verified before they are moved into place). */
+	installed: boolean,
+	/**  Download size in bytes. */
+	bytes: number,
+};
+
+/**  A downloadable set of models. */
+export type ModelGroupStatus = {
+	/**  Pass to `download_models` (e.g. `"segmentation"`). */
+	id: string,
+	/**  User-facing name (e.g. "AI masking models"). */
+	label: string,
+	/**  Every file installed. */
+	installed: boolean,
+	/**  Sum of `files[].bytes`. */
+	bytesTotal: number,
+	files: ModelFileStatus[],
 };
 
 /**

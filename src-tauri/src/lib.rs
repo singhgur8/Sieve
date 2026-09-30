@@ -23,7 +23,8 @@ use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
     AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress, ImportProgress,
-    SceneProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    ModelDownloadFinished, ModelDownloadProgress, SceneProgress, ThumbnailFailed, ThumbnailReady, XmpSynced,
+    XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -134,6 +135,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::detect_people,
             commands::render_mask_overlay,
             commands::get_mask_capabilities,
+            commands::model_downloads_status,
+            commands::download_models,
+            commands::cancel_model_download,
         ])
         .events(collect_events![
             ImportProgress,
@@ -147,7 +151,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             XmpWriteFailed,
             ExportProgress,
             ExportFinished,
-            SceneProgress
+            SceneProgress,
+            ModelDownloadProgress,
+            ModelDownloadFinished
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -157,6 +163,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         )
         // Local adjustment defaults for new mask groups (IPC v10).
         .constant("DEFAULT_LOCAL_ADJUSTMENTS", ipc::types::LocalAdjustments::default())
+        // `download_models` group id of the AI-mask models (IPC v12).
+        .constant("MODEL_GROUP_SEGMENTATION", ipc::types::MODEL_GROUP_SEGMENTATION)
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -236,6 +244,8 @@ pub fn run() {
             // AI mattes + segmentation (IPC v10); no I/O or model loading here.
             let mask_cache =
                 MaskCache::new(MaskCacheConfig { catalog_path: path.clone(), cache_dir: config.cache_dir.clone() });
+            // In-app model downloads (IPC v12) install into the directory the segmenter reads.
+            app.manage(model_fetch::ModelDownloads::new(segment_models_dir.clone()));
             let segmenter = Segmenter::new(
                 SegmenterConfig { models_dir: segment_models_dir, catalog_path: path.clone() },
                 mask_cache.clone(),
