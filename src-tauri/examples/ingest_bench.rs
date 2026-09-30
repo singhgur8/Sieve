@@ -6,6 +6,11 @@
 //! `folder` defaults to `$SIEVE_SAMPLES`, then "/Users/gurjotsingh/Pictures/test RAWS".
 //! The source folder is only read. Set `SIEVE_BENCH_KEEP=/dir` to keep the
 //! generated catalog + thumbnails there instead of a temp dir.
+//! `SIEVE_BENCH_NON_RAW=1`: also import JPEG/HEIC/TIFF/PNG (camera JPEG siblings pair with
+//! their RAW unless `SIEVE_BENCH_PAIR=0`). `SIEVE_BENCH_XMP=1`: then read the folder's
+//! sidecars into the catalog (import hook, sidecar-wins; never writes files) and report
+//! ratings / develop settings imported. Per-format ready/failed and capture-time nulls
+//! are always reported.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,6 +20,7 @@ use sieve_lib::db::{self, repo};
 use sieve_lib::ingest::{default_threads, run_until_idle, IngestConfig, IngestSink};
 use sieve_lib::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
 use sieve_lib::ipc::types::ImportOptions;
+use sieve_lib::xmp::{XmpSync, XmpSyncConfig};
 
 const DEFAULT_SAMPLES: &str = "/Users/gurjotsingh/Pictures/test RAWS";
 
@@ -85,15 +91,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut conn = db::open(&config.catalog_path)?;
     let t_import = Instant::now();
-    let summary = repo::import_folder(&mut conn, &folder_path, &ImportOptions::raw_only(false))?;
+    let flag = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+    let opts = ImportOptions {
+        recursive: true,
+        include_non_raw: flag("SIEVE_BENCH_NON_RAW"),
+        pair_jpeg_with_raw: std::env::var("SIEVE_BENCH_PAIR").map_or(true, |v| v != "0"),
+    };
+    let summary = repo::import_folder(&mut conn, &folder_path, &opts)?;
     if let Some(n) = limit {
         conn.execute("DELETE FROM images WHERE id NOT IN (SELECT id FROM images ORDER BY file_name LIMIT ?1)", [n])?;
     }
     let import_s = t_import.elapsed().as_secs_f64();
     let queued = repo::count_pending(&conn)?;
     println!(
-        "folder: {folder}\nregistered: {} added, {} invalid; queued {queued} (limit {limit:?}) in {import_s:.2}s",
-        summary.added, summary.invalid
+        "folder: {folder}\nregistered: {} added, {} invalid, {} companions; queued {queued} (limit {limit:?}) in {import_s:.2}s",
+        summary.added, summary.invalid, summary.companions
     );
 
     let threads =
@@ -125,6 +137,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sink.failed.load(Ordering::Relaxed),
         sink.progress.load(Ordering::Relaxed)
     );
+    let mut stmt = conn.prepare(
+        "SELECT i.format, COUNT(*), SUM(t.status = 'ready'), SUM(t.status = 'failed'),
+                SUM(i.captured_at_ms IS NULL), SUM(i.camera_model IS NULL), SUM(i.width IS NULL),
+                GROUP_CONCAT(DISTINCT i.sensor_layout), GROUP_CONCAT(DISTINCT i.camera_model)
+         FROM images i JOIN thumbnails t ON t.image_id = i.id GROUP BY i.format ORDER BY i.format",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(format!(
+            "  {:<5} n={:<4} ready={:<4} failed={:<3} no_time={:<3} no_model={:<3} no_dims={:<3} layouts=[{}] models=[{}]",
+            r.get::<_, String>(0)?,
+            r.get::<_, u32>(1)?,
+            r.get::<_, u32>(2)?,
+            r.get::<_, u32>(3)?,
+            r.get::<_, u32>(4)?,
+            r.get::<_, u32>(5)?,
+            r.get::<_, u32>(6)?,
+            r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        ))
+    })?;
+    println!("per format:");
+    for row in rows {
+        println!("{}", row?);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT i.file_name, t.error FROM images i JOIN thumbnails t ON t.image_id = i.id WHERE t.status = 'failed' LIMIT 20",
+    )?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
+        let (name, err) = row?;
+        println!("  FAILED {name}: {}", err.unwrap_or_default());
+    }
+    drop(stmt);
+
+    if flag("SIEVE_BENCH_XMP") {
+        let t = Instant::now();
+        let sync = XmpSync::new(XmpSyncConfig { catalog_path: config.catalog_path.clone() });
+        let read = sync.refresh_folder(summary.folder_id)?;
+        let secs = t.elapsed().as_secs_f64();
+        let rated =
+            count("SELECT COUNT(*) FROM images WHERE rating > 0 OR pick != 'unflagged' OR color_label IS NOT NULL")?;
+        let edited = count("SELECT COUNT(*) FROM adjustments")?;
+        let not_neutral = count("SELECT COUNT(*) FROM adjustments WHERE neutral = 0")?;
+        let warned =
+            count("SELECT COUNT(*) FROM images WHERE develop_warnings IS NOT NULL AND develop_warnings != '[]'")?;
+        let errors = count("SELECT COUNT(*) FROM images WHERE xmp_error IS NOT NULL")?;
+        let dirty = count("SELECT COUNT(*) FROM images WHERE xmp_dirty = 1")?;
+        println!(
+            "sidecars read: {read} in {secs:.2}s; images with rating/pick/label: {rated}; develop rows: {edited} \
+             (non-neutral {not_neutral}); with develop warnings: {warned}; xmp errors: {errors}; dirty after read: {dirty}"
+        );
+        let mut stmt = conn.prepare("SELECT rating, COUNT(*) FROM images GROUP BY rating ORDER BY rating")?;
+        let dist: Vec<String> = stmt
+            .query_map([], |r| Ok(format!("{}*:{}", r.get::<_, u8>(0)?, r.get::<_, u32>(1)?)))?
+            .collect::<Result<_, _>>()?;
+        println!("rating distribution: {}", dist.join(" "));
+        let mut stmt =
+            conn.prepare("SELECT i.file_name, i.xmp_error FROM images i WHERE xmp_error IS NOT NULL LIMIT 10")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (n, e) = row?;
+            println!("  XMP ERROR {n}: {e}");
+        }
+    }
     println!("peak RSS (ru_maxrss): {:.1} MB", peak_rss_mb());
     if let Some(mb) = peak_footprint_mb() {
         println!("peak physical footprint: {mb:.1} MB");

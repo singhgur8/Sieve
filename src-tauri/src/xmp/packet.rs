@@ -17,8 +17,8 @@ use quick_xml::escape::{escape, unescape};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::crs::{self, PropertyEdit};
-use crate::ipc::types::{DevelopWarning, LookSettings, ParametricAdjustments};
+use super::crs::{self, LookChange, PropertyEdit, SeqEdit};
+use crate::ipc::types::{DevelopWarning, ImageFormat, LookSettings, ParametricAdjustments, ProfileSettings};
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
@@ -86,6 +86,41 @@ pub struct Desired {
     pub tags: Vec<String>,
     /// `xmp:MetadataDate` value (ISO 8601).
     pub metadata_date: String,
+    /// `rdf:Seq` develop properties (point curves, `crs::encode_curves`) to create/replace
+    /// (`items: None` removes). Empty = leave untouched.
+    pub seqs: Vec<SeqEdit>,
+    /// Camera profile + look to write (`crs::encode_profile` rules, `<crs:Look>` struct);
+    /// `None` = leave the sidecar's profile as it is.
+    pub profile: Option<ProfileWrite>,
+}
+
+/// Profile part of a develop write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileWrite {
+    pub settings: ProfileSettings,
+    /// The installed look profile file (XMP text) for `settings.look`, copied into a new
+    /// `<crs:Look>` struct when the look changes (`None`: Name/Amount/UUID only).
+    pub look_source: Option<std::sync::Arc<str>>,
+}
+
+impl Desired {
+    /// Culling-only write (no develop settings).
+    pub fn culling(rating: i32, label: Option<&'static str>, tags: Vec<String>, metadata_date: String) -> Self {
+        Desired { develop: Vec::new(), rating, label, tags, metadata_date, seqs: Vec::new(), profile: None }
+    }
+}
+
+/// [`parse`] for an image of `format`: develop properties missing from the packet read as
+/// that format's defaults (`ParametricAdjustments::defaults_for`; non-RAW: no sharpening /
+/// colour NR / profile unless recorded).
+pub fn parse_for(src: &str, format: ImageFormat) -> Result<SidecarValues> {
+    let mut values = parse(src)?;
+    if let Some(adj) = values.develop.as_mut() {
+        let body = src.strip_prefix(BOM).unwrap_or(src);
+        let doc = Doc::parse(body)?;
+        crs::overlay_format_defaults(&ScopeSource { doc: &doc, scope: Scope::Top }, adj, format);
+    }
+    Ok(values)
 }
 
 /// Reads the Sieve-relevant values of a packet.
@@ -101,7 +136,7 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     let list = |ns: &str, local: &str| -> Vec<String> {
         doc.list(ns, local).map(|p| p.items.iter().map(|i| i.value.clone()).collect()).unwrap_or_default()
     };
-    let source = DocSource(&doc);
+    let source = ScopeSource { doc: &doc, scope: Scope::Top };
     let (develop, develop_error) = match crs::decode_source(&source) {
         Ok(d) => (d, None),
         Err(e) => (None, Some(e)),
@@ -164,12 +199,12 @@ pub fn export_values(src: &str) -> Result<ExportValues> {
         creator.extend(scalar(NS_DC, "creator"));
     }
     let mut contact = Vec::new();
-    for a in &doc.attr_props {
+    for a in doc.top_attrs() {
         if a.uri == NS_IPTC_CORE && a.local.starts_with("Ci") && !a.attr.value.trim().is_empty() {
             contact.push((a.local.clone(), a.attr.value.trim().to_owned()));
         }
     }
-    if let Some(p) = doc.elem_props.iter().find(|p| p.uri == NS_IPTC_CORE && p.local == "CreatorContactInfo") {
+    if let Some(p) = doc.top_elems().find(|p| p.uri == NS_IPTC_CORE && p.local == "CreatorContactInfo") {
         for a in &p.elem.attrs {
             let (_, local) = split_qname(&a.qname);
             if local.starts_with("Ci") && !a.value.trim().is_empty() {
@@ -193,17 +228,13 @@ pub fn export_values(src: &str) -> Result<ExportValues> {
         }
     }
     let mut gps: Vec<(&'static str, String, String)> = doc
-        .attr_props
-        .iter()
+        .top_attrs()
         .filter(|a| a.uri == NS_EXIF && a.local.starts_with("GPS"))
         .map(|a| (NS_EXIF, a.local.clone(), a.attr.value.trim().to_owned()))
         .chain(
-            doc.elem_props
-                .iter()
-                .filter(|p| p.uri == NS_EXIF && p.local.starts_with("GPS") && p.container.is_none())
-                .map(|p| {
-                    (NS_EXIF, p.local.clone(), p.items.first().map_or(String::new(), |i| i.value.trim().to_owned()))
-                }),
+            doc.top_elems().filter(|p| p.uri == NS_EXIF && p.local.starts_with("GPS") && p.container.is_none()).map(
+                |p| (NS_EXIF, p.local.clone(), p.items.first().map_or(String::new(), |i| i.value.trim().to_owned())),
+            ),
         )
         .filter(|(_, _, v)| !v.is_empty())
         .collect();
@@ -254,31 +285,268 @@ fn child_texts(fragment: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Top-level properties of a parsed packet, for `crs::decode_source`.
-struct DocSource<'a>(&'a Doc);
+/// Properties of one scope of a parsed packet (top level, or a nested struct description)
+/// as a [`crs::CrsSource`].
+#[derive(Clone, Copy)]
+pub struct ScopeSource<'a> {
+    doc: &'a Doc,
+    scope: Scope,
+}
 
-impl crs::CrsSource for DocSource<'_> {
+impl crs::CrsSource for ScopeSource<'_> {
     fn scalar(&self, ns: &str, name: &str) -> Option<String> {
-        self.0.scalars(ns, name).into_iter().next().map(|s| s.value.to_owned())
+        self.doc.scalars_in(self.scope, ns, name).into_iter().next().map(|s| s.value.to_owned())
     }
 
     fn seq(&self, ns: &str, name: &str) -> Option<Vec<String>> {
-        let p = self.0.list(ns, name)?;
+        let p = self.doc.list_in(self.scope, ns, name)?;
         p.container.as_ref()?;
         Some(p.items.iter().map(|i| i.value.clone()).collect())
     }
 
     fn has(&self, ns: &str, name: &str) -> bool {
-        self.0.attr_props.iter().any(|a| a.uri == ns && a.local == name)
-            || self.0.elem_props.iter().any(|p| p.uri == ns && p.local == name)
+        self.doc.attrs_in(self.scope).any(|a| a.uri == ns && a.local == name)
+            || self.doc.elems_in(self.scope).any(|p| p.uri == ns && p.local == name)
     }
 
     fn look(&self) -> Option<LookSettings> {
-        // rust-engine-dev (Phase 7b): index nested structs (`<crs:Look><rdf:Description
-        // crs:Name crs:Amount crs:UUID ...>`) and return them here. Until then the caller
-        // keeps the default look when `<crs:Look>` is present.
-        None
+        look_struct(self.doc, self.scope).map(|l| l.settings)
     }
+}
+
+impl ScopeSource<'_> {
+    /// Every scalar property in namespace `ns` of this scope: `(local name, value)`.
+    pub fn scalars(&self, ns: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(usize, String, String)> = self
+            .doc
+            .attrs_in(self.scope)
+            .filter(|a| a.uri == ns)
+            .map(|a| (a.attr.ws_start, a.local.clone(), a.attr.value.clone()))
+            .collect();
+        out.extend(
+            self.doc
+                .elems_in(self.scope)
+                .filter(|p| p.uri == ns && p.container.is_none() && p.struct_desc.is_none())
+                .map(|p| (p.elem.start, p.local.clone(), p.items.first().map(|i| i.value.clone()).unwrap_or_default())),
+        );
+        out.sort_by_key(|(pos, _, _)| *pos);
+        out.into_iter().map(|(_, k, v)| (k, v)).collect()
+    }
+
+    /// Names of the list (`rdf:Seq` / `Bag` / `Alt`) properties in namespace `ns`.
+    pub fn lists(&self, ns: &str) -> Vec<String> {
+        self.doc
+            .elems_in(self.scope)
+            .filter(|p| p.uri == ns && p.container.is_some())
+            .map(|p| p.local.clone())
+            .collect()
+    }
+
+    /// First item of an `rdf:Alt` (e.g. `crs:Name` / `crs:Group` in look files), or the
+    /// scalar value.
+    pub fn text(&self, ns: &str, name: &str) -> Option<String> {
+        use crs::CrsSource;
+        self.seq(ns, name).and_then(|v| v.into_iter().next()).or_else(|| self.scalar(ns, name))
+    }
+}
+
+/// A `<crs:Look>` struct (sidecar) as read by [`Packet::look`].
+pub struct LookStruct<'a> {
+    pub settings: LookSettings,
+    pub supports_amount: Option<bool>,
+    pub supports_monochrome: Option<bool>,
+    pub supports_output_referred: Option<bool>,
+    pub group: Option<String>,
+    pub copyright: Option<String>,
+    /// `crs:Parameters`: the look's own develop settings (and `crs:LookTable` /
+    /// `crs:RGBTable` references to top-level `crs:Table_<md5>` values).
+    pub parameters: Option<ScopeSource<'a>>,
+}
+
+fn parse_bool_opt(v: Option<String>) -> Option<bool> {
+    match v?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads `crs:Look` in `scope`. `None` if absent or its UUID is not 32 hex digits.
+fn look_struct(doc: &Doc, scope: Scope) -> Option<LookStruct<'_>> {
+    let (_, d) = doc.struct_in(scope, crs::CRS_NS, "Look")?;
+    let s = ScopeSource { doc, scope: Scope::Desc(d) };
+    let uuid = s.text(crs::CRS_NS, "UUID")?.trim().to_ascii_uppercase();
+    if !LookSettings::is_valid_uuid(&uuid) {
+        return None;
+    }
+    let name: String =
+        s.text(crs::CRS_NS, "Name").unwrap_or_default().trim().chars().take(ProfileSettings::MAX_NAME).collect();
+    let amount = s
+        .text(crs::CRS_NS, "Amount")
+        .and_then(|v| v.trim().trim_start_matches('+').parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| v.clamp(0.0, 2.0));
+    let parameters = doc
+        .struct_in(Scope::Desc(d), crs::CRS_NS, "Parameters")
+        .map(|(_, pd)| ScopeSource { doc, scope: Scope::Desc(pd) });
+    use crs::CrsSource;
+    Some(LookStruct {
+        settings: LookSettings { name, uuid, amount },
+        supports_amount: parse_bool_opt(s.scalar(crs::CRS_NS, "SupportsAmount")),
+        supports_monochrome: parse_bool_opt(s.scalar(crs::CRS_NS, "SupportsMonochrome")),
+        supports_output_referred: parse_bool_opt(s.scalar(crs::CRS_NS, "SupportsOutputReferred")),
+        group: s.text(crs::CRS_NS, "Group"),
+        copyright: s.text(crs::CRS_NS, "Copyright"),
+        parameters,
+    })
+}
+
+/// A parsed packet for read-only structured access (look profiles, sidecar looks, tables).
+pub struct Packet {
+    doc: Doc,
+}
+
+impl Packet {
+    pub fn parse(src: &str) -> Result<Packet> {
+        let body = src.strip_prefix(BOM).unwrap_or(src);
+        Ok(Packet { doc: Doc::parse(body)? })
+    }
+
+    /// Top-level properties (every top-level `rdf:Description`).
+    pub fn top(&self) -> ScopeSource<'_> {
+        ScopeSource { doc: &self.doc, scope: Scope::Top }
+    }
+
+    /// The top-level `<crs:Look>` struct, if present and valid.
+    pub fn look(&self) -> Option<LookStruct<'_>> {
+        look_struct(&self.doc, Scope::Top)
+    }
+}
+
+/// Raw source text of every top-level property as `(namespace, local name, text)`:
+/// attributes as `qname="value"`, elements as their full span (for round-trip checks:
+/// what Sieve does not own must come back byte-for-byte).
+pub fn top_level_properties(src: &str) -> Result<Vec<(String, String, String)>> {
+    let body = src.strip_prefix(BOM).unwrap_or(src);
+    let doc = Doc::parse(body)?;
+    let mut out: Vec<(usize, String, String, String)> = doc
+        .top_attrs()
+        .map(|a| (a.attr.name_start, a.uri.clone(), a.local.clone(), body[a.attr.name_start..a.attr.end].to_owned()))
+        .collect();
+    out.extend(
+        doc.top_elems()
+            .map(|p| (p.elem.start, p.uri.clone(), p.local.clone(), body[p.elem.start..p.elem.end].to_owned())),
+    );
+    out.sort_by_key(|(pos, ..)| *pos);
+    Ok(out.into_iter().map(|(_, u, l, t)| (u, l, t)).collect())
+}
+
+/// Look-file properties that describe the look rather than being develop parameters.
+const LOOK_META: &[&str] = &[
+    "PresetType",
+    "Cluster",
+    "UUID",
+    "SupportsAmount",
+    "SupportsColor",
+    "SupportsMonochrome",
+    "SupportsHighDynamicRange",
+    "SupportsNormalDynamicRange",
+    "SupportsSceneReferred",
+    "SupportsOutputReferred",
+    "CameraModelRestriction",
+    "Copyright",
+    "ContactInfo",
+    "HasSettings",
+    "Name",
+    "ShortName",
+    "SortName",
+    "Group",
+    "Description",
+];
+
+/// Renders a `<crs:Look>` struct (Lightroom's sidecar layout, one space per level) for
+/// `look`. With the installed look file `source`, its descriptive fields and develop
+/// parameters are copied (never its `crs:Table_*`: Lightroom resolves installed looks by
+/// UUID); without it only Name/Amount/UUID are written.
+fn render_look(look: &LookSettings, source: Option<&str>, qname: &str, rdf: &str, crs_prefix: &str) -> Vec<String> {
+    let c = |local: &str| qualify(crs_prefix, local);
+    let desc = qualify(rdf, "Description");
+    let parsed = source.and_then(|s| Packet::parse(s).ok());
+    let top = parsed.as_ref().map(Packet::top);
+    let flag = |name: &str| -> Option<String> {
+        use crs::CrsSource;
+        parse_bool_opt(top.as_ref()?.scalar(crs::CRS_NS, name)).map(|b| if b { "true".into() } else { "false".into() })
+    };
+    let mut attrs = vec![
+        (c("Name"), look.name.clone()),
+        (c("Amount"), crs::format_num(look.amount, crs::NumFormat::Plain)),
+        (c("UUID"), look.uuid.clone()),
+    ];
+    for f in ["SupportsAmount", "SupportsMonochrome", "SupportsOutputReferred"] {
+        if let Some(v) = flag(f) {
+            attrs.push((c(f), v));
+        }
+    }
+    if let Some(v) = top.as_ref().and_then(|t| t.text(crs::CRS_NS, "Copyright")).filter(|v| !v.is_empty()) {
+        attrs.push((c("Copyright"), v));
+    }
+    let mut lines = vec![format!("<{qname}>")];
+    let attr_lines = |indent: &str, list: &[(String, String)]| -> Vec<String> {
+        list.iter().map(|(k, v)| format!("{indent}{k}=\"{}\"", escape(v.as_str()))).collect()
+    };
+    let open = |indent: &str, list: &[(String, String)]| -> Vec<String> {
+        let mut out = vec![format!("{indent}<{desc}")];
+        let mut al = attr_lines(&format!("{indent} "), list);
+        if let Some(last) = al.last_mut() {
+            last.push('>');
+        } else {
+            out[0].push('>');
+        }
+        out.extend(al);
+        out
+    };
+    lines.extend(open(" ", &attrs));
+    if let Some(t) = &top {
+        if let Some(group) = t.text(crs::CRS_NS, "Group").filter(|g| !g.is_empty()) {
+            let alt = qualify(rdf, "Alt");
+            let li = qualify(rdf, "li");
+            lines.push(format!(" <{}>", c("Group")));
+            lines.push(format!("  <{alt}>"));
+            lines.push(format!("   <{li} xml:lang=\"x-default\">{}</{li}>", escape(group.as_str())));
+            lines.push(format!("  </{alt}>"));
+            lines.push(format!(" </{}>", c("Group")));
+        }
+        let params: Vec<(String, String)> = t
+            .scalars(crs::CRS_NS)
+            .into_iter()
+            .filter(|(k, _)| !LOOK_META.contains(&k.as_str()) && !k.starts_with("Table_"))
+            .map(|(k, v)| (c(&k), v))
+            .collect();
+        let seqs: Vec<(String, Vec<String>)> = t
+            .lists(crs::CRS_NS)
+            .into_iter()
+            .filter(|k| !LOOK_META.contains(&k.as_str()))
+            .filter_map(|k| {
+                use crs::CrsSource;
+                let items = t.seq(crs::CRS_NS, &k)?;
+                Some((c(&k), items))
+            })
+            .collect();
+        if !params.is_empty() || !seqs.is_empty() {
+            lines.push(format!(" <{}>", c("Parameters")));
+            lines.extend(open("  ", &params));
+            for (name, items) in &seqs {
+                for l in render_list(name, rdf, "Seq", items) {
+                    lines.push(format!("  {l}"));
+                }
+            }
+            lines.push(format!("  </{desc}>"));
+            lines.push(format!(" </{}>", c("Parameters")));
+        }
+    }
+    lines.push(format!(" </{desc}>"));
+    lines.push(format!("</{qname}>"));
+    lines
 }
 
 /// Applies `want` to `existing` (or to a new minimal packet), touching only the fields
@@ -320,11 +588,50 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
         None => ed.remove_scalar_if(NS_XMP, "Label", is_owned_label),
     }
     ed.set_scalar(NS_XMP, "MetadataDate", &want.metadata_date);
-    for edit in &want.develop {
+    let top = ScopeSource { doc, scope: Scope::Top };
+    let mut develop_edits: Vec<PropertyEdit> = want.develop.clone();
+    if let Some(pw) = &want.profile {
+        let current = crs::current_profile(&top);
+        let adj = ParametricAdjustments { profile: pw.settings.clone(), ..Default::default() };
+        develop_edits.extend(crs::encode_profile(&adj, current.as_ref()));
+        match crs::look_change(&pw.settings, current.as_ref(), crs::CrsSource::has(&top, crs::CRS_NS, "Look")) {
+            LookChange::Keep => {}
+            LookChange::Remove => ed.put_element(crs::CRS_NS, "Look", &|_, _| Vec::new(), false),
+            LookChange::Amount(amount) => {
+                let nested = doc
+                    .struct_in(Scope::Top, crs::CRS_NS, "Look")
+                    .filter(|(p, _)| doc.elem_props[*p].elem.has_children)
+                    .map(|(_, d)| d)
+                    .filter(|d| split_qname(&doc.descs[*d].elem.qname).1 == "Description");
+                let value = crs::format_num(amount, crs::NumFormat::Plain);
+                match nested {
+                    Some(d) => ed.set_scalar_in(Scope::Desc(d), crs::CRS_NS, "Amount", &value),
+                    None => put_look(&mut ed, pw),
+                }
+            }
+            LookChange::Replace => put_look(&mut ed, pw),
+        }
+    }
+    for edit in &develop_edits {
+        // Never downgrade a newer process version (Lightroom would re-render with the old one).
+        if edit.ns == crs::CRS_NS && edit.name == "ProcessVersion" {
+            let current = crs::CrsSource::scalar(&top, crs::CRS_NS, "ProcessVersion");
+            let newer = |v: &str| v.trim().parse::<f32>().ok();
+            if let (Some(cur), Some(want_pv)) =
+                (current.as_deref().and_then(newer), edit.value.as_deref().and_then(newer))
+            {
+                if cur >= want_pv {
+                    continue;
+                }
+            }
+        }
         match &edit.value {
             Some(v) => ed.set_scalar(edit.ns, &edit.name, v),
             None => ed.remove_scalar_if(edit.ns, &edit.name, |_| true),
         }
+    }
+    for seq in &want.seqs {
+        ed.set_seq(seq.ns, seq.name, seq.items.as_deref());
     }
 
     // Keywords: drop every Sieve|* item, then add the wanted ones.
@@ -345,6 +652,17 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
     ed.update_list(NS_DC, "subject", &drop_leaf, &want.tags);
     ed.update_list(NS_LR, "hierarchicalSubject", &|v| is_ours(v) && !wanted_hier.iter().any(|w| w == v), &wanted_hier);
     ed.finish()
+}
+
+fn put_look(ed: &mut Editor<'_>, pw: &ProfileWrite) {
+    let Some(look) = pw.settings.look.clone() else {
+        ed.put_element(crs::CRS_NS, "Look", &|_, _| Vec::new(), false);
+        return;
+    };
+    let source = pw.look_source.clone();
+    let d = ed.host_desc(crs::CRS_NS);
+    let crs_prefix = ed.prefix_for(d, crs::CRS_NS);
+    ed.put_element(crs::CRS_NS, "Look", &|q, rdf| render_look(&look, source.as_deref(), q, rdf, &crs_prefix), true);
 }
 
 pub fn is_owned_label(v: &str) -> bool {
@@ -387,10 +705,15 @@ struct Desc {
     elem: Elem,
     /// Namespace bindings in scope inside the element (prefix -> uri), including its own.
     scope: HashMap<String, String>,
+    /// Struct property (index into `elem_props`) this description is the value of;
+    /// `None` for top-level descriptions (children of `rdf:RDF`).
+    parent: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 struct AttrProp {
+    /// Owning description.
+    desc: usize,
     uri: String,
     local: String,
     attr: Attr,
@@ -410,6 +733,8 @@ struct ElemProp {
     elem: Elem,
     container: Option<Elem>,
     items: Vec<Item>,
+    /// Struct value (`<prop><rdf:Description ...>` or `rdf:parseType="Resource"`).
+    struct_desc: Option<usize>,
 }
 
 struct ScalarRef<'a> {
@@ -424,6 +749,15 @@ struct Doc {
     elem_props: Vec<ElemProp>,
 }
 
+/// Which descriptions a query looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Every top-level `rdf:Description`.
+    Top,
+    /// One (nested) description.
+    Desc(usize),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Role {
     Other,
@@ -432,6 +766,8 @@ enum Role {
     Prop(usize),
     Container(usize),
     Item(usize, usize),
+    /// `rdf:parseType="Resource"` struct property (prop, its description).
+    ResProp(usize, usize),
 }
 
 struct Frame {
@@ -497,33 +833,9 @@ impl Doc {
                     let role = match parent_role {
                         _ if is_rdf("RDF") => Role::Rdf,
                         Role::Rdf if is_rdf("Description") => {
-                            let mut scope: HashMap<String, String> = HashMap::new();
-                            for f in &stack {
-                                for (p, u) in &f.bindings {
-                                    scope.insert(p.clone(), u.clone());
-                                }
-                            }
-                            for (p, u) in &bindings {
-                                scope.insert(p.clone(), u.clone());
-                            }
-                            let idx = doc.descs.len();
-                            for a in &attrs {
-                                if a.qname == NS_XMLNS_PREFIX || a.qname.starts_with("xmlns:") {
-                                    continue;
-                                }
-                                let (ap, al) = split_qname(&a.qname);
-                                // Unprefixed attributes have no namespace.
-                                let auri = if ap.is_empty() {
-                                    String::new()
-                                } else {
-                                    scope.get(ap).cloned().unwrap_or_default()
-                                };
-                                doc.attr_props.push(AttrProp { uri: auri, local: al.to_owned(), attr: a.clone() });
-                            }
-                            doc.descs.push(Desc { elem: elem.clone(), scope });
-                            Role::Desc(idx)
+                            Role::Desc(new_desc(&mut doc, &stack, &bindings, &elem, None, true))
                         }
-                        Role::Desc(d) => {
+                        Role::Desc(d) | Role::ResProp(_, d) => {
                             doc.elem_props.push(ElemProp {
                                 desc: d,
                                 uri: uri.clone(),
@@ -531,8 +843,29 @@ impl Doc {
                                 elem: elem.clone(),
                                 container: None,
                                 items: Vec::new(),
+                                struct_desc: None,
                             });
-                            Role::Prop(doc.elem_props.len() - 1)
+                            let p = doc.elem_props.len() - 1;
+                            let resource = attrs.iter().any(|a| {
+                                let (ap, al) = split_qname(&a.qname);
+                                al == "parseType" && lookup(ap).as_deref() == Some(NS_RDF) && a.value == "Resource"
+                            });
+                            if resource {
+                                let nd = new_desc(&mut doc, &stack, &bindings, &elem, Some(p), false);
+                                doc.elem_props[p].struct_desc = Some(nd);
+                                Role::ResProp(p, nd)
+                            } else {
+                                Role::Prop(p)
+                            }
+                        }
+                        Role::Prop(p)
+                            if is_rdf("Description")
+                                && doc.elem_props[p].struct_desc.is_none()
+                                && doc.elem_props[p].container.is_none() =>
+                        {
+                            let nd = new_desc(&mut doc, &stack, &bindings, &elem, Some(p), true);
+                            doc.elem_props[p].struct_desc = Some(nd);
+                            Role::Desc(nd)
                         }
                         Role::Prop(p) if uri == NS_RDF && matches!(local, "Bag" | "Seq" | "Alt") => {
                             if doc.elem_props[p].container.is_none() {
@@ -571,15 +904,43 @@ impl Doc {
         Ok(doc)
     }
 
+    /// Whether description `d` is in `scope`.
+    fn in_scope(&self, d: usize, scope: Scope) -> bool {
+        match scope {
+            Scope::Top => self.descs[d].parent.is_none(),
+            Scope::Desc(x) => d == x,
+        }
+    }
+
+    fn attrs_in(&self, scope: Scope) -> impl Iterator<Item = &AttrProp> + '_ {
+        self.attr_props.iter().filter(move |a| self.in_scope(a.desc, scope))
+    }
+
+    fn elems_in(&self, scope: Scope) -> impl Iterator<Item = &ElemProp> + '_ {
+        self.elem_props.iter().filter(move |p| self.in_scope(p.desc, scope))
+    }
+
+    fn top_attrs(&self) -> impl Iterator<Item = &AttrProp> + '_ {
+        self.attrs_in(Scope::Top)
+    }
+
+    fn top_elems(&self) -> impl Iterator<Item = &ElemProp> + '_ {
+        self.elems_in(Scope::Top)
+    }
+
     fn scalars(&self, uri: &str, local: &str) -> Vec<ScalarRef<'_>> {
+        self.scalars_in(Scope::Top, uri, local)
+    }
+
+    fn scalars_in(&self, scope: Scope, uri: &str, local: &str) -> Vec<ScalarRef<'_>> {
         let mut out: Vec<(usize, ScalarRef<'_>)> = Vec::new();
-        for a in &self.attr_props {
+        for a in self.attrs_in(scope) {
             if a.uri == uri && a.local == local {
                 out.push((a.attr.ws_start, ScalarRef { value: &a.attr.value }));
             }
         }
-        for p in &self.elem_props {
-            if p.uri == uri && p.local == local && p.container.is_none() {
+        for p in self.elems_in(scope) {
+            if p.uri == uri && p.local == local && p.container.is_none() && p.struct_desc.is_none() {
                 out.push((p.elem.start, ScalarRef { value: p.items.first().map_or("", |i| &i.value) }));
             }
         }
@@ -588,8 +949,59 @@ impl Doc {
     }
 
     fn list(&self, uri: &str, local: &str) -> Option<&ElemProp> {
-        self.elem_props.iter().find(|p| p.uri == uri && p.local == local)
+        self.list_in(Scope::Top, uri, local)
     }
+
+    fn list_in(&self, scope: Scope, uri: &str, local: &str) -> Option<&ElemProp> {
+        self.elems_in(scope).find(|p| p.uri == uri && p.local == local && p.struct_desc.is_none())
+    }
+
+    /// Struct property `(prop index, its description)` in `scope`.
+    fn struct_in(&self, scope: Scope, uri: &str, local: &str) -> Option<(usize, usize)> {
+        self.elem_props
+            .iter()
+            .enumerate()
+            .find(|(_, p)| self.in_scope(p.desc, scope) && p.uri == uri && p.local == local && p.struct_desc.is_some())
+            .map(|(i, p)| (i, p.struct_desc.unwrap_or_default()))
+    }
+}
+
+/// Registers an `rdf:Description` (top-level when `parent` is `None`, else the value of
+/// struct property `parent`) and, if `index_attrs`, its attribute-form properties.
+fn new_desc(
+    doc: &mut Doc,
+    stack: &[Frame],
+    bindings: &[(String, String)],
+    elem: &Elem,
+    parent: Option<usize>,
+    index_attrs: bool,
+) -> usize {
+    let mut scope: HashMap<String, String> = HashMap::new();
+    for f in stack {
+        for (p, u) in &f.bindings {
+            scope.insert(p.clone(), u.clone());
+        }
+    }
+    for (p, u) in bindings {
+        scope.insert(p.clone(), u.clone());
+    }
+    let idx = doc.descs.len();
+    if index_attrs {
+        for a in &elem.attrs {
+            if a.qname == NS_XMLNS_PREFIX || a.qname.starts_with("xmlns:") {
+                continue;
+            }
+            let (ap, al) = split_qname(&a.qname);
+            // Unprefixed attributes have no namespace.
+            let auri = if ap.is_empty() { String::new() } else { scope.get(ap).cloned().unwrap_or_default() };
+            if auri == NS_RDF && matches!(al, "about" | "parseType" | "ID" | "nodeID") && parent.is_some() {
+                continue;
+            }
+            doc.attr_props.push(AttrProp { desc: idx, uri: auri, local: al.to_owned(), attr: a.clone() });
+        }
+    }
+    doc.descs.push(Desc { elem: elem.clone(), scope, parent });
+    idx
 }
 
 /// Records element text / spans once the element is complete.
@@ -617,6 +1029,10 @@ fn close_frame(doc: &mut Doc, src: &str, frame: Frame) {
             doc.elem_props[p].elem = elem;
         }
         Role::Container(p) => doc.elem_props[p].container = Some(elem),
+        Role::ResProp(p, d) => {
+            doc.descs[d].elem = elem.clone();
+            doc.elem_props[p].elem = elem;
+        }
         Role::Item(p, i) => {
             let value = text();
             doc.elem_props[p].items[i] = Item { elem, value };
@@ -769,7 +1185,12 @@ impl<'a> Editor<'a> {
     /// Description to host a new property in namespace `uri`: the first one that already
     /// binds it, else the first one.
     fn host_desc(&self, uri: &str) -> usize {
-        self.doc.descs.iter().position(|d| d.scope.values().any(|u| u == uri)).unwrap_or(0)
+        self.doc
+            .descs
+            .iter()
+            .position(|d| d.parent.is_none() && d.scope.values().any(|u| u == uri))
+            .or_else(|| self.doc.descs.iter().position(|d| d.parent.is_none()))
+            .unwrap_or(0)
     }
 
     /// Prefix bound to `uri` in description `d`, declaring one if needed.
@@ -799,10 +1220,16 @@ impl<'a> Editor<'a> {
     }
 
     fn set_scalar(&mut self, uri: &str, local: &str, value: &str) {
+        self.set_scalar_in(Scope::Top, uri, local, value);
+    }
+
+    /// Sets a scalar in `scope`; if absent, adds it as an attribute of the host description
+    /// (top level) or of the scoped description.
+    fn set_scalar_in(&mut self, scope: Scope, uri: &str, local: &str, value: &str) {
         let esc = escape(value).into_owned();
         let mut found = false;
         let attr_hits: Vec<Attr> =
-            self.doc.attr_props.iter().filter(|a| a.uri == uri && a.local == local).map(|a| a.attr.clone()).collect();
+            self.doc.attrs_in(scope).filter(|a| a.uri == uri && a.local == local).map(|a| a.attr.clone()).collect();
         for a in attr_hits {
             found = true;
             if a.value != value {
@@ -811,9 +1238,8 @@ impl<'a> Editor<'a> {
         }
         let elem_hits: Vec<ElemProp> = self
             .doc
-            .elem_props
-            .iter()
-            .filter(|p| p.uri == uri && p.local == local && p.container.is_none())
+            .elems_in(scope)
+            .filter(|p| p.uri == uri && p.local == local && p.container.is_none() && p.struct_desc.is_none())
             .cloned()
             .collect();
         for p in elem_hits {
@@ -827,7 +1253,10 @@ impl<'a> Editor<'a> {
             }
         }
         if !found {
-            let d = self.host_desc(uri);
+            let d = match scope {
+                Scope::Top => self.host_desc(uri),
+                Scope::Desc(d) => d,
+            };
             let prefix = self.prefix_for(d, uri);
             self.new_attrs.entry(d).or_default().push(format!("{}=\"{esc}\"", qualify(&prefix, local)));
         }
@@ -836,8 +1265,7 @@ impl<'a> Editor<'a> {
     fn remove_scalar_if(&mut self, uri: &str, local: &str, pred: impl Fn(&str) -> bool) {
         let attr_hits: Vec<Attr> = self
             .doc
-            .attr_props
-            .iter()
+            .top_attrs()
             .filter(|a| a.uri == uri && a.local == local && pred(&a.attr.value))
             .map(|a| a.attr.clone())
             .collect();
@@ -846,18 +1274,73 @@ impl<'a> Editor<'a> {
         }
         let elem_hits: Vec<Elem> = self
             .doc
-            .elem_props
-            .iter()
+            .top_elems()
             .filter(|p| {
                 p.uri == uri
                     && p.local == local
                     && p.container.is_none()
+                    && p.struct_desc.is_none()
                     && pred(p.items.first().map_or("", |i| &i.value))
             })
             .map(|p| p.elem.clone())
             .collect();
         for e in elem_hits {
             self.splice(ws_before(self.src, e.start), e.end, "");
+        }
+    }
+
+    /// Replaces (or removes, `None`) every top-level element-form property `uri:local`
+    /// (scalar, list or struct) and attribute of that name with `lines` (relative
+    /// indentation, rendered with the property's qualified name `qname`), or appends it to
+    /// the host description when absent.
+    fn put_element(&mut self, uri: &str, local: &str, render: &dyn Fn(&str, &str) -> Vec<String>, keep: bool) {
+        let attrs: Vec<Attr> =
+            self.doc.top_attrs().filter(|a| a.uri == uri && a.local == local).map(|a| a.attr.clone()).collect();
+        for a in attrs {
+            self.splice(a.ws_start, a.end, "");
+        }
+        let elems: Vec<ElemProp> = self.doc.top_elems().filter(|p| p.uri == uri && p.local == local).cloned().collect();
+        let mut placed = !keep;
+        for p in elems {
+            if placed {
+                self.splice(ws_before(self.src, p.elem.start), p.elem.end, "");
+                continue;
+            }
+            let rdf = self.rdf_prefix(p.desc);
+            let lines = render(&p.elem.qname, &rdf);
+            let indent = line_indent(self.src, p.elem.start).unwrap_or("").to_owned();
+            self.splice(p.elem.start, p.elem.end, lines.join(&format!("\n{indent}")));
+            placed = true;
+        }
+        if !placed {
+            let d = self.host_desc(uri);
+            let prefix = self.prefix_for(d, uri);
+            let rdf = self.rdf_prefix(d);
+            let lines = render(&qualify(&prefix, local), &rdf);
+            self.new_children.entry(d).or_default().push(lines);
+        }
+    }
+
+    /// Creates / replaces / removes an `rdf:Seq` property. Unchanged items are left as-is.
+    fn set_seq(&mut self, uri: &str, local: &str, items: Option<&[String]>) {
+        let existing = self.doc.list(uri, local).filter(|p| p.container.is_some()).map(|p| {
+            let kind = p.container.as_ref().map(|c| split_qname(&c.qname).1.to_owned()).unwrap_or_default();
+            (kind, p.items.iter().map(|i| i.value.clone()).collect::<Vec<_>>())
+        });
+        let has_scalar = !self.doc.scalars(uri, local).is_empty();
+        match items {
+            None => {
+                if existing.is_some() || has_scalar {
+                    self.put_element(uri, local, &|_, _| Vec::new(), false);
+                }
+            }
+            Some(items) => {
+                if existing.as_ref().is_some_and(|(k, v)| k == "Seq" && v == items) && !has_scalar {
+                    return;
+                }
+                let items = items.to_vec();
+                self.put_element(uri, local, &|q, rdf| render_list(q, rdf, "Seq", &items), true);
+            }
         }
     }
 

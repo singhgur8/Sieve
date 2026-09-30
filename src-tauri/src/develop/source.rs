@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::NormRect;
 use crate::raw::libraw;
+use crate::raw::raster::{self, SourceColorSpace};
 
 use super::wb;
 
@@ -48,6 +49,13 @@ pub struct LinearImage {
     /// Full-size output dimensions before orientation.
     pub full_width: u32,
     pub full_height: u32,
+    /// Display-referred source (non-RAW, Phase 7b): pixels are the file's own linear light,
+    /// so the pipeline must skip `BASELINE_EV` and the base (filmic) curve; neutral
+    /// adjustments then reproduce the file. `false` for RAW decodes.
+    pub display_referred: bool,
+    /// Colour encoding of a raster source (`None` for RAW). `Unknown` =>
+    /// `DevelopWarningCode::SourceColorAssumed` (detail: `SourceColorSpace::assumed_detail`).
+    pub source_color: Option<SourceColorSpace>,
 }
 
 impl LinearImage {
@@ -96,8 +104,26 @@ pub fn color_info(c: &libraw::ColorData) -> ColorInfo {
     ColorInfo { as_shot_mul: normalized_mul(c.cam_mul), daylight_mul, rgb_cam: c.rgb_cam, xyz_to_cam }
 }
 
-/// Blocking half-size decode (~0.3-0.8 s for 24-33 MP on Apple Silicon).
+/// Long edge of the editor's cached decode of a non-RAW source (the RAW equivalent is
+/// LibRaw's half-size decode).
+pub const RASTER_EDITOR_EDGE: u32 = 4096;
+
+/// Non-RAW sources (by extension) are decoded by `raw::raster`; `None` = a RAW path.
+fn decode_raster(path: &Path, max_edge: Option<u32>) -> Option<AppResult<LinearImage>> {
+    let format = crate::raw::format_from_extension(path).filter(|f| !f.is_raw())?;
+    Some(
+        raster::decode_linear(path, format, max_edge)
+            .map(raster::to_linear_image)
+            .map_err(|e| AppError::internal(format!("{}: {e}", path.display()))),
+    )
+}
+
+/// Blocking half-size decode (~0.3-0.8 s for 24-33 MP on Apple Silicon). Non-RAW sources:
+/// linear decode downscaled to [`RASTER_EDITOR_EDGE`].
 pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
+    if let Some(r) = decode_raster(path, Some(RASTER_EDITOR_EDGE)) {
+        return r;
+    }
     let d = libraw::decode_linear(path, true).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
     let (full_width, full_height) = if d.color.width > 0 && d.color.height > 0 {
@@ -105,7 +131,16 @@ pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
     } else {
         (d.width * 2, d.height * 2)
     };
-    Ok(LinearImage { width: d.width, height: d.height, pixels: d.pixels, color, full_width, full_height })
+    Ok(LinearImage {
+        width: d.width,
+        height: d.height,
+        pixels: d.pixels,
+        color,
+        full_width,
+        full_height,
+        display_referred: false,
+        source_color: None,
+    })
 }
 
 /// Blocking full-resolution decode for export: the same LibRaw settings as
@@ -113,6 +148,9 @@ pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
 /// Markesteijn for X-Trans). LibRaw's buffers are released before returning;
 /// `full_width/full_height` equal `width/height`.
 pub fn decode_full(path: &Path) -> AppResult<LinearImage> {
+    if let Some(r) = decode_raster(path, None) {
+        return r;
+    }
     let d = libraw::decode_linear(path, false).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
     Ok(LinearImage {
@@ -122,6 +160,8 @@ pub fn decode_full(path: &Path) -> AppResult<LinearImage> {
         color,
         full_width: d.width,
         full_height: d.height,
+        display_referred: false,
+        source_color: None,
     })
 }
 
@@ -350,6 +390,8 @@ mod tests {
             },
             full_width: w * 2,
             full_height: h * 2,
+            display_referred: false,
+            source_color: None,
         }
     }
 

@@ -341,6 +341,8 @@ mod tests {
             },
             full_width: w,
             full_height: h,
+            display_referred: false,
+            source_color: None,
         }
     }
 

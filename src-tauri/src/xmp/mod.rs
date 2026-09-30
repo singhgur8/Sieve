@@ -51,10 +51,11 @@
 //!   written back so tags reach the sidecar too.
 
 pub mod crs;
+pub mod looks;
 pub mod packet;
 mod store;
 
-pub use packet::{Desired, PacketError, SidecarValues};
+pub use packet::{Desired, PacketError, ProfileWrite, SidecarValues};
 
 use std::fs;
 use std::io::Write;
@@ -338,9 +339,12 @@ impl XmpSync {
         let mut conn = db::open(&self.config.catalog_path)?;
         let mut read = 0;
         for (id, raw, recorded) in store::clean_images_in_folder(&conn, folder_id)? {
-            let Some(mtime) = file_mtime_ms(&resolve_sidecar(&raw)) else { continue };
-            if Some(mtime) == recorded {
-                continue;
+            match file_mtime_ms(&resolve_sidecar(&raw)) {
+                Some(mtime) if Some(mtime) == recorded => continue,
+                Some(_) => {}
+                // Non-RAW without a sidecar: embedded XMP (read-only) until a sidecar exists.
+                None if non_raw_format(&raw).is_some() && recorded.is_none() => {}
+                None => continue,
             }
             let Some(row) = store::load(&conn, id)? else { continue };
             match self.sync_one(&mut conn, &row, SyncPolicy::SidecarWins) {
@@ -356,13 +360,18 @@ impl XmpSync {
     fn sync_one(&self, conn: &mut Connection, row: &ImageRow, policy: SyncPolicy) -> Result<Outcome, String> {
         let _io = lock_ignore_poison(&self.io_lock);
         let path = resolve_sidecar(&row.path);
+        let format = crate::raw::format_from_extension(&row.path);
         let action = match policy {
             SyncPolicy::CatalogWins => Action::Write,
             SyncPolicy::SidecarWins => {
-                if !path.exists() {
-                    return Ok(Outcome::Skipped);
+                if path.exists() {
+                    Action::Read(None)
+                } else {
+                    match embedded_packet(&row.path) {
+                        Some(text) => Action::Read(Some(text)),
+                        None => return Ok(Outcome::Skipped),
+                    }
                 }
-                Action::Read
             }
             SyncPolicy::NewerWins => decide(file_mtime_ms(&path), row.xmp_mtime_ms, row.meta_updated_at),
         };
@@ -374,9 +383,16 @@ impl XmpSync {
                 store::mark_written(conn, row, file_mtime_ms(&path)).map_err(|e| e.message)?;
                 Ok(Outcome::Written)
             }
-            Action::Read => {
-                let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let values = packet::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            Action::Read(preloaded) => {
+                let text = match preloaded {
+                    Some(t) => t,
+                    None => fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+                };
+                let values = match format {
+                    Some(f) => packet::parse_for(&text, f),
+                    None => packet::parse(&text),
+                }
+                .map_err(|e| format!("{}: {e}", path.display()))?;
                 if let Some(e) = &values.develop_error {
                     // Ratings still sync; develop settings stay as they are in the catalog.
                     eprintln!("{}: develop settings not imported: {e}", path.display());
@@ -420,10 +436,22 @@ enum Outcome {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     Write,
-    Read,
+    /// Read the sidecar (`None`) or this already-loaded packet (embedded XMP).
+    Read(Option<String>),
+}
+
+/// Format of a non-RAW image path.
+fn non_raw_format(path: &Path) -> Option<crate::ipc::types::ImageFormat> {
+    crate::raw::format_from_extension(path).filter(|f| !f.is_raw())
+}
+
+/// Embedded XMP of a non-RAW original (read-only fallback when it has no sidecar).
+fn embedded_packet(image: &Path) -> Option<String> {
+    let format = non_raw_format(image)?;
+    crate::raw::raster::embedded_xmp(image, format).ok().flatten()
 }
 
 /// [`SyncPolicy::NewerWins`] for a dirty image.
@@ -431,7 +459,7 @@ fn decide(sidecar_mtime: Option<i64>, recorded_mtime: Option<i64>, meta_updated_
     match sidecar_mtime {
         None => Action::Write,
         Some(m) if Some(m) == recorded_mtime => Action::Write,
-        Some(m) if m > meta_updated_at.unwrap_or(i64::MIN) => Action::Read,
+        Some(m) if m > meta_updated_at.unwrap_or(i64::MIN) => Action::Read(None),
         Some(_) => Action::Write,
     }
 }
@@ -449,12 +477,24 @@ fn file_mtime_ms(path: &Path) -> Option<i64> {
 fn desired(row: &ImageRow, tags: &[String], develop: Option<&ParametricAdjustments>) -> Desired {
     let rating = if row.pick == PickFlag::Reject { -1 } else { i32::from(row.rating.min(5)) };
     let label = if row.pick == PickFlag::Pick { Some("Pick") } else { row.color_label.map(label_name) };
+    let (develop, seqs, profile) = match develop {
+        Some(adj) => {
+            let mut edits = crs::encode(adj);
+            let (seqs, curve_name) = crs::encode_curves(adj);
+            edits.push(curve_name);
+            let look_source = adj.profile.look.as_ref().and_then(|l| looks::installed(&l.uuid));
+            (edits, seqs, Some(ProfileWrite { settings: adj.profile.clone(), look_source }))
+        }
+        None => (Vec::new(), Vec::new(), None),
+    };
     Desired {
         rating,
         label,
         tags: tags.to_vec(),
         metadata_date: iso8601_utc(SystemTime::now()),
-        develop: develop.map(crs::encode).unwrap_or_default(),
+        develop,
+        seqs,
+        profile,
     }
 }
 
@@ -554,3 +594,6 @@ fn iso8601_utc(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parity_tests;
