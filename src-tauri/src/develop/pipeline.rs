@@ -609,7 +609,8 @@ const LUMA_709: [f32; 3] = [0.2126, 0.7152, 0.0722];
 /// Everything after the local operators, per pixel.
 struct Chain<'a> {
     hsm: Option<&'a HsvTable>,
-    tone: ToneModel,
+    /// Exposure (+ baseline) as a linear gain; the rest of the global tone is in `curve`.
+    exposure_gain: f32,
     display_referred: bool,
     dcp_look: Option<&'a HsvTable>,
     look_hsv: Option<(&'a HsvTable, f32)>,
@@ -617,7 +618,9 @@ struct Chain<'a> {
     bw: Option<crate::ipc::types::HslChannels>,
     color: ColorOps,
     shadow_tint: f32,
-    /// Base curve composed with the master curves: linear -> linear (RGB tone).
+    /// Global tone sliders (Whites, Contrast, Blacks, the exposure shoulder) + base curve +
+    /// master curves: post-exposure linear -> display linear, applied as Camera Raw's
+    /// hue-preserving RGB tone (so Contrast/Blacks change saturation like an RGB curve).
     curve: SqrtTable,
     rgb_curves: [Option<Vec<f32>>; 3],
     grade: Grade,
@@ -664,15 +667,7 @@ impl Chain<'_> {
         if let Some(t) = self.hsm {
             v = t.apply(v, 1.0);
         }
-        // Whites / exposure / contrast / blacks: a luminance gain.
-        let y = dot(PROPHOTO_Y, v);
-        if y > 1e-12 {
-            let ev = y.log2();
-            let g = (self.tone.global(ev) - ev).clamp(-30.0, 30.0);
-            v = v.map(|c| c * g.exp2());
-        } else {
-            v = [0.0; 3];
-        }
+        v = v.map(|c| c * self.exposure_gain);
         if let Some(t) = self.dcp_look {
             v = t.apply(v, 1.0);
         }
@@ -703,6 +698,19 @@ impl Chain<'_> {
         // Display-linear ProPhoto; the output stage runs per pixel after the LUT.
         e.map(|c| srgb_decode(c.clamp(0.0, 1.0)))
     }
+}
+
+/// The RGB tone curve of the global sliders: post-exposure linear `c` (exposure
+/// `exposure` EV, baseline included) -> `finish` (base + master curves) of the tone model's
+/// output, `2^global(log2(c) - exposure)`.
+fn global_tone_curve(model: &ToneModel, exposure: f32, finish: impl Fn(f32) -> f32) -> SqrtTable {
+    let max = (LUT_LOG_MAX + exposure.max(0.0)).exp2();
+    SqrtTable::new(max, 8192, |c| {
+        if c <= 0.0 {
+            return finish(0.0);
+        }
+        finish(model.global(c.log2() - exposure).exp2())
+    })
 }
 
 /// Settings after merging the look's own parameters (at the look amount) under the user's.
@@ -928,7 +936,8 @@ fn develop(
     let display = profile.display_referred;
     let base_fn = tone::profile_curve(tone_curve.as_deref());
     let master = luts.master.clone();
-    let curve = SqrtTable::new(1.0, 8192, |x| {
+    let tone_model = ToneModel::new(ToneSliders { shadows: 0.0, highlights: 0.0, ..tone_sliders });
+    let curve = global_tone_curve(&tone_model, tone_sliders.exposure, |x| {
         let t = if display { x.clamp(0.0, 1.0) } else { base_fn(x) };
         match &master {
             Some(lut) => srgb_decode(parity::eval_lut(lut, srgb_encode(t))),
@@ -940,7 +949,7 @@ fn develop(
     let out = Output::new(space, cube.filter(|_| lut_amount > 0.0).map(|l| (l, lut_amount)), quality);
     let chain = Chain {
         hsm: setup.hsm.as_ref(),
-        tone: ToneModel::new(ToneSliders { shadows: 0.0, highlights: 0.0, ..tone_sliders }),
+        exposure_gain: tone_sliders.exposure.exp2(),
         display_referred: display,
         dcp_look: profile.dcp.as_ref().and_then(|d| d.look_table.as_ref()),
         look_hsv,
@@ -1534,7 +1543,7 @@ mod tests {
         let master = luts.master.clone();
         let chain = Chain {
             hsm: setup.hsm.as_ref(),
-            tone: ToneModel::new(ToneSliders { exposure: 0.35, contrast: -40.0, ..Default::default() }),
+            exposure_gain: 0.35f32.exp2(),
             display_referred: false,
             dcp_look: None,
             look_hsv: None,
@@ -1542,10 +1551,14 @@ mod tests {
             bw: None,
             color: ColorOps::new(&adj),
             shadow_tint: 0.0,
-            curve: SqrtTable::new(1.0, 8192, |x| {
-                let t = tone::base_curve(x);
-                srgb_decode(parity::eval_lut(master.as_ref().unwrap(), srgb_encode(t)))
-            }),
+            curve: global_tone_curve(
+                &ToneModel::new(ToneSliders { exposure: 0.35, contrast: -40.0, ..Default::default() }),
+                0.35,
+                |x| {
+                    let t = tone::base_curve(x);
+                    srgb_decode(parity::eval_lut(master.as_ref().unwrap(), srgb_encode(t)))
+                },
+            ),
             rgb_curves: [None, None, None],
             grade: Grade::new(&adj.color_grading),
             _marker: std::marker::PhantomData,

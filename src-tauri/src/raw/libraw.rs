@@ -227,18 +227,26 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
 
 /// The default crop of a decode (LibRaw's "raw inset", which equals Adobe's `DefaultCrop`
 /// for Sony and Canon), so crop coordinates and framing match Lightroom's. `ColorData`
-/// `width`/`height` become the cropped full-size dimensions. Fujifilm keeps LibRaw's frame
-/// (Adobe's X-Trans frame is trimmed differently; not verified).
+/// `width`/`height` become the cropped full-size dimensions. Fujifilm: Adobe uses the
+/// inset's left edge and bottom with a 3:2 frame (6240 x 4160 for the X-M5, where LibRaw's
+/// inset is 4155 high; verified by aligning Camera Raw renders).
 fn default_crop(img: LinearRgb16, c: &ShimColor, half: bool) -> LinearRgb16 {
     let make = c_name(&c.make);
-    let supported = make.eq_ignore_ascii_case("sony") || make.eq_ignore_ascii_case("canon");
+    let fuji = make.eq_ignore_ascii_case("fujifilm");
+    let supported = fuji || make.eq_ignore_ascii_case("sony") || make.eq_ignore_ascii_case("canon");
     let [il, it, iw, ih] = c.inset;
     let [ml, mt] = c.margin;
     if !supported || iw == 0 || ih == 0 || il < ml || it < mt {
         return img;
     }
-    let (fx, fy) = ((il - ml) as usize, (it - mt) as usize);
-    let (fw, fh) = (iw as usize, ih as usize);
+    let (fx, mut fy) = ((il - ml) as usize, (it - mt) as usize);
+    let (fw, mut fh) = (iw as usize, ih as usize);
+    if fuji && fw > fh {
+        // Same bottom edge as LibRaw's inset (best alignment with Camera Raw renders).
+        let tall = fh.max((fw * 2).div_ceil(3));
+        fy = (fy + fh).saturating_sub(tall);
+        fh = tall;
+    }
     if fx + fw > c.width.max(0) as usize || fy + fh > c.height.max(0) as usize {
         return img;
     }
