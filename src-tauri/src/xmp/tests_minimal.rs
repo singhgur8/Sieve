@@ -170,6 +170,9 @@ fn real_masked_sidecars_minimal_diff() {
         adj.masks = read.groups.clone();
         let (rating, pick, color_label) = catalog_values(&v, 0);
         let copy = out_dir.join(f.file_name().unwrap());
+        // write_sidecar refuses to create a sidecar for a missing original; a placeholder stands in.
+        let raw = copy.with_extension("ARW");
+        std::fs::write(&raw, b"").unwrap();
         let row = ImageRow {
             id: 1,
             path: copy.with_extension("ARW"),
@@ -206,6 +209,7 @@ fn real_masked_sidecars_minimal_diff() {
         m.effects.grain.amount = 15.0;
         run(&m, &["xmp:MetadataDate", "crs:GrainAmount"], "grain");
         let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(&raw);
         done += 1;
         if done == 5 {
             break;
