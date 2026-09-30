@@ -20,6 +20,12 @@ pub type ImageId = i64;
 pub type FolderId = i64;
 /// Catalog row id of a burst group.
 pub type BurstGroupId = i64;
+/// Catalog row id of a develop preset.
+pub type PresetId = i64;
+/// Catalog row id of an adjustment history entry.
+pub type HistoryEntryId = i64;
+/// LUT library id: the `.cube` file stem in the LUT directory (`[a-z0-9-]+`).
+pub type LutId = String;
 
 /// Declares a fieldless enum that round-trips through the same snake_case string
 /// on the wire (serde) and in SQLite (`as_str` / `parse`).
@@ -479,7 +485,7 @@ pub struct RawImageEntry {
     pub tags: Vec<CullTagEntry>,
     pub quality: Option<QualityScore>,
     pub has_edits: bool,
-    /// Sidecar sync state of the XMP-mapped values (rating, pick, label, tags).
+    /// Sidecar sync state of the XMP-mapped values (rating, pick, label, tags, develop settings).
     pub xmp: XmpSyncState,
 }
 
@@ -491,7 +497,8 @@ pub struct RawImageEntry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct XmpSyncState {
-    /// Rating/pick/label/tags changed in the catalog since the sidecar was last written.
+    /// Rating/pick/label/tags or develop settings (crs:) changed in the catalog since the
+    /// sidecar was last written.
     pub dirty: bool,
     /// Unix ms when catalog and sidecar last agreed (write or read); `None` = never synced.
     pub synced_at_ms: Option<i64>,
@@ -516,7 +523,7 @@ pub struct XmpSyncReport {
     /// `read_xmp`: images without a sidecar. `write_xmp`: always 0.
     pub skipped: u32,
     pub failed: Vec<XmpFailure>,
-    /// Images whose catalog rating/pick/label changed as a result (reads only);
+    /// Images whose catalog rating/pick/label or develop settings changed as a result (reads only);
     /// refetch them with `get_images`.
     pub changed: Vec<ImageId>,
 }
@@ -589,12 +596,15 @@ pub struct HslAdjustments {
     pub luminance: HslChannels,
 }
 
-/// A 3D LUT (`.cube`) applied after the parametric stage.
+/// A `.cube` LUT from the LUT library, applied after the parametric stage
+/// (on display-referred sRGB-encoded values, before output encoding).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LutRef {
-    pub path: String,
-    /// Blend amount 0..=100.
+    /// `LutInfo.id` (library file stem). A missing LUT renders as if absent and sets
+    /// `RenderedPreview.lutMissing`.
+    pub id: LutId,
+    /// Blend amount 0..=100 (100 = full LUT output).
     #[specta(type = Number)]
     pub amount: f32,
 }
@@ -678,10 +688,268 @@ impl ParametricAdjustments {
             }
         }
         if let Some(lut) = &self.lut {
+            if !is_valid_lut_id(&lut.id) {
+                return Err(format!("lut.id {:?} is not a valid LUT id", lut.id));
+            }
             check("lut.amount", lut.amount, 0.0, 100.0)?;
         }
         Ok(())
     }
+
+    /// Copies the groups in `fields` from `src` into `self`, leaving other groups as-is.
+    /// The semantics of every fields mask (presets, paste, sync).
+    pub fn copy_fields(&mut self, src: &ParametricAdjustments, fields: &[AdjustmentField]) {
+        for field in fields {
+            match field {
+                AdjustmentField::WhiteBalance => self.white_balance = src.white_balance,
+                AdjustmentField::Exposure => self.exposure = src.exposure,
+                AdjustmentField::Contrast => self.contrast = src.contrast,
+                AdjustmentField::Highlights => self.highlights = src.highlights,
+                AdjustmentField::Shadows => self.shadows = src.shadows,
+                AdjustmentField::Whites => self.whites = src.whites,
+                AdjustmentField::Blacks => self.blacks = src.blacks,
+                AdjustmentField::Texture => self.texture = src.texture,
+                AdjustmentField::Clarity => self.clarity = src.clarity,
+                AdjustmentField::Dehaze => self.dehaze = src.dehaze,
+                AdjustmentField::Vibrance => self.vibrance = src.vibrance,
+                AdjustmentField::Saturation => self.saturation = src.saturation,
+                AdjustmentField::HslHue => self.hsl.hue = src.hsl.hue,
+                AdjustmentField::HslSaturation => self.hsl.saturation = src.hsl.saturation,
+                AdjustmentField::HslLuminance => self.hsl.luminance = src.hsl.luminance,
+                AdjustmentField::Lut => self.lut = src.lut.clone(),
+            }
+        }
+    }
+
+    /// All values neutral (an unedited image renders identically).
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[a-z0-9-]{1,64}`: safe as a file stem and inside XMP.
+pub fn is_valid_lut_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+string_enum! {
+    /// Groups of `ParametricAdjustments` selectable in a fields mask (Lightroom's
+    /// "Copy Settings" / preset checkboxes). `ALL` selects everything.
+    pub enum AdjustmentField {
+        /// `whiteBalance` (mode + temperature + tint).
+        WhiteBalance => "white_balance",
+        Exposure => "exposure",
+        Contrast => "contrast",
+        Highlights => "highlights",
+        Shadows => "shadows",
+        Whites => "whites",
+        Blacks => "blacks",
+        Texture => "texture",
+        Clarity => "clarity",
+        Dehaze => "dehaze",
+        Vibrance => "vibrance",
+        Saturation => "saturation",
+        /// `hsl.hue` (all 8 bands).
+        HslHue => "hsl_hue",
+        /// `hsl.saturation` (all 8 bands).
+        HslSaturation => "hsl_saturation",
+        /// `hsl.luminance` (all 8 bands).
+        HslLuminance => "hsl_luminance",
+        /// `lut` (reference + amount; copying a `null` removes the target's LUT).
+        Lut => "lut",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Editor (Phase 5): preview render, develop info, history, presets, LUTs
+// ---------------------------------------------------------------------------
+
+string_enum! {
+    /// Independent latest-wins render stream per image. A newer request in the same
+    /// (image, slot) supersedes older ones; different slots never cancel each other.
+    pub enum RenderSlot {
+        /// The edited image in the loupe (slider feedback).
+        Main => "main",
+        /// Before/after view (the frontend sends the "before" adjustments, e.g. neutral).
+        Before => "before",
+        /// A zoomed region (`RenderOptions.region`), e.g. 1:1 loupe detail.
+        Detail => "detail",
+    }
+}
+
+/// How to render a preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderOptions {
+    /// Long edge of the output in px, 64..=8192 (use CSS size x devicePixelRatio).
+    /// Never upscaled beyond the develop source (`DevelopInfo.sourceWidth/Height`, or the
+    /// region's share of it).
+    pub max_edge: u32,
+    pub slot: RenderSlot,
+    /// Render only this part of the (orientation-corrected) frame; `null` = whole frame.
+    pub region: Option<NormRect>,
+}
+
+impl RenderOptions {
+    pub const MIN_EDGE: u32 = 64;
+    pub const MAX_EDGE: u32 = 8192;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(Self::MIN_EDGE..=Self::MAX_EDGE).contains(&self.max_edge) {
+            return Err(format!("maxEdge = {} is outside {}..={}", self.max_edge, Self::MIN_EDGE, Self::MAX_EDGE));
+        }
+        if let Some(r) = self.region {
+            let ok = [r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
+                && r.x >= 0.0
+                && r.y >= 0.0
+                && r.width > 0.0
+                && r.height > 0.0
+                && r.x + r.width <= 1.0 + 1e-4
+                && r.y + r.height <= 1.0 + 1e-4;
+            if !ok {
+                return Err("region must lie within 0..=1 with positive size".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 256-bin histograms of the rendered output (8-bit sRGB-encoded values, what the user
+/// sees). `luma` uses Rec.709 weights on the encoded values. Each vector has 256 entries;
+/// every channel sums to `width * height` of the render.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Histogram {
+    pub red: Vec<u32>,
+    pub green: Vec<u32>,
+    pub blue: Vec<u32>,
+    pub luma: Vec<u32>,
+}
+
+impl Histogram {
+    pub const BINS: usize = 256;
+}
+
+/// A finished preview render. Pixels are an in-memory JPEG (sRGB, quality ~90, 4:4:4)
+/// served by the `sieve` URI scheme at `url`; set it as an `<img src>` directly (do not
+/// pass it through `convertFileSrc`). The URL is unique per render (`?v=<seq>`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedPreview {
+    pub image_id: ImageId,
+    pub slot: RenderSlot,
+    /// Monotonic per (image, slot); larger = newer.
+    pub seq: u32,
+    /// `sieve://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+    /// (`http://sieve.localhost/...` on Windows).
+    pub url: String,
+    /// Output pixel size (orientation applied).
+    pub width: u32,
+    pub height: u32,
+    pub histogram: Histogram,
+    /// Wall time of this request inside the backend (decode if uncached + pipeline + encode).
+    pub render_ms: u32,
+    /// `adjustments.lut` refers to a LUT not in the library; rendered without it.
+    pub lut_missing: bool,
+}
+
+/// White balance as Lightroom shows it for RAW files.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WhiteBalanceValues {
+    /// Kelvin, 2000..=50000.
+    #[specta(type = Number)]
+    pub temperature_k: f32,
+    /// -150..=150.
+    #[specta(type = Number)]
+    pub tint: f32,
+}
+
+/// Facts about an image's develop source, for initializing the editor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DevelopInfo {
+    pub image_id: ImageId,
+    /// The camera's as-shot white balance expressed as temperature/tint (from LibRaw's
+    /// camera multipliers and colour matrix); `null` if the file has none. Seeds the
+    /// Temp/Tint sliders when switching from `as_shot` to `custom`.
+    pub as_shot: Option<WhiteBalanceValues>,
+    /// Size of the cached develop source (half-size demosaic), orientation applied.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Full sensor output size, orientation applied (Phase 6 export size).
+    pub full_width: u32,
+    pub full_height: u32,
+}
+
+/// One state in an image's edit history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: HistoryEntryId,
+    /// e.g. "Exposure", "Paste Settings", "Preset: Warm", "Reset", "Read from XMP".
+    /// The first entry of every history is "Original" (the state before the first edit).
+    pub label: String,
+    pub created_at_ms: i64,
+}
+
+/// Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
+/// and make that entry's snapshot the image's adjustments; a new edit after an undo
+/// discards the entries after the cursor.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentHistory {
+    pub image_id: ImageId,
+    pub entries: Vec<HistoryEntry>,
+    /// Entry whose snapshot is the current adjustments; `null` = never edited (no entries).
+    pub current_entry_id: Option<HistoryEntryId>,
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// Adjustments + history after an undo/redo/jump.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditState {
+    pub adjustments: ParametricAdjustments,
+    pub history: AdjustmentHistory,
+}
+
+/// A saved develop preset: applies `adjustments` restricted to `fields`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Preset {
+    pub id: PresetId,
+    /// Unique (case-insensitive), 1..=100 chars.
+    pub name: String,
+    pub adjustments: ParametricAdjustments,
+    /// Non-empty; groups outside it are ignored when applying.
+    pub fields: Vec<AdjustmentField>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+string_enum! {
+    pub enum LutKind {
+        /// `LUT_1D_SIZE`: per-channel curves.
+        Lut1d => "lut_1d",
+        /// `LUT_3D_SIZE`: RGB cube.
+        Lut3d => "lut_3d",
+    }
+}
+
+/// A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$SIEVE_LUTS`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LutInfo {
+    pub id: LutId,
+    /// `TITLE` from the file, else the imported file's name without extension.
+    pub name: String,
+    pub kind: LutKind,
+    /// Entries per axis (2..=65 for 3D, 2..=65536 for 1D).
+    pub size: u32,
+    /// Absolute path of the library copy.
+    pub path: String,
 }
 
 impl Default for ParametricAdjustments {
@@ -881,4 +1149,58 @@ pub struct ImportStatus {
     pub failed: u32,
     /// The background pipeline is currently working.
     pub running: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_fields_copies_only_selected_groups() {
+        let mut src = ParametricAdjustments {
+            exposure: 1.0,
+            contrast: 20.0,
+            white_balance: WhiteBalance::Custom { temperature_k: 3200.0, tint: 5.0 },
+            lut: Some(LutRef { id: "film-1".into(), amount: 50.0 }),
+            ..Default::default()
+        };
+        src.hsl.hue.red = 10.0;
+        src.hsl.luminance.blue = -30.0;
+
+        let mut dst = ParametricAdjustments { shadows: 40.0, ..Default::default() };
+        dst.copy_fields(&src, &[AdjustmentField::Exposure, AdjustmentField::HslHue, AdjustmentField::Lut]);
+        assert_eq!(dst.exposure, 1.0);
+        assert_eq!(dst.contrast, 0.0);
+        assert_eq!(dst.shadows, 40.0);
+        assert_eq!(dst.white_balance, WhiteBalance::AsShot);
+        assert_eq!(dst.hsl.hue.red, 10.0);
+        assert_eq!(dst.hsl.luminance.blue, 0.0);
+        assert_eq!(dst.lut, src.lut);
+
+        let mut all = ParametricAdjustments::default();
+        all.copy_fields(&src, AdjustmentField::ALL);
+        assert_eq!(all, src);
+        assert!(!all.is_neutral());
+        assert!(ParametricAdjustments::default().is_neutral());
+    }
+
+    #[test]
+    fn lut_ids_and_render_options_validate() {
+        assert!(is_valid_lut_id("kodak-portra-400-3f2a91c0"));
+        let long = "x".repeat(65);
+        for bad in ["", "Upper", "a/b", "../x", "a.cube", long.as_str()] {
+            assert!(!is_valid_lut_id(bad), "{bad}");
+        }
+        let adj =
+            ParametricAdjustments { lut: Some(LutRef { id: "../etc".into(), amount: 10.0 }), ..Default::default() };
+        assert!(adj.validate().is_err());
+
+        let ok = RenderOptions { max_edge: 2048, slot: RenderSlot::Main, region: None };
+        assert!(ok.validate().is_ok());
+        assert!(RenderOptions { max_edge: 10, ..ok.clone() }.validate().is_err());
+        let region = NormRect { x: 0.5, y: 0.5, width: 0.6, height: 0.2 };
+        assert!(RenderOptions { region: Some(region), ..ok.clone() }.validate().is_err());
+        let region = NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        assert!(RenderOptions { region: Some(region), ..ok }.validate().is_ok());
+    }
 }

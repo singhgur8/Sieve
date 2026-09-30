@@ -242,7 +242,7 @@ const ENTRY_SELECT: &str = "
            q.overall, q.face_sharpness, q.global_sharpness, q.eyes_open, q.composition,
            q.face_count, q.clipped_highlights_pct, q.clipped_shadows_pct, q.mean_luma,
            q.model_version,
-           EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id),
+           EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id AND a.neutral = 0),
            t.preview_path,
            q.suggested_rating, q.suggested_pick,
            EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id),
@@ -662,17 +662,20 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     }
 }
 
+/// Upserts the adjustments row only (no history; see `develop::history::commit` for the
+/// command path). Keeps `neutral` in step with the values.
 pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustments) -> AppResult<()> {
     adj.validate().map_err(AppError::invalid)?;
     let json = serde_json::to_string(adj)?;
     let changed = conn.execute(
-        "INSERT INTO adjustments (image_id, params_json, process_version, updated_at)
-         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1)
+        "INSERT INTO adjustments (image_id, params_json, process_version, updated_at, neutral)
+         SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1)
          ON CONFLICT(image_id) DO UPDATE SET
              params_json = excluded.params_json,
              process_version = excluded.process_version,
-             updated_at = excluded.updated_at",
-        params![id, json, adj.process_version, now_ms()],
+             updated_at = excluded.updated_at,
+             neutral = excluded.neutral",
+        params![id, json, adj.process_version, now_ms(), adj.is_neutral()],
     )?;
     if changed == 0 {
         return Err(AppError::not_found(format!("image {id}")));
@@ -1052,7 +1055,7 @@ mod tests {
             exposure: 0.7,
             shadows: 35.0,
             white_balance: WhiteBalance::Custom { temperature_k: 5600.0, tint: 8.0 },
-            lut: Some(LutRef { path: "/luts/film.cube".into(), amount: 60.0 }),
+            lut: Some(LutRef { id: "film".into(), amount: 60.0 }),
             ..Default::default()
         };
         adj.hsl.saturation.orange = -20.0;
@@ -1064,6 +1067,29 @@ mod tests {
         assert_eq!(save_adjustments(&conn, id, &bad).unwrap_err().kind, ErrorKind::InvalidArgument);
         assert_eq!(get_adjustments(&conn, 9999).unwrap_err().kind, ErrorKind::NotFound);
         assert_eq!(save_adjustments(&conn, 9999, &adj).unwrap_err().kind, ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn adjustments_dirty_xmp_and_neutral_rows_are_not_edits() {
+        let mut conn = open_in_memory();
+        let dir = fixture_dir();
+        import(&mut conn, dir.path(), false);
+        let id = all_ids(&conn)[0];
+        let dirty = |conn: &Connection| -> bool {
+            conn.query_row("SELECT xmp_dirty FROM images WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+
+        let adj = ParametricAdjustments { exposure: 0.3, ..Default::default() };
+        save_adjustments(&conn, id, &adj).unwrap();
+        assert!(dirty(&conn), "insert dirties the sidecar");
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+        save_adjustments(&conn, id, &adj).unwrap();
+        assert!(!dirty(&conn), "unchanged values do not");
+
+        save_adjustments(&conn, id, &ParametricAdjustments::default()).unwrap();
+        assert!(dirty(&conn), "reset to neutral does");
+        assert!(!get_image(&conn, id).unwrap().has_edits, "neutral row is not an edit");
     }
 
     #[test]

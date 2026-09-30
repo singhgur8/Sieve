@@ -6,4 +6,5 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0002_ingest.sql"),
     include_str!("../../migrations/0003_analysis.sql"),
     include_str!("../../migrations/0004_xmp.sql"),
+    include_str!("../../migrations/0005_editor.sql"),
 ];

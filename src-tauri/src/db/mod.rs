@@ -65,4 +65,41 @@ mod tests {
         let fk: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
         assert_eq!(fk, 1);
     }
+
+    #[test]
+    fn v5_drops_path_style_lut_refs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &schema::MIGRATIONS[..4] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                 file_size, file_mtime_ms, imported_at)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 'bayer', 1, 0, 0),
+                    (2, 1, '/f/b.arw', 'b.arw', 'arw', 'sony', 'bayer', 1, 0, 0);
+             INSERT INTO adjustments (image_id, params_json, process_version, updated_at) VALUES
+                 (1, '{\"exposure\":1.0,\"lut\":{\"path\":\"/x.cube\",\"amount\":50}}', 1, 0),
+                 (2, '{\"exposure\":1.0,\"lut\":{\"id\":\"film\",\"amount\":50}}', 1, 0);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let lut = |id: i64| -> Option<String> {
+            conn.query_row(
+                "SELECT json_extract(params_json, '$.lut.id') FROM adjustments WHERE image_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(lut(1), None);
+        assert_eq!(lut(2).as_deref(), Some("film"));
+        let exposure: f64 = conn
+            .query_row("SELECT json_extract(params_json, '$.exposure') FROM adjustments WHERE image_id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(exposure, 1.0);
+    }
 }

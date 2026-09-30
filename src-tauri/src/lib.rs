@@ -1,6 +1,8 @@
 pub mod db;
+pub mod develop;
 pub mod ingest;
 pub mod ipc;
+pub mod lut;
 pub mod ml;
 pub mod raw;
 pub mod xmp;
@@ -10,6 +12,7 @@ use std::path::PathBuf;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
+use develop::{DevelopCache, DevelopConfig};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
@@ -17,6 +20,7 @@ use ipc::events::{
     XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
+use lut::LutLibrary;
 use ml::{Analysis, AnalysisConfig};
 use xmp::{XmpSync, XmpSyncConfig};
 
@@ -27,6 +31,10 @@ const CACHE_ENV: &str = "SIEVE_CACHE";
 /// Overrides the ONNX model directory (default: `src-tauri/models` in debug builds,
 /// `<resource_dir>/models` in release).
 const MODELS_ENV: &str = "SIEVE_MODELS";
+/// Overrides the LUT library directory (default `<app_data_dir>/luts`).
+const LUTS_ENV: &str = "SIEVE_LUTS";
+/// Overrides the develop cache budget in MiB (default `DevelopConfig::DEFAULT_CACHE_MB`).
+const DEVELOP_CACHE_ENV: &str = "SIEVE_DEVELOP_CACHE_MB";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -65,6 +73,23 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::read_xmp,
             commands::set_xmp_auto_sync,
             commands::get_xmp_status,
+            commands::render_preview,
+            commands::get_develop_info,
+            commands::prepare_develop,
+            commands::get_history,
+            commands::undo_adjustments,
+            commands::redo_adjustments,
+            commands::goto_history,
+            commands::paste_settings,
+            commands::sync_settings,
+            commands::reset_adjustments,
+            commands::apply_preset,
+            commands::list_presets,
+            commands::save_preset,
+            commands::delete_preset,
+            commands::list_luts,
+            commands::import_lut,
+            commands::delete_lut,
         ])
         .events(collect_events![
             ImportProgress,
@@ -95,6 +120,19 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(builder.invoke_handler())
+        // Rendered previews (`sieve://localhost/render/<id>/<slot>?v=<seq>`), served from
+        // memory off the main thread.
+        .register_asynchronous_uri_scheme_protocol(develop::RENDER_SCHEME, |ctx, request, responder| {
+            let Some(cache) = ctx.app_handle().try_state::<DevelopCache>().map(|s| s.inner().clone()) else {
+                let mut unavailable = tauri::http::Response::new(Vec::new());
+                *unavailable.status_mut() = tauri::http::StatusCode::SERVICE_UNAVAILABLE;
+                responder.respond(unavailable);
+                return;
+            };
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(develop::handle_protocol(&cache, &request));
+            });
+        })
         .setup(move |app| {
             builder.mount_events(app);
             let path = match std::env::var_os(CATALOG_ENV) {
@@ -110,6 +148,15 @@ pub fn run() {
                 None if cfg!(debug_assertions) => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/models")),
                 None => app.path().resource_dir()?.join("models"),
             };
+            let luts_dir = match std::env::var_os(LUTS_ENV) {
+                Some(p) => PathBuf::from(p),
+                None => app.path().app_data_dir()?.join("luts"),
+            };
+            std::fs::create_dir_all(&luts_dir)?;
+            let develop_cache_mb = std::env::var(DEVELOP_CACHE_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DevelopConfig::DEFAULT_CACHE_MB);
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
@@ -122,6 +169,8 @@ pub fn run() {
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path }));
+            app.manage(DevelopCache::new(DevelopConfig { cache_bytes: develop_cache_mb * 1024 * 1024 }));
+            app.manage(LutLibrary::new(luts_dir));
             // Auto tags change during analysis; flush them (if auto-sync is on) once it settles.
             let handle = app.handle().clone();
             AnalysisFinished::listen(app.handle(), move |_| handle.state::<XmpSync>().notify(&handle));

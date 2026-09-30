@@ -163,3 +163,79 @@ Who updates what
   bundle id `com.lumenraw.app` → `com.sieve.app` (app data/cache dirs move; no user catalogs existed yet);
   env vars `LUMENRAW_*` → `SIEVE_*`; XMP auto-tag keywords `LumenRAW|<tag>` → `Sieve|<tag>`.
   No IPC type/command changes. Historical entries above keep the old name.
+
+## v5 — 2026-09-29 (Phase 5: editor)
+Types
+- `LutRef` (BREAKING): `{ path, amount }` -> `{ id: LutId, amount }` (library id, `[a-z0-9-]{1,64}`,
+  `is_valid_lut_id`; validated by `ParametricAdjustments::validate`). `ParametricAdjustments` otherwise unchanged
+  (it already carried every Process 2012 slider + `lut`).
+- `ParametricAdjustments::copy_fields(src, fields)` (defines fields-mask semantics) and `is_neutral()`.
+- New `AdjustmentField` (fields mask groups): `white_balance, exposure, contrast, highlights, shadows, whites, blacks,
+  texture, clarity, dehaze, vibrance, saturation, hsl_hue, hsl_saturation, hsl_luminance, lut`.
+- New `RenderSlot` (`main | before | detail`), `RenderOptions { maxEdge 64..=8192, slot, region: NormRect | null }`,
+  `Histogram { red, green, blue, luma }` (256 bins each, of the 8-bit sRGB output),
+  `RenderedPreview { imageId, slot, seq, url, width, height, histogram, renderMs, lutMissing }`.
+- New `WhiteBalanceValues { temperatureK, tint }`, `DevelopInfo { imageId, asShot, sourceWidth, sourceHeight,
+  fullWidth, fullHeight }`.
+- New `HistoryEntry { id, label, createdAtMs }`, `AdjustmentHistory { imageId, entries, currentEntryId, canUndo,
+  canRedo }`, `EditState { adjustments, history }`.
+- New `Preset { id, name, adjustments, fields, createdAtMs, updatedAtMs }`.
+- New `LutKind` (`lut_1d | lut_3d`), `LutInfo { id, name, kind, size, path }`.
+- `RawImageEntry.hasEdits` now means "adjustments differ from neutral" (a reset image has a row but no edits).
+- `XmpSyncState.dirty` / `XmpSyncReport.changed` now also cover develop settings (crs:).
+
+Commands (changed)
+- `save_adjustments(id, adjustments, label: string) -> AdjustmentHistory` (BREAKING: new `label`, returns history).
+  Pushes a history entry; same-label saves within 1.5 s coalesce; unchanged values are a no-op. Notifies XMP auto-sync.
+- `write_xmp` / auto-sync also write `crs:` develop settings (images with an adjustments row only); `read_xmp` and
+  `import_folder` also import `crs:` settings (PV2012+) from Lightroom-edited sidecars. Mapping: `xmp/crs.rs`.
+
+Commands (new)
+- Render: `render_preview(id, adjustments, options) -> RenderedPreview | null` (null = superseded, latest-wins per
+  (id, slot)); `get_develop_info(id) -> DevelopInfo`; `prepare_develop(ids) -> null` (background decode).
+- History: `get_history(id) -> AdjustmentHistory`; `undo_adjustments(id)`, `redo_adjustments(id)`,
+  `goto_history(id, entryId)` -> `EditState`.
+- Batch (atomic, one history entry per changed image, XMP notify): `paste_settings(ids, adjustments, fields)`,
+  `sync_settings(sourceId, targetIds, fields)`, `reset_adjustments(ids)`, `apply_preset(ids, presetId)`.
+  Copy is frontend-only (keep the copied `ParametricAdjustments` + fields in UI state).
+- Presets: `list_presets() -> Preset[]`, `save_preset(id | null, name, adjustments, fields) -> Preset`,
+  `delete_preset(id)`.
+- LUTs: `list_luts() -> LutInfo[]`, `import_lut(path) -> LutInfo`, `delete_lut(id, force)` (`invalid_argument` if
+  referenced and not `force`).
+
+Events: none new (renders resolve their command; `xmpSynced.read` covers develop settings read by auto-sync).
+
+Transport
+- New custom URI scheme `sieve` (`register_asynchronous_uri_scheme_protocol`, served on the blocking pool from
+  memory): `sieve://localhost/render/<id>/<slot>?v=<seq>` (Windows: `http://sieve.localhost/...`). CSP `img-src` and
+  `connect-src` allow `sieve: http://sieve.localhost`. Use `RenderedPreview.url` as `<img src>` directly.
+
+Schema (migration `0005_editor.sql`, user_version 5)
+- `adjustments.neutral` (drives `hasEdits`), `adjustments.history_entry_id` (history cursor).
+- New tables `adjustment_history` (+ `idx_adjustment_history_image`) and `presets` (name unique, NOCASE).
+- Triggers `adjustments_xmp_insert` / `adjustments_xmp_update` set `images.xmp_dirty` + `meta_updated_at` on real
+  develop changes.
+- Data fix: path-style `lut` objects removed from stored adjustments.
+
+Config
+- `SIEVE_LUTS=/dir` (default `<app_data_dir>/luts`, created at startup); `SIEVE_DEVELOP_CACHE_MB` (default 1024).
+
+Who updates what
+- architect (done): types + tests, commands, registration, `sieve` protocol registration, managed `DevelopCache` +
+  `LutLibrary`, CSP, migration + test, `repo::save_adjustments` keeps `neutral`, `ENTRY_SELECT` `hasEdits` via
+  `neutral = 0`, `DevelopCache::ticket/is_current` (latest-wins bookkeeping), `render_url`, `ALL_ADJUSTMENT_FIELDS`
+  in `src/ipc/index.ts`.
+- rust-engine-dev: fill every `todo!()` in `src-tauri/src/develop/` (`DevelopCache::{render, info, prefetch,
+  encoded}`, `handle_protocol`, `source::decode_half_size` + LibRaw FFI additions, `pipeline::render`,
+  `wb::{multipliers_for, values_for}`, `history::*`, `presets::*`), `src-tauri/src/lut/` (`Lut::{parse, apply}`,
+  `LutLibrary::{list, import, delete, load}`, `references`), and `src-tauri/src/xmp/crs.rs` (`encode`, `decode`) +
+  wiring into `XmpSync` write/read/refresh (develop settings read through `history::commit(.., LABEL_READ_XMP)`,
+  listed in `changed`). Acceptance: cached 2048 px render < 100 ms; XMP crs round trip lossless; LUT reference values.
+- frontend-dev: editor panel (sliders -> `renderPreview` per input event with `slot: "main"`, ignore `null` results
+  and results older than the last shown `seq`; `saveAdjustments(id, adj, "<Slider name>")` on release),
+  histogram from `RenderedPreview.histogram`, before/after (`slot: "before"`, neutral or "Original" adjustments),
+  WB mode + Temp/Tint seeded from `getDevelopInfo().asShot`, history panel + Cmd+Z / Shift+Cmd+Z
+  (`undoAdjustments` / `redoAdjustments`, `gotoHistory`), copy/paste/sync with a fields dialog
+  (`ALL_ADJUSTMENT_FIELDS`), presets (`listPresets`/`savePreset`/`applyPreset`/`deletePreset`), LUT picker
+  (`listLuts`/`importLut` via the dialog plugin, amount slider). Add mock cases for the new commands in
+  `src/testing/mockBackend.ts` (render `url` can point at a Playwright-routed JPEG). `saveAdjustments` gained `label`.
