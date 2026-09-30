@@ -66,11 +66,11 @@ Conventions
 - [x] **QA gate**.
   - Acceptance: 50-file batch per format from `test-data/`; output dimensions, JPEG quality, ICC profile and metadata verified with `exiftool`; memory flat during batch.
 
-## Phase 7 — Anchor-photo scene matching
+## Phase 7 — Anchor-photo scene matching ✅
 - [x] **Contract** (architect): scenes table + `match_scene(anchor_ids, target_ids)`.
 - [x] **Matching** (vision-ml-dev): group frames by scene (time + histogram/embedding similarity); normalize histogram + white point delta from 1–2 graded anchors; apply relative adjustments.
 - [x] **UI** (frontend-dev): mark anchors, preview and apply to scene.
-- [ ] **QA gate**.
+- [x] **QA gate**.
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
 ## Phase 7b — Real-world parity (user request 2026-09-29)
@@ -162,3 +162,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 6 Contract: IPC v6 (ExportSettings/ExportPreset + built-ins, capabilities, plan_export, export_images/cancel/jobs, exportProgress/exportFinished, memory-budgeted job runner), migration 0006. Gate: 133 tests, clippy, fmt, build, UI 38/38.
 - 2026-09-29 — Phase 6 complete: full-res LibRaw decode (AHD / X-Trans 3-pass), shared develop pipeline (preview == export, Lanczos-3), output sharpening, sRGB/P3/AdobeRGB with generated ICC, JPEG/TIFF16/PNG/WebP/HEIC encoders, whitelisted metadata, naming templates, memory-budgeted job runner. QA: 157 tests + 10 ignored real-sample tests; 6 formats x 50 files, 0 failures; exiftool: dims, JPEG q90/q80, ICC, 16-bit TIFF, orientation 1, metadata per option, no crs:/Sieve| leakage; peak footprint 899 MiB; app migrates to v6.
 - 2026-09-29 — Phase 7b slider responsiveness: one render in flight per slot + draft (≤1024 px) while dragging, full on release/idle; Playwright: 24–25 intermediate renders shown during a 1 s drag with 40 ms renders (0 before fix). UX review 1 P0/P1 implemented (69/69 Playwright; Library chrome 108/140 px, Develop viewer 571 px at 1280×800). Real-backend slider feel still to confirm in the app.
+- 2026-09-29 — Phase 7 complete: scene features/detection (time gaps + histogram similarity, bursts never split), render-space ImageStats, Broyden solver for exposure/temp/tint (+tone) with safety caps, time-weighted 2-anchor blending, scene UI (strip, anchors, Match panel with local strength lerp, apply + undo). QA: 189 tests + 10 ignored; scene_eval 142/146 targets (97.3%) within 0.15 EV / 0.012 ab, all 4 misses flagged (dark LED scene, blown close-up); 48 scenes over 396 frames; 7 ms/target warm; app migrates to v8. Also merged here: IPC v8 UX additions + UX review 1 implementation (Playwright 69/69).

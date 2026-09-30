@@ -54,7 +54,7 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 - [x] Phase 4: Virtualized Photo Grid + Tag Filter + Loupe Zoom View
 - [x] Phase 5: Parametric Slider Engine, .CUBE LUT Parser & XMP Exporter
 - [x] Phase 6: Full RAW internal demosaic & JPEG export engine
-- [ ] Phase 7: Anchor-photo scene matching (One-Shot relative grading)
+- [x] Phase 7: Anchor-photo scene matching (One-Shot relative grading)
 
 ## Development
 - Toolchain: Rust stable (rustup; `~/.cargo/bin` may need adding to PATH), Node 24, pnpm (via corepack),
