@@ -9,6 +9,10 @@ scripts/fetch-models.sh --force  # re-download everything
 
 The script exits non-zero (and deletes the partial download) on any checksum mismatch.
 
+The table below covers the culling models. The AI-mask models (`birefnet_lite.onnx`, `skyseg.onnx`,
+`yolox_m.onnx`, `efficientsam_ti_*.onnx`, `selfie_multiclass_256x256.onnx`; all MIT / Apache-2.0) are
+documented in "Segmentation models" at the end of this file.
+
 | File | Purpose | Size | SHA-256 |
 |---|---|---|---|
 | `det_10g.onnx` | SCRFD-10GF face detector with 5-point keypoints (insightface `buffalo_l`) | 16,923,827 B | `5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91` |
@@ -199,3 +203,121 @@ dimension when building the session. Both H and W share the name `"?"`, so one o
 
 CoreML outputs matched CPU to <1e-4 at all tested sizes. Recommended: MLProgram model format,
 detector at 640 (4.4 ms) for small faces in wide wedding shots, CPU EP as fallback.
+
+---
+
+# Segmentation models (AI masks, Phase 7c prep)
+
+Prototype: `src-tauri/src/ml/segment.rs` (`Segmenter`: `subject`, `sky`, `people(img, with_parts)`), evaluated
+by `cargo run --release --example segment_eval` (16 previews from the sample shoots, overlays in
+`test-data/segment-check/`). No IPC yet. All models are fetched by `scripts/fetch-models.sh` (pinned revisions,
+SHA-256 in `checksums.sha256`); about 560 MB in total.
+
+| Mask | File | Model, license | Size | Input | EP | ms (M3 Max, 2048 px preview) |
+|---|---|---|---|---|---|---|
+| Subject / Background | `birefnet_lite.onnx` | BiRefNet_lite (Swin-T), **MIT** (onnx-community export) | 224 MB | `input_image` `[1,3,1024,1024]` | CPU (CoreML fails to compile) | 2,840 infer + 110 refine = **2,950** |
+| Sky | `skyseg.onnx` | U2-Net sky segmentation (xiongzhu666), **MIT** | 176 MB | `input.1` `[1,3,320,320]` | CPU (CoreML runs but is slower: 218 vs 188 ms) | 200 infer + 120 refine = **320** |
+| Person boxes | `yolox_m.onnx` | YOLOX-m COCO (Megvii official release), **Apache-2.0** | 101 MB | `images` `[1,3,640,640]` | **CoreML** (model 9.5 ms; CPU 117) | 26 (CPU 127) |
+| Person instances | `efficientsam_ti_encoder.onnx`, `efficientsam_ti_decoder.onnx` | EfficientSAM-Ti (official HF repo), **Apache-2.0** | 25 + 17 MB | encoder `[1,3,1024,1024]`; decoder prompts | encoder **CoreML** (CPU 377), decoder CPU | encode 108 + decode ~30 for all people |
+| Hair / face skin / body skin / clothes | `selfie_multiclass_256x256.onnx` | MediaPipe selfie multiclass, **Apache-2.0** (Google weights; ONNX conversion by senty-au, outputs identical to our own tf2onnx conversion of the TFLite file) | 16 MB | `input_29` `[1,256,256,3]` NHWC | CPU (CoreML: MLProgram parse error) | ~20 per crop; all parts incl. refinement ~750 |
+| Eyes (sclera) / iris / brows / lips / teeth | existing `face_landmarks_detector_1x3x256x256.onnx` + `det_10g.onnx` | MediaPipe FaceMesh V2 (Apache-2.0) polygons; SCRFD faces (insightface, **non-commercial**, already used by culling) | – | – | FaceMesh CPU, SCRFD CoreML | ~16 face detection (2 scales) + a few ms per face |
+
+Per 2048 px image (CoreML where supported, medians over 15 images after warm-up): **subject 2.95 s, sky 0.32 s,
+people with all parts 1.08 s** (0.6–2.2 s depending on the number of people; parts are ~70% of it). CPU only:
+subject 2.91 s, sky 0.31 s, people 1.43 s. First use: BiRefNet load 1.0 s; SAM encoder CoreML session 2–9 s even
+with `coreml_cache` set (the ORT CoreML cache directory is written, but the first session still takes seconds).
+Masks are meant to be computed on demand or in the background and cached per image, never per slider frame.
+Cheap speed-ups not done yet: share the guide statistics across the four part masks of a person (the guided
+filter recomputes them per part), and run parts only when a part mask is requested.
+
+## Refinement (all masks)
+
+Network outputs are low resolution (256–1024 px). `segment.rs` upsamples every mask with a **fast colour guided
+filter** (He et al.): coefficients `a` (3) / `b` are solved at <= 1024 px over the mask's ROI and applied with the
+full-resolution RGB as guide, then an S-curve (`gamma`) counters the filter's softening. Radius / eps per kind
+(radius as a fraction of the working long edge): subject 0.4% / 1e-4 (BiRefNet is already sharp), sky 1.2% / 1e-4,
+person 0.6% / 1e-4, parts 0.8% / 5e-4. Masks are `Mask { x0, y0, width, height, data: Vec<f32> }` ROIs in image
+pixels, so per-person part masks cost only their bounding box. For resolution-independent storage the natural
+unit is the low-res network output plus ROI, refined against whatever resolution is being rendered.
+
+## Preprocessing / decoding
+
+- **BiRefNet_lite**: stretch to 1024x1024, RGB `/255`, ImageNet mean/std, NCHW. Output `output_image`
+  `[1,1,1024,1024]` = logits (about -27..15) -> sigmoid.
+- **skyseg**: stretch to 320x320, RGB `/255`, ImageNet mean/std. 7 outputs (U2-Net side outputs); output 0 is the
+  fused map, already a sigmoid. The upstream demo min-max normalises per image; we do not, so frames without sky
+  stay at 0 (max 0.0007–0.05 on our indoor / close-up frames).
+- **YOLOX-m**: letterbox top-left into 640x640 filled with 114, **BGR**, raw 0..255. Output `[1,8400,85]`: per
+  anchor over strides 8/16/32 (row-major grids) `cx = (o0 + gx) * s`, `cy = (o1 + gy) * s`, `w = exp(o2) * s`,
+  `h = exp(o3) * s`, score = `o4 * o5` (class 0 = person; sigmoids are in the graph). Score >= 0.35, NMS 0.5.
+- **EfficientSAM-Ti**: encoder input RGB in [0,1] (normalisation is inside the graph); we stretch to 1024x1024 so
+  CoreML gets static shapes (free dims `batch` / `height` / `width` pinned). Output `image_embeddings`
+  `[1,256,64,64]`. Decoder inputs, in this order: `image_embeddings`, `batched_point_coords` `[1,1,N,2]`,
+  `batched_point_labels` `[1,1,N]` (1 positive, 0 negative, 2 / 3 box top-left / bottom-right), `orig_im_size`
+  int64 `[h, w]`. Point coordinates are in the `orig_im_size` frame (the decoder rescales them by `1024 / size`) and
+  masks come out at that size: `output_masks` `[1,1,3,h,w]` logits, `iou_predictions` `[1,1,3]` (take the best).
+- **Selfie multiclass**: stretch the crop to 256x256, NHWC RGB in [0,1]. Output `Identity` `[1,256,256,6]` logits
+  (apply softmax): 0 background, 1 hair, 2 body skin, 3 face skin, 4 clothes, 5 others (accessories).
+- **FaceMesh** contours (MediaPipe `face_mesh_connections`): lips outer / inner rings, eye rings (33.. / 263..),
+  brows (70,63,105,66,107 + 55,65,52,53,46 and the mirrored 300..276), iris centre 468 / 473 + 4 ring points each.
+
+## People pipeline
+
+1. YOLOX person boxes + SCRFD faces (two scales: at 640 SCRFD misses faces that fill most of the frame).
+2. Faces matched to boxes greedily by distance to the expected head position, so a partner's box that also
+   contains the face does not steal it; unmatched faces seed a synthetic box.
+3. EfficientSAM per person: box prompt + own face centre (positive) + other people's face centres inside the box
+   (negative). Pixels claimed by several instances go to the **smaller** mask (a box around an embrace otherwise
+   swallows the partner; the smaller one is usually also in front). Slivers (< 12% of their box) are dropped.
+4. Parts: selfie multiclass over near-square, 25%-overlapping tiles of each person (the model expects selfie
+   framing; a stretched full-body crop comes back mostly as background) plus a head crop with 4x weight. Face skin
+   further than ~1 face size from the face becomes body skin (arms were read as faces); accessories and
+   unclassified pixels inside the person count as clothes. Features from FaceMesh polygons: sclera = eye opening
+   minus iris disc, lips = outer minus inner ring, teeth = inner-mouth pixels that are bright and unsaturated;
+   face skin excludes all features.
+
+## Quality on the samples (overlays viewed)
+
+- **Subject** (BiRefNet_lite): best candidate. Clean hair edges on the bride's updo (MON04829) and on loose hair
+  (AZA06603; DSCF5929 at night against fairy lights), whole groups (6 on stage in MON05151, 5 dancers in
+  MON05322), white dresses kept. It selects the *salient* subject: blurred foreground shoulders are excluded, as in
+  Lightroom; in wide landscapes with small people it returns just the people (2–3% of the frame).
+- **Sky**: good on clear / dusk skies with bridge towers, lamp posts and palm fronds (IMG_5595, AZA06579);
+  suspension cables are partially included; blurred building edges are slightly stepped (320 px model); near a hazy
+  horizon the mask fades to partial. ~0 on indoor, close-up and night frames (the small real sky patch in DSCF5929
+  is found).
+- **People instances**: separates all 6 in the stage group, the dancers, both women in MON04849, and couples in
+  embraces (IMG_5697 including her hand on his cheek; DSCF5929 her hand on his chest). Errors: an arm across the
+  partner can go to the partner (AZA06693 pointing arm, parts of the forearm in IMG_5697), a person-shaped picture
+  on the wall is detected as a person (MON04849), and extreme close-ups rely on YOLOX alone because SCRFD misses
+  the faces (AZA06793, no feature masks there).
+- **Parts**: face skin, hair, clothes, lips, brows, eyes and teeth look right on frontal and 3/4 faces. Gaps vs
+  Lightroom: beards are classified as face skin, turbans are hair or clothes depending on the crop, profile faces
+  get partial face skin, feature polygons need FaceMesh (faces >= 40 px), and internal part boundaries are soft
+  (256 px model).
+
+## Candidates rejected
+
+| Candidate | Why |
+|---|---|
+| RMBG-1.4 / RMBG-2.0 (BRIA) | Non-commercial license; not tested |
+| BEN2 Base (MIT) | Hair quality close to BiRefNet, but **missed a whole person** (white-shirt dancer, MON05322); CoreML 1.36 s after a 2 min first compile |
+| IS-Net / DIS general-use (Apache-2.0) | Drops white wedding dresses (semi-transparent); CoreML build fails; 585 ms CPU |
+| MODNet (Apache-2.0) | Portrait-only, visible halos around hair, no CoreML; 100 ms (possible fast fallback) |
+| U2-Net (Apache-2.0) | Predecessor of IS-Net; not better |
+| BiRefNet_lite fp16 | Slower on CPU (3.6 s) |
+| BiRefNet_lite on CoreML | "Required param 'pad' is missing" (Conv nodes without `pads`); with `pads` patched into the graph: 2.36 s vs 2.85 s CPU, 82 s compile; not worth shipping a patched model |
+| SegFormer ADE20K (sky class) | NVIDIA source code license, non-commercial |
+| Mask2Former ADE20K (Meta HF) | Weights license "other"; heavy export |
+| MaskRCNN-12 (ONNX zoo, Apache) | 28x28 masks; missed the partner in close-ups (DSCF5929, IMG_5697); 0.6–3 s CPU |
+| torchvision Mask R-CNN v2 (ONNX zoo, opset 18) | Exported with a fixed 224x224 input; mask pasting baked for that size |
+| YOLOv8 / YOLO11-seg | AGPL-3.0 |
+| BiSeNet face parsing (zllrunning, yakhyo), jonathandinu/face-parsing (SegFormer-B5) | Code MIT, but trained on CelebAMask-HQ (non-commercial research dataset); the SegFormer one also carries NVIDIA's backbone license |
+
+License notes: BiRefNet, skyseg, EfficientSAM, YOLOX and MediaPipe weights are published under the licenses above by
+their authors (GitHub repository licenses checked via the API: ZhengPeng7/BiRefNet MIT,
+xiongzhu666/Sky-Segmentation-and-Post-processing MIT, yformer/EfficientSAM Apache-2.0, Megvii YOLOX Apache-2.0,
+google-ai-edge/mediapipe Apache-2.0; HF model cards agree). They were trained on public datasets (DIS5K etc.,
+COCO, SA-1B, Google's own data) whose terms were not audited beyond that. Re-check Google's selfie-multiclass model
+card before commercial distribution. The SCRFD face detector reused here is the insightface **non-commercial**
+model (see above) and would need replacing (e.g. the MediaPipe face detector, Apache-2.0) for commercial use.

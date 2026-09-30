@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download the ONNX models used by the culling engine into src-tauri/models/.
+# Download the ONNX models used by the culling engine and AI masks into src-tauri/models/.
 #
 # Idempotent: files already present with the expected SHA-256 are skipped.
 # Every file is verified against src-tauri/models/checksums.sha256; a mismatch
@@ -7,7 +7,7 @@
 #
 # Usage: scripts/fetch-models.sh [--force]
 #
-# Licenses: the insightface model zoo weights are released for NON-COMMERCIAL
+# Licenses: the insightface model zoo weights (det_10g, 2d106det) are released for NON-COMMERCIAL
 # research use only (see src-tauri/models/README.md and docs/decisions.md).
 set -euo pipefail
 
@@ -30,12 +30,33 @@ OMZ_EYE="https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/
 # (shipped only inside an 18 MB tarball; the extracted file is checksum-verified).
 PINTO_MESH="https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz"
 
+# --- Segmentation / AI masks (Phase 7c; all permissively licensed, see models/README.md) ---
+# Pinned HuggingFace revisions; the YOLOX file is an immutable GitHub release asset.
+HF="https://huggingface.co"
+# BiRefNet_lite (MIT), onnx-community export: Select Subject / Background, 1024x1024.
+SEG_SUBJECT="$HF/onnx-community/BiRefNet_lite-ONNX/resolve/de15b22ba131738a16dff04aab8bdf8dc32e3ac1/onnx/model.onnx"
+# Sky segmentation (MIT, xiongzhu666/Sky-Segmentation-and-Post-processing), U2-Net 320x320.
+SEG_SKY="$HF/JianyuanWang/skyseg/resolve/3ba8c6df1d9ba9ff26f637c7ba9568ac11a9aa7f/skyseg.onnx"
+# YOLOX-m COCO detector (Apache-2.0, Megvii official release): person boxes.
+SEG_PERSON="https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_m.onnx"
+# EfficientSAM-Ti (Apache-2.0, official HF repo): per-person instance masks from box prompts.
+SEG_SAM="$HF/yunyangx/EfficientSAM/resolve/1cf49585c39567bfc49e991ab8eb31f491ad4877"
+# MediaPipe selfie multiclass 256x256 (Apache-2.0, Google), ONNX conversion of the unchanged
+# TFLite weights (verified identical to a local tf2onnx conversion): hair / face skin / body skin / clothes.
+SEG_PARTS="$HF/senty-au/selfie_multiclass_256x256-ONNX/resolve/6db8421a7150ac20558f2c24675078eb3a1a04d0/onnx/model.onnx"
+
 # name|url[|member inside a .tar.gz at url]
 MODELS=(
   "det_10g.onnx|$HF_REPO/$HF_REV/models/buffalo_l/det_10g.onnx"
   "2d106det.onnx|$HF_REPO/$HF_REV/models/buffalo_l/2d106det.onnx"
   "open_closed_eye.onnx|$OMZ_EYE"
   "face_landmarks_detector_1x3x256x256.onnx|$PINTO_MESH|face_landmarks_detector_1x3x256x256.onnx"
+  "birefnet_lite.onnx|$SEG_SUBJECT"
+  "skyseg.onnx|$SEG_SKY"
+  "yolox_m.onnx|$SEG_PERSON"
+  "efficientsam_ti_encoder.onnx|$SEG_SAM/efficientsam_ti_encoder.onnx"
+  "efficientsam_ti_decoder.onnx|$SEG_SAM/efficientsam_ti_decoder.onnx"
+  "selfie_multiclass_256x256.onnx|$SEG_PARTS"
 )
 
 die() { echo "fetch-models: ERROR: $*" >&2; exit 1; }
