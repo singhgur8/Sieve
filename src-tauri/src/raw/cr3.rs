@@ -151,6 +151,24 @@ pub fn parse(src: &(impl ByteSource + ?Sized)) -> Result<Container, String> {
     Ok(Container { meta, jpegs })
 }
 
+/// EXIF directories for export: CMT1 = IFD0, CMT2 = EXIF, CMT4 = GPS (each box is a
+/// standalone TIFF whose IFD0 holds that directory).
+pub fn exif_dirs(src: &(impl ByteSource + ?Sized)) -> Result<tiff::ExifDirs, String> {
+    let top = children(src, 0, src.len());
+    let moov = find(&top, b"moov").ok_or("CR3 has no moov box")?;
+    let moov_children = children(src, moov.start, moov.end);
+    let canon = find_uuid(&moov_children, &CANON_UUID).ok_or("CR3 has no Canon metadata box")?;
+    let canon_children = children(src, canon.start, canon.end);
+    let dir = |name: &[u8; 4]| -> Vec<tiff::RawTag> {
+        find(&canon_children, name)
+            .filter(|b| b.end - b.start <= MAX_CMT)
+            .and_then(|b| src.read_vec(b.start, (b.end - b.start) as usize).ok())
+            .and_then(|bytes| tiff::Tiff::new(bytes.as_slice()).and_then(|t| t.ifd0_tags()).ok())
+            .unwrap_or_default()
+    };
+    Ok(tiff::ExifDirs { ifd0: dir(b"CMT1"), exif: dir(b"CMT2"), gps: dir(b"CMT4") })
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;

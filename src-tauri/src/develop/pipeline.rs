@@ -18,9 +18,11 @@
 //!    (so Lightroom's band centres apply): chroma scaling around luminance, hue rotation
 //!    around the grey axis, band luminance as a saturation-weighted exposure.
 //! 5. Base tone curve (filmic Hill curve: toe + shoulder, white at +2.25 EV over the raw
-//!    clip at 0 EV) per channel -> Rec.2020 -> sRGB, out-of-gamut colours desaturated
-//!    towards their luminance, sRGB encode (table).
-//! 6. `.cube` LUT on the encoded values (amount blend) -> 8-bit, histogram.
+//!    clip at 0 EV) per channel. Stages 1-5 are [`Stages`], shared by preview and export.
+//! 6. Output: preview ([`render`]) = Rec.2020 -> sRGB, out-of-gamut colours desaturated
+//!    towards their luminance, sRGB encode (table), `.cube` LUT on the encoded values
+//!    (amount blend) -> 8-bit, histogram. Export ([`render_output`]) = the same into any
+//!    [`OutputSpace`] at 16 bits (LUTs still run on sRGB-encoded values).
 //!
 //! Blurs run on a block-averaged grid (2x2 at preview sizes, coarser for big radii) with
 //! three box passes (~gaussian) and bilinear upsampling, so their cost does not grow with
@@ -497,32 +499,150 @@ fn base_grids(input: &RenderInput, k: &Consts, f: usize, dark: bool) -> (Grid, O
     (lum, dk)
 }
 
-/// Renders `input` with `adjustments`; `lut` is the resolved `adjustments.lut` (if present
-/// in the library).
-pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Option<&Lut>) -> RenderedImage {
-    let st = statics();
-    let k = Consts::new(adjustments, input.color, st);
-    let (w, h) = (input.width as usize, input.height as usize);
-    let edge = input.frame_long_edge.max(1.0);
+/// Stages 1-5 of the pipeline for one input: per-render constants plus the blurred fields
+/// of the local operators. Shared by the preview ([`render`], 8-bit sRGB + histogram) and
+/// the export ([`render_output`], 16-bit in any [`OutputSpace`]), so both produce the same
+/// display-referred working image; only the output encoding differs.
+pub struct Stages<'a> {
+    width: usize,
+    pixels: &'a [u16],
+    k: Consts,
+    mask: Option<Field>,
+    tex: Option<Field>,
+    haze: Option<Field>,
+    tone_any: bool,
+    color_any: bool,
+    st: &'static Statics,
+}
 
-    let need_mask = k.tone_local.is_some() || k.clarity != 0.0;
-    let need_tex = k.texture != 0.0;
-    let need_haze = k.dehaze > 0.0;
-    let f0 = if w.min(h) >= 256 { 2 } else { 1 };
-    let (mask, tex, haze) = if need_mask || need_tex || need_haze {
-        let (lum, dark) = base_grids(input, &k, f0, need_haze);
-        let mask = need_mask.then(|| lum.blurred(SIGMA_MASK * edge));
-        let tex = need_tex.then(|| lum.blurred(SIGMA_TEXTURE * edge));
-        let haze = dark.map(|d| d.blurred(SIGMA_HAZE * edge));
-        (mask, tex, haze)
+impl<'a> Stages<'a> {
+    /// Builds the constants and blurs (the only non-per-pixel work of a render).
+    pub fn new(input: &RenderInput<'a>, adjustments: &ParametricAdjustments) -> Self {
+        let st = statics();
+        let k = Consts::new(adjustments, input.color, st);
+        let (w, h) = (input.width as usize, input.height as usize);
+        let edge = input.frame_long_edge.max(1.0);
+
+        let need_mask = k.tone_local.is_some() || k.clarity != 0.0;
+        let need_tex = k.texture != 0.0;
+        let need_haze = k.dehaze > 0.0;
+        let f0 = if w.min(h) >= 256 { 2 } else { 1 };
+        let (mask, tex, haze) = if need_mask || need_tex || need_haze {
+            let (lum, dark) = base_grids(input, &k, f0, need_haze);
+            let mask = need_mask.then(|| lum.blurred(SIGMA_MASK * edge));
+            let tex = need_tex.then(|| lum.blurred(SIGMA_TEXTURE * edge));
+            let haze = dark.map(|d| d.blurred(SIGMA_HAZE * edge));
+            (mask, tex, haze)
+        } else {
+            (None, None, None)
+        };
+
+        let tone_any = k.tone_local.is_some() || k.tone_global.is_some() || need_mask || need_tex || k.contrast != 1.0;
+        let color_any = k.saturation != 1.0 || k.vibrance != 0.0 || k.hsl.is_some() || k.dehaze > 0.0;
+        Stages { width: w, pixels: input.pixels, k, mask, tex, haze, tone_any, color_any, st }
+    }
+
+    /// Camera RGB row `y` of the input.
+    #[inline]
+    fn row(&self, y: usize) -> &'a [u16] {
+        &self.pixels[y * self.width * 3..(y + 1) * self.width * 3]
+    }
+
+    /// LUT blend factor 0..=1 (0 = no LUT).
+    fn lut_amount(&self) -> f32 {
+        (self.k.lut_amount / 100.0).clamp(0.0, 1.0)
+    }
+
+    /// Stages 1-5 for pixel (x, y) with camera RGB `p`: display-referred linear Rec.2020
+    /// after the base curve (0..=1 per channel).
+    #[inline(always)]
+    fn display_linear(&self, x: usize, y: usize, p: &[u16]) -> [f32; 3] {
+        let k = &self.k;
+        let st = self.st;
+        let mut v = k.linear(p);
+
+        if self.tone_any {
+            let yl = dot(LUMA_2020, v).max(1e-6);
+            let ev = yl.log2() - LOG2_GREY;
+            let mut delta = 0.0f32;
+            if let Some(mask) = &self.mask {
+                let evb = mask.sample(x, y) - LOG2_GREY;
+                if let Some(t) = &k.tone_local {
+                    delta += t.eval(evb * 0.7 + ev * 0.3);
+                }
+                if k.clarity != 0.0 {
+                    let mid = 1.0 / (1.0 + (ev * (1.0 / 3.0)) * (ev * (1.0 / 3.0)));
+                    delta += k.clarity * (ev - evb) * mid;
+                }
+            }
+            if let Some(tex) = &self.tex {
+                delta += k.texture * (ev - (tex.sample(x, y) - LOG2_GREY));
+            }
+            if let Some(t) = &k.tone_global {
+                delta += t.eval(ev);
+            }
+            let ev2 = (ev + delta) * k.contrast;
+            let gain = (ev2 - ev).clamp(-12.0, 12.0).exp2();
+            v = [v[0] * gain, v[1] * gain, v[2] * gain];
+        }
+
+        if let Some(haze) = &self.haze {
+            // Remove the locally estimated veil (scene white ~1).
+            let veil = (haze.sample(x, y).max(0.0) * k.dehaze * 0.9).min(0.9);
+            let t = 1.0 - veil;
+            v = [(v[0] - veil).max(0.0) / t, (v[1] - veil).max(0.0) / t, (v[2] - veil).max(0.0) / t];
+        } else if k.dehaze < 0.0 {
+            // Add a uniform light-grey veil.
+            let a = -k.dehaze * 0.6;
+            let fog = 0.35;
+            v = [v[0] + (fog - v[0]) * a, v[1] + (fog - v[1]) * a, v[2] + (fog - v[2]) * a];
+        }
+
+        if self.color_any {
+            v = color_ops(v, k, st);
+        }
+
+        // Base curve per channel.
+        [st.curve.eval(v[0]), st.curve.eval(v[1]), st.curve.eval(v[2])]
+    }
+}
+
+/// Out-of-gamut (negative) components desaturated towards the luminance `luma . s`.
+#[inline(always)]
+fn gamut_map(s: [f32; 3], luma: [f32; 3]) -> [f32; 3] {
+    let mn = s[0].min(s[1]).min(s[2]);
+    if mn < 0.0 {
+        let ys = dot(luma, s).max(0.0);
+        let t = ys / (ys - mn);
+        [ys + (s[0] - ys) * t, ys + (s[1] - ys) * t, ys + (s[2] - ys) * t]
     } else {
-        (None, None, None)
-    };
+        s
+    }
+}
 
-    let tone_any = k.tone_local.is_some() || k.tone_global.is_some() || need_mask || need_tex || k.contrast != 1.0;
-    let color_any = k.saturation != 1.0 || k.vibrance != 0.0 || k.hsl.is_some() || k.dehaze > 0.0;
-    let to_srgb = st.rec2020_to_srgb;
-    let lut = lut.filter(|_| k.lut_amount > 0.0);
+/// Display-linear Rec.2020 -> gamut-mapped, encoded sRGB (the preview's output stage).
+#[inline(always)]
+fn encode_srgb(d: [f32; 3], st: &Statics, table: &SqrtTable) -> [f32; 3] {
+    let s = gamut_map(mat3(&st.rec2020_to_srgb, d), LUMA_709);
+    [table.eval(s[0]), table.eval(s[1]), table.eval(s[2])]
+}
+
+/// Blends the LUT result of `e` by `a`.
+#[inline(always)]
+fn apply_lut(e: [f32; 3], lut: &Lut, a: f32) -> [f32; 3] {
+    let m = lut.eval(e, Interpolation::Tetrahedral);
+    [e[0] + (m[0] - e[0]) * a, e[1] + (m[1] - e[1]) * a, e[2] + (m[2] - e[2]) * a]
+}
+
+/// Renders `input` with `adjustments` for the preview (8-bit sRGB + histogram); `lut` is the
+/// resolved `adjustments.lut` (if present in the library).
+pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Option<&Lut>) -> RenderedImage {
+    let stages = Stages::new(input, adjustments);
+    let st = stages.st;
+    let w = input.width as usize;
+    let h = input.height as usize;
+    let a = stages.lut_amount();
+    let lut = lut.filter(|_| a > 0.0);
 
     const BAND: usize = 8;
     let mut rgb = vec![0u8; w * h * 3];
@@ -533,65 +653,12 @@ pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Opt
             let mut hist = [[0u32; 256]; 4];
             for (ry, out_row) in out.chunks_mut(w * 3).enumerate() {
                 let y = band * BAND + ry;
-                let in_row = &input.pixels[y * w * 3..(y + 1) * w * 3];
+                let in_row = stages.row(y);
                 for x in 0..w {
-                    let mut v = k.linear(&in_row[x * 3..x * 3 + 3]);
-
-                    if tone_any {
-                        let yl = dot(LUMA_2020, v).max(1e-6);
-                        let ev = yl.log2() - LOG2_GREY;
-                        let mut delta = 0.0f32;
-                        if let Some(mask) = &mask {
-                            let evb = mask.sample(x, y) - LOG2_GREY;
-                            if let Some(t) = &k.tone_local {
-                                delta += t.eval(evb * 0.7 + ev * 0.3);
-                            }
-                            if k.clarity != 0.0 {
-                                let mid = 1.0 / (1.0 + (ev * (1.0 / 3.0)) * (ev * (1.0 / 3.0)));
-                                delta += k.clarity * (ev - evb) * mid;
-                            }
-                        }
-                        if let Some(tex) = &tex {
-                            delta += k.texture * (ev - (tex.sample(x, y) - LOG2_GREY));
-                        }
-                        if let Some(t) = &k.tone_global {
-                            delta += t.eval(ev);
-                        }
-                        let ev2 = (ev + delta) * k.contrast;
-                        let gain = (ev2 - ev).clamp(-12.0, 12.0).exp2();
-                        v = [v[0] * gain, v[1] * gain, v[2] * gain];
-                    }
-
-                    if let Some(haze) = &haze {
-                        // Remove the locally estimated veil (scene white ~1).
-                        let veil = (haze.sample(x, y).max(0.0) * k.dehaze * 0.9).min(0.9);
-                        let t = 1.0 - veil;
-                        v = [(v[0] - veil).max(0.0) / t, (v[1] - veil).max(0.0) / t, (v[2] - veil).max(0.0) / t];
-                    } else if k.dehaze < 0.0 {
-                        // Add a uniform light-grey veil.
-                        let a = -k.dehaze * 0.6;
-                        let fog = 0.35;
-                        v = [v[0] + (fog - v[0]) * a, v[1] + (fog - v[1]) * a, v[2] + (fog - v[2]) * a];
-                    }
-
-                    if color_any {
-                        v = color_ops(v, &k, st);
-                    }
-
-                    // Base curve per channel, then Rec.2020 -> sRGB with gamut mapping.
-                    let d = [st.curve.eval(v[0]), st.curve.eval(v[1]), st.curve.eval(v[2])];
-                    let mut s = mat3(&to_srgb, d);
-                    let mn = s[0].min(s[1]).min(s[2]);
-                    if mn < 0.0 {
-                        let ys = dot(LUMA_709, s).max(0.0);
-                        let t = ys / (ys - mn);
-                        s = [ys + (s[0] - ys) * t, ys + (s[1] - ys) * t, ys + (s[2] - ys) * t];
-                    }
-                    let mut e = [st.encode.eval(s[0]), st.encode.eval(s[1]), st.encode.eval(s[2])];
+                    let d = stages.display_linear(x, y, &in_row[x * 3..x * 3 + 3]);
+                    let mut e = encode_srgb(d, st, &st.encode);
                     if let Some(lut) = lut {
-                        let m = lut.eval(e, Interpolation::Tetrahedral);
-                        let a = (k.lut_amount / 100.0).min(1.0);
-                        e = [e[0] + (m[0] - e[0]) * a, e[1] + (m[1] - e[1]) * a, e[2] + (m[2] - e[2]) * a];
+                        e = apply_lut(e, lut, a);
                     }
                     let q = e.map(|c| (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
                     out_row[x * 3..x * 3 + 3].copy_from_slice(&q);
@@ -620,6 +687,148 @@ pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Opt
         );
     let [red, green, blue, luma] = hist.map(|h| h.to_vec());
     RenderedImage { width: input.width, height: input.height, rgb, histogram: Histogram { red, green, blue, luma } }
+}
+
+/// Transfer curve (linear -> encoded) of an output colour space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Transfer {
+    /// IEC 61966-2-1 (sRGB, Display P3).
+    Srgb,
+    /// Pure power law with this gamma (Adobe RGB (1998): 563/256).
+    Gamma(f32),
+}
+
+impl Transfer {
+    pub fn encode(self, v: f32) -> f32 {
+        let v = v.clamp(0.0, 1.0);
+        match self {
+            Transfer::Srgb => srgb_encode(v),
+            Transfer::Gamma(g) => v.powf(1.0 / g),
+        }
+    }
+
+    pub fn decode(self, e: f32) -> f32 {
+        let e = e.clamp(0.0, 1.0);
+        match self {
+            Transfer::Srgb => {
+                if e <= 0.040_45 {
+                    e / 12.92
+                } else {
+                    ((e + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            Transfer::Gamma(g) => e.powf(g),
+        }
+    }
+}
+
+/// An RGB output colour space (D65 white) for [`render_output`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSpace {
+    /// Linear Rec.2020 -> linear target RGB.
+    pub from_rec2020: [[f64; 3]; 3],
+    /// Target RGB -> XYZ (D65), the ICC colorants before chromatic adaptation.
+    pub to_xyz: [[f64; 3]; 3],
+    pub transfer: Transfer,
+    /// The target is sRGB (a LUT's sRGB output is used as is).
+    pub is_srgb: bool,
+}
+
+/// D65 white point (xy, as used by sRGB / Display P3 / Adobe RGB / Rec.2020).
+pub const D65_XY: [f64; 2] = [0.3127, 0.3290];
+
+/// RGB -> XYZ matrix for `primaries` (xy of R, G, B) and `white` (xy), Y of white = 1.
+pub fn rgb_to_xyz(primaries: [[f64; 2]; 3], white: [f64; 2]) -> [[f64; 3]; 3] {
+    let xyz = |p: [f64; 2]| [p[0] / p[1], 1.0, (1.0 - p[0] - p[1]) / p[1]];
+    let (r, g, b) = (xyz(primaries[0]), xyz(primaries[1]), xyz(primaries[2]));
+    let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let wv = xyz(white);
+    let inv = wb::invert3(&m).expect("primaries are independent");
+    let s: Vec<f64> = (0..3).map(|i| (0..3).map(|j| inv[i][j] * wv[j]).sum()).collect();
+    let mut out = m;
+    for row in out.iter_mut() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v *= s[j];
+        }
+    }
+    out
+}
+
+impl OutputSpace {
+    /// sRGB: the preview's own matrices (so an sRGB export matches the preview exactly).
+    pub fn srgb() -> Self {
+        let (_, rec2020_to_srgb) = gamut_matrices();
+        OutputSpace { from_rec2020: rec2020_to_srgb, to_xyz: XYZ_FROM_SRGB, transfer: Transfer::Srgb, is_srgb: true }
+    }
+
+    /// Any D65 RGB space from its primaries.
+    pub fn from_primaries(primaries: [[f64; 2]; 3], transfer: Transfer) -> Self {
+        let to_xyz = rgb_to_xyz(primaries, D65_XY);
+        let from_xyz = wb::invert3(&to_xyz).expect("invertible");
+        OutputSpace { from_rec2020: mat_mul(&from_xyz, &XYZ_FROM_2020), to_xyz, transfer, is_srgb: false }
+    }
+}
+
+/// Renders `input` for export: the same stages as [`render`], then the output stage for
+/// `space`, as interleaved 16-bit values in the target's transfer curve.
+/// - No LUT: linear Rec.2020 -> target primaries (negative components desaturated towards
+///   the target luminance, >1 clipped per channel) -> transfer curve. Keeps wide gamuts.
+/// - LUT: sRGB-encode exactly as the preview, apply the LUT (it expects sRGB input), then
+///   convert the result to the target space.
+///
+/// For sRGB without a LUT this equals the preview's values up to table precision (the
+/// export uses a finer encode table).
+pub fn render_output(
+    input: &RenderInput,
+    adjustments: &ParametricAdjustments,
+    lut: Option<&Lut>,
+    space: &OutputSpace,
+) -> Vec<u16> {
+    let stages = Stages::new(input, adjustments);
+    let st = stages.st;
+    let w = input.width as usize;
+    let h = input.height as usize;
+    let a = stages.lut_amount();
+    let lut = lut.filter(|_| a > 0.0);
+
+    let transfer = space.transfer;
+    let encode = SqrtTable::new(1.0, 1 << 16, |v| transfer.encode(v));
+    let srgb_fine = SqrtTable::new(1.0, 1 << 16, srgb_encode);
+    let to_target = to_f32(space.from_rec2020);
+    let luma = to_f32(space.to_xyz)[1];
+    let srgb_to_target = to_f32(mat_mul(&space.from_rec2020, &st.srgb_to_2020));
+    let decode_srgb = |e: f32| Transfer::Srgb.decode(e);
+
+    const BAND: usize = 8;
+    let mut out = vec![0u16; w * h * 3];
+    out.par_chunks_mut(w * 3 * BAND).enumerate().for_each(|(band, out)| {
+        for (ry, out_row) in out.chunks_mut(w * 3).enumerate() {
+            let y = band * BAND + ry;
+            let in_row = stages.row(y);
+            for x in 0..w {
+                let d = stages.display_linear(x, y, &in_row[x * 3..x * 3 + 3]);
+                let e = match lut {
+                    Some(lut) => {
+                        let e = apply_lut(encode_srgb(d, st, &srgb_fine), lut, a);
+                        if space.is_srgb {
+                            e
+                        } else {
+                            let lin = e.map(decode_srgb);
+                            let t = gamut_map(mat3(&srgb_to_target, lin), luma);
+                            t.map(|c| encode.eval(c))
+                        }
+                    }
+                    None => {
+                        let t = gamut_map(mat3(&to_target, d), luma);
+                        t.map(|c| encode.eval(c))
+                    }
+                };
+                let q = e.map(|c| (c * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16);
+                out_row[x * 3..x * 3 + 3].copy_from_slice(&q);
+            }
+        }
+    });
+    out
 }
 
 /// Vibrance, saturation, dehaze colour lift and HSL on linear Rec.2020.

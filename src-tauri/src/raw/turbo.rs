@@ -285,6 +285,83 @@ fn encode_rgb_sub<T>(
     })
 }
 
+const TJPARAM_OPTIMIZE: c_int = 11;
+const TJPARAM_XDENSITY: c_int = 20;
+const TJPARAM_YDENSITY: c_int = 21;
+const TJPARAM_DENSITYUNITS: c_int = 22;
+const TJSAMP_422: c_int = 1;
+
+thread_local! {
+    /// Separate handle for exports: their density/quality settings never leak into the
+    /// preview/ingest encoder.
+    static EXPORT_COMPRESSOR: RefCell<Option<Tj>> = const { RefCell::new(None) };
+}
+
+/// JPEG chroma subsampling for [`encode_export`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subsampling {
+    S444,
+    S422,
+    S420,
+}
+
+/// Export-quality encode of interleaved RGB8: accurate DCT, optimized Huffman tables, JFIF
+/// density `ppi` dots per inch. The bytes (owned by TurboJPEG) are handed to `sink`.
+pub fn encode_export<T>(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    subsampling: Subsampling,
+    ppi: u32,
+    sink: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 3 {
+        return Err("TurboJPEG encode: bad buffer".into());
+    }
+    with_handle(&EXPORT_COMPRESSOR, TJINIT_COMPRESS, |tj| {
+        tj.set(TJPARAM_QUALITY, quality.clamp(1, 100) as c_int)?;
+        let samp = match subsampling {
+            Subsampling::S444 => TJSAMP_444,
+            Subsampling::S422 => TJSAMP_422,
+            Subsampling::S420 => TJSAMP_420,
+        };
+        tj.set(TJPARAM_SUBSAMP, samp)?;
+        tj.set(TJPARAM_FASTDCT, 0)?;
+        tj.set(TJPARAM_OPTIMIZE, 1)?;
+        let density = ppi.clamp(1, 65535) as c_int;
+        tj.set(TJPARAM_DENSITYUNITS, 1)?;
+        tj.set(TJPARAM_XDENSITY, density)?;
+        tj.set(TJPARAM_YDENSITY, density)?;
+        let mut buf: *mut c_uchar = std::ptr::null_mut();
+        let mut size: usize = 0;
+        // SAFETY: src holds height rows of width*3 bytes; TurboJPEG allocates `buf`.
+        let rc = unsafe {
+            tj3Compress8(
+                tj.0,
+                pixels.as_ptr(),
+                width as c_int,
+                (width * 3) as c_int,
+                height as c_int,
+                TJPF_RGB,
+                &mut buf,
+                &mut size,
+            )
+        };
+        let out = if rc == 0 && !buf.is_null() {
+            // SAFETY: TurboJPEG wrote `size` bytes into `buf`, freed below after use.
+            sink(unsafe { std::slice::from_raw_parts(buf, size) })
+        } else {
+            Err(tj.error("encode"))
+        };
+        if !buf.is_null() {
+            // SAFETY: buffer was allocated by TurboJPEG.
+            unsafe { tj3Free(buf.cast()) };
+        }
+        out
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

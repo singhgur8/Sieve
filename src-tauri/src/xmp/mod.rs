@@ -51,7 +51,7 @@
 //!   written back so tags reach the sidecar too.
 
 pub mod crs;
-mod packet;
+pub mod packet;
 mod store;
 
 pub use packet::{Desired, PacketError, SidecarValues};

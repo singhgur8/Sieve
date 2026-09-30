@@ -105,6 +105,18 @@ pub fn parse_container(src: &(impl ByteSource + ?Sized), format: RawFormat) -> R
     }
 }
 
+/// Raw EXIF directories (IFD0, EXIF, GPS) of a RAW, values little-endian, for copying into
+/// exported files. ARW: the file's own IFDs; RAF: the embedded JPEG's EXIF; CR3: CMT1/2/4.
+pub fn exif_dirs(path: &Path) -> Result<tiff::ExifDirs, String> {
+    let format = format_from_extension(path).ok_or_else(|| format!("{}: not a supported RAW", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    match format {
+        RawFormat::Arw => tiff::Tiff::new(&src)?.exif_dirs(),
+        RawFormat::Raf => raf::exif_dirs(&src),
+        RawFormat::Cr3 => cr3::exif_dirs(&src),
+    }
+}
+
 /// Upper bound for an embedded JPEG we are willing to read.
 const MAX_JPEG_BYTES: u64 = 64 << 20;
 /// Prefix read to validate a JPEG candidate and find its frame size.

@@ -305,6 +305,79 @@ impl<'a, S: ByteSource + ?Sized> Tiff<'a, S> {
     }
 }
 
+/// A raw TIFF/EXIF tag with its value bytes normalized to little-endian (for re-emitting
+/// in exported files).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTag {
+    pub tag: u16,
+    pub typ: u16,
+    pub count: u32,
+    pub data: Vec<u8>,
+}
+
+/// The directories exported metadata is copied from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExifDirs {
+    /// IFD0 (camera make/model, artist, copyright, date).
+    pub ifd0: Vec<RawTag>,
+    /// EXIF sub-IFD (exposure, lens, capture time).
+    pub exif: Vec<RawTag>,
+    /// GPS sub-IFD.
+    pub gps: Vec<RawTag>,
+}
+
+const GPS_IFD: u16 = 0x8825;
+/// Values larger than this (maker notes, thumbnails) are never copied.
+const MAX_RAW_TAG_BYTES: u32 = 64 * 1024;
+
+impl<S: ByteSource + ?Sized> Tiff<'_, S> {
+    /// Every entry of `ifd` with a known type and a value <= 64 KiB, values little-endian.
+    fn raw_tags(&self, ifd: &Ifd) -> Vec<RawTag> {
+        ifd.entries
+            .iter()
+            .filter_map(|e| {
+                let size = Self::type_size(e.typ)?;
+                let total = size.checked_mul(e.count)?;
+                if total > MAX_RAW_TAG_BYTES {
+                    return None;
+                }
+                let mut data = self.value_bytes(e, e.count)?;
+                if !self.le {
+                    let unit = match e.typ {
+                        3 | 8 => 2,
+                        4 | 9 | 11 | 13 | 5 | 10 => 4,
+                        12 => 8,
+                        _ => 1,
+                    };
+                    if unit > 1 {
+                        data.chunks_exact_mut(unit).for_each(<[u8]>::reverse);
+                    }
+                }
+                Some(RawTag { tag: e.tag, typ: e.typ, count: e.count, data })
+            })
+            .collect()
+    }
+
+    /// Raw tags of IFD0 only (e.g. a CR3 `CMT` box, whose IFD0 holds one directory).
+    pub fn ifd0_tags(&self) -> Result<Vec<RawTag>, String> {
+        Ok(self.raw_tags(&self.read_ifd(self.first_ifd)?))
+    }
+
+    /// IFD0 plus its EXIF and GPS sub-IFDs (missing/corrupt sub-IFDs are empty).
+    pub fn exif_dirs(&self) -> Result<ExifDirs, String> {
+        let ifd0 = self.read_ifd(self.first_ifd)?;
+        let sub = |tag: u16| -> Vec<RawTag> {
+            ifd0.get(tag)
+                .and_then(|e| self.uint(e))
+                .filter(|&o| o != 0 && o != self.first_ifd)
+                .and_then(|o| self.read_ifd(o).ok())
+                .map(|ifd| self.raw_tags(&ifd))
+                .unwrap_or_default()
+        };
+        Ok(ExifDirs { ifd0: self.raw_tags(&ifd0), exif: sub(EXIF_IFD), gps: sub(GPS_IFD) })
+    }
+}
+
 fn set<T>(slot: &mut Option<T>, value: Option<T>) {
     if slot.is_none() {
         *slot = value;

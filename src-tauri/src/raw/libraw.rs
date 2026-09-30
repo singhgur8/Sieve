@@ -2,8 +2,8 @@
 //! dynamically by `build.rs`). Only opaque handles and accessor functions are used, so
 //! no struct layouts beyond `libraw_processed_image_t`'s fixed header are mirrored.
 //!
-//! Phase 2 uses it as a thumbnail fallback; Phase 6 will add `unpack` +
-//! `dcraw_process` + `dcraw_make_mem_image` through the same handle type.
+//! Phase 2 uses it as a thumbnail fallback; Phases 5/6 decode linear camera RGB with
+//! `unpack` + `dcraw_process` (half size for the editor, full demosaic for export).
 
 use std::ffi::{c_char, c_int, c_uint, c_ushort, CStr, CString};
 use std::os::unix::ffi::OsStrExt;
@@ -44,6 +44,7 @@ extern "C" {
     // native/libraw_shim.c
     fn sieve_lr_set_linear(lr: *mut LibrawData, half_size: c_int);
     fn sieve_lr_get_color(lr: *mut LibrawData, out: *mut ShimColor);
+    fn sieve_lr_copy_rgb16(lr: *mut LibrawData, out: *mut u16, cap: usize, w: *mut c_int, h: *mut c_int) -> c_int;
 }
 
 /// Mirror of `sieve_lr_color_t` in `native/libraw_shim.c`.
@@ -119,6 +120,19 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
     if rc != 0 {
         return Err(err(rc));
     }
+    let color = color_data(&c);
+    // Fast path: copy LibRaw's processed image straight into our buffer (no intermediate
+    // full-size mem image; peak memory = raw + image + ours).
+    let (mut w, mut hgt): (c_int, c_int) = (0, 0);
+    // SAFETY: processed above; a null `out` only queries the size.
+    if unsafe { sieve_lr_copy_rgb16(h.0, std::ptr::null_mut(), 0, &mut w, &mut hgt) } == 0 && w > 0 && hgt > 0 {
+        let mut pixels = vec![0u16; w as usize * hgt as usize * 3];
+        // SAFETY: `pixels` holds w*h*3 values, as passed in `cap`.
+        let rc = unsafe { sieve_lr_copy_rgb16(h.0, pixels.as_mut_ptr(), pixels.len(), &mut w, &mut hgt) };
+        if rc == 0 {
+            return Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color });
+        }
+    }
     let mut code: c_int = 0;
     // SAFETY: processed above; the buffer is freed with dcraw_clear_mem below.
     let img = unsafe { libraw_dcraw_make_mem_image(h.0, &mut code) };
@@ -140,12 +154,40 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
                 pixels.as_mut_ptr().cast::<u8>(),
                 pixels.len() * 2,
             );
-            Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color: color_data(&c) })
+            Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color })
         }
     };
     // SAFETY: img came from dcraw_make_mem_image and is freed once.
     unsafe { libraw_dcraw_clear_mem(img) };
     result
+}
+
+/// Test helper: the same decode through `dcraw_make_mem_image` (the pre-Phase 6 path).
+#[cfg(test)]
+fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, String> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| "path contains NUL".to_owned())?;
+    let h = Handle::new()?;
+    // SAFETY: as in `decode_linear`.
+    unsafe {
+        if libraw_open_file(h.0, c_path.as_ptr()) != 0 {
+            return Err("open".into());
+        }
+        sieve_lr_set_linear(h.0, c_int::from(half_size));
+        if libraw_unpack(h.0) != 0 || libraw_dcraw_process(h.0) != 0 {
+            return Err("process".into());
+        }
+        let mut code: c_int = 0;
+        let img = libraw_dcraw_make_mem_image(h.0, &mut code);
+        if img.is_null() {
+            return Err(err(code));
+        }
+        let r = &*img;
+        let n = r.width as usize * r.height as usize * 3;
+        let mut pixels = vec![0u16; n];
+        std::ptr::copy_nonoverlapping(std::ptr::addr_of!(r.data).cast::<u8>(), pixels.as_mut_ptr().cast::<u8>(), n * 2);
+        libraw_dcraw_clear_mem(img);
+        Ok(pixels)
+    }
 }
 
 fn color_data(c: &ShimColor) -> ColorData {
@@ -262,6 +304,24 @@ mod tests {
         std::fs::write(&p, b"not a raw file at all").unwrap();
         let e = thumbnail(&p).err().expect("garbage must fail");
         assert!(e.starts_with("LibRaw:"), "{e}");
+    }
+
+    /// The direct image copy equals `dcraw_make_mem_image`'s output (identity curve).
+    #[test]
+    #[ignore = "needs sample RAWs ($SIEVE_SAMPLES)"]
+    fn direct_copy_matches_mem_image() {
+        let folder = std::env::var("SIEVE_SAMPLES").unwrap_or_else(|_| "/Users/gurjotsingh/Pictures/test RAWS".into());
+        let raw = std::fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| crate::raw::format_from_extension(p).is_some())
+            .expect("no RAW in sample folder");
+        let a = decode_linear(&raw, true).unwrap();
+        let b = decode_linear_mem_image(&raw, true).unwrap();
+        assert_eq!(a.pixels.len(), b.len());
+        let max = a.pixels.iter().zip(&b).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap();
+        assert!(max <= 1, "max diff {max}");
     }
 
     /// The fallback path on a real RAW (read-only): LibRaw's pick must be a valid JPEG.
