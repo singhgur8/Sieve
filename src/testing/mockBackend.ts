@@ -2,6 +2,7 @@
 // Uses Tauri's official IPC mocks; image bytes are served by the test harness (Playwright route)
 // or fall back to broken images when opened by hand. Loaded only in dev builds (see main.tsx).
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
 import type {
   BurstGroup,
@@ -12,6 +13,10 @@ import type {
   AdjustmentHistory,
   FilterCounts,
   HistoryEntry,
+  ExportFailure,
+  ExportJob,
+  ExportPreset,
+  ExportSettings,
   ImageQuery,
   LutInfo,
   ParametricAdjustments,
@@ -34,8 +39,55 @@ declare global {
     __ipcLog: MockCall[];
     /** Test hook: delay (ms) before a `render_preview` call with this per-slot sequence number resolves. */
     __mockRenderDelay?: (seq: number, slot: string) => number;
+    /** Test hook: when true, export jobs only advance through `__mockExportStep`. */
+    __mockExportManual?: boolean;
+    /** Advances the running mock export job by n files (default 1); finishes it when done. */
+    __mockExportStep?: (n?: number) => void;
   }
 }
+
+
+// ---- export (v6) emulation ----
+const BASE_EXPORT: ExportSettings = {
+  format: { kind: "jpeg", quality: 90, chromaSubsampling: "444" },
+  colorSpace: "srgb",
+  resize: { mode: { kind: "none" }, dontEnlarge: true, resolutionPpi: 300 },
+  sharpening: null,
+  naming: { template: "{filename}", startNumber: 1, collision: "unique_suffix" },
+  destination: { kind: "choose" },
+  subfolder: null,
+  metadata: { include: "all", removeLocation: false, includeKeywords: true, copyright: null, creator: null },
+};
+const BUILTIN_EXPORT_PRESETS: ExportPreset[] = [
+  { id: -1, name: "Client JPEG full-res sRGB q90", builtIn: true, settings: BASE_EXPORT, createdAtMs: 0, updatedAtMs: 0 },
+  {
+    id: -2,
+    name: "Web 2048 sRGB",
+    builtIn: true,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    settings: {
+      ...BASE_EXPORT,
+      format: { kind: "jpeg", quality: 80, chromaSubsampling: "420" },
+      resize: { mode: { kind: "long_edge", px: 2048 }, dontEnlarge: true, resolutionPpi: 72 },
+      sharpening: { media: "screen", amount: "standard" },
+      metadata: { include: "copyright_only", removeLocation: true, includeKeywords: true, copyright: null, creator: null },
+    },
+  },
+  {
+    id: -3,
+    name: "Print TIFF 16-bit Adobe RGB",
+    builtIn: true,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    settings: {
+      ...BASE_EXPORT,
+      format: { kind: "tiff", bitDepth: "16", compression: "lzw" },
+      colorSpace: "adobe_rgb",
+      sharpening: { media: "glossy", amount: "standard" },
+    },
+  },
+];
 
 function rng(seed: number) {
   let s = seed >>> 0;
@@ -295,6 +347,59 @@ export function installMockBackend(count: number) {
     return null;
   }
 
+  // ---- export (v6) state: fake jobs that emit progress over time and honour cancel ----
+  const exportPresets: ExportPreset[] = [];
+  let exportPresetId = 0;
+  let exportJobId = 0;
+  const exportJobs: ExportJob[] = [];
+  interface Run {
+    job: ExportJob;
+    ids: number[];
+    timer: ReturnType<typeof setInterval> | null;
+    cancelled: boolean;
+  }
+  let activeRun: Run | null = null;
+  const allExportPresets = () => [...BUILTIN_EXPORT_PRESETS, ...exportPresets];
+  function stepRun(run: Run, n: number) {
+    for (let k = 0; k < n && run.job.done < run.job.total && !run.cancelled; k++) {
+      const id = run.ids[run.job.done];
+      const r = byId.get(id);
+      run.job.done++;
+      if (id % 7 === 0) {
+        run.job.failed++;
+        run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: "Decode error (mock)" });
+      } else run.job.succeeded++;
+      void emit("export-progress", {
+        jobId: run.job.id,
+        done: run.job.done,
+        total: run.job.total,
+        failed: run.job.failed,
+        skipped: 0,
+        currentFile: run.job.done < run.job.total ? (byId.get(run.ids[run.job.done])?.fileName ?? null) : null,
+      });
+    }
+    if (run.cancelled || run.job.done >= run.job.total) finishRun(run);
+  }
+  function finishRun(run: Run) {
+    if (run.timer) clearInterval(run.timer);
+    run.job.state = run.cancelled ? "cancelled" : "completed";
+    run.job.finishedAtMs = Date.now();
+    if (activeRun === run) activeRun = null;
+    const failed: ExportFailure[] = run.job.failures;
+    void emit("export-finished", {
+      jobId: run.job.id,
+      succeeded: run.job.succeeded,
+      skipped: 0,
+      failed,
+      cancelled: run.cancelled,
+      outputDir: run.job.outputDir,
+      elapsedMs: 1234,
+    });
+  }
+  window.__mockExportStep = (n = 1) => {
+    if (activeRun) stepRun(activeRun, n);
+  };
+
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
 
   mockIPC(
@@ -430,8 +535,91 @@ export function installMockBackend(count: number) {
         case "delete_lut":
           luts.splice(luts.findIndex((x) => x.id === args.id), 1);
           return null;
+        case "get_export_capabilities":
+          return {
+            formats: [
+              { kind: "jpeg", available: true, reason: null, bitDepths: ["8"], supportsMetadata: true },
+              { kind: "tiff", available: true, reason: null, bitDepths: ["8", "16"], supportsMetadata: true },
+              { kind: "png", available: true, reason: null, bitDepths: ["8", "16"], supportsMetadata: true },
+              { kind: "webp", available: true, reason: null, bitDepths: ["8"], supportsMetadata: true },
+              { kind: "heic", available: false, reason: "HEIC encoder not available", bitDepths: ["8"], supportsMetadata: true },
+            ],
+            maxParallel: 4,
+            memoryBudgetMb: 4096,
+          };
+        case "list_export_presets":
+          return allExportPresets();
+        case "save_export_preset": {
+          const name = ((args.name as string) ?? "").trim();
+          if (!name || name.length > 100) throw { kind: "invalid_argument", message: "Preset name must be 1-100 characters" };
+          const clash = allExportPresets().find((p) => p.name.toLowerCase() === name.toLowerCase() && p.id !== args.id);
+          if (clash) throw { kind: "invalid_argument", message: `A preset named "${name}" already exists` };
+          const now = Date.now();
+          if (args.id != null) {
+            const ex = exportPresets.find((p) => p.id === args.id);
+            if (!ex) throw { kind: (args.id as number) < 0 ? "invalid_argument" : "not_found", message: "Built-in presets are read-only" };
+            Object.assign(ex, { name, settings: args.settings, updatedAtMs: now });
+            return ex;
+          }
+          const p: ExportPreset = { id: ++exportPresetId, name, builtIn: false, settings: args.settings as ExportSettings, createdAtMs: now, updatedAtMs: now };
+          exportPresets.push(p);
+          return p;
+        }
+        case "delete_export_preset": {
+          const i = exportPresets.findIndex((p) => p.id === args.id);
+          if (i < 0) throw { kind: "not_found", message: "preset" };
+          exportPresets.splice(i, 1);
+          return null;
+        }
+        case "plan_export": {
+          const st = args.settings as ExportSettings;
+          if (st.destination.kind === "choose") throw { kind: "invalid_argument", message: "Choose a destination" };
+          const dir = st.destination.kind === "folder" ? st.destination.path : null;
+          return {
+            outputDir: dir,
+            // Mock: every 10th planned file "already exists".
+            files: ids.map((imageId) => ({ imageId, path: dir ? `${dir}/${imageId}.jpg` : null, exists: imageId % 10 === 0 })),
+            existing: ids.filter((i) => i % 10 === 0).length,
+          };
+        }
+        case "export_images": {
+          const st = args.settings as ExportSettings;
+          if (st.destination.kind === "choose") throw { kind: "invalid_argument", message: "Choose a destination folder" };
+          if (ids.length === 0) throw { kind: "invalid_argument", message: "Nothing to export" };
+          const uniq = [...new Set(ids)];
+          const job: ExportJob = {
+            id: ++exportJobId,
+            state: "running",
+            presetName: (args.presetName as string | null) ?? null,
+            format: st.format.kind,
+            total: uniq.length,
+            done: 0,
+            succeeded: 0,
+            failed: 0,
+            skipped: 0,
+            outputDir: st.destination.kind === "folder" ? st.destination.path + (st.subfolder ? `/${st.subfolder}` : "") : null,
+            failures: [],
+            createdAtMs: Date.now(),
+            finishedAtMs: null,
+          };
+          exportJobs.unshift(job);
+          const run: Run = { job, ids: uniq, timer: null, cancelled: false };
+          activeRun = run;
+          if (!window.__mockExportManual) run.timer = setInterval(() => stepRun(run, 1), 120);
+          return job;
+        }
+        case "cancel_export": {
+          if (!activeRun || activeRun.job.id !== args.jobId) throw { kind: "not_found", message: "no such running job" };
+          const run = activeRun;
+          run.cancelled = true;
+          // Like the real engine: finishes asynchronously.
+          setTimeout(() => finishRun(run), 30);
+          return null;
+        }
+        case "get_export_jobs":
+          return exportJobs.map((j) => ({ ...j }));
         case "plugin:dialog|open":
-          return "/mock/import/Moody Blue.cube";
+          return (args.options as { directory?: boolean } | undefined)?.directory ? "/mock/export/Smith Wedding" : "/mock/import/Moody Blue.cube";
         default:
           return null;
       }

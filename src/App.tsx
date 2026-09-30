@@ -14,6 +14,9 @@ import { PhotoGrid } from "./components/PhotoGrid";
 import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
 import { DevelopView, type DevelopHandle } from "./components/develop/DevelopView";
 import { AnalysisBar, ImportBar } from "./components/ProgressBars";
+import { ExportDialog } from "./components/export/ExportDialog";
+import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
+import { useExportJobs } from "./hooks/useExportJobs";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
 
@@ -25,6 +28,7 @@ export default function App() {
   const [autoAdvance, setAutoAdvance] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const colsRef = useRef(1);
   const loupe = useRef<LoupeHandle>(null);
   const develop = useRef<DevelopHandle>(null);
@@ -36,6 +40,7 @@ export default function App() {
   const lib = useLibrary(query, reportError);
   reloadRef.current = () => void lib.reload();
   const { ids } = lib;
+  const exportJobs = useExportJobs(reportError);
   const sel = useSelection(ids);
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
@@ -248,10 +253,21 @@ export default function App() {
     }
   }, [targets, lib, status, reportError, membershipSensitive]);
 
+  const openExport = useCallback(() => {
+    if (ids.length === 0) return;
+    setExportOpen(targets());
+  }, [ids.length, targets]);
+
   // ---- keyboard ----
   useKeyboard((e) => {
     const k = e.key;
     const lower = k.toLowerCase();
+    if (exportOpen) return;
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && lower === "e") {
+      e.preventDefault();
+      openExport();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && mode === "develop") {
       if (lower === "z") {
         e.preventDefault();
@@ -444,7 +460,19 @@ export default function App() {
         onApplySuggestions={applyAll}
         onWriteXmp={() => void writeXmp()}
         onReadXmp={() => void readXmp()}
+        onExport={openExport}
+        exportsRunning={exportJobs.jobs.filter((j) => j.running).length}
       />
+      <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} />
+      {exportOpen && (
+        <ExportDialog
+          selectionIds={exportOpen}
+          filteredIds={ids}
+          sampleEntry={(id) => lib.getEntry(id)}
+          onClose={() => setExportOpen(null)}
+          onStarted={exportJobs.track}
+        />
+      )}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
       )}
