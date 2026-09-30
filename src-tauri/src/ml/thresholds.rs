@@ -6,12 +6,13 @@
 use crate::ipc::types::{CullThresholds, ScoreWeights, ShootType};
 
 pub fn default_thresholds(shoot_type: ShootType) -> CullThresholds {
-    // Calibrated on test-data/labels.json (50 wedding frames; see docs/decisions.md):
+    // Calibrated on test-data/labels.json (103 wedding frames; see docs/decisions.md):
     // - blink_ear applies to the *more-open* eye (both eyes closed). Open eyes measure
-    //   0.20-0.35, squints/laughs 0.15-0.20, downcast gaze 0.10-0.16, closed < 0.12;
-    //   0.15 favours precision (downcast gaze is ambiguous).
-    // - face_sharpness_min: eye-region sharpness (worst direction, capped by detail)
-    //   of the sharpest subject; sharp eyes measure 0.52-0.8, soft/motion-blurred 0.34-0.49.
+    //   0.20-0.35, squints/laughs 0.15-0.20, downcast gaze 0.04-0.16, closed < 0.12.
+    //   Low EAR is necessary, not sufficient: `scoring::eye_state` also needs the eye CNN,
+    //   head pitch and a smiling mouth to agree (downcast gaze looks identical by EAR).
+    // - face_sharpness_min: eye-region sharpness (worst direction, capped by detail, or a
+    //   tight per-eye crop) of the sharpest face; sharp eyes 0.5-0.8, soft/motion 0.2-0.47.
     // - global_sharpness_min: 90th-percentile tile sharpness; in-focus frames 0.6-0.87.
     let base = CullThresholds {
         blink_ear: 0.15,

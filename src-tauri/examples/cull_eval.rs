@@ -168,34 +168,65 @@ fn main() {
 
     let labels: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&labels_path).unwrap()).unwrap();
     let images = labels["images"].as_object().unwrap();
-    println!("\nlabeled set: {} images", images.len());
-    for (label, tag) in [
-        ("blink", "blink"),
-        ("missed_focus", "missed_focus"),
-        ("motion_blur", "motion_blur"),
-        ("underexposed", "underexposed"),
-    ] {
-        let (mut tp, mut fp, mut fn_) = (0, 0, 0);
-        let mut errors = Vec::new();
-        for (stem, l) in images {
-            let Some(truth) = l[label].as_bool() else { continue };
-            let pred = tags.get(stem).is_some_and(|t| t.iter().any(|x| x == tag));
-            match (pred, truth) {
-                (true, true) => tp += 1,
-                (true, false) => {
-                    fp += 1;
-                    errors.push(format!("FP {stem}"));
+    // Label sets: entries without "set" are the original 50; others name their set.
+    let set_of = |l: &serde_json::Value| l["set"].as_str().unwrap_or("original").to_string();
+    let mut sets: Vec<String> = images.values().map(set_of).collect();
+    sets.sort();
+    sets.dedup();
+    sets.push("all".into());
+    for set in &sets {
+        let n = images.values().filter(|l| set == "all" || &set_of(l) == set).count();
+        println!("\nlabel set '{set}': {n} images");
+        for (label, tag) in [
+            ("blink", "blink"),
+            ("missed_focus", "missed_focus"),
+            ("motion_blur", "motion_blur"),
+            ("underexposed", "underexposed"),
+        ] {
+            let (mut tp, mut fp, mut fn_) = (0, 0, 0);
+            let mut errors = Vec::new();
+            for (stem, l) in images {
+                if set != "all" && &set_of(l) != set {
+                    continue;
                 }
-                (false, true) => {
-                    fn_ += 1;
-                    errors.push(format!("FN {stem}"));
+                let Some(truth) = l[label].as_bool() else { continue };
+                let pred = tags.get(stem).is_some_and(|t| t.iter().any(|x| x == tag));
+                match (pred, truth) {
+                    (true, true) => tp += 1,
+                    (true, false) => {
+                        fp += 1;
+                        errors.push(format!("FP {stem}"));
+                    }
+                    (false, true) => {
+                        fn_ += 1;
+                        errors.push(format!("FN {stem}"));
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+            let p = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { f64::NAN };
+            let r = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { f64::NAN };
+            if tp + fp + fn_ > 0 {
+                println!(
+                    "{label:>13}: precision {p:.2} recall {r:.2}  (TP {tp}, FP {fp}, FN {fn_})  {}",
+                    errors.join(" ")
+                );
             }
         }
-        let p = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { f64::NAN };
-        let r = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { f64::NAN };
-        println!("{label:>13}: precision {p:.2} recall {r:.2}  (TP {tp}, FP {fp}, FN {fn_})  {}", errors.join(" "));
+    }
+    // Tagged frames nobody has labeled for that tag (for review).
+    for tag in ["blink", "missed_focus"] {
+        let mut unlabeled: Vec<&String> = tags
+            .iter()
+            .filter(|(stem, t)| t.iter().any(|x| x == tag) && images.get(*stem).is_none_or(|l| l[tag].is_null()))
+            .map(|(stem, _)| stem)
+            .collect();
+        unlabeled.sort();
+        println!(
+            "\n{tag} tagged, not labeled for it ({}): {}",
+            unlabeled.len(),
+            unlabeled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
+        );
     }
     // Keeper agreement.
     let mut keeper = BTreeMap::new();
