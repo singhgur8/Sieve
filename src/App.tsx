@@ -1,494 +1,468 @@
-// Phase 2 ingest view: simple list with thumbnails, EXIF and import progress.
-// The virtualized grid / loupe replace this in Phase 4.
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+// Phase 4 culling UI: virtualized grid, filter bar, loupe / compare, Lightroom-style keyboard.
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Aperture, Check, FolderOpen, ImageOff, Loader2, RotateCw, ScanSearch, Star, X } from "lucide-react";
-import {
-  commands,
-  convertFileSrc,
-  DEFAULT_QUERY,
-  events,
-  unwrap,
-  type AnalysisStatus,
-  type AppError,
-  type CatalogState,
-  type ImportProgress,
-  type ImportStatus,
-  type RawImageEntry,
-  type ShootType,
-} from "./ipc";
+import { X } from "lucide-react";
+import { commands, unwrap, type ColorLabel, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
+import { BASE_QUERY, useLibrary, type Query } from "./hooks/useLibrary";
+import { useSelection } from "./hooks/useSelection";
+import { useBackendStatus } from "./hooks/useBackendStatus";
+import { useKeyboard } from "./hooks/useKeyboard";
+import { TopBar } from "./components/TopBar";
+import { FilterBar } from "./components/FilterBar";
+import { GridToolbar, type Mode } from "./components/GridToolbar";
+import { PhotoGrid } from "./components/PhotoGrid";
+import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
+import { AnalysisBar, ImportBar } from "./components/ProgressBars";
 
-const PAGE_SIZE = 200;
-const SHOOT_TYPES: ShootType[] = ["wedding", "portrait", "sports", "event", "landscape", "general"];
-
-interface AnalysisView {
-  done: number;
-  total: number;
-  failed: number;
-  running: boolean;
-}
+const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
 
 export default function App() {
-  const [catalog, setCatalog] = useState<CatalogState | null>(null);
-  const [items, setItems] = useState<RawImageEntry[]>([]);
-  const [total, setTotal] = useState(0);
-  const [progress, setProgress] = useState<ImportProgress | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState<Query>(BASE_QUERY);
+  const [mode, setMode] = useState<Mode>("grid");
+  const [cmp, setCmp] = useState<CompareState | null>(null);
+  const [size, setSize] = useState(200);
+  const [autoAdvance, setAutoAdvance] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [analysis, setAnalysis] = useState<AnalysisView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [versions, setVersions] = useState<Record<number, number>>({});
-  const loadedRef = useRef(0);
-  // Thumbnail states delivered by events; they win over older list snapshots still marked pending.
-  const eventThumbs = useRef(new Map<number, RawImageEntry["thumbnail"]>());
+  const colsRef = useRef(1);
+  const loupe = useRef<LoupeHandle>(null);
+  const reloadRef = useRef<() => void>(() => {});
 
-  const merge = useCallback((e: RawImageEntry): RawImageEntry => {
-    const t = eventThumbs.current.get(e.id);
-    return t && e.thumbnail.status === "pending" ? { ...e, thumbnail: t } : e;
-  }, []);
+  const onLibraryChanged = useCallback(() => reloadRef.current(), []);
+  const status = useBackendStatus(onLibraryChanged);
+  const { reportError, setError } = status;
+  const lib = useLibrary(query, reportError);
+  reloadRef.current = () => void lib.reload();
+  const { ids } = lib;
+  const sel = useSelection(ids);
 
-  const patch = useCallback((id: number, fn: (e: RawImageEntry) => RawImageEntry) => {
-    setItems((prev) => prev.map((e) => (e.id === id ? fn(e) : e)));
-  }, []);
+  const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
+  const membershipSensitive =
+    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating";
 
-  const loadPage = useCallback(
-    async (offset: number, limit = PAGE_SIZE) => {
-      const page = await unwrap(commands.listImages({ ...DEFAULT_QUERY, offset, limit }));
-      const fresh = page.items.map(merge);
-      setTotal(page.total);
-      setItems((prev) => (offset === 0 ? fresh : [...prev, ...fresh]));
-      loadedRef.current = offset + page.items.length;
+  // Keep entries needed outside the grid range (active image, compare panes) loaded.
+  const { pin } = lib;
+  useEffect(() => {
+    pin([sel.active, cmp?.a, cmp?.b].filter((x): x is number => x != null));
+  }, [pin, sel.active, cmp?.a, cmp?.b]);
+
+  // If the active image left the result set (filter/rating change), move to its neighbour.
+  const prevIds = useRef<number[]>([]);
+  const { active: selActive, set: selSet, clear: selClear } = sel;
+  useEffect(() => {
+    const prev = prevIds.current;
+    prevIds.current = ids;
+    if (selActive != null && lib.loaded && !ids.includes(selActive)) {
+      const at = Math.min(Math.max(prev.indexOf(selActive), 0), ids.length - 1);
+      if (ids[at] != null) selSet([ids[at]], ids[at]);
+      else selClear();
+    }
+  }, [ids, lib.loaded, selActive, selSet, selClear]);
+
+  const targets = useCallback((): number[] => {
+    if (mode === "compare" && cmp) return [cmp[cmp.focus]];
+    if (mode === "loupe") return sel.active != null ? [sel.active] : [];
+    if (sel.selected.size > 0) return [...sel.selected];
+    return sel.active != null ? [sel.active] : [];
+  }, [mode, cmp, sel.active, sel.selected]);
+
+  const step = useCallback(
+    (delta: number, extend = false) => {
+      if (ids.length === 0) return;
+      const i = sel.active != null ? ids.indexOf(sel.active) : -1;
+      const n = i < 0 ? 0 : Math.min(ids.length - 1, Math.max(0, i + delta));
+      sel.moveTo(ids[n], extend);
     },
-    [merge],
+    [ids, sel],
   );
 
-  const refresh = useCallback(async () => {
+  const stepCompare = useCallback(
+    (dir: 1 | -1) => {
+      if (!cmp) return;
+      const other = cmp.focus === "a" ? cmp.b : cmp.a;
+      let i = cmp.pool.indexOf(cmp[cmp.focus]) + dir;
+      while (i >= 0 && i < cmp.pool.length && cmp.pool[i] === other) i += dir;
+      if (i < 0 || i >= cmp.pool.length) return;
+      const id = cmp.pool[i];
+      setCmp({ ...cmp, [cmp.focus]: id });
+      sel.set([id], id);
+    },
+    [cmp, sel],
+  );
+
+  const openLoupe = useCallback(
+    (id?: number) => {
+      const target = id ?? sel.active ?? ids[0];
+      if (target == null) return;
+      sel.set([target], target);
+      setCmp(null);
+      setMode("loupe");
+    },
+    [sel, ids],
+  );
+
+  const enterCompare = useCallback(async () => {
     try {
-      setCatalog(await unwrap(commands.getCatalogState()));
-      await loadPage(0);
-    } catch (e) {
-      setError(formatError(e));
-    }
-  }, [loadPage]);
-
-  // Initial load + restore progress.
-  useEffect(() => {
-    void refresh();
-    unwrap(commands.getImportStatus())
-      .then((s: ImportStatus) => {
-        const done = s.total - s.pending;
-        if (s.running || s.pending > 0) setProgress({ done, total: s.total, failed: s.failed });
-      })
-      .catch((e) => setError(formatError(e)));
-    unwrap(commands.getAnalysisStatus())
-      .then((s: AnalysisStatus) => {
-        if (s.running || s.pending > 0 || s.failed > 0) {
-          setAnalysis({
-            done: s.analyzed + s.failed,
-            total: s.analyzed + s.failed + s.pending,
-            failed: s.failed,
-            running: s.running,
-          });
+      let a: number | undefined;
+      let b: number | undefined;
+      let pool = ids;
+      if (mode === "grid" && sel.selected.size === 2) {
+        [a, b] = [...sel.selected];
+      } else {
+        a = sel.active ?? ids[0];
+        if (a == null) return;
+        const entry = lib.getEntry(a);
+        if (entry?.burstGroupId != null) {
+          const groups = await unwrap(commands.listBurstGroups(query.folderId));
+          const g = groups.find((x) => x.id === entry.burstGroupId);
+          if (g) {
+            pool = g.imageIds;
+            b = g.keeperImageId != null && g.keeperImageId !== a ? g.keeperImageId : g.imageIds.find((x) => x !== a);
+          }
         }
-      })
-      .catch((e) => setError(formatError(e)));
-  }, [refresh]);
-
-  // Live events.
-  useEffect(() => {
-    const unlisten = [
-      events.importProgress.listen((ev) => {
-        setProgress(ev.payload);
-        if (ev.payload.done >= ev.payload.total) {
-          void unwrap(commands.getCatalogState()).then(setCatalog).catch(() => {});
-          // Re-fetch what is loaded so no row stays pending after a stale snapshot.
-          void loadPage(0, Math.max(loadedRef.current, PAGE_SIZE)).catch(() => {});
+        if (b == null) {
+          const i = ids.indexOf(a);
+          b = ids[i + 1] ?? ids[i - 1];
         }
-      }),
-      events.thumbnailReady.listen((ev) => {
-        const p = ev.payload;
-        eventThumbs.current.set(p.imageId, {
-          status: "ready",
-          path: p.path,
-          previewPath: p.previewPath,
-          width: p.width,
-          height: p.height,
-        });
-        setVersions((v) => ({ ...v, [p.imageId]: (v[p.imageId] ?? 0) + 1 }));
-        patch(p.imageId, (e) => ({
-          ...e,
-          thumbnail: { status: "ready", path: p.path, previewPath: p.previewPath, width: p.width, height: p.height },
-        }));
-        // EXIF is written in the same pass; fetch just this entry.
-        unwrap(commands.getImage(p.imageId))
-          .then((fresh) => patch(p.imageId, () => merge(fresh)))
-          .catch(() => {});
-      }),
-      events.thumbnailFailed.listen((ev) => {
-        eventThumbs.current.set(ev.payload.imageId, { status: "failed", reason: ev.payload.reason });
-        patch(ev.payload.imageId, (e) => ({
-          ...e,
-          thumbnail: { status: "failed", reason: ev.payload.reason },
-        }));
-      }),
-      events.analysisProgress.listen((ev) => {
-        setAnalysis({ ...ev.payload, running: ev.payload.done < ev.payload.total });
-      }),
-      events.analysisReady.listen((ev) => {
-        const id = ev.payload.imageId;
-        unwrap(commands.getImage(id))
-          .then((fresh) => patch(id, () => merge(fresh)))
-          .catch(() => {});
-      }),
-      events.analysisFinished.listen(() => {
-        setAnalysis((a) => (a ? { ...a, running: false } : a));
-        void unwrap(commands.getCatalogState()).then(setCatalog).catch(() => {});
-        // Burst groups / duplicate tags may have changed on any row.
-        void loadPage(0, Math.max(loadedRef.current, PAGE_SIZE)).catch(() => {});
-      }),
-    ];
-    return () => {
-      unlisten.forEach((u) => void u.then((f) => f()));
-    };
-  }, [patch, merge, loadPage]);
-
-  async function importFolder() {
-    const path = await open({ directory: true, title: "Import RAW folder" });
-    if (typeof path !== "string") return;
-    setBusy(true);
-    setError(null);
-    try {
-      await unwrap(commands.importFolder(path, { recursive: true }));
-      await refresh();
+      }
+      if (a == null || b == null) {
+        setNotice("Select two photos (or a burst member) to compare");
+        return;
+      }
+      setCmp({ pool, a, b, focus: "a" });
+      sel.set([a], a);
+      setMode("compare");
     } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setBusy(false);
+      reportError(e);
     }
-  }
+  }, [ids, mode, sel, lib, query.folderId, reportError]);
 
-  const retry = useCallback(
-    async (id: number) => {
-      eventThumbs.current.delete(id);
-      patch(id, (e) => ({ ...e, thumbnail: { status: "pending" } }));
-      try {
-        await unwrap(commands.regenerateThumbnails([id]));
-      } catch (e) {
-        setError(formatError(e));
+  const changeMode = useCallback(
+    (m: Mode) => {
+      if (m === "grid") {
+        setMode("grid");
+        setCmp(null);
+      } else if (m === "loupe") openLoupe();
+      else void enterCompare();
+    },
+    [openLoupe, enterCompare],
+  );
+
+  // ---- culling actions (batch over targets) ----
+  const advanceIf = useCallback(
+    (t: number[], force: boolean) => {
+      if ((force || autoAdvance) && t.length === 1) {
+        if (mode === "compare") stepCompare(1);
+        else step(1);
       }
     },
-    [patch],
+    [autoAdvance, mode, step, stepCompare],
   );
 
-  async function run(fn: () => Promise<unknown>) {
-    setError(null);
+  const mutate = useCallback(
+    async (t: number[], optimistic: (e: RawImageEntry) => RawImageEntry, call: () => Promise<unknown>) => {
+      lib.patch(t, optimistic);
+      try {
+        await call();
+      } catch (e) {
+        reportError(e);
+      }
+      try {
+        await lib.refresh(t);
+      } catch (e) {
+        reportError(e);
+      }
+      if (membershipSensitive) void lib.reload();
+    },
+    [lib, reportError, membershipSensitive],
+  );
+
+  const doPick = useCallback(
+    (pick: PickFlag, advance: boolean) => {
+      const t = targets();
+      if (t.length === 0) return;
+      void mutate(t, (e) => ({ ...e, pick }), () => unwrap(commands.setPick(t, pick)));
+      advanceIf(t, advance);
+    },
+    [targets, mutate, advanceIf],
+  );
+
+  const doRating = useCallback(
+    (rating: number) => {
+      const t = targets();
+      if (t.length === 0) return;
+      void mutate(t, (e) => ({ ...e, rating }), () => unwrap(commands.setRating(t, rating)));
+      advanceIf(t, false);
+    },
+    [targets, mutate, advanceIf],
+  );
+
+  const doLabel = useCallback(
+    (label: ColorLabel) => {
+      const t = targets();
+      if (t.length === 0) return;
+      const allHave = t.every((id) => lib.getEntry(id)?.colorLabel === label);
+      const next = allHave ? null : label;
+      void mutate(t, (e) => ({ ...e, colorLabel: next }), () => unwrap(commands.setColorLabel(t, next)));
+      advanceIf(t, false);
+    },
+    [targets, mutate, advanceIf, lib],
+  );
+
+  const writeXmp = useCallback(async () => {
+    const t = targets();
+    if (t.length === 0) return;
     try {
-      await fn();
+      const r = await unwrap(commands.writeXmp(t));
+      setNotice(`Saved metadata for ${r.succeeded} photo${r.succeeded === 1 ? "" : "s"}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      await lib.refresh(t);
+      status.refreshXmp();
     } catch (e) {
-      setError(formatError(e));
+      reportError(e);
     }
-  }
+  }, [targets, lib, status, reportError]);
+
+  const readXmp = useCallback(async () => {
+    const t = targets();
+    if (t.length === 0) return;
+    try {
+      const r = await unwrap(commands.readXmp(t));
+      setNotice(`Read ${r.changed.length} changed, ${r.skipped} without sidecar`);
+      await lib.refresh(t);
+      if (membershipSensitive) void lib.reload();
+      status.refreshXmp();
+    } catch (e) {
+      reportError(e);
+    }
+  }, [targets, lib, status, reportError, membershipSensitive]);
+
+  // ---- keyboard ----
+  useKeyboard((e) => {
+    const k = e.key;
+    const lower = k.toLowerCase();
+    if (e.metaKey || e.ctrlKey) {
+      if (lower === "a") {
+        e.preventDefault();
+        sel.selectAll();
+      } else if (lower === "s") {
+        e.preventDefault();
+        void writeXmp();
+      }
+      return;
+    }
+    if (e.altKey) return;
+    const used = () => e.preventDefault();
+    if (lower === "p") { used(); doPick("pick", e.shiftKey); return; }
+    if (lower === "x") { used(); doPick("reject", e.shiftKey); return; }
+    if (lower === "u") { used(); doPick("unflagged", false); return; }
+    if (/^[0-5]$/.test(k)) { used(); doRating(Number(k)); return; }
+    if (LABEL_KEYS[k]) { used(); doLabel(LABEL_KEYS[k]); return; }
+    switch (k) {
+      case "ArrowLeft":
+      case "ArrowRight": {
+        used();
+        const dir = k === "ArrowRight" ? 1 : -1;
+        if (mode === "compare") stepCompare(dir);
+        else step(dir, e.shiftKey && mode === "grid");
+        return;
+      }
+      case "ArrowUp":
+      case "ArrowDown":
+        if (mode === "grid") {
+          used();
+          step(k === "ArrowDown" ? colsRef.current : -colsRef.current, e.shiftKey);
+        }
+        return;
+      case " ":
+        used();
+        if (mode === "grid") openLoupe();
+        else changeMode("grid");
+        return;
+      case "Enter":
+        used();
+        if (mode === "grid") openLoupe();
+        return;
+      case "Escape":
+        if (mode !== "grid") changeMode("grid");
+        else sel.clear();
+        return;
+      case "Tab":
+        if (mode === "compare" && cmp) {
+          used();
+          const focus = cmp.focus === "a" ? "b" : "a";
+          setCmp({ ...cmp, focus });
+          sel.set([cmp[focus]], cmp[focus]);
+        }
+        return;
+    }
+    switch (lower) {
+      case "e":
+        used();
+        if (mode === "grid") openLoupe();
+        else changeMode("grid");
+        return;
+      case "g":
+        used();
+        changeMode("grid");
+        return;
+      case "c":
+        used();
+        if (mode === "compare") openLoupe(cmp ? cmp[cmp.focus] : undefined);
+        else void enterCompare();
+        return;
+      case "z":
+        used();
+        if (mode === "grid") openLoupe();
+        setTimeout(() => loupe.current?.toggleZoom(), mode === "grid" ? 120 : 0);
+        return;
+      case "f":
+        used();
+        if (mode !== "grid") loupe.current?.cycleFace(e.shiftKey ? -1 : 1);
+        return;
+    }
+  });
+
+  // ---- top-bar actions ----
+  const run = useCallback(
+    async (fn: () => Promise<unknown>) => {
+      setError(null);
+      try {
+        await fn();
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    [setError, reportError],
+  );
+
+  const importFolder = () =>
+    void run(async () => {
+      const path = await open({ directory: true, title: "Import RAW folder" });
+      if (typeof path !== "string") return;
+      setBusy(true);
+      try {
+        const s = await unwrap(commands.importFolder(path, { recursive: true }));
+        setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read)`);
+        await status.refreshCatalog();
+        await lib.reload();
+      } finally {
+        setBusy(false);
+      }
+    });
 
   const analyze = (kind: "pending" | "all") =>
-    run(async () => {
-      setAnalysis((a) => ({ done: 0, total: a?.total ?? 0, failed: 0, running: true }));
+    void run(async () => {
+      status.setAnalysis((a) => ({ done: 0, total: a?.total ?? 0, failed: 0, running: true }));
       await unwrap(commands.analyzeImages({ kind }));
     });
 
-  const changeShootType = (t: ShootType) =>
-    run(async () => {
-      await unwrap(commands.setShootType(t));
-      setCatalog(await unwrap(commands.getCatalogState()));
-    });
-
-  const toggleAuto = (enabled: boolean) =>
-    run(async () => {
-      await unwrap(commands.setAutoAnalyze(enabled));
-      setCatalog((c) => (c ? { ...c, autoAnalyze: enabled } : c));
-    });
-
   const applyAll = () =>
-    run(async () => {
-      const n = await unwrap(commands.applySuggestions(items.map((i) => i.id)));
-      setNotice(`Applied suggestions to ${n} of ${items.length} loaded images`);
-      await loadPage(0, Math.max(loadedRef.current, PAGE_SIZE));
+    void run(async () => {
+      const t = sel.selected.size > 0 ? [...sel.selected] : ids;
+      const n = await unwrap(commands.applySuggestions(t));
+      setNotice(`Applied suggestions to ${n} of ${t.length} photos`);
+      await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
+      if (membershipSensitive) void lib.reload();
     });
 
-  const active = progress !== null && progress.done < progress.total;
+  const importActive = status.progress !== null && status.progress.done < status.progress.total;
+  const catalog = status.catalog;
 
   return (
     <main className="flex h-screen flex-col">
-      <header className="flex items-center gap-3 border-b border-neutral-800 px-4 py-3">
-        <Aperture className="size-5 text-amber-400" />
-        <h1 className="font-semibold tracking-tight">LumenRAW</h1>
-        <span className="truncate text-xs text-neutral-500">
-          {catalog ? `${catalog.imageCount} images · ${catalog.shootType}` : "…"}
-        </span>
-        <button
-          onClick={importFolder}
-          disabled={busy}
-          className="ml-auto flex items-center gap-2 rounded-md bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700 disabled:opacity-50"
-        >
-          <FolderOpen className="size-4" />
-          {busy ? "Importing…" : "Import folder"}
-        </button>
-      </header>
-
-      <div className="flex flex-wrap items-center gap-3 border-b border-neutral-800 px-4 py-2 text-sm">
-        <label className="flex items-center gap-2 text-xs text-neutral-400">
-          Shoot type
-          <select
-            value={catalog?.shootType ?? "general"}
-            onChange={(e) => void changeShootType(e.target.value as ShootType)}
-            disabled={!catalog}
-            className="rounded bg-neutral-800 px-2 py-1 text-sm text-neutral-200"
-          >
-            {SHOOT_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button onClick={() => void analyze("pending")} disabled={analysis?.running} className={btn}>
-          <ScanSearch className="size-4" />
-          Analyze
-        </button>
-        <button onClick={() => void analyze("all")} disabled={analysis?.running} className={btn}>
-          Re-analyze all
-        </button>
-        <label className="flex items-center gap-1.5 text-xs text-neutral-400">
-          <input
-            type="checkbox"
-            checked={catalog?.autoAnalyze ?? false}
-            disabled={!catalog}
-            onChange={(e) => void toggleAuto(e.target.checked)}
-          />
-          Auto-analyze
-        </label>
-        <button onClick={applyAll} disabled={items.length === 0} className={`${btn} ml-auto`}>
-          <Check className="size-4" />
-          Apply suggestions
-        </button>
-      </div>
-
-      {analysis && (analysis.running || analysis.failed > 0 || analysis.done < analysis.total) && (
-        <AnalysisBar
-          a={analysis}
-          onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))}
-        />
+      <TopBar
+        catalog={catalog}
+        analysis={status.analysis}
+        xmp={status.xmp}
+        busy={busy}
+        hasSelection={targets().length > 0}
+        hasImages={ids.length > 0}
+        onImport={importFolder}
+        onShootType={(t: ShootType) =>
+          void run(async () => {
+            await unwrap(commands.setShootType(t));
+            await status.refreshCatalog();
+          })
+        }
+        onAnalyze={analyze}
+        onAutoAnalyze={(v) =>
+          void run(async () => {
+            await unwrap(commands.setAutoAnalyze(v));
+            status.setCatalog((c) => (c ? { ...c, autoAnalyze: v } : c));
+          })
+        }
+        onAutoXmp={(v) =>
+          void run(async () => {
+            await unwrap(commands.setXmpAutoSync(v));
+            status.setCatalog((c) => (c ? { ...c, xmpAutoSync: v } : c));
+            status.refreshXmp();
+          })
+        }
+        onApplySuggestions={applyAll}
+        onWriteXmp={() => void writeXmp()}
+        onReadXmp={() => void readXmp()}
+      />
+      {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
+        <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
       )}
+      {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
       {notice && (
-        <p className="flex items-center justify-between bg-neutral-900 px-4 py-1.5 text-xs text-neutral-300">
+        <p className="flex items-center justify-between bg-neutral-900 px-4 py-1 text-xs text-neutral-300" data-testid="notice">
           {notice}
           <button onClick={() => setNotice(null)} aria-label="Dismiss">
             <X className="size-3.5" />
           </button>
         </p>
       )}
+      {status.error && (
+        <p className="flex items-center justify-between bg-red-950 px-4 py-1.5 text-sm text-red-300" data-testid="error">
+          {status.error}
+          <button onClick={() => setError(null)} aria-label="Dismiss">
+            <X className="size-3.5" />
+          </button>
+        </p>
+      )}
 
-      {progress && (active || progress.failed > 0) && <ProgressBar progress={progress} active={active} />}
-      {error && <p className="bg-red-950 px-4 py-2 text-sm text-red-300">{error}</p>}
+      <FilterBar query={query} setQuery={setQuery} catalog={catalog} epoch={lib.epoch} shown={ids.length} />
+      <GridToolbar
+        mode={mode}
+        query={query}
+        setQuery={setQuery}
+        size={size}
+        onSize={setSize}
+        selectedCount={sel.selected.size}
+        total={ids.length}
+        autoAdvance={autoAdvance}
+        onAutoAdvance={setAutoAdvance}
+        onMode={changeMode}
+      />
 
-      <ul className="flex-1 divide-y divide-neutral-900 overflow-auto">
-        {items.map((img) => (
-          <Row key={img.id} img={img} version={versions[img.id] ?? 0} onRetry={retry} />
-        ))}
-        {items.length < total && (
-          <li className="px-4 py-3">
-            <button
-              onClick={() => loadPage(loadedRef.current).catch((e) => setError(formatError(e)))}
-              className="rounded-md bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700"
-            >
-              Load more ({items.length} of {total})
-            </button>
-          </li>
+      <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
+        <PhotoGrid
+          lib={lib}
+          targetSize={size}
+          selected={sel.selected}
+          active={sel.active}
+          onColsChange={(c) => (colsRef.current = c)}
+          onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
+          onCellDoubleClick={openLoupe}
+        />
+        {mode !== "grid" && (
+          <LoupeLayer
+            ref={loupe}
+            mode={mode}
+            lib={lib}
+            activeId={active}
+            compare={cmp}
+            onFocusPane={(k) => {
+              if (!cmp) return;
+              setCmp({ ...cmp, focus: k });
+              sel.set([cmp[k]], cmp[k]);
+            }}
+            onOpen={(id) => sel.set([id], id)}
+          />
         )}
-      </ul>
+      </div>
     </main>
   );
-}
-
-const btn =
-  "flex items-center gap-2 rounded-md bg-neutral-800 px-3 py-1 text-sm hover:bg-neutral-700 disabled:opacity-50";
-
-function AnalysisBar({ a, onCancel }: { a: AnalysisView; onCancel: () => void }) {
-  const pct = a.total > 0 ? Math.min(100, (a.done / a.total) * 100) : 0;
-  return (
-    <div className="border-b border-neutral-800 px-4 py-2">
-      <div className="mb-1 flex items-center gap-2 text-xs text-neutral-400">
-        {a.running && <Loader2 className="size-3 animate-spin" />}
-        <span>
-          {a.running ? "Analyzing" : "Analysis paused"}: {a.done} / {a.total}
-        </span>
-        {a.failed > 0 && <span className="text-red-400">{a.failed} failed</span>}
-        {a.running && (
-          <button onClick={onCancel} className="ml-auto rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700">
-            Cancel
-          </button>
-        )}
-      </div>
-      <div className="h-1.5 overflow-hidden rounded bg-neutral-800">
-        <div className="h-full bg-sky-400 transition-[width]" style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function ProgressBar({ progress, active }: { progress: ImportProgress; active: boolean }) {
-  const pct = progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : 0;
-  return (
-    <div className="border-b border-neutral-800 px-4 py-2">
-      <div className="mb-1 flex items-center gap-2 text-xs text-neutral-400">
-        {active && <Loader2 className="size-3 animate-spin" />}
-        <span>
-          {active ? "Extracting thumbnails" : "Done"}: {progress.done} / {progress.total}
-        </span>
-        {progress.failed > 0 && <span className="text-red-400">{progress.failed} failed</span>}
-      </div>
-      <div className="h-1.5 overflow-hidden rounded bg-neutral-800">
-        <div className="h-full bg-amber-400 transition-[width]" style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
-}
-
-const Row = memo(function Row({
-  img,
-  version,
-  onRetry,
-}: {
-  img: RawImageEntry;
-  version: number;
-  onRetry: (id: number) => void;
-}) {
-  const t = img.thumbnail;
-  const c = img.capture;
-  return (
-    <li className="flex items-center gap-4 px-4 py-2">
-      <div className="flex size-20 shrink-0 items-center justify-center overflow-hidden rounded bg-neutral-900">
-        {t.status === "ready" ? (
-          <img
-            src={`${convertFileSrc(t.path)}?v=${version}`}
-            loading="lazy"
-            decoding="async"
-            alt={img.fileName}
-            className="size-full object-contain"
-          />
-        ) : t.status === "pending" ? (
-          <Loader2 className="size-5 animate-spin text-neutral-600" />
-        ) : (
-          <ImageOff className="size-5 text-red-500" />
-        )}
-      </div>
-      <div className="min-w-0 flex-1 text-sm">
-        <div className="flex items-center gap-2">
-          <span className="truncate font-medium" title={img.path}>
-            {img.fileName}
-          </span>
-          <span className="text-xs uppercase text-neutral-500">{img.format}</span>
-        </div>
-        <div className="text-xs text-neutral-400">
-          {[img.camera.model, c.lens].filter(Boolean).join(" · ") || "—"}
-        </div>
-        <div className="text-xs text-neutral-500">
-          {[
-            c.capturedAtMs != null ? formatTime(c.capturedAtMs) : null,
-            c.iso != null ? `ISO ${c.iso}` : null,
-            c.shutterSeconds != null ? formatShutter(c.shutterSeconds) : null,
-            c.aperture != null ? `f/${trimNum(c.aperture)}` : null,
-            c.focalLengthMm != null ? `${trimNum(c.focalLengthMm)} mm` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ") || "No EXIF yet"}
-        </div>
-        <CullInfo img={img} />
-        {t.status === "failed" && (
-          <div className="mt-1 flex items-center gap-2 text-xs text-red-400">
-            <AlertTriangle className="size-3.5 shrink-0" />
-            <span className="rounded bg-red-950 px-1.5 py-0.5">Failed</span>
-            <span className="truncate" title={t.reason}>
-              {t.reason}
-            </span>
-            <button
-              onClick={() => onRetry(img.id)}
-              className="ml-1 flex items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-neutral-200 hover:bg-neutral-700"
-            >
-              <RotateCw className="size-3" />
-              Retry
-            </button>
-          </div>
-        )}
-      </div>
-    </li>
-  );
-});
-
-function CullInfo({ img }: { img: RawImageEntry }) {
-  const q = img.quality;
-  if (!q && img.tags.length === 0 && img.burstGroupId == null) return null;
-  return (
-    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
-      {img.tags.map((t) => (
-        <span
-          key={t.tag}
-          title={`${t.source}, confidence ${t.confidence.toFixed(2)}${t.suppressed ? " (dismissed)" : ""}`}
-          className={
-            t.suppressed
-              ? "rounded bg-neutral-900 px-1.5 py-0.5 text-neutral-600 line-through"
-              : "rounded bg-amber-950 px-1.5 py-0.5 text-amber-300"
-          }
-        >
-          {t.tag.replace("_", " ")}
-        </span>
-      ))}
-      {q && (
-        <>
-          <span className="text-neutral-300" title="Overall quality score">
-            Q {Math.round(q.overall * 100)}
-          </span>
-          <span className="flex items-center gap-0.5 text-neutral-400" title="Suggested rating">
-            <Star className="size-3" />
-            {q.suggestedRating}
-          </span>
-          {q.suggestedPick !== "unflagged" && (
-            <span
-              className={`rounded px-1.5 py-0.5 ${q.suggestedPick === "pick" ? "bg-green-950 text-green-300" : "bg-red-950 text-red-300"}`}
-            >
-              suggest {q.suggestedPick}
-            </span>
-          )}
-        </>
-      )}
-      {img.burstGroupId != null && (
-        <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-300">
-          burst #{img.burstGroupId}
-          {img.isBurstKeeper ? " · keeper" : ""}
-        </span>
-      )}
-    </div>
-  );
-}
-
-const timeFmt = new Intl.DateTimeFormat(undefined, {
-  timeZone: "UTC",
-  dateStyle: "medium",
-  timeStyle: "medium",
-});
-
-function formatTime(ms: number): string {
-  return timeFmt.format(new Date(ms));
-}
-
-function formatShutter(s: number): string {
-  return s >= 1 ? `${trimNum(s)}s` : `1/${Math.round(1 / s)}s`;
-}
-
-function trimNum(n: number): string {
-  return String(Math.round(n * 10) / 10);
-}
-
-function formatError(e: unknown): string {
-  const err = e as Partial<AppError>;
-  return err.kind ? `${err.kind}: ${err.message}` : String(e);
 }
