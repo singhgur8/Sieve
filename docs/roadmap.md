@@ -58,12 +58,12 @@ Conventions
 - [x] **QA gate**.
   - Acceptance: slider change → updated preview < 100 ms; XMP round trip lossless; LUT output matches reference values in unit tests; Playwright slider tests.
 
-## Phase 6 — Full RAW develop + Export
+## Phase 6 — Full RAW develop + Export ✅
 - [x] **Contract** (architect): `ExportPreset` type + `export_images` / `cancel_export` + `exportProgress` event.
-- [ ] **Full-res develop** (rust-engine-dev): LibRaw demosaic (Bayer + X-Trans), same pipeline as preview at full res.
-- [ ] **Export presets** (rust-engine-dev): JPEG (quality 0–100), TIFF 8/16-bit, PNG, optional WebP/HEIC; resize (long edge / short edge / megapixels / none); sRGB / Display P3 / Adobe RGB with embedded ICC; output sharpening (screen/matte/glossy × low/std/high); filename template; metadata (all / copyright only / none); named saved presets.
-- [ ] **Export UI** (frontend-dev): preset editor, batch export dialog with progress + cancel.
-- [ ] **QA gate**.
+- [x] **Full-res develop** (rust-engine-dev): LibRaw demosaic (Bayer + X-Trans), same pipeline as preview at full res.
+- [x] **Export presets** (rust-engine-dev): JPEG (quality 0–100), TIFF 8/16-bit, PNG, optional WebP/HEIC; resize (long edge / short edge / megapixels / none); sRGB / Display P3 / Adobe RGB with embedded ICC; output sharpening (screen/matte/glossy × low/std/high); filename template; metadata (all / copyright only / none); named saved presets.
+- [x] **Export UI** (frontend-dev): preset editor, batch export dialog with progress + cancel.
+- [x] **QA gate**.
   - Acceptance: 50-file batch per format from `test-data/`; output dimensions, JPEG quality, ICC profile and metadata verified with `exiftool`; memory flat during batch.
 
 ## Phase 7 — Anchor-photo scene matching
@@ -160,3 +160,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 5 Contract: IPC v5 (render_preview via sieve:// scheme latest-wins, develop info, history undo/redo, presets, paste/sync/reset, LUT library, crs: XMP seam), migration 0005. Gate: 100 tests, clippy, fmt, build, UI 14/14.
 - 2026-09-29 — Phase 5 complete: LibRaw linear decode (C shim for half_size/user_flip/cam_xyz), DevelopCache LRU, parametric pipeline (DNG-model WB, tone, texture/clarity/dehaze, vibrance/sat/HSL, filmic base, Rec.2020->sRGB), .cube LUTs (tetrahedral/trilinear), history/presets/paste/sync, crs: XMP read/write, sieve:// render protocol; Develop UI. QA: 129 Rust tests + 7 ignored real-sample tests pass; Playwright 27/27 (+ WB reset fixes); warm 2048 render p50 18.6 ms / p95 42.4 ms (target < 100), region 13 ms, cold decode 337 ms; crs round trip lossless (exiftool-verified); LUT reference values; app migrates to v5 clean. Note: sample ARWs are Sony lossless M-size, so 'half-size' source equals full size for these files; no RAF/CR3 real samples.
 - 2026-09-29 — Phase 6 Contract: IPC v6 (ExportSettings/ExportPreset + built-ins, capabilities, plan_export, export_images/cancel/jobs, exportProgress/exportFinished, memory-budgeted job runner), migration 0006. Gate: 133 tests, clippy, fmt, build, UI 38/38.
+- 2026-09-29 — Phase 6 complete: full-res LibRaw decode (AHD / X-Trans 3-pass), shared develop pipeline (preview == export, Lanczos-3), output sharpening, sRGB/P3/AdobeRGB with generated ICC, JPEG/TIFF16/PNG/WebP/HEIC encoders, whitelisted metadata, naming templates, memory-budgeted job runner. QA: 157 tests + 10 ignored real-sample tests; 6 formats x 50 files, 0 failures; exiftool: dims, JPEG q90/q80, ICC, 16-bit TIFF, orientation 1, metadata per option, no crs:/Sieve| leakage; peak footprint 899 MiB; app migrates to v6.
