@@ -8,7 +8,11 @@ export const commands = {
 	getCatalogState: () => typedError<CatalogState, AppError>(__TAURI_INVOKE("get_catalog_state")),
 	setShootType: (shootType: ShootType) => typedError<null, AppError>(__TAURI_INVOKE("set_shoot_type", { shootType })),
 	setBurstWindow: (ms: number) => typedError<null, AppError>(__TAURI_INVOKE("set_burst_window", { ms })),
-	/**  Registers RAW files under `path`. Does not decode; thumbnails start `pending`. */
+	/**
+	 *  Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
+	 *  then kicks the background ingest pipeline and returns. Extraction progress arrives
+	 *  as `importProgress` / `thumbnailReady` / `thumbnailFailed` events.
+	 */
 	importFolder: (path: string, options: ImportOptions) => typedError<ImportSummary, AppError>(__TAURI_INVOKE("import_folder", { path, options })),
 	listImages: (query: ImageQuery) => typedError<ImagePage, AppError>(__TAURI_INVOKE("list_images", { query })),
 	getImage: (id: number) => typedError<RawImageEntry, AppError>(__TAURI_INVOKE("get_image", { id })),
@@ -20,12 +24,20 @@ export const commands = {
 	/**  Stored adjustments, or neutral defaults for an unedited image. */
 	getAdjustments: (id: number) => typedError<ParametricAdjustments, AppError>(__TAURI_INVOKE("get_adjustments", { id })),
 	saveAdjustments: (id: number, adjustments: ParametricAdjustments) => typedError<null, AppError>(__TAURI_INVOKE("save_adjustments", { id, adjustments })),
+	/**
+	 *  Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
+	 *  `pending` and returns immediately; results arrive as events.
+	 */
+	regenerateThumbnails: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("regenerate_thumbnails", { ids })),
+	/**  Catalog-wide pending/ready/failed counts and whether the pipeline is running. */
+	getImportStatus: () => typedError<ImportStatus, AppError>(__TAURI_INVOKE("get_import_status")),
 };
 
 /** Events */
 export const events = {
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
+	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
 };
 
@@ -50,9 +62,17 @@ export type CameraInfo = {
 
 export type CameraMake = "sony" | "fujifilm" | "canon" | "other";
 
-/**  EXIF capture metadata. All optional: populated by thumbnail extraction (Phase 2). */
+/**
+ *  EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
+ *  in the same pass that extracts the embedded preview.
+ */
 export type CaptureMeta = {
-	/**  Capture time in unix ms, including sub-second precision (needed for burst grouping). */
+	/**
+	 *  Capture time in ms, including sub-seconds (`SubSecTimeOriginal`), needed for
+	 *  burst grouping. EXIF `DateTimeOriginal` is camera-local wall-clock time with no
+	 *  zone, so it is stored as that wall-clock time *interpreted as UTC* ("naive" ms):
+	 *  display with `timeZone: "UTC"`; differences between frames are exact.
+	 */
 	capturedAtMs: number | null,
 	iso: number | null,
 	shutterSeconds: number | null,
@@ -70,6 +90,11 @@ export type CatalogState = {
 	folders: FolderEntry[],
 	/**  Counts of non-suppressed tags, for the filter bar. */
 	tagCounts: TagCount[],
+	/**
+	 *  Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+	 *  Thumbnails/previews live in `<cacheDir>/thumbs/`.
+	 */
+	cacheDir: string,
 };
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
@@ -156,10 +181,31 @@ export type ImportOptions = {
 	recursive: boolean,
 };
 
-/**  Progress of `import_folder` / metadata scan. */
+/**
+ *  Progress of the ingest pipeline (thumbnail + EXIF extraction).
+ *  Counts cover the current pipeline run: images queued since the pipeline was last
+ *  idle (new imports and regenerations join the running batch and grow `total`).
+ *  `done` includes failures. `done == total` means the pipeline is idle.
+ *  Throttled by the emitter (at most ~10 per second, plus a final one).
+ */
 export type ImportProgress = {
 	done: number,
 	total: number,
+	/**  Of `done`, how many failed. */
+	failed: number,
+};
+
+/**
+ *  Snapshot of thumbnail/metadata extraction, so the UI can restore its progress
+ *  display after a reload. Counts cover the whole catalog.
+ */
+export type ImportStatus = {
+	total: number,
+	pending: number,
+	ready: number,
+	failed: number,
+	/**  The background pipeline is currently working. */
+	running: boolean,
 };
 
 export type ImportSummary = {
@@ -282,19 +328,45 @@ export type TagSource =
 /**  Applied by the user. */
 "user";
 
-/**  An embedded preview finished extracting. */
+/**  Extraction failed for an image. Mirrors `ThumbnailState::Failed`. */
+export type ThumbnailFailed = {
+	imageId: number,
+	reason: string,
+};
+
+/**
+ *  An image's thumbnail (and preview) finished extracting and its EXIF is in the
+ *  catalog. Mirrors `ThumbnailState::Ready`; refetch the entry for EXIF fields.
+ */
 export type ThumbnailReady = {
 	imageId: number,
+	/**  Absolute path of the 512 px thumbnail. */
 	path: string,
+	/**  Absolute path of the 2048 px preview, if produced. */
+	previewPath: string | null,
 	width: number,
 	height: number,
 };
 
 /**
- *  Where the embedded preview for an image stands. Pixels are files in the app
- *  cache dir; the frontend loads `path` via Tauri's asset protocol.
+ *  Where the embedded preview for an image stands. Pixels are JPEG files under
+ *  `<cacheDir>/thumbs/`; the frontend loads them with `convertFileSrc(path)`
+ *  (Tauri asset protocol). Paths are absolute. Orientation is already applied.
  */
-export type ThumbnailState = { status: "pending" } | { status: "ready"; path: string; width: number; height: number } | { status: "failed"; reason: string };
+export type ThumbnailState = 
+/**  Registered, not yet extracted (or queued for regeneration). */
+{ status: "pending" } | { status: "ready"; 
+/**  Grid thumbnail, long edge 512 px. */
+path: string; 
+/**
+ *  Loupe preview, long edge 2048 px (smaller if the embedded JPEG is smaller).
+ *  `None` if only the thumbnail could be produced.
+ */
+previewPath: string | null; 
+/**  Pixel size of the thumbnail at `path` (after orientation). */
+width: number; height: number } | 
+/**  Extraction failed; `reason` is a human-readable message. */
+{ status: "failed"; reason: string };
 
 /**  White balance. `AsShot` uses the camera's recorded multipliers. */
 export type WhiteBalance = { mode: "as_shot" } | 

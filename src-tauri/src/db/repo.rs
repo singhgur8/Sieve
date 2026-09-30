@@ -41,7 +41,7 @@ pub fn set_burst_window(conn: &Connection, ms: u32) -> AppResult<()> {
     set_meta(conn, "burst_window_ms", &ms.to_string())
 }
 
-pub fn catalog_state(conn: &Connection, catalog_path: &str) -> AppResult<CatalogState> {
+pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> AppResult<CatalogState> {
     let shoot_type = ShootType::parse(&get_meta(conn, "shoot_type")?).unwrap_or(ShootType::General);
     let burst_window_ms = get_meta(conn, "burst_window_ms")?.parse().unwrap_or(1500);
     let image_count: u32 = conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
@@ -71,6 +71,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str) -> AppResult<Catalog
         burst_window_ms,
         folders,
         tag_counts,
+        cache_dir: cache_dir.to_owned(),
     })
 }
 
@@ -168,7 +169,8 @@ const ENTRY_SELECT: &str = "
            q.overall, q.face_sharpness, q.global_sharpness, q.eyes_open, q.composition,
            q.face_count, q.clipped_highlights_pct, q.clipped_shadows_pct, q.mean_luma,
            q.model_version,
-           EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id)
+           EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id),
+           t.preview_path
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -193,7 +195,9 @@ fn opt_enum_col<T>(row: &Row, idx: usize, parse: fn(&str) -> Option<T>) -> rusql
 /// Maps an `ENTRY_SELECT` row; `tags` are filled in afterwards.
 fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
     let thumbnail = match r.get::<_, Option<String>>(19)?.as_deref() {
-        Some("ready") => ThumbnailState::Ready { path: r.get(20)?, width: r.get(21)?, height: r.get(22)? },
+        Some("ready") => {
+            ThumbnailState::Ready { path: r.get(20)?, preview_path: r.get(39)?, width: r.get(21)?, height: r.get(22)? }
+        }
         Some("failed") => ThumbnailState::Failed { reason: r.get::<_, Option<String>>(23)?.unwrap_or_default() },
         _ => ThumbnailState::Pending,
     };
@@ -542,7 +546,7 @@ mod tests {
 
         assert_eq!(get_image(&conn, raf.id).unwrap(), *raf);
 
-        let state = catalog_state(&conn, ":memory:").unwrap();
+        let state = catalog_state(&conn, ":memory:", "").unwrap();
         assert_eq!(state.image_count, 4);
         assert_eq!(state.folders.len(), 1);
         assert_eq!(state.folders[0].image_count, 4);
@@ -613,7 +617,7 @@ mod tests {
         set_user_tag(&mut conn, &[b], Blink, false).unwrap();
         assert!(get_image(&conn, b).unwrap().tags.is_empty());
 
-        let counts = catalog_state(&conn, "").unwrap().tag_counts;
+        let counts = catalog_state(&conn, "", "").unwrap().tag_counts;
         assert_eq!(counts, [TagCount { tag: Blink, count: 1 }, TagCount { tag: MotionBlur, count: 1 }]);
     }
 
@@ -692,7 +696,7 @@ mod tests {
         set_shoot_type(&conn, ShootType::Wedding).unwrap();
         set_burst_window(&conn, 800).unwrap();
         assert!(set_burst_window(&conn, 5).is_err());
-        let s = catalog_state(&conn, "").unwrap();
+        let s = catalog_state(&conn, "", "").unwrap();
         assert_eq!((s.shoot_type, s.burst_window_ms), (ShootType::Wedding, 800));
     }
 }

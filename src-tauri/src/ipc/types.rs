@@ -91,11 +91,15 @@ pub struct CameraInfo {
     pub sensor_layout: SensorLayout,
 }
 
-/// EXIF capture metadata. All optional: populated by thumbnail extraction (Phase 2).
+/// EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
+/// in the same pass that extracts the embedded preview.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureMeta {
-    /// Capture time in unix ms, including sub-second precision (needed for burst grouping).
+    /// Capture time in ms, including sub-seconds (`SubSecTimeOriginal`), needed for
+    /// burst grouping. EXIF `DateTimeOriginal` is camera-local wall-clock time with no
+    /// zone, so it is stored as that wall-clock time *interpreted as UTC* ("naive" ms):
+    /// display with `timeZone: "UTC"`; differences between frames are exact.
     pub captured_at_ms: Option<i64>,
     pub iso: Option<u32>,
     #[specta(type = Option<Number>)]
@@ -107,13 +111,25 @@ pub struct CaptureMeta {
     pub lens: Option<String>,
 }
 
-/// Where the embedded preview for an image stands. Pixels are files in the app
-/// cache dir; the frontend loads `path` via Tauri's asset protocol.
+/// Where the embedded preview for an image stands. Pixels are JPEG files under
+/// `<cacheDir>/thumbs/`; the frontend loads them with `convertFileSrc(path)`
+/// (Tauri asset protocol). Paths are absolute. Orientation is already applied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum ThumbnailState {
+    /// Registered, not yet extracted (or queued for regeneration).
     Pending,
-    Ready { path: String, width: u32, height: u32 },
+    Ready {
+        /// Grid thumbnail, long edge 512 px.
+        path: String,
+        /// Loupe preview, long edge 2048 px (smaller if the embedded JPEG is smaller).
+        /// `None` if only the thumbnail could be produced.
+        preview_path: Option<String>,
+        /// Pixel size of the thumbnail at `path` (after orientation).
+        width: u32,
+        height: u32,
+    },
+    /// Extraction failed; `reason` is a human-readable message.
     Failed { reason: String },
 }
 
@@ -535,4 +551,20 @@ pub struct CatalogState {
     pub folders: Vec<FolderEntry>,
     /// Counts of non-suppressed tags, for the filter bar.
     pub tag_counts: Vec<TagCount>,
+    /// Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+    /// Thumbnails/previews live in `<cacheDir>/thumbs/`.
+    pub cache_dir: String,
+}
+
+/// Snapshot of thumbnail/metadata extraction, so the UI can restore its progress
+/// display after a reload. Counts cover the whole catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportStatus {
+    pub total: u32,
+    pub pending: u32,
+    pub ready: u32,
+    pub failed: u32,
+    /// The background pipeline is currently working.
+    pub running: bool,
 }

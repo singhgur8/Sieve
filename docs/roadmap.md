@@ -19,7 +19,7 @@ Conventions
 - [x] Tauri v2 + React/TS/Tailwind scaffold, typed IPC via tauri-specta, SQLite catalog v1.
 
 ## Phase 2 — Ingest: thumbnails + metadata
-- [ ] **Contract** (architect): add fields/commands needed for extraction progress & cache dir; asset-protocol scope for thumbnail cache in `tauri.conf.json`; log in `docs/ipc-changelog.md`.
+- [x] **Contract** (architect): add fields/commands needed for extraction progress & cache dir; asset-protocol scope for thumbnail cache in `tauri.conf.json`; log in `docs/ipc-changelog.md`.
 - [ ] **LibRaw binding** (rust-engine-dev): `brew install libraw`; pick FFI crate (evaluate `libraw-rs`, `rsraw`, or own `bindgen` wrapper); record choice in `docs/decisions.md`.
 - [ ] **Embedded preview extraction** (rust-engine-dev): fastest path first (embedded JPEG from ARW/RAF/CR3, via LibRaw `unpack_thumb` or direct container parsing); write resized JPEG (long edge 512) + preview (long edge 2048) to `<app_cache>/thumbs/`; orientation applied.
 - [ ] **EXIF → catalog** (rust-engine-dev): capture time incl. sub-seconds, ISO, shutter, aperture, focal length, lens, model, dims, orientation; Fuji `sensor_layout` from model.
@@ -102,3 +102,4 @@ Requested 2026-09-29. User provides a reference photo B (any source/JPEG) and a 
 Orchestrator appends one entry per completed task/phase: date, what was done, verify results, decisions.
 
 - 2026-09-29 — Phase 1 complete (`bae9d2c`): 12 Rust tests, frontend build, dev app launches.
+- 2026-09-29 — Phase 2 Contract: IPC v2 (previewPath, cacheDir, ImportStatus, regenerate_thumbnails, get_import_status, thumbnailFailed), migration 0002, asset protocol scoped to cache. Gate: 13 tests, clippy, fmt, pnpm build green.

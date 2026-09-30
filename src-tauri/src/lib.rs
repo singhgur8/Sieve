@@ -1,4 +1,5 @@
 pub mod db;
+pub mod ingest;
 pub mod ipc;
 pub mod ml;
 pub mod raw;
@@ -8,11 +9,14 @@ use std::path::PathBuf;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
+use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
-use ipc::events::{AnalysisProgress, ImportProgress, ThumbnailReady};
+use ipc::events::{AnalysisProgress, ImportProgress, ThumbnailFailed, ThumbnailReady};
 
 /// Overrides the catalog location (useful for tests and scratch catalogs).
 const CATALOG_ENV: &str = "LUMENRAW_CATALOG";
+/// Overrides the derived-file cache root (thumbnails live in `<cache>/thumbs/`).
+const CACHE_ENV: &str = "LUMENRAW_CACHE";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -33,8 +37,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::set_user_tag,
             commands::get_adjustments,
             commands::save_adjustments,
+            commands::regenerate_thumbnails,
+            commands::get_import_status,
         ])
-        .events(collect_events![ImportProgress, ThumbnailReady, AnalysisProgress])
+        .events(collect_events![ImportProgress, ThumbnailReady, ThumbnailFailed, AnalysisProgress])
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -59,7 +65,20 @@ pub fn run() {
                 Some(p) => PathBuf::from(p),
                 None => app.path().app_data_dir()?.join("catalog.sqlite"),
             };
+            let cache_dir = match std::env::var_os(CACHE_ENV) {
+                Some(p) => PathBuf::from(p),
+                None => app.path().app_cache_dir()?,
+            };
+            let config = IngestConfig { catalog_path: path.clone(), cache_dir };
+            std::fs::create_dir_all(config.thumbs_dir())?;
+            // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
+            // covers a `LUMENRAW_CACHE` override (and is a no-op widening otherwise).
+            app.asset_protocol_scope().allow_directory(config.thumbs_dir(), true)?;
+
             app.manage(Catalog::open(path)?);
+            app.manage(Ingest::new(config));
+            // Resume thumbnails left `pending` by a previous session.
+            app.state::<Ingest>().start(app.handle())?;
             Ok(())
         })
         .run(tauri::generate_context!())

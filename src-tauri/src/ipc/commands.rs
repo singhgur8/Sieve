@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use super::error::{AppError, AppResult};
 use super::types::*;
 use crate::db::{self, repo};
+use crate::ingest::{self, Ingest};
 
 /// Managed state: the open catalog.
 pub struct Catalog {
@@ -43,9 +44,10 @@ impl Catalog {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_catalog_state(catalog: State<'_, Catalog>) -> AppResult<CatalogState> {
+pub async fn get_catalog_state(catalog: State<'_, Catalog>, ingest: State<'_, Ingest>) -> AppResult<CatalogState> {
     let path = catalog.path.display().to_string();
-    catalog.run(move |c| repo::catalog_state(c, &path)).await
+    let cache_dir = ingest.config().cache_dir.display().to_string();
+    catalog.run(move |c| repo::catalog_state(c, &path, &cache_dir)).await
 }
 
 #[tauri::command]
@@ -60,15 +62,37 @@ pub async fn set_burst_window(catalog: State<'_, Catalog>, ms: u32) -> AppResult
     catalog.run(move |c| repo::set_burst_window(c, ms)).await
 }
 
-/// Registers RAW files under `path`. Does not decode; thumbnails start `pending`.
+/// Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
+/// then kicks the background ingest pipeline and returns. Extraction progress arrives
+/// as `importProgress` / `thumbnailReady` / `thumbnailFailed` events.
 #[tauri::command]
 #[specta::specta]
 pub async fn import_folder(
+    app: AppHandle,
     catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
     path: String,
     options: ImportOptions,
 ) -> AppResult<ImportSummary> {
-    catalog.run(move |c| repo::import_folder(c, Path::new(&path), &options)).await
+    let summary = catalog.run(move |c| repo::import_folder(c, Path::new(&path), &options)).await?;
+    ingest.start(&app)?;
+    Ok(summary)
+}
+
+/// Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
+/// `pending` and returns immediately; results arrive as events.
+#[tauri::command]
+#[specta::specta]
+pub async fn regenerate_thumbnails(app: AppHandle, ingest: State<'_, Ingest>, ids: Vec<ImageId>) -> AppResult<()> {
+    ingest.regenerate(&app, ids)
+}
+
+/// Catalog-wide pending/ready/failed counts and whether the pipeline is running.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_import_status(catalog: State<'_, Catalog>, ingest: State<'_, Ingest>) -> AppResult<ImportStatus> {
+    let running = ingest.is_running();
+    catalog.run(move |c| ingest::import_status(c, running)).await
 }
 
 #[tauri::command]
