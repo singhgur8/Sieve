@@ -611,6 +611,8 @@ export default function App() {
       case "maskFeather":
       case "maskAuto":
       case "maskDelete":
+      case "maskMoveUp":
+      case "maskMoveDown":
         return develop.current?.maskKey(def.id, e);
       case "saveXmp":
         return void writeXmp();

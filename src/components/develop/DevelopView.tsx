@@ -22,10 +22,10 @@ import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
 import { AdjustPanel } from "./AdjustPanel";
 import { LeftPanel } from "./LeftPanel";
 import { FieldsDialog } from "./FieldsDialog";
-import { CropOverlay, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
+import { CropOverlay, constrainTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { WarningsChip } from "./WarningsChip";
-import { FULL, fromStored, isFull, loadCropAspect, toStored } from "../../lib/crop";
+import { FULL, fromStored, isFull, loadCropAspect, previewRotation, toStored } from "../../lib/crop";
 import { setSectionOpen } from "../../lib/sections";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 
@@ -155,6 +155,14 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   useEffect(() => setCropTool(null), [id]);
   const orientation = entry?.orientation ?? 1;
   const imageAspect = editor.main && editor.main.uncropped && editor.main.height > 0 ? editor.main.width / editor.main.height : 0;
+  // Oriented, uncropped aspect (w / h) of the photo: what crop rectangles are fractions of.
+  const frameAspect = info && info.fullWidth > 0 && info.fullHeight > 0 ? info.fullWidth / info.fullHeight : imageAspect || 1.5;
+  const frameAspectRef = useRef(frameAspect);
+  frameAspectRef.current = frameAspect;
+  const orientationRef = useRef(orientation);
+  orientationRef.current = orientation;
+  /** Every crop tool change goes through here: the rectangle stays inside the straightened image. */
+  const changeCrop = useCallback((t: CropTool) => setCropTool(constrainTool(t, frameAspectRef.current, orientationRef.current)), []);
   const startCrop = useCallback(() => {
     if (id == null) return;
     const c = editor.adj.crop;
@@ -164,10 +172,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setSplit(false);
     setSectionOpen("crop", true);
     setPicking(false);
-    setCropTool({ rect: c.enabled ? fromStored(c, orientation) : FULL, angle: c.angle, aspect: loadCropAspect(), flip: false });
+    setCropTool({ rect: c.enabled ? fromStored(c, orientation, frameAspect) : FULL, angle: c.enabled ? c.angle : 0, aspect: loadCropAspect(), flip: false });
     // Make sure the crop controls are on screen (the panel may be scrolled to another section).
     setTimeout(() => document.querySelector('[data-testid="section-crop"]')?.scrollIntoView({ block: "nearest" }), 0);
-  }, [id, editor.adj.crop, orientation]);
+  }, [id, editor.adj.crop, orientation, frameAspect]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
     if (!t) {
@@ -175,10 +183,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       return;
     }
     setCropTool(null);
-    const next = isFull(t.rect) && t.angle === 0 ? { ...editor.defaults.crop } : toStored(t.rect, orientation, t.angle);
+    const next = isFull(t.rect) && t.angle === 0 ? { ...editor.defaults.crop } : toStored(t.rect, orientation, t.angle, frameAspect);
     if (JSON.stringify(next) === JSON.stringify(editor.adj.crop)) return; // nothing changed: no history entry
     editor.change((a) => ({ ...a, crop: next }), "Crop");
-  }, [editor, orientation]);
+  }, [editor, orientation, frameAspect]);
   const cancelCrop = useCallback(() => {
     if (!cropRef.current) return false;
     setCropTool(null);
@@ -186,7 +194,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, []);
   const imageAspectRef = useRef(imageAspect);
   imageAspectRef.current = imageAspect;
-  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: setCropTool, commit: commitCrop, cancel: cancelCrop };
+  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: changeCrop, commit: commitCrop, cancel: cancelCrop };
 
   const toggleZoom = useCallback((at?: { x: number; y: number }) => cropRef.current || setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
 
@@ -362,6 +370,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           return;
         case "maskDelete":
           return m.deleteSelected();
+        case "maskMoveUp":
+          return m.moveSelected(-1);
+        case "maskMoveDown":
+          return m.moveSelected(1);
       }
     },
     [],
@@ -455,8 +467,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       },
       escape,
       isCropping: () => cropRef.current !== null,
-      cropSwap: () => cropRef.current && setCropTool(swapTool(cropRef.current, imageAspectRef.current || 1.5)),
-      cropLock: () => cropRef.current && setCropTool(toggleLockTool(cropRef.current, imageAspectRef.current || 1.5)),
+      cropSwap: () => cropRef.current && changeCrop(swapTool(cropRef.current, imageAspectRef.current || 1.5)),
+      cropLock: () => cropRef.current && changeCrop(toggleLockTool(cropRef.current, imageAspectRef.current || 1.5)),
       lastCommitAt: editor.lastCommitAt,
       canRedo: editor.canRedo,
       toggleBw,
@@ -578,8 +590,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onPanEnd={onPanEnd}
             onToggleZoom={toggleZoom}
             inset={cropTool ? CROP_INSET : 0}
+            rotate={cropTool ? previewRotation(cropTool.angle, orientation) : 0}
           />
-          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} onError={onError} />}
+          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} region={zoom.on ? region : null} onError={onError} />}
           {masks.open && masks.tool && !cropTool && (
             <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>
               {TOOL_HELP[masks.tool.kind]}
@@ -587,7 +600,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           )}
           {cropTool && imageAspect > 0 && (
             <div className="absolute" style={{ inset: CROP_INSET }} data-testid="crop-inset">
-              <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} onChange={setCropTool} />
+              <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} />
             </div>
           )}
           {cropTool && <CropBar crop={cropApi} />}

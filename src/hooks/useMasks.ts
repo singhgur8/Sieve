@@ -99,6 +99,10 @@ export interface MasksApi {
   patchComponent: (gid: string, cid: string, patch: Partial<MaskComponent>, label: string) => void;
   deleteComponent: (gid: string, cid: string) => void;
   deleteSelected: () => void;
+  /** Moves a group / component so it ends at array index `to` (clamped); one history entry. */
+  reorderGroup: (gid: string, to: number) => void;
+  reorderComponent: (gid: string, cid: string, to: number) => void;
+  moveSelected: (delta: number) => void;
   liveGroup: (gid: string, fn: (g: MaskGroup) => MaskGroup, label: string) => void;
   commit: () => void;
   changeGroup: (gid: string, fn: (g: MaskGroup) => MaskGroup, label: string) => void;
@@ -126,6 +130,15 @@ function insert(m: MaskGroup[], gid: string | null, newGid: string, comp: MaskCo
 }
 
 const EMPTY_STATES: Record<string, AiMaskState> = {};
+
+const clampIndex = (i: number, len: number) => Math.max(0, Math.min(len - 1, i));
+/** `list` with the item at `from` moved so that it ends at index `to`. */
+function moveItem<T>(list: T[], from: number, to: number): T[] {
+  const out = list.slice();
+  const [it] = out.splice(from, 1);
+  out.splice(to, 0, it);
+  return out;
+}
 
 export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
   const [open, setOpen] = useState(false);
@@ -398,6 +411,41 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
     else deleteGroup(g);
   }, [deleteComponent, deleteGroup]);
 
+  // Order is array order in `adjustments.masks` / `components` (later groups apply after earlier ones).
+  const reorderGroup = useCallback(
+    (gid: string, to: number) => {
+      const from = groupsRef.current.findIndex((x) => x.id === gid);
+      if (from < 0) return;
+      const dest = clampIndex(to, groupsRef.current.length);
+      if (dest === from) return;
+      change((m) => moveItem(m, from, dest), `Mask: Reorder ${groupsRef.current[from].name}`);
+    },
+    [change],
+  );
+  const reorderComponent = useCallback(
+    (gid: string, cid: string, to: number) => {
+      const g = groupsRef.current.find((x) => x.id === gid);
+      const from = g ? g.components.findIndex((c) => c.id === cid) : -1;
+      if (!g || from < 0) return;
+      const dest = clampIndex(to, g.components.length);
+      if (dest === from) return;
+      change((m) => mapGroup(m, gid, (x) => ({ ...x, components: moveItem(x.components, from, dest) })), "Mask: Reorder component");
+    },
+    [change],
+  );
+  /** Alt+Up / Alt+Down: moves the selected component within its group, else the selected group in the stack. */
+  const moveSelected = useCallback(
+    (delta: number) => {
+      const { g, c } = selRef.current;
+      if (!g) return;
+      const grp = groupsRef.current.find((x) => x.id === g);
+      if (!grp) return;
+      if (c && grp.components.length > 1) reorderComponent(g, c, grp.components.findIndex((x) => x.id === c) + delta);
+      else reorderGroup(g, groupsRef.current.findIndex((x) => x.id === g) + delta);
+    },
+    [reorderComponent, reorderGroup],
+  );
+
   const liveGroup = useCallback((gid: string, fn: (g: MaskGroup) => MaskGroup, label: string) => edit((m) => mapGroup(m, gid, fn), label), [edit]);
   const changeGroup = useCallback((gid: string, fn: (g: MaskGroup) => MaskGroup, label: string) => change((m) => mapGroup(m, gid, fn), label), [change]);
 
@@ -561,6 +609,9 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
     patchComponent,
     deleteComponent,
     deleteSelected,
+    reorderGroup,
+    reorderComponent,
+    moveSelected,
     liveGroup,
     commit,
     changeGroup,

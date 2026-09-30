@@ -51,6 +51,8 @@ interface Props {
   onToggleZoom: (at?: { x: number; y: number }) => void;
   /** Margin (px) around the fitted image (crop tool: handles must not sit on the panel borders). */
   inset?: number;
+  /** Live straighten preview: rotates the displayed frame about its centre (degrees, CSS sense). Crop tool only. */
+  rotate?: number;
 }
 
 const img = "pointer-events-none absolute select-none";
@@ -156,7 +158,17 @@ export function Viewer(p: Props) {
           <span className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-1.5 text-[10px] text-white">After</span>
         </>
       ) : (
-        shown && <img src={shown.url} alt={alt(shown)} draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid={p.showBefore ? "view-before" : "view-main"} />
+        shown && (
+          <img
+            src={shown.url}
+            alt={alt(shown)}
+            draggable={false}
+            className={`${img} inset-0 size-full object-contain`}
+            style={p.rotate ? { ...insetStyle, transform: `rotate(${p.rotate}deg)`, transformOrigin: "50% 50%" } : insetStyle}
+            data-testid={p.showBefore ? "view-before" : "view-main"}
+            data-rotation={p.rotate ? p.rotate.toFixed(2) : "0"}
+          />
+        )
       )}
       {p.showBefore && <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="before-badge">Before</span>}
       {p.loading && !shown && (

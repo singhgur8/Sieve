@@ -1,7 +1,8 @@
 // Masks panel (Shift+W): create tools, mask groups with their components, and the local adjustment sliders.
 import { useEffect, useRef, useState } from "react";
-import { Brush, Copy, Eye, EyeOff, FlipHorizontal2, Loader2, MoreHorizontal, MousePointer2, Mountain, RefreshCw, Sun, Trash2, Users, UserRound, Circle, Blend, Palette, SquareDashed } from "lucide-react";
-import { defaultLocalAdjustments, type MaskBlendMode, type MaskComponent, type MaskGroup } from "../../ipc";
+import { Brush, Copy, Eye, GripVertical, EyeOff, FlipHorizontal2, Loader2, MoreHorizontal, MousePointer2, Mountain, RefreshCw, Sun, Trash2, Users, UserRound, Circle, Blend, Palette, SquareDashed } from "lucide-react";
+import { IDENTITY_CURVE, defaultLocalAdjustments, type CurvePoint, type MaskBlendMode, type MaskComponent, type MaskGroup, type PointCurves } from "../../ipc";
+import { PointCurveEditor, type CurveHost } from "./ToneCurvePanel";
 import type { MasksApi } from "../../hooks/useMasks";
 import { hint } from "../../lib/keymap";
 import { CREATE_LABEL, CREATE_ORDER, CREATE_SHORT, LOCAL_GROUPS, MODE_GLYPH, OVERLAY_STYLES, componentTitle, type CreateKind } from "../../lib/masks";
@@ -39,6 +40,11 @@ const MODES: { mode: MaskBlendMode; label: string }[] = [
 interface Props {
   masks: MasksApi;
 }
+
+const identityCurves = (): PointCurves => {
+  const id = () => IDENTITY_CURVE.map((p) => [...p] as CurvePoint);
+  return { master: id(), red: id(), green: id(), blue: id() };
+};
 
 export function MasksPanel({ masks }: Props) {
   const sel = masks.groups.find((g) => g.id === masks.selGroup) ?? null;
@@ -108,8 +114,8 @@ export function MasksPanel({ masks }: Props) {
           </p>
         )}
         <ul className="min-h-0 flex-1 space-y-1 overflow-y-auto" data-testid="mask-list-scroll">
-          {masks.groups.map((g) => (
-            <GroupRow key={g.id} g={g} masks={masks} />
+          {masks.groups.map((g, i) => (
+            <GroupRow key={g.id} g={g} index={i} masks={masks} />
           ))}
         </ul>
       </section>
@@ -191,7 +197,58 @@ function compKind(c: MaskComponent): CreateKind {
   return "object";
 }
 
-function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
+/**
+ * Drag handle that reorders its row among the siblings of the same list (`ul`). Pointer-based: while dragging, a line
+ * marks the drop position; on release `onMove(finalIndex)` runs once. Alt+Up / Alt+Down move the selection (keymap).
+ */
+function ReorderHandle({ index, onMove, onPick, testid, label }: { index: number; onMove: (to: number) => void; onPick: () => void; testid: string; label: string }) {
+  const st = useRef<{ items: HTMLElement[]; to: number } | null>(null);
+  const clear = () => st.current?.items.forEach((el) => (el.style.boxShadow = ""));
+  const target = (y: number, items: HTMLElement[]) => items.filter((el, i) => i !== index && (() => { const r = el.getBoundingClientRect(); return r.top + r.height / 2 < y; })()).length;
+  const mark = (to: number, items: HTMLElement[]) => {
+    items.forEach((el) => (el.style.boxShadow = ""));
+    const others = items.filter((_, i) => i !== index);
+    if (to < others.length) others[to].style.boxShadow = "0 -2px 0 0 #38bdf8";
+    else others[others.length - 1] && (others[others.length - 1].style.boxShadow = "0 2px 0 0 #38bdf8");
+  };
+  return (
+    <button
+      className="cursor-grab touch-none rounded p-0.5 text-neutral-500 hover:text-neutral-200 active:cursor-grabbing"
+      aria-label={label}
+      title={`${label} (drag, or Alt+Up / Alt+Down)`}
+      data-testid={testid}
+      onClick={onPick}
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        const ul = e.currentTarget.closest("li")?.parentElement;
+        if (!ul) return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        st.current = { items: Array.from(ul.children).filter((c): c is HTMLElement => c instanceof HTMLElement && c.tagName === "LI"), to: index };
+      }}
+      onPointerMove={(e) => {
+        const s = st.current;
+        if (!s) return;
+        s.to = target(e.clientY, s.items);
+        mark(s.to, s.items);
+      }}
+      onPointerUp={() => {
+        const s = st.current;
+        st.current = null;
+        if (!s) return;
+        s.items.forEach((el) => (el.style.boxShadow = ""));
+        if (s.to !== index) onMove(s.to);
+      }}
+      onPointerCancel={() => {
+        clear();
+        st.current = null;
+      }}
+    >
+      <GripVertical className="size-3.5" />
+    </button>
+  );
+}
+
+function GroupRow({ g, index, masks }: { g: MaskGroup; index: number; masks: MasksApi }) {
   const on = masks.selGroup === g.id;
   const [renaming, setRenaming] = useState(false);
   const rowRef = useRef<HTMLLIElement>(null);
@@ -213,6 +270,7 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
       onMouseLeave={() => masks.setHover(null)}
     >
       <div className="flex items-center gap-1 px-1.5 py-1">
+        <ReorderHandle index={index} onMove={(to) => masks.reorderGroup(g.id, to)} onPick={() => masks.select(g.id, null)} testid={`mask-group-handle-${g.id}`} label="Reorder mask" />
         {single && <KindIcon className="size-3.5 shrink-0 text-neutral-400" aria-hidden />}
         <button className="text-neutral-300 hover:text-white" onClick={() => masks.toggleGroup(g.id)} title={g.active ? "Hide this mask's adjustments" : "Show this mask's adjustments"} aria-label="Toggle mask" aria-pressed={g.active} data-testid={`mask-group-eye-${g.id}`}>
           {g.active ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5 opacity-60" />}
@@ -260,8 +318,8 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
       </div>
       {(!single || on) && (
         <ul className="space-y-0.5 px-1.5 pb-1">
-          {g.components.map((c) => (
-            <ComponentRow key={c.id} g={g} c={c} masks={masks} />
+          {g.components.map((c, i) => (
+            <ComponentRow key={c.id} g={g} c={c} index={i} masks={masks} />
           ))}
         </ul>
       )}
@@ -302,7 +360,7 @@ function RenameInput({ initial, onDone, testid }: { initial: string; onDone: (v:
   );
 }
 
-function ComponentRow({ g, c, masks }: { g: MaskGroup; c: MaskComponent; masks: MasksApi }) {
+function ComponentRow({ g, c, index, masks }: { g: MaskGroup; c: MaskComponent; index: number; masks: MasksApi }) {
   const on = masks.selComp === c.id && masks.selGroup === g.id;
   const st = c.shape.kind === "ai" ? masks.aiState[c.id] : undefined;
   const first = g.components[0]?.id === c.id;
@@ -321,6 +379,7 @@ function ComponentRow({ g, c, masks }: { g: MaskGroup; c: MaskComponent; masks: 
       }}
       onMouseLeave={() => masks.setHover({ groupId: g.id, componentId: null })}
     >
+      <ReorderHandle index={index} onMove={(to) => masks.reorderComponent(g.id, c.id, to)} onPick={() => masks.select(g.id, c.id)} testid={`mask-comp-handle-${c.id}`} label="Reorder component" />
       <button className="text-neutral-300 hover:text-white" onClick={() => masks.patchComponent(g.id, c.id, { active: !c.active }, "Mask: Component visibility")} aria-label="Toggle component" aria-pressed={c.active} title="Show or hide this component" data-testid={`mask-comp-eye-${c.id}`}>
         {c.active ? <Eye className="size-3" /> : <EyeOff className="size-3 opacity-60" />}
       </button>
@@ -508,6 +567,20 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
     else masks.liveGroup(g.id, fn, label);
   };
   const color = g.adjustments.color;
+  // Per-mask point curves (`LocalAdjustments.toneCurve`, absent = identity), edited with the Tone Curve panel's editor.
+  const curves = g.adjustments.toneCurve ?? identityCurves();
+  const curvesDirty = (Object.keys(curves) as (keyof PointCurves)[]).some((k) => JSON.stringify(curves[k]) !== JSON.stringify(IDENTITY_CURVE));
+  const curveFn = (ch: keyof PointCurves, fn: (pts: CurvePoint[]) => CurvePoint[]) => (x: MaskGroup): MaskGroup => {
+    const cur = (x.adjustments.toneCurve ?? identityCurves())[ch];
+    const next = fn(cur);
+    return next === cur ? x : { ...x, adjustments: { ...x.adjustments, toneCurve: { ...(x.adjustments.toneCurve ?? identityCurves()), [ch]: next } } };
+  };
+  const curveHost: CurveHost = {
+    curves,
+    edit: (ch, fn) => masks.liveGroup(g.id, curveFn(ch, fn), `Mask: ${g.name} Tone Curve`),
+    change: (ch, fn) => masks.changeGroup(g.id, curveFn(ch, fn), `Mask: ${g.name} Tone Curve`),
+    commit: masks.commit,
+  };
   const setColor = (patch: Partial<typeof color>, label: string, commit: boolean) => {
     const fn = (x: MaskGroup): MaskGroup => ({ ...x, adjustments: { ...x.adjustments, color: { ...x.adjustments.color, ...patch } } });
     if (commit) masks.changeGroup(g.id, fn, label);
@@ -559,6 +632,26 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
           ))}
         </Section>
       ))}
+      <Section
+        id="mask-tonecurve"
+        title="Tone Curve"
+        dirty={curvesDirty || g.adjustments.curveRefineSaturation !== defaults.curveRefineSaturation}
+        onReset={() => masks.changeGroup(g.id, (x) => ({ ...x, adjustments: { ...x.adjustments, toneCurve: identityCurves(), curveRefineSaturation: defaults.curveRefineSaturation } }), `Mask: ${g.name} Reset Tone Curve`)}
+      >
+        <PointCurveEditor host={curveHost} tid="mask-curve" />
+        <Slider
+          id="mask-curveRefineSaturation"
+          label="Refine Saturation"
+          value={g.adjustments.curveRefineSaturation}
+          min={0}
+          max={100}
+          step={1}
+          defaultValue={100}
+          onInput={(v) => setLocal("curveRefineSaturation", v, `Mask: ${g.name} Refine Saturation`, false)}
+          onCommit={masks.commit}
+          onReset={() => setLocal("curveRefineSaturation", 100, `Mask: ${g.name} Refine Saturation`, true)}
+        />
+      </Section>
       <Section id="mask-color" dirty={color.saturation !== defaults.color.saturation || color.hue !== defaults.color.hue} title="Color" onReset={() => masks.changeGroup(g.id, (x) => ({ ...x, adjustments: { ...x.adjustments, color: defaults.color } }), `Mask: ${g.name} Reset Color`)}>
         <div className="mb-1 flex items-center gap-2 text-[11px] text-neutral-300">
           <span className="size-5 rounded border border-neutral-600" style={{ backgroundColor: color.saturation > 0 ? `hsl(${color.hue} ${color.saturation}% 50%)` : "transparent" }} data-testid="mask-color-swatch" title="Color tint applied inside the mask" />

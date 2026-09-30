@@ -2,7 +2,7 @@
 // gradient / range tools. Pointer positions become displayed-frame fractions (`screenToDisp`) and are converted to the
 // sensor frame (un-oriented, uncropped) with `dispToSensor` before they reach the mask data.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { commands, unwrap, type LinearMask, type MaskGroup, type MaskShape, type NormPoint, type RadialMask, type RenderedMaskOverlay } from "../../ipc";
+import { commands, unwrap, type LinearMask, type MaskGroup, type MaskShape, type NormPoint, type NormRect, type RadialMask, type RenderedMaskOverlay } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
 import type { MasksApi } from "../../hooks/useMasks";
 import {
@@ -27,35 +27,73 @@ interface Props {
   id: number | null;
   frame: Frame | null;
   box: Box | null;
+  /** Visible region of the frame while zoomed to 100% (null when fitted): the overlay is rendered for it, so it stays sharp. */
+  region?: NormRect | null;
   onError: (e: unknown) => void;
 }
 
 type Pt = { x: number; y: number };
 const DEG = 180 / Math.PI;
 
-/** Luminance (CIE L* / 100) of the displayed image under `p` (displayed-frame fraction), or null when unreadable. */
-function sampleLuma(p: NormPoint): number | null {
+/** L* / 100 of an sRGB pixel (the space `luminance_weight` works in). */
+function lightness(px: ArrayLike<number>): number {
+  const [r, g, b] = [px[0], px[1], px[2]];
+  const lin = (v: number) => (v / 255) ** 2.2;
+  const Y = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  return (Y > 0.008856 ? 116 * Y ** (1 / 3) - 16 : 903.3 * Y) / 100;
+}
+
+/** Reads one pixel of `src` at (sx, sy) through a canvas; throws when the canvas is tainted. */
+function readPixel(src: CanvasImageSource, sx: number, sy: number): ArrayLike<number> {
+  const c = document.createElement("canvas");
+  c.width = 1;
+  c.height = 1;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  if (!g) throw new Error("no 2d context");
+  g.drawImage(src, sx, sy, 1, 1, 0, 0, 1, 1);
+  return g.getImageData(0, 0, 1, 1).data;
+}
+
+/**
+ * Luminance (CIE L* / 100) of the rendered image the viewer shows under `p` (displayed-frame fraction), or null when
+ * unreadable. The pixels come from the preview render itself. A `sieve://` image taints the canvas, so on failure the
+ * render URL is fetched as a blob and decoded (`createImageBitmap`, or an `<img>` on an object URL for formats it rejects).
+ */
+export async function sampleLuma(p: NormPoint): Promise<number | null> {
   const img = document.querySelector<HTMLImageElement>('[data-testid="view-main"]');
   if (!img || !img.naturalWidth) return null;
+  const at = (w: number, h: number) => [clamp(Math.round(p.x * w), 0, w - 1), clamp(Math.round(p.y * h), 0, h - 1)] as const;
   try {
-    const c = document.createElement("canvas");
-    c.width = 1;
-    c.height = 1;
-    const g = c.getContext("2d", { willReadFrequently: true });
-    if (!g) return null;
-    const sx = clamp(Math.round(p.x * img.naturalWidth), 0, img.naturalWidth - 1);
-    const sy = clamp(Math.round(p.y * img.naturalHeight), 0, img.naturalHeight - 1);
-    g.drawImage(img, sx, sy, 1, 1, 0, 0, 1, 1);
-    const [r, gg, b] = g.getImageData(0, 0, 1, 1).data;
-    const lin = (v: number) => ((v / 255) ** 2.2);
-    const Y = 0.2126 * lin(r) + 0.7152 * lin(gg) + 0.0722 * lin(b);
-    return (Y > 0.008856 ? 116 * Y ** (1 / 3) - 16 : 903.3 * Y) / 100;
+    return lightness(readPixel(img, ...at(img.naturalWidth, img.naturalHeight)));
   } catch {
-    return null; // tainted canvas (custom protocol without CORS)
+    /* tainted canvas: decode the bytes ourselves */
+  }
+  try {
+    const res = await fetch(img.currentSrc || img.src);
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    try {
+      const bmp = await createImageBitmap(blob);
+      const px = readPixel(bmp, ...at(bmp.width, bmp.height));
+      bmp.close();
+      return lightness(px);
+    } catch {
+      const url = URL.createObjectURL(blob);
+      try {
+        const im = new Image();
+        im.src = url;
+        await im.decode();
+        return lightness(readPixel(im, ...at(im.naturalWidth, im.naturalHeight)));
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+  } catch {
+    return null;
   }
 }
 
-export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
+export function MaskLayer({ masks, editor, id, frame, box, region = null, onError }: Props) {
   const root = useRef<HTMLDivElement>(null);
   const [cursor, setCursor] = useState<Pt | null>(null);
   const [rubber, setRubber] = useState<{ a: Pt; b: Pt } | null>(null);
@@ -69,19 +107,26 @@ export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
   }, []);
 
   // ---- overlay (latest-wins, one request in flight) ----
-  const [ov, setOv] = useState<RenderedMaskOverlay | null>(null);
-  const ovReq = useRef<{ busy: boolean; latest: { id: number; adj: typeof editor.adj; groupId: string; componentId: string | null; maxEdge: number } | null }>({ busy: false, latest: null });
+  const [ovState, setOv] = useState<{ res: RenderedMaskOverlay; region: NormRect | null } | null>(null);
+  const ov = ovState?.res ?? null;
+  type OvReq = { id: number; adj: typeof editor.adj; groupId: string; componentId: string | null; maxEdge: number; region: NormRect | null };
+  const ovReq = useRef<{ busy: boolean; latest: OvReq | null }>({ busy: false, latest: null });
   const target = masks.hover ?? (selGroup ? { groupId: selGroup, componentId: null } : null);
   const targetOk = target && groups.some((g) => g.id === target.groupId);
-  const maxEdge = box ? clamp(Math.ceil(Math.max(box.w, box.h) * (window.devicePixelRatio || 1)), 64, 1200) : 0;
+  // Fitted: the whole frame at screen size. Zoomed to 100%: only the visible region, at its screen size (long edge, as
+  // `RenderOptions.maxEdge` with a region), so the mask is as sharp as the photo instead of a stretched fitted render.
+  const dpr = window.devicePixelRatio || 1;
+  const shown = region && box ? { w: region.width * box.w, h: region.height * box.h } : box;
+  const maxEdge = shown ? clamp(Math.ceil(Math.max(shown.w, shown.h) * dpr), 64, region ? 2048 : 1200) : 0;
+  const regionKey = region ? JSON.stringify(region) : "";
   const pump = useCallback(() => {
     const r = ovReq.current;
     if (r.busy || !r.latest) return;
     const a = r.latest;
     r.busy = true;
-    unwrap(commands.renderMaskOverlay(a.id, a.adj, { groupId: a.groupId, componentId: a.componentId }, { maxEdge: a.maxEdge, region: null }))
+    unwrap(commands.renderMaskOverlay(a.id, a.adj, { groupId: a.groupId, componentId: a.componentId }, { maxEdge: a.maxEdge, region: a.region }))
       .then((res) => {
-        if (res && r.latest?.id === res.imageId) setOv(res);
+        if (res && r.latest?.id === res.imageId) setOv({ res, region: a.region });
       })
       .catch(onError)
       .finally(() => {
@@ -96,10 +141,10 @@ export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
       setOv(null);
       return;
     }
-    ovReq.current.latest = { id, adj, groupId: target.groupId, componentId: target.componentId, maxEdge };
+    ovReq.current.latest = { id, adj, groupId: target.groupId, componentId: target.componentId, maxEdge, region };
     pump();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, masks.overlayOn, targetOk, target?.groupId, target?.componentId, adj, maxEdge, pump]);
+  }, [id, masks.overlayOn, targetOk, target?.groupId, target?.componentId, adj, maxEdge, regionKey, pump]);
   useEffect(() => setOv(null), [id]);
 
   // ---- geometry helpers ----
@@ -187,15 +232,18 @@ export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
         break;
       }
       case "luminance": {
-        const l = sampleLuma(screenToDisp(g.start.x, g.start.y, box)) ?? 0.5;
-        masks.setLuminance((s) => ({
-          ...s,
-          low: clamp(l - 0.15, 0, 1),
-          high: clamp(l + 0.15, 0, 1),
-          featherLow: clamp(l - 0.3, 0, 1),
-          featherHigh: clamp(l + 0.3, 0, 1),
-        }));
-        masks.endTool();
+        const at = screenToDisp(g.start.x, g.start.y, box);
+        void sampleLuma(at).then((v) => {
+          const l = v ?? 0.5;
+          masks.setLuminance((s) => ({
+            ...s,
+            low: clamp(l - 0.15, 0, 1),
+            high: clamp(l + 0.15, 0, 1),
+            featherLow: clamp(l - 0.3, 0, 1),
+            featherHigh: clamp(l + 0.3, 0, 1),
+          }));
+          masks.endTool();
+        });
         break;
       }
       case "object":
@@ -414,13 +462,16 @@ export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
 
   const brushR = tool?.kind === "brush" ? brushRadiusPx(sizeToRadius(masks.brush.size), frame, box) : 0;
   const showOv = ov && masks.overlayOn && targetOk;
-  const ovBox = { left: box.x, top: box.y, width: box.w, height: box.h };
+  const ovRegion = ovState?.region ?? null;
+  const ovBox = ovRegion
+    ? { left: box.x + ovRegion.x * box.w, top: box.y + ovRegion.y * box.h, width: ovRegion.width * box.w, height: ovRegion.height * box.h }
+    : { left: box.x, top: box.y, width: box.w, height: box.h };
 
   return (
     <div ref={root} className="pointer-events-none absolute inset-0 overflow-hidden" data-testid="mask-layer" data-tool={tool?.kind ?? ""} data-box={JSON.stringify(box)}>
       {showOv &&
         (style.mode === "color" ? (
-          <div className="absolute isolate" style={{ ...ovBox, mixBlendMode: "screen" }} data-testid="mask-overlay" data-overlay-seq={ov!.seq} data-overlay-style={style.id}>
+          <div className="absolute isolate" style={{ ...ovBox, mixBlendMode: "screen" }} data-testid="mask-overlay" data-overlay-seq={ov!.seq} data-overlay-style={style.id} data-overlay-region={ovRegion ? JSON.stringify(ovRegion) : ""}>
             <div className="absolute inset-0" style={{ backgroundColor: style.color, opacity: 0.6 }} />
             <img src={ov!.url} alt="" draggable={false} className="absolute inset-0 size-full" style={{ mixBlendMode: "multiply" }} />
           </div>
@@ -434,6 +485,7 @@ export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
             data-testid="mask-overlay"
             data-overlay-seq={ov!.seq}
             data-overlay-style={style.id}
+            data-overlay-region={ovRegion ? JSON.stringify(ovRegion) : ""}
           />
         ))}
 
