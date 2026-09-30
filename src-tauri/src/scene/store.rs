@@ -202,7 +202,7 @@ pub fn create_scene(conn: &mut Connection, ids: &[ImageId]) -> AppResult<Scene> 
     if ids.is_empty() {
         return Err(AppError::invalid("a scene needs at least one image"));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     require_images(&tx, &ids)?;
     let now = now_ms();
     let id = insert_scene(&tx, SceneMethod::Manual, now)?;
@@ -220,7 +220,7 @@ pub fn set_scene_members(conn: &mut Connection, id: SceneId, ids: &[ImageId]) ->
     if ids.is_empty() {
         return Err(AppError::invalid("a scene needs at least one image (use delete_scene)"));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     require_scene(&tx, id)?;
     require_images(&tx, &ids)?;
     let now = now_ms();
@@ -248,7 +248,7 @@ pub fn set_scene_anchors(conn: &mut Connection, id: SceneId, anchor_ids: &[Image
     if anchors.len() > Scene::MAX_ANCHORS {
         return Err(AppError::invalid(format!("at most {} anchors per scene", Scene::MAX_ANCHORS)));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     require_scene(&tx, id)?;
     require_images(&tx, &anchors)?;
     let member_ids: Vec<ImageId> = members(&tx, id)?.into_iter().map(|(i, _)| i).collect();
@@ -269,7 +269,7 @@ pub fn merge_scenes(conn: &mut Connection, ids: &[SceneId]) -> AppResult<Scene> 
     if ids.len() < 2 {
         return Err(AppError::invalid("merge needs at least two scenes"));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     for &s in &ids {
         require_scene(&tx, s)?;
     }
@@ -300,7 +300,7 @@ pub fn merge_scenes(conn: &mut Connection, ids: &[SceneId]) -> AppResult<Scene> 
 /// new scene. Anchors follow their images. Both scenes become `manual`. Returns `[id, new]`.
 /// `first_image_id` must be a member other than the first.
 pub fn split_scene(conn: &mut Connection, id: SceneId, first_image_id: ImageId) -> AppResult<Vec<Scene>> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     require_scene(&tx, id)?;
     let list = members(&tx, id)?;
     let Some(pos) = list.iter().position(|(i, _)| *i == first_image_id) else {
@@ -325,7 +325,7 @@ pub fn split_scene(conn: &mut Connection, id: SceneId, first_image_id: ImageId) 
 
 /// Deletes scene `id`; its members become unassigned.
 pub fn delete_scene(conn: &mut Connection, id: SceneId) -> AppResult<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     require_scene(&tx, id)?;
     tx.execute("UPDATE images SET scene_id = NULL, scene_anchor = 0 WHERE scene_id = ?1", [id])?;
     tx.execute("DELETE FROM scenes WHERE id = ?1", [id])?;
@@ -370,7 +370,7 @@ pub fn detection_frames(
 
 /// Stores freshly computed features (version [`FEATURES_VERSION`], `computed_at` = now).
 pub fn save_features(conn: &mut Connection, items: &[(ImageId, SceneFeatures)]) -> AppResult<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let now = now_ms();
     {
         let mut stmt = tx.prepare_cached(
@@ -399,7 +399,7 @@ pub fn replace_scenes(
     groups: &[Vec<ImageId>],
     replace_manual: bool,
 ) -> AppResult<Vec<Scene>> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let now = now_ms();
     let all: Vec<ImageId> = groups.iter().flatten().copied().collect();
     require_images(&tx, &all)?;

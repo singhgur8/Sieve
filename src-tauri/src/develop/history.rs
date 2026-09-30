@@ -160,7 +160,7 @@ pub fn commit(
 ) -> AppResult<AdjustmentHistory> {
     adj.validate().map_err(AppError::invalid)?;
     validate_label(label)?;
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     commit_in(&tx, id, adj, label, true)?;
     let h = history(&tx, id)?;
     tx.commit()?;
@@ -181,7 +181,7 @@ pub fn apply_fields(
         return Err(AppError::invalid("fields must not be empty"));
     }
     validate_label(label)?;
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     for &id in ids {
         let mut next = repo::get_adjustments(&tx, id)?;
         next.copy_fields(src, fields);
@@ -204,7 +204,7 @@ pub fn commit_batch(
     for (_, adj) in items {
         adj.validate().map_err(AppError::invalid)?;
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let mut changed = Vec::new();
     for (id, adj) in items {
         if commit_in(&tx, *id, adj, label, false)? {
@@ -222,7 +222,7 @@ fn move_cursor(
     id: ImageId,
     pick: impl FnOnce(&[HistoryEntry], usize) -> AppResult<Option<HistoryEntryId>>,
 ) -> AppResult<EditState> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let h = history(&tx, id)?;
     if let Some(cur) = h.current_entry_id {
         let idx = h.entries.iter().position(|e| e.id == cur).unwrap_or(0);

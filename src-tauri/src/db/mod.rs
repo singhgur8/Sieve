@@ -1,24 +1,337 @@
 //! Embedded SQLite catalog.
+//!
+//! Crash safety (Phase 8, see `docs/decisions.md`):
+//! - WAL journal + `synchronous = NORMAL`: a crash of the app (or a killed process) never
+//!   loses a committed transaction and never corrupts the file; a power loss can roll back
+//!   the last few commits but leaves a consistent catalog. `checkpoint_fullfsync` makes the
+//!   (rare) checkpoints use `F_FULLFSYNC`, so Apple drives' volatile caches cannot reorder
+//!   them. Every multi-row write is one transaction (or savepoint).
+//! - The first [`open`] of a catalog in a process ([`health`] tracks it) runs
+//!   `PRAGMA quick_check`. A healthy catalog is backed up (`VACUUM INTO`, atomic) to
+//!   `<catalog>.bak-1` (newest) .. `.bak-3` before any migration and at most once a day
+//!   ([`BACKUP_INTERVAL_MS`]).
+//! - A damaged catalog is opened **read-only** (writes fail with an explanation, see
+//!   [`health`] / [`read_only_message`]) and is never backed up over the good backups. A
+//!   file that is not a database at all is moved aside (`<catalog>.corrupt-<ms>`) and a
+//!   new catalog is created. [`stage_restore`] + the next launch put a backup back.
 
 pub mod repo;
 pub mod schema;
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
-use crate::ipc::error::AppResult;
+use crate::ipc::error::{AppError, AppResult, ErrorKind};
+
+/// Backups kept (`.bak-1` newest .. `.bak-N`).
+pub const BACKUPS_KEPT: usize = 3;
+/// A startup backup is taken when the newest one is older than this.
+pub const BACKUP_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// State of a catalog as found by the first [`open`] of this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogHealth {
+    Ok,
+    /// Integrity check failed: every connection is read-only. `reason` = first problem.
+    ReadOnly {
+        reason: String,
+    },
+    /// The file was not a database; it was moved to `moved_to` and a new catalog created.
+    Replaced {
+        moved_to: PathBuf,
+        reason: String,
+    },
+}
+
+fn health_map() -> &'static Mutex<HashMap<PathBuf, CatalogHealth>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, CatalogHealth>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stable identity of a catalog path (the file itself may not exist yet).
+fn key(path: &Path) -> PathBuf {
+    match (path.parent().and_then(|d| d.canonicalize().ok()), path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Health of the catalog at `path` (as checked by the first [`open`]; `Ok` before that).
+pub fn health(path: &Path) -> CatalogHealth {
+    health_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key(path)).cloned().unwrap_or(CatalogHealth::Ok)
+}
+
+/// User-facing explanation for a write refused because the catalog is damaged.
+pub fn read_only_message(path: &Path, reason: &str) -> String {
+    let backups = list_backups(path);
+    let hint = match backups.first() {
+        Some(b) => format!(
+            "Quit Sieve and restore the backup {} (newest of {}), or copy it over {}.",
+            b.path.display(),
+            backups.len(),
+            path.display()
+        ),
+        None => "No backup exists yet; export or copy what you need, then re-import the folders.".to_owned(),
+    };
+    format!("The catalog is damaged ({reason}) and was opened read-only, so changes cannot be saved. {hint}")
+}
+
+/// Actionable wording for a `database` error of the catalog at `path`: a damaged catalog
+/// (read-only, see [`health`]) says how to restore a backup; a full or failing disk says
+/// so. Other errors pass through unchanged.
+pub fn explain_error(path: &Path, e: AppError) -> AppError {
+    if e.kind != ErrorKind::Database {
+        return e;
+    }
+    if let CatalogHealth::ReadOnly { reason } = health(path) {
+        return AppError::new(e.kind, read_only_message(path, &reason));
+    }
+    let m = e.message.to_ascii_lowercase();
+    // SQLITE_FULL, or SQLITE_IOERR (what a full disk produces on a WAL append).
+    if m.contains("database or disk is full") || m.contains("disk i/o error") {
+        return AppError::new(
+            e.kind,
+            format!(
+                "The change could not be saved to the catalog ({}): the disk holding {} is full or unavailable. \
+                 Free up space (or reconnect the drive) and try again; earlier changes are intact.",
+                e.message,
+                path.display()
+            ),
+        );
+    }
+    e
+}
 
 /// Opens (creating if needed) the catalog at `path` and brings it to the latest schema.
+/// The first call per catalog in this process also checks integrity and backs it up (see
+/// the module docs); a damaged catalog yields a read-only connection instead of an error.
 pub fn open(path: &Path) -> AppResult<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+    }
+    let first = {
+        let map = health_map().lock().unwrap_or_else(|e| e.into_inner());
+        !map.contains_key(&key(path))
+    };
+    if first {
+        let found = check_on_first_open(path);
+        health_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key(path), found);
+    }
+    if let CatalogHealth::ReadOnly { .. } = health(path) {
+        return open_read_only(path);
     }
     let mut conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     configure(&mut conn)?;
     Ok(conn)
+}
+
+/// Read-only connection (no migrations, `query_only`).
+fn open_read_only(path: &Path) -> AppResult<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
+}
+
+/// Integrity check, pending-restore application and backups for the first open.
+fn check_on_first_open(path: &Path) -> CatalogHealth {
+    apply_staged_restore(path);
+    let exists = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+    if !exists {
+        return CatalogHealth::Ok;
+    }
+    match integrity(path) {
+        Ok(None) => {}
+        Ok(Some(problem)) => {
+            eprintln!("catalog {}: integrity check failed: {problem}", path.display());
+            return CatalogHealth::ReadOnly { reason: problem };
+        }
+        Err(e) if is_not_a_database(&e) => {
+            let moved_to = aside_path(path);
+            eprintln!("catalog {}: not a database ({e}); moved to {}", path.display(), moved_to.display());
+            for suffix in ["", "-wal", "-shm"] {
+                let from = PathBuf::from(format!("{}{suffix}", path.display()));
+                if from.exists() {
+                    let _ = std::fs::rename(&from, format!("{}{suffix}", moved_to.display()));
+                }
+            }
+            return CatalogHealth::Replaced { moved_to, reason: e.to_string() };
+        }
+        Err(e) => {
+            // Locked / unreadable: not evidence of corruption; the normal open reports it.
+            eprintln!("catalog {}: integrity check skipped: {e}", path.display());
+            return CatalogHealth::Ok;
+        }
+    }
+    // Healthy: back up before migrations and at most once per interval. A catalog without
+    // images is never backed up, so a fresh catalog (e.g. after a damaged one was replaced)
+    // cannot rotate the good backups away.
+    let pending = schema_version(path).map(|v| (v as usize) < schema::MIGRATIONS.len()).unwrap_or(false);
+    let stale = list_backups(path).first().is_none_or(|b| now_ms() - b.modified_ms >= BACKUP_INTERVAL_MS);
+    if (pending || stale) && has_images(path) {
+        if let Err(e) = backup(path) {
+            eprintln!("catalog {}: backup failed: {}", path.display(), e.message);
+        }
+    }
+    CatalogHealth::Ok
+}
+
+fn is_not_a_database(e: &rusqlite::Error) -> bool {
+    matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::NotADatabase))
+}
+
+/// `Ok(None)` = `quick_check` passed; `Ok(Some(first problem))`; `Err` = could not check.
+pub fn integrity(path: &Path) -> rusqlite::Result<Option<String>> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let problems: Vec<String> =
+        conn.prepare("PRAGMA quick_check(5)")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(match problems.as_slice() {
+        [ok] if ok == "ok" => None,
+        [] => Some("integrity check returned nothing".to_owned()),
+        [first, ..] => Some(first.clone()),
+    })
+}
+
+fn schema_version(path: &Path) -> rusqlite::Result<i64> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.pragma_query_value(None, "user_version", |r| r.get(0))
+}
+
+/// The catalog holds at least one image (`false` if unreadable or pre-schema).
+fn has_images(path: &Path) -> bool {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .and_then(|c| c.query_row("SELECT EXISTS (SELECT 1 FROM images)", [], |r| r.get(0)))
+        .unwrap_or(false)
+}
+
+fn aside_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.corrupt-{}", path.display(), now_ms()))
+}
+
+/// One catalog backup file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    /// 1 = newest.
+    pub index: usize,
+    pub path: PathBuf,
+    pub modified_ms: i64,
+    pub size_bytes: u64,
+}
+
+/// `<catalog>.bak-N`.
+pub fn backup_path(path: &Path, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.bak-{index}", path.display()))
+}
+
+/// Existing backups of `path`, newest (`.bak-1`) first.
+pub fn list_backups(path: &Path) -> Vec<Backup> {
+    (1..=BACKUPS_KEPT)
+        .filter_map(|index| {
+            let p = backup_path(path, index);
+            let m = std::fs::metadata(&p).ok()?;
+            let modified_ms = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Some(Backup { index, path: p, modified_ms, size_bytes: m.len() })
+        })
+        .collect()
+}
+
+/// Writes a consistent snapshot of the catalog (`VACUUM INTO` a temp file, then an atomic
+/// rename) as `.bak-1`, shifting older backups down and dropping the oldest beyond
+/// [`BACKUPS_KEPT`]. Safe while other connections are open (reads a WAL snapshot).
+pub fn backup(path: &Path) -> AppResult<PathBuf> {
+    let tmp = PathBuf::from(format!("{}.bak-tmp", path.display()));
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy()]).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            AppError::new(ErrorKind::Io, format!("catalog backup to {} failed: {e}", tmp.display()))
+        })?;
+    }
+    let _ = std::fs::remove_file(backup_path(path, BACKUPS_KEPT));
+    for i in (1..BACKUPS_KEPT).rev() {
+        let from = backup_path(path, i);
+        if from.exists() {
+            std::fs::rename(&from, backup_path(path, i + 1))?;
+        }
+    }
+    let newest = backup_path(path, 1);
+    std::fs::rename(&tmp, &newest)?;
+    Ok(newest)
+}
+
+/// `<catalog>.restore`: a backup staged by [`stage_restore`], applied by the next launch.
+pub fn staged_restore_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.restore", path.display()))
+}
+
+/// Stages backup `index` to replace the catalog on the next launch (the running app keeps
+/// connections open, so the swap happens before the first [`open`] of the next process).
+/// The backup must pass `quick_check`.
+pub fn stage_restore(path: &Path, index: usize) -> AppResult<PathBuf> {
+    let src = backup_path(path, index);
+    if !src.exists() {
+        return Err(AppError::not_found(format!("backup {} does not exist", src.display())));
+    }
+    match integrity(&src) {
+        Ok(None) => {}
+        Ok(Some(p)) => return Err(AppError::invalid(format!("backup {} is damaged too: {p}", src.display()))),
+        Err(e) => return Err(AppError::invalid(format!("backup {} cannot be read: {e}", src.display()))),
+    }
+    let staged = staged_restore_path(path);
+    std::fs::copy(&src, &staged)?;
+    Ok(staged)
+}
+
+/// Swaps a staged restore into place: the current catalog (and its WAL) is kept as
+/// `<catalog>.corrupt-<ms>` (never deleted).
+fn apply_staged_restore(path: &Path) {
+    let staged = staged_restore_path(path);
+    if !staged.exists() {
+        return;
+    }
+    let aside = aside_path(path);
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", path.display()));
+        if from.exists() {
+            if let Err(e) = std::fs::rename(&from, format!("{}{suffix}", aside.display())) {
+                eprintln!("catalog restore: cannot move {} aside: {e}", from.display());
+                return;
+            }
+        }
+    }
+    match std::fs::rename(&staged, path) {
+        Ok(()) => eprintln!("catalog restored from backup; previous catalog kept as {}", aside.display()),
+        Err(e) => eprintln!("catalog restore failed: {e}"),
+    }
+}
+
+/// Runs `f` atomically inside a savepoint: nests inside an open transaction (then it is
+/// part of the outer one) or acts as its own transaction. `f` may call functions that use
+/// savepoints themselves (the `repo`/`history`/`xmp` write functions do), but not ones
+/// that `BEGIN` a transaction (`Connection::transaction`).
+pub fn atomic<T>(conn: &mut Connection, f: impl FnOnce(&mut Connection) -> AppResult<T>) -> AppResult<T> {
+    conn.execute_batch("SAVEPOINT sieve_atomic")?;
+    match f(conn) {
+        Ok(v) => {
+            conn.execute_batch("RELEASE sieve_atomic")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO sieve_atomic; RELEASE sieve_atomic");
+            Err(e)
+        }
+    }
 }
 
 /// In-memory catalog for tests.
@@ -32,6 +345,7 @@ pub fn open_in_memory() -> Connection {
 fn configure(conn: &mut Connection) -> AppResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "checkpoint_fullfsync", "ON")?;
     migrate(conn)
 }
 
@@ -53,6 +367,221 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Makes the next `open(path)` behave like the first one of a new process.
+    fn forget_health(path: &Path) {
+        health_map().lock().unwrap().remove(&key(path));
+    }
+
+    /// Catalog at `path` (fully migrated, checkpointed, closed) holding `n` images.
+    fn seeded(path: &Path, n: i64) {
+        let conn = open(path).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < {n})
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                 imported_at)
+             SELECT x, 1, '/f/' || x || '.arw', x || '.arw', 'arw', 'sony', 1, 0, 0 FROM s;
+             PRAGMA wal_checkpoint(TRUNCATE);"
+        ))
+        .unwrap();
+    }
+
+    fn ratings(conn: &Connection) -> Vec<(i64, i64)> {
+        conn.prepare("SELECT rating, COUNT(*) FROM images GROUP BY rating ORDER BY rating")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn first_open_checks_backs_up_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        seeded(&path, 10);
+        assert!(list_backups(&path).is_empty(), "a new catalog has nothing to back up");
+        // Next launch: healthy, no backup yet -> one is taken (stale).
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert_eq!(health(&path), CatalogHealth::Ok);
+        let b = list_backups(&path);
+        assert_eq!(b.len(), 1);
+        assert_eq!(integrity(&b[0].path).unwrap(), None);
+        let n: i64 =
+            Connection::open(&b[0].path).unwrap().query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 10);
+        // A fresh backup is not repeated within the interval.
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert_eq!(list_backups(&path).len(), 1);
+        // Rotation keeps BACKUPS_KEPT, newest first.
+        for _ in 0..4 {
+            backup(&path).unwrap();
+        }
+        let b = list_backups(&path);
+        assert_eq!(b.iter().map(|b| b.index).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(!backup_path(&path, 4).exists());
+        assert!(!PathBuf::from(format!("{}.bak-tmp", path.display())).exists());
+
+        // An older schema is backed up (at its old version) before migrating, even when a
+        // fresh backup exists.
+        let old = dir.path().join("old.sqlite");
+        {
+            let mut conn = Connection::open(&old).unwrap();
+            for (i, sql) in schema::MIGRATIONS[..9].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0);",
+            )
+            .unwrap();
+        }
+        backup(&old).unwrap();
+        let conn = open(&old).unwrap();
+        let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, schema::MIGRATIONS.len());
+        let b = list_backups(&old);
+        assert_eq!(b.len(), 2, "pending migrations back up despite a fresh backup");
+        assert_eq!(schema_version(&b[0].path).unwrap(), 9);
+    }
+
+    #[test]
+    fn damaged_catalog_opens_read_only_and_restores_from_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        seeded(&path, 3000);
+        backup(&path).unwrap();
+        // Scribble over the middle of the file (table/index pages), as a failing disk would.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        for b in &mut bytes[mid..mid + 16384] {
+            *b = 0x5A;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        forget_health(&path);
+        let conn = open(&path).unwrap();
+        let CatalogHealth::ReadOnly { reason } = health(&path) else { panic!("expected read-only") };
+        let err = conn.execute("UPDATE images SET rating = 1", []).unwrap_err();
+        assert!(err.to_string().contains("readonly") || err.to_string().contains("read-only"), "{err}");
+        let msg = read_only_message(&path, &reason);
+        assert!(msg.contains("read-only") && msg.contains(".bak-1"), "{msg}");
+        let explained = explain_error(&path, AppError::from(err));
+        assert_eq!(explained.message, msg, "command errors carry the restore hint");
+        let other = dir.path().join("other.sqlite");
+        let full = explain_error(&other, AppError::new(ErrorKind::Database, "database or disk is full"));
+        assert!(full.message.contains("is full or unavailable"), "{}", full.message);
+        assert_eq!(explain_error(&other, AppError::invalid("x")).message, "x");
+        // The damaged file is never backed up over the good backups.
+        assert_eq!(list_backups(&path).len(), 1);
+        drop(conn);
+
+        // Restore: staged now, applied by the next launch; the damaged file is kept aside.
+        stage_restore(&path, 1).unwrap();
+        forget_health(&path);
+        let conn = open(&path).unwrap();
+        assert_eq!(health(&path), CatalogHealth::Ok);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3000);
+        conn.execute("UPDATE images SET rating = 2 WHERE id = 1", []).unwrap();
+        let aside = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert!(aside >= 1);
+        assert!(!staged_restore_path(&path).exists());
+        assert!(stage_restore(&path, 3).is_err(), "missing backup");
+    }
+
+    #[test]
+    fn non_database_file_is_moved_aside_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        std::fs::write(&path, vec![0x42u8; 8192]).unwrap();
+        let conn = open(&path).unwrap();
+        let CatalogHealth::Replaced { moved_to, .. } = health(&path) else { panic!("expected replaced") };
+        assert!(moved_to.exists());
+        let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, schema::MIGRATIONS.len());
+        // The fresh (empty) catalog never rotates older backups away.
+        drop(conn);
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert!(list_backups(&path).is_empty());
+    }
+
+    #[test]
+    fn atomic_nests_savepoints_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        seeded(&path, 5);
+        let mut conn = open(&path).unwrap();
+        // Inner repo write (its own savepoint) + a failing step: nothing is kept.
+        let r: AppResult<()> = atomic(&mut conn, |c| {
+            repo::set_rating(c, &[1, 2, 3], 4)?;
+            Err(AppError::internal("boom"))
+        });
+        assert!(r.is_err());
+        assert_eq!(ratings(&conn), [(0, 5)]);
+        atomic(&mut conn, |c| repo::set_rating(c, &[1, 2], 5)).unwrap();
+        assert_eq!(ratings(&conn), [(0, 3), (5, 2)]);
+    }
+
+    /// Kill test, child half: rewrites every rating in one batch and aborts the process
+    /// from another thread while the batch is running (no unwinding, no rollback, WAL
+    /// frames half written). Run by `killed_mid_batch_leaves_catalog_consistent`.
+    #[test]
+    #[ignore = "child process of killed_mid_batch_leaves_catalog_consistent"]
+    fn crash_child() {
+        let Some(path) = std::env::var_os("SIEVE_CRASH_CATALOG") else { return };
+        let path = PathBuf::from(path);
+        let mut conn = open(&path).unwrap();
+        let ids: Vec<i64> = (1..=200_000).collect();
+        let delay_ms: u64 = std::env::var("SIEVE_CRASH_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            std::process::abort();
+        });
+        loop {
+            repo::set_rating(&mut conn, &ids, 3).unwrap();
+            repo::set_rating(&mut conn, &ids, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn killed_mid_batch_leaves_catalog_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        seeded(&path, 200_000);
+        let exe = std::env::current_exe().unwrap();
+        for delay in [15, 60, 150] {
+            let status = std::process::Command::new(&exe)
+                .args(["db::tests::crash_child", "--exact", "--ignored", "--nocapture"])
+                .env("SIEVE_CRASH_CATALOG", &path)
+                .env("SIEVE_CRASH_DELAY_MS", delay.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(!status.success(), "the child must die mid-batch");
+            // Recovery: WAL replay on open; the batch is all-or-nothing and the file is sound.
+            assert_eq!(integrity(&path).unwrap(), None);
+            forget_health(&path);
+            let conn = open(&path).unwrap();
+            assert_eq!(health(&path), CatalogHealth::Ok);
+            let r = ratings(&conn);
+            assert!(r == [(0, 200_000)] || r == [(3, 200_000)], "partial batch after crash: {r:?}");
+        }
+    }
 
     #[test]
     fn migrations_apply_and_are_idempotent() {

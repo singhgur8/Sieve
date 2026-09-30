@@ -279,7 +279,7 @@ impl XmpSync {
         let mut event = XmpSynced { written: Vec::new(), read: Vec::new() };
         for id in ids {
             let Some(row) = store::load(&conn, id)? else { continue };
-            match self.sync_one(&mut conn, &row, SyncPolicy::NewerWins) {
+            match atomically(&mut conn, |c| self.sync_one(c, &row, SyncPolicy::NewerWins)) {
                 Ok(Outcome::Written) => event.written.push(id),
                 Ok(Outcome::Read { .. }) => event.read.push(id),
                 Ok(Outcome::Skipped) => {}
@@ -323,7 +323,7 @@ impl XmpSync {
         let mut report = XmpSyncReport::default();
         for &id in ids {
             let row = store::load(&conn, id)?.ok_or_else(|| AppError::not_found(format!("image {id}")))?;
-            match self.sync_one(&mut conn, &row, policy) {
+            match atomically(&mut conn, |c| self.sync_one(c, &row, policy)) {
                 Ok(Outcome::Written) => report.succeeded += 1,
                 Ok(Outcome::Read { changed }) => {
                     report.succeeded += 1;
@@ -358,7 +358,7 @@ impl XmpSync {
                 None => continue,
             }
             let Some(row) = store::load(&conn, id)? else { continue };
-            match self.sync_one(&mut conn, &row, SyncPolicy::SidecarWins) {
+            match atomically(&mut conn, |c| self.sync_one(c, &row, SyncPolicy::SidecarWins)) {
                 Ok(Outcome::Read { .. }) => read += 1,
                 Ok(_) => {}
                 Err(reason) => store::mark_failed(&conn, id, &reason)?,
@@ -378,7 +378,7 @@ impl XmpSync {
         let mut imported = 0;
         for id in store::masks_pending_ids(&conn)? {
             let Some(row) = store::load(&conn, id)? else { continue };
-            match self.import_masks_only(&mut conn, &row) {
+            match atomically(&mut conn, |c| self.import_masks_only(c, &row)) {
                 Ok(true) => imported += 1,
                 Ok(false) => {}
                 Err(reason) => eprintln!("masks catch-up, image {id}: {reason}"),
@@ -543,6 +543,13 @@ impl XmpSync {
     }
 }
 
+/// Runs one image's sync as a single catalog savepoint (history entry, warnings, ratings,
+/// sync stamps all land together or not at all; a crash mid-image leaves the image as it
+/// was, so the next sync redoes it). Per-file reasons pass through unchanged.
+fn atomically<T>(conn: &mut Connection, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
+    db::atomic(conn, |c| f(c).map_err(AppError::internal)).map_err(|e| e.message)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Written,
@@ -660,17 +667,19 @@ fn write_sidecar(
     masks_pending: bool,
 ) -> Result<(), String> {
     let shown = path.display();
+    // Never leave an orphan sidecar next to a RAW that is gone (moved, drive unplugged).
+    crate::raw::access::require_original(&row.path).map_err(|e| e.message)?;
     let existing = match fs::read(path) {
         Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| format!("{shown}: sidecar is not UTF-8"))?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{shown}: {e}")),
+        Err(e) => return Err(crate::raw::access::io_message(path, "read", &e)),
     };
     let mut merged =
         packet::merge(existing.as_deref(), &desired(row, tags, develop)).map_err(|e| format!("{shown}: {e}"))?;
     if let (Some(adj), false) = (develop, masks_pending) {
         merged = masks::apply(&merged, &adj.masks).map_err(|e| format!("{shown}: masks: {e}"))?;
     }
-    write_atomic(path, merged.as_bytes()).map_err(|e| format!("{shown}: {e}"))
+    write_atomic(path, merged.as_bytes()).map_err(|e| crate::raw::access::io_message(path, "write", &e))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

@@ -192,7 +192,7 @@ fn decode_jpeg_bytes(bytes: &[u8], min_long_edge: Option<u32>) -> Result<Encoded
 }
 
 fn decode_png(path: &Path) -> Result<Encoded, String> {
-    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     let m = png::scan(&src)?;
     drop(src);
     let (profile, reported) = match &m.icc {
@@ -571,7 +571,7 @@ pub fn extract(path: &Path, format: ImageFormat, buf: &mut Vec<u8>) -> Result<Ex
     match format {
         ImageFormat::Jpeg => {
             buf.clear();
-            let bytes = std::fs::read(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let bytes = std::fs::read(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
             buf.extend_from_slice(&bytes);
             drop(bytes);
             let exif = jpeg::exif_tiff(buf);
@@ -596,7 +596,7 @@ pub fn extract(path: &Path, format: ImageFormat, buf: &mut Vec<u8>) -> Result<Ex
             Ok(Extracted { meta: finish_meta(builder, size, None), preview })
         }
         ImageFormat::Png => {
-            let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
             let scanned = png::scan(&src);
             drop(src);
             let (builder, size) = match &scanned {
@@ -607,7 +607,7 @@ pub fn extract(path: &Path, format: ImageFormat, buf: &mut Vec<u8>) -> Result<Ex
             Ok(Extracted { meta: finish_meta(builder, size, None), preview })
         }
         ImageFormat::Tiff | ImageFormat::Heic => {
-            let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
             let (builder, heif_size, heif_orient) = if format == ImageFormat::Tiff {
                 let b = tiff::Tiff::new(&src).ok().and_then(|t| t.scan(false).ok()).map(|s| s.meta);
                 (b.unwrap_or_default(), None, None)
@@ -632,7 +632,7 @@ pub fn extract(path: &Path, format: ImageFormat, buf: &mut Vec<u8>) -> Result<Ex
 /// Raw EXIF directories of a raster file for exported metadata (JPEG APP1, TIFF IFDs,
 /// PNG `eXIf`, HEIC `Exif` item). Files without EXIF yield empty directories.
 pub fn exif_dirs(path: &Path, format: ImageFormat) -> Result<tiff::ExifDirs, String> {
-    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     let from = |t: Option<&[u8]>| -> Result<tiff::ExifDirs, String> {
         match t {
             Some(t) => tiff::Tiff::new(t)?.exif_dirs(),
@@ -727,7 +727,7 @@ fn merge_extended(main: &str, ext: &str) -> Option<String> {
 /// incl. extended XMP, TIFF tag 700, PNG `iTXt` `XML:com.adobe.xmp`, HEIC `mime` item).
 /// Read-only: Sieve never writes into originals.
 pub fn embedded_xmp(path: &Path, format: ImageFormat) -> Result<Option<String>, String> {
-    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     let text = match format {
         ImageFormat::Jpeg => jpeg_xmp(&jpeg_header(&src)?),
         ImageFormat::Tiff => tiff::Tiff::new(&src)?

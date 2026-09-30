@@ -54,8 +54,8 @@ pub fn probe_formats() -> Vec<ExportFormatInfo> {
         .clone()
 }
 
-fn io_err(path: &Path, e: impl std::fmt::Display) -> AppError {
-    AppError::new(crate::ipc::error::ErrorKind::Io, format!("{}: {e}", path.display()))
+fn io_err(path: &Path, e: std::io::Error) -> AppError {
+    crate::raw::access::io_error(path, "write", &e)
 }
 
 fn rgb8(image: &ExportImage) -> AppResult<&[u8]> {
@@ -112,8 +112,9 @@ pub fn write_file(
             Some(webp(rgb8(image)?, w, h, *quality, *lossless, icc, &exif(), metadata.xmp.as_deref())?)
         }
         ExportFormat::Heic { quality } => {
-            heic::write(rgb8(image)?, w, h, *quality, icc, Some(&metadata.xmp_with_exif()), path)
-                .map_err(|e| io_err(path, e))?;
+            heic::write(rgb8(image)?, w, h, *quality, icc, Some(&metadata.xmp_with_exif()), path).map_err(|e| {
+                AppError::new(crate::ipc::error::ErrorKind::Io, format!("Could not write {}: {e}", path.display()))
+            })?;
             None
         }
         ExportFormat::Tiff { compression, .. } => {
