@@ -99,6 +99,7 @@ copy subsets into `test-data/` for anything that writes.
   (X-Trans + Bayer)/CR3/JPG thumbnails + EXIF + develop + export correct; user XMP ratings + develop settings imported;
   throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
   side-by-side of Sieve renders of the user's edits for visual parity review.
+- [ ] **Culling calibration to user picks** (vision-ml-dev): QA found 31% of the user's keepers suggested reject (burst duplicates, overexposed on 40% of frames). Acceptance on held-out part of the shoot: keeper false-reject ≤ 5%, overexposed < 10% unless truly clipped, no blink/missed_focus precision regression.
 - [ ] **QA gate**.
 
 ## Phase 7c — Local adjustments & masking (moved from Phase 11: user requires an all-in-one Lightroom replacement)
