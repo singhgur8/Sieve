@@ -60,15 +60,127 @@ function mapRect(r: Rect, f: (u: number, v: number) => [number, number]): Rect {
 
 const round = (n: number) => Math.round(n * 10000) / 10000;
 
-/** Displayed rect -> `CropSettings` fields (stored orientation). */
-export function toStored(r: Rect, orientation: number, angle: number): CropSettings {
-  const s = mapRect(r, (u, v) => toStoredPoint(orientation, u, v));
-  return { enabled: true, top: round(s.t), left: round(s.l), bottom: round(s.b), right: round(s.r), angle: Math.round(angle * 100) / 100 };
+const RAD = Math.PI / 180;
+
+/** True for the mirrored EXIF orientations (2, 4, 5, 7), which flip the sense of a rotation on screen. */
+const mirrored = (o: number) => o === 2 || o === 4 || o === 5 || o === 7;
+/** Orientations 5..8 swap the sensor's width and height on screen. */
+const swapsAxes = (o: number) => o >= 5 && o <= 8;
+
+/**
+ * Rotation (degrees, CSS `rotate()` sense: positive = clockwise on screen) of the displayed uncropped image while the
+ * straighten angle is `angle` (`crs:CropAngle`).
+ *
+ * Sign convention, read from `src-tauri/src/develop/parity.rs::crop_geometry`: the output frame is sampled from the
+ * source at `p = C + R(angle) * local` with `R(a) = [cos a, -sin a; sin a, cos a]` in y-down pixels, i.e. the crop frame
+ * is rotated *clockwise* by `angle` in the source. A source point therefore appears in the straightened frame rotated by
+ * `-angle` (counter-clockwise for a positive angle): `rotation = -angle`. A mirrored orientation flips it, because the
+ * rotation happens in the un-oriented frame and mirroring conjugates a rotation to its inverse.
+ */
+export function previewRotation(angle: number, orientation: number): number {
+  return (mirrored(orientation) ? angle : -angle) || 0;
 }
 
-/** `CropSettings` -> displayed rect. */
-export function fromStored(c: Pick<CropSettings, "top" | "left" | "bottom" | "right">, orientation: number): Rect {
-  return mapRect({ l: c.left, t: c.top, r: c.right, b: c.bottom }, (x, y) => fromStoredPoint(orientation, x, y));
+/** Inverse of `previewRotation`. */
+export const angleFromRotation = (rotation: number, orientation: number): number => (mirrored(orientation) ? rotation : -rotation) || 0;
+
+/**
+ * Crop rectangle of the displayed *straightened* frame -> `CropSettings`. While straightening, the tool's rectangle is
+ * axis-aligned on the rotated image (Lightroom); the stored fields are the corners of the same frame in the un-rotated
+ * source (`crop_geometry`: `left/top` and `right/bottom` are the rotated frame's corner-to-corner points, its size is that
+ * vector rotated back by `-angle`). `aspect` = displayed (oriented, uncropped) width / height; used when `angle != 0`.
+ */
+export function toStored(r: Rect, orientation: number, angle: number, aspect = 1): CropSettings {
+  if (!angle) {
+    const s = mapRect(r, (u, v) => toStoredPoint(orientation, u, v));
+    return { enabled: true, top: round(s.t), left: round(s.l), bottom: round(s.b), right: round(s.r), angle: 0 };
+  }
+  // Un-oriented pixel space with height 1: the image is (au, 1).
+  const au = swapsAxes(orientation) ? 1 / aspect : aspect;
+  const [cxf, cyf] = toStoredPoint(orientation, (r.l + r.r) / 2, (r.t + r.b) / 2);
+  const dw = (r.r - r.l) * aspect;
+  const dh = r.b - r.t;
+  const [fw, fh] = swapsAxes(orientation) ? [dh, dw] : [dw, dh];
+  const th = angle * RAD;
+  const [sn, cs] = [Math.sin(th), Math.cos(th)];
+  // Frame centre in the straightened image (q) -> in the source: C = c + R(th) (q - c).
+  const qx = cxf * au - au / 2;
+  const qy = cyf - 0.5;
+  const cx = au / 2 + cs * qx - sn * qy;
+  const cy = 0.5 + sn * qx + cs * qy;
+  const dx = fw * cs - fh * sn;
+  const dy = fw * sn + fh * cs;
+  const xs = [(cx - dx / 2) / au, (cx + dx / 2) / au];
+  const ys = [cy - dy / 2, cy + dy / 2];
+  return { enabled: true, top: round(Math.min(...ys)), left: round(Math.min(...xs)), bottom: round(Math.max(...ys)), right: round(Math.max(...xs)), angle: Math.round(angle * 100) / 100 };
+}
+
+/** `CropSettings` -> the displayed straightened rect (inverse of `toStored`; `aspect` = displayed uncropped w / h). */
+export function fromStored(c: Pick<CropSettings, "top" | "left" | "bottom" | "right"> & { angle?: number }, orientation: number, aspect = 1): Rect {
+  const angle = c.angle ?? 0;
+  if (!angle) return mapRect({ l: c.left, t: c.top, r: c.right, b: c.bottom }, (x, y) => fromStoredPoint(orientation, x, y));
+  const au = swapsAxes(orientation) ? 1 / aspect : aspect;
+  const th = angle * RAD;
+  const [sn, cs] = [Math.sin(th), Math.cos(th)];
+  const cx = ((c.left + c.right) / 2) * au;
+  const cy = (c.top + c.bottom) / 2;
+  const dx = (c.right - c.left) * au;
+  const dy = c.bottom - c.top;
+  const fw = Math.max(dx * cs + dy * sn, 1e-6);
+  const fh = Math.max(-dx * sn + dy * cs, 1e-6);
+  // Source -> straightened: q = c + R(-th) (C - c).
+  const px = cx - au / 2;
+  const py = cy - 0.5;
+  const qx = (au / 2 + cs * px + sn * py) / au;
+  const qy = 0.5 - sn * px + cs * py;
+  const [u, v] = fromStoredPoint(orientation, qx, qy);
+  const [w, h] = swapsAxes(orientation) ? [fh, fw] : [fw, fh];
+  const hw = w / aspect / 2;
+  return { l: u - hw, r: u + hw, t: v - h / 2, b: v + h / 2 };
+}
+
+/**
+ * Lightroom "constrain to image": true when the axis-aligned displayed rect lies inside the uncropped image rotated by
+ * `rotation` degrees (CSS sense) about its centre, and inside the frame. `aspect` = image w / h.
+ */
+export function insideRotated(rect: Rect, aspect: number, rotation: number, eps = 1e-4): boolean {
+  const th = rotation * RAD;
+  const [sn, cs] = [Math.sin(th), Math.cos(th)];
+  for (const [u, v] of [[rect.l, rect.t], [rect.r, rect.t], [rect.l, rect.b], [rect.r, rect.b]]) {
+    const dx = (u - 0.5) * aspect;
+    const dy = v - 0.5;
+    // Rotate by -rotation into the image's own frame.
+    const lx = cs * dx + sn * dy;
+    const ly = -sn * dx + cs * dy;
+    if (Math.abs(lx) > aspect / 2 + eps || Math.abs(ly) > 0.5 + eps) return false;
+  }
+  return rect.l >= -eps && rect.t >= -eps && rect.r <= 1 + eps && rect.b <= 1 + eps;
+}
+
+/** Shrinks `rect` about its centre (same aspect ratio) until it lies inside the rotated image and the frame. */
+export function fitInsideRotated(rect: Rect, aspect: number, rotation: number): Rect {
+  if (insideRotated(rect, aspect, rotation)) return rect;
+  const th = rotation * RAD;
+  const [sn, cs] = [Math.sin(th), Math.cos(th)];
+  const hw = ((rect.r - rect.l) * aspect) / 2; // half sizes in height units
+  const hh = (rect.b - rect.t) / 2;
+  const toLocal = (x: number, y: number): [number, number] => [cs * x + sn * y, -sn * x + cs * y];
+  // Centre in the image's frame, pulled inside first.
+  let [qx, qy] = toLocal(((rect.l + rect.r) / 2 - 0.5) * aspect, (rect.t + rect.b) / 2 - 0.5);
+  qx = clamp(qx, -aspect / 2, aspect / 2);
+  qy = clamp(qy, -0.5, 0.5);
+  // Corner extents in the image's frame (worst case over the four corners).
+  const ex = Math.max(Math.abs(toLocal(hw, hh)[0]), Math.abs(toLocal(-hw, hh)[0]));
+  const ey = Math.max(Math.abs(toLocal(hw, hh)[1]), Math.abs(toLocal(-hw, hh)[1]));
+  let s = Math.min(1, ex > 1e-9 ? (aspect / 2 - Math.abs(qx)) / ex : 1, ey > 1e-9 ? (0.5 - Math.abs(qy)) / ey : 1);
+  // Back to displayed coordinates (rotate by +rotation).
+  const cu = (cs * qx - sn * qy) / aspect + 0.5;
+  const cv = sn * qx + cs * qy + 0.5;
+  // The frame itself bounds the rect too.
+  const fu = hw / aspect;
+  s = Math.min(s, fu > 1e-9 ? Math.min(cu, 1 - cu) / fu : 1, hh > 1e-9 ? Math.min(cv, 1 - cv) / hh : 1);
+  s = Math.max(0, s - 1e-6);
+  return { l: cu - fu * s, r: cu + fu * s, t: cv - hh * s, b: cv + hh * s };
 }
 
 export const isFull = (r: Rect) => r.l <= 0.0005 && r.t <= 0.0005 && r.r >= 0.9995 && r.b >= 0.9995;

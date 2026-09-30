@@ -1,9 +1,8 @@
 // Mask geometry: conversions between the displayed frame (what the viewer shows: EXIF-oriented and cropped),
 // and the sensor frame the contract stores (un-oriented, uncropped, normalized). See docs/architecture.md "Masks".
 //
-// Chain: displayed (cropped) --crop rect (+ straighten angle)--> oriented uncropped --unorientPoint--> sensor.
+// Chain: displayed (cropped) --unorient--> un-oriented frame --crop frame (corners + straighten angle)--> sensor.
 import { orientPoint, unorientPoint, type CropSettings, type NormPoint, type NormRect, type RadialMask } from "../ipc";
-import { FULL, fromStored } from "./crop";
 
 export interface Frame {
   /** EXIF orientation 1..8. */
@@ -25,46 +24,52 @@ export interface Box {
 const RAD = Math.PI / 180;
 export const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-function cropInfo(f: Frame) {
-  const enabled = f.crop.enabled;
-  const r = enabled ? fromStored(f.crop, f.orientation) : FULL;
-  return { r, cx: (r.l + r.r) / 2, cy: (r.t + r.b) / 2, rw: r.r - r.l, rh: r.b - r.t, ang: enabled ? f.crop.angle : 0 };
+/**
+ * The crop frame exactly as the backend evaluates it (`develop/masks/eval.rs::crop_frame`, same as
+ * `parity.rs::crop_geometry`): `left/top` and `right/bottom` are the corners of the (rotated) frame in the un-oriented
+ * source, whose size is that corner-to-corner vector rotated back by `-angle`; the frame is sampled at
+ * `p = C + R(angle) * ((u - 0.5) fw, (v - 0.5) fh)` (pixels, y down). Everything here is a similarity (uniform scale,
+ * rotation, orientation), so angles and circles survive the mapping.
+ */
+function cropFrame(f: Frame) {
+  const { w: sw, h: sh } = sensorSize(f);
+  const c = f.crop;
+  const l = clamp(c.left, 0, 1);
+  const r = clamp(c.right, 0, 1);
+  const t = clamp(c.top, 0, 1);
+  const b = clamp(c.bottom, 0, 1);
+  const on = c.enabled && r - l > 1e-6 && b - t > 1e-6;
+  const ang = on ? clamp(c.angle, -45, 45) : 0;
+  const [cx, cy] = on ? [((l + r) / 2) * sw, ((t + b) / 2) * sh] : [sw / 2, sh / 2];
+  const [dx, dy] = on ? [(r - l) * sw, (b - t) * sh] : [sw, sh];
+  const cs = Math.cos(ang * RAD);
+  const sn = Math.sin(ang * RAD);
+  const fw = Math.max(dx * cs + dy * sn, 1);
+  const fh = Math.max(-dx * sn + dy * cs, 1);
+  return { sw, sh, cx, cy, cs, sn, fw, fh, ang };
 }
 
-/** Displayed (cropped) frame point -> oriented uncropped frame. The straighten angle rotates about the crop centre. */
-export function dispToOriented(p: NormPoint, f: Frame): NormPoint {
-  const { r, cx, cy, rw, rh, ang } = cropInfo(f);
-  let x = r.l + p.x * rw;
-  let y = r.t + p.y * rh;
-  if (ang) {
-    const dx = (x - cx) * f.w;
-    const dy = (y - cy) * f.h;
-    const c = Math.cos(ang * RAD);
-    const s = Math.sin(ang * RAD);
-    x = cx + (dx * c - dy * s) / f.w;
-    y = cy + (dx * s + dy * c) / f.h;
-  }
-  return { x, y };
+/** Displayed (cropped) frame point -> sensor frame (what masks store). */
+export function dispToSensor(p: NormPoint, f: Frame): NormPoint {
+  const { sw, sh, cx, cy, cs, sn, fw, fh } = cropFrame(f);
+  const q = unorientPoint(p, f.orientation); // un-oriented frame coordinates (u, v)
+  const lx = (q.x - 0.5) * fw;
+  const ly = (q.y - 0.5) * fh;
+  return { x: (cx + cs * lx - sn * ly) / sw, y: (cy + sn * lx + cs * ly) / sh };
 }
 
-export function orientedToDisp(p: NormPoint, f: Frame): NormPoint {
-  const { r, cx, cy, rw, rh, ang } = cropInfo(f);
-  let { x, y } = p;
-  if (ang) {
-    const dx = (x - cx) * f.w;
-    const dy = (y - cy) * f.h;
-    const c = Math.cos(-ang * RAD);
-    const s = Math.sin(-ang * RAD);
-    x = cx + (dx * c - dy * s) / f.w;
-    y = cy + (dx * s + dy * c) / f.h;
-  }
-  return { x: (x - r.l) / rw, y: (y - r.t) / rh };
+/** Sensor frame -> displayed (cropped) frame. */
+export function sensorToDisp(p: NormPoint, f: Frame): NormPoint {
+  const { sw, sh, cx, cy, cs, sn, fw, fh } = cropFrame(f);
+  const px = p.x * sw - cx;
+  const py = p.y * sh - cy;
+  return orientPoint({ x: (cs * px + sn * py) / fw + 0.5, y: (-sn * px + cs * py) / fh + 0.5 }, f.orientation);
 }
 
-/** Displayed frame -> sensor frame (what masks store). */
-export const dispToSensor = (p: NormPoint, f: Frame): NormPoint => unorientPoint(dispToOriented(p, f), f.orientation);
-/** Sensor frame -> displayed frame. */
-export const sensorToDisp = (p: NormPoint, f: Frame): NormPoint => orientedToDisp(orientPoint(p, f.orientation), f);
+/** True for the mirrored EXIF orientations, which flip the sense of a rotation on screen. */
+const mirroredOrientation = (o: number) => o === 2 || o === 4 || o === 5 || o === 7;
+/** Straighten angle as seen on screen: the sense of the displayed rotation (a mirrored orientation flips it). */
+const screenAngle = (f: Frame) => (mirroredOrientation(f.orientation) ? -1 : 1) * cropFrame(f).ang;
 
 /** Axis-aligned rectangle spanned by two displayed points, as a sensor-frame `NormRect`. */
 export function dispRectToSensor(a: NormPoint, b: NormPoint, f: Frame): NormRect {
@@ -83,8 +88,8 @@ export function sensorSize(f: Frame): { w: number; h: number } {
 
 /** Screen pixels per (oriented, uncropped) image pixel for a displayed-frame box. */
 export function screenScale(f: Frame, box: Box): number {
-  const { rw } = cropInfo(f);
-  return box.w / Math.max(1, rw * f.w);
+  const { fw, fh } = cropFrame(f);
+  return box.w / Math.max(1, swapsAxes(f.orientation) ? fh : fw);
 }
 
 /** On-screen brush radius (px) of a stroke radius given as a fraction of the sensor width. */
@@ -127,7 +132,7 @@ export function radialToScreen(m: RadialMask, f: Frame, box: Box): ScreenEllipse
   const s = screenScale(f, box);
   const sz = sensorSize(f);
   const u = orientVec({ x: Math.cos(m.angle * RAD), y: Math.sin(m.angle * RAD) }, f.orientation);
-  const rot = Math.atan2(u.y, u.x) / RAD - cropInfo(f).ang;
+  const rot = Math.atan2(u.y, u.x) / RAD - screenAngle(f);
   return { cx: c.x, cy: c.y, rx: ((m.right - m.left) / 2) * sz.w * s, ry: ((m.bottom - m.top) / 2) * sz.h * s, rot };
 }
 
@@ -136,7 +141,7 @@ export function radialFromScreen(e: ScreenEllipse, f: Frame, box: Box, base: Rad
   const cs = dispToSensor(screenToDisp(e.cx, e.cy, box), f);
   const s = screenScale(f, box);
   const sz = sensorSize(f);
-  const rot = (e.rot + cropInfo(f).ang) * RAD;
+  const rot = (e.rot + screenAngle(f)) * RAD;
   const u = unorientVec({ x: Math.cos(rot), y: Math.sin(rot) }, f.orientation);
   let hx = e.rx / s / sz.w;
   let hy = e.ry / s / sz.h;

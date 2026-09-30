@@ -72,9 +72,9 @@ export function CropPanel({ editor, crop }: { editor: Editor; crop: CropApi }) {
         step={0.1}
         digits={1}
         display={(v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}°`}
-        onInput={(v) => crop.change({ ...tool, angle: v })}
-        onCommit={() => {}}
-        onReset={() => crop.change({ ...tool, angle: 0 })}
+        onInput={(v) => crop.change({ ...tool, angle: v, rotating: true })}
+        onCommit={() => crop.change({ ...tool, rotating: false })}
+        onReset={() => crop.change({ ...tool, angle: 0, rotating: false })}
       />
       <div className="mt-2 flex gap-1">
         <button className={`${b} bg-sky-700 text-white hover:bg-sky-600`} onClick={crop.commit} data-testid="crop-done" title="Apply the crop (Enter)">
@@ -141,8 +141,11 @@ export function CropBar({ crop }: { crop: CropApi }) {
           value={tool.angle}
           aria-label="Crop angle"
           data-testid="cropbar-angle"
-          onChange={(e) => crop.change({ ...tool, angle: Number(e.target.value) })}
-          onDoubleClick={() => crop.change({ ...tool, angle: 0 })}
+          onChange={(e) => crop.change({ ...tool, angle: Number(e.target.value), rotating: true })}
+          onPointerUp={() => crop.change({ ...tool, rotating: false })}
+          onBlur={() => tool.rotating && crop.change({ ...tool, rotating: false })}
+          onKeyUp={() => crop.change({ ...tool, rotating: false })}
+          onDoubleClick={() => crop.change({ ...tool, angle: 0, rotating: false })}
         />
         <span className="w-10 tabular-nums text-neutral-300" data-testid="cropbar-angle-value">
           {`${tool.angle > 0 ? "+" : ""}${tool.angle.toFixed(1)}°`}
