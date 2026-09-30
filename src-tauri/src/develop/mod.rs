@@ -25,6 +25,7 @@
 
 pub mod camera;
 pub mod history;
+pub mod masks;
 mod param_data;
 pub mod parity;
 pub mod pipeline;

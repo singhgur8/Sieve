@@ -163,3 +163,20 @@ export function Viewer(p: Props) {
     </div>
   );
 }
+
+/**
+ * Screen box (viewer px) of the displayed, cropped frame: the fitted image (`object-contain` of the render's aspect)
+ * or the 100% frame. Null until something is rendered. Used by the masking layer to place overlays and tools.
+ */
+export function frameBox(z: Zoom, size: Size, fw: number, fh: number, view: { width: number; height: number } | null): { x: number; y: number; w: number; h: number } | null {
+  if (!size.w || !size.h) return null;
+  if (z.on && fw > 0 && fh > 0) {
+    const o = frameOffset(z, size, fw, fh);
+    return { x: o.x, y: o.y, w: fw, h: fh };
+  }
+  if (!view || !view.width || !view.height) return null;
+  const s = Math.min(size.w / view.width, size.h / view.height);
+  const w = view.width * s;
+  const h = view.height * s;
+  return { x: (size.w - w) / 2, y: (size.h - h) / 2, w, h };
+}

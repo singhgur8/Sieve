@@ -78,11 +78,15 @@ export interface Editor {
   reload: () => Promise<void>;
 }
 
+/** Settings that change the develop warnings: the profile / look, and which AI masks have a computed matte. */
+const warnKey = (a: CompleteAdjustments) =>
+  JSON.stringify([a.profile, a.masks.flatMap((g) => g.components.map((c) => (c.shape.kind === "ai" ? (c.shape.digest ?? "") : "")))]);
+
 export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
   const [info, setInfo] = useState<DevelopInfo | null>(null);
-  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null });
+  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null, mask: null });
   const [histogram, setHistogram] = useState<Histogram | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -94,7 +98,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const lastProfile = useRef("");
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
-  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false });
+  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false });
   const inflight = useRef(new Set<string>());
   const nullStreak = useRef(new Map<string, number>());
   const draft = useRef(false);
@@ -167,7 +171,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const setAdjBoth = useCallback((a0: ParametricAdjustments) => {
     const a = completeAdjustments(a0, optsRef.current.format);
     adjRef.current = a;
-    lastProfile.current ||= JSON.stringify(a.profile);
+    lastProfile.current ||= warnKey(a);
     setAdj(a);
   }, []);
 
@@ -182,7 +186,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       // Profile / look availability warnings depend on the saved settings.
-      const pk = JSON.stringify(snapshot.profile);
+      const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
         lastProfile.current = pk;
         setInfo(await unwrap(commands.getDevelopInfo(p.id)));
@@ -195,7 +199,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (id == null) return;
     let stale = false;
     setLoading(true);
-    setViews({ main: null, before: null, detail: null });
+    setViews({ main: null, before: null, detail: null, mask: null });
     setHistogram(null);
     setInfo(null);
     setHistory(null);
@@ -299,10 +303,11 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (cur == null) return;
     commitPending();
     await chain.current;
-    const [a, h] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur))]);
+    const [a, h, i] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur)), unwrap(commands.getDevelopInfo(cur))]);
     if (idRef.current !== cur) return;
     setAdjBoth(a);
     setHistory(h);
+    setInfo(i);
     schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     optsRef.current.onChanged(cur);
   }, [commitPending, setAdjBoth, schedule]);

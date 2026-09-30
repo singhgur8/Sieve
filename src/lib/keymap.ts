@@ -40,6 +40,19 @@ export type ActionId =
   | "paste"
   | "sync"
   | "reset"
+  | "maskPanel"
+  | "maskBrush"
+  | "maskLinear"
+  | "maskRadial"
+  | "maskColor"
+  | "maskLuminance"
+  | "maskOverlay"
+  | "maskOverlayStyle"
+  | "maskPins"
+  | "maskSize"
+  | "maskFeather"
+  | "maskAuto"
+  | "maskDelete"
   | "selectBurst"
   | "selectAll"
   | "selectNone"
@@ -124,6 +137,21 @@ export const KEYMAP: KeyDef[] = [
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
   { id: "sync", group: "Develop", label: "Sync settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
   { id: "reset", group: "Develop", label: "Reset all adjustments", chords: [c("r", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+R"], where: "Develop" },
+
+  // ---- masks (Develop; the tool keys only act while the Masks panel is open, so K never clashes with Compare's keeper) ----
+  { id: "maskPanel", group: "Masks", label: "Show / hide the Masks panel", chords: [c("w", { shift: true })], modes: ["develop"], display: ["Shift+W"], where: "Develop" },
+  { id: "maskBrush", group: "Masks", label: "Brush (Alt = erase, A = auto mask)", chords: [c("k")], modes: ["develop"], display: ["K"], where: "Develop, Masks panel open" },
+  { id: "maskLinear", group: "Masks", label: "Linear gradient", chords: [c("m")], modes: ["develop"], display: ["M"], where: "Develop, Masks panel open" },
+  { id: "maskRadial", group: "Masks", label: "Radial gradient", chords: [c("m", { shift: true })], modes: ["develop"], display: ["Shift+M"], where: "Develop, Masks panel open" },
+  { id: "maskColor", group: "Masks", label: "Color range", chords: [c("j", { shift: true })], modes: ["develop"], display: ["Shift+J"], where: "Develop, Masks panel open" },
+  { id: "maskLuminance", group: "Masks", label: "Luminance range", chords: [c("q", { shift: true })], modes: ["develop"], display: ["Shift+Q"], where: "Develop, Masks panel open" },
+  { id: "maskOverlay", group: "Masks", label: "Show / hide the mask overlay", chords: [c("o")], modes: ["develop"], display: ["O"], where: "Develop, Masks panel open" },
+  { id: "maskOverlayStyle", group: "Masks", label: "Cycle the overlay color / mode", chords: [c("o", { shift: true })], modes: ["develop"], display: ["Shift+O"], where: "Develop, Masks panel open" },
+  { id: "maskPins", group: "Masks", label: "Show / hide mask pins", chords: [c("h")], modes: ["develop"], display: ["H"], where: "Develop, Masks panel open" },
+  { id: "maskSize", group: "Masks", label: "Brush size smaller / larger", chords: [c("["), c("]")], modes: ["develop"], display: ["[ / ]"], where: "Develop, brush active" },
+  { id: "maskFeather", group: "Masks", label: "Brush feather less / more", chords: [c("[", { shift: true }), c("]", { shift: true }), c("{", { shift: "any" }), c("}", { shift: "any" })], modes: ["develop"], display: ["Shift+[ / Shift+]"], where: "Develop, brush active" },
+  { id: "maskAuto", group: "Masks", label: "Toggle brush auto mask", chords: [c("a")], modes: ["develop"], display: ["A"], where: "Develop, brush active" },
+  { id: "maskDelete", group: "Masks", label: "Delete the selected mask component (Enter / Esc: finish the tool)", chords: [c("Delete"), c("Backspace")], modes: ["develop"], display: ["Delete"], where: "Develop, Masks panel open" },
 
   // ---- app ----
   { id: "saveXmp", group: "App", label: "Save metadata (XMP)", chords: [c("s", { mod: true })], modes: ALL, display: ["Cmd+S"], where: "Everywhere" },
