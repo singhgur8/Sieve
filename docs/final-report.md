@@ -23,7 +23,19 @@ exporting high-volume shoots, intended to replace Lightroom Classic for this wor
    filename template, metadata options, saved presets.
 
 ## What works (verified; see Status Log in `docs/roadmap.md`)
-_To be completed from the Phase 8 QA gate._
+| Area | Evidence (this Mac, M-series) |
+|---|---|
+| Ingest (ARW/RAF X-Trans+Bayer/CR3/JPG) | 847 mixed RAWs (45 GB proposal shoot) all ready, ~100–108 files/s, ~330 MB peak; EXIF matches exiftool; originals never modified |
+| Culling | SCRFD faces + 106-pt landmarks + eye-state CNN (CoreML), per-eye sharpness, motion vs creative blur, exposure, bursts, per-shoot-type scoring; 9 ms/image; calibrated on your picks: held-out keeper false-reject 0/115 |
+| Culling UI | Virtualized grid (50k-image catalog: worst query 15 ms), tag filters, loupe/face zoom, 2-up compare, burst keeper, culling undo, Lightroom keys, `?` cheat sheet |
+| XMP | Lightroom/Bridge-readable ratings, rejects, Pick label, `Sieve|<tag>` keywords; Lightroom develop settings and masks read and written; unchanged writes touch only `MetadataDate`; JPEG edits in `<name>.JPG.xmp` |
+| Develop | Full Lightroom Basic/Tone curve/HSL/Color grading/Detail/Effects/Calibration, Adobe camera profiles + Looks (read locally), .cube LUTs, crop/straighten with live preview, presets, history, copy/paste/sync; slider draft frame ~29 ms while dragging |
+| Masks | Brush, linear, radial, luminance/color range, AI Subject/Sky/Background/People (+ face parts); your 50 Lightroom AI masks import and render (mattes decoded, byte-identical round trip) |
+| Scene matching | Grade 1–2 anchors → 97% of targets within 0.15 EV / WB tolerance |
+| Export | JPEG/TIFF 8/16/PNG/WebP/HEIC, resize, sRGB/P3/Adobe RGB ICC, output sharpening, templates, metadata options, presets; full-res JPEG ~3 files/s, 2048 px ~7 files/s, ≤ 0.95 GB peak |
+| Robustness | Crash-safe catalog (WAL, integrity check, 3 rotating backups, read-only fallback, restore); missing originals flagged with "Locate folder…"; disk-full/read-only/undecodable errors explained; view-level error boundaries |
+| Packaging | Self-contained `Sieve.app` (58 MB) / `.dmg` (38 MB), bundled dylibs + culling models; bundle smoke (import → analysis → render → export) passes with no Homebrew on PATH |
+| Tests | 364 Rust + 168 Playwright tests; clippy/fmt clean |
 
 ## Known gaps
 - Stars/picks: culling suggestions barely predict this user's keepers (AUC ~0.57); a content/preference model is
