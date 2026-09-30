@@ -2,21 +2,31 @@
 // The virtualized grid / loupe replace this in Phase 4.
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Aperture, FolderOpen, ImageOff, Loader2, RotateCw } from "lucide-react";
+import { AlertTriangle, Aperture, Check, FolderOpen, ImageOff, Loader2, RotateCw, ScanSearch, Star, X } from "lucide-react";
 import {
   commands,
   convertFileSrc,
   DEFAULT_QUERY,
   events,
   unwrap,
+  type AnalysisStatus,
   type AppError,
   type CatalogState,
   type ImportProgress,
   type ImportStatus,
   type RawImageEntry,
+  type ShootType,
 } from "./ipc";
 
 const PAGE_SIZE = 200;
+const SHOOT_TYPES: ShootType[] = ["wedding", "portrait", "sports", "event", "landscape", "general"];
+
+interface AnalysisView {
+  done: number;
+  total: number;
+  failed: number;
+  running: boolean;
+}
 
 export default function App() {
   const [catalog, setCatalog] = useState<CatalogState | null>(null);
@@ -25,6 +35,8 @@ export default function App() {
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [analysis, setAnalysis] = useState<AnalysisView | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [versions, setVersions] = useState<Record<number, number>>({});
   const loadedRef = useRef(0);
   // Thumbnail states delivered by events; they win over older list snapshots still marked pending.
@@ -68,6 +80,18 @@ export default function App() {
         if (s.running || s.pending > 0) setProgress({ done, total: s.total, failed: s.failed });
       })
       .catch((e) => setError(formatError(e)));
+    unwrap(commands.getAnalysisStatus())
+      .then((s: AnalysisStatus) => {
+        if (s.running || s.pending > 0 || s.failed > 0) {
+          setAnalysis({
+            done: s.analyzed + s.failed,
+            total: s.analyzed + s.failed + s.pending,
+            failed: s.failed,
+            running: s.running,
+          });
+        }
+      })
+      .catch((e) => setError(formatError(e)));
   }, [refresh]);
 
   // Live events.
@@ -107,6 +131,21 @@ export default function App() {
           thumbnail: { status: "failed", reason: ev.payload.reason },
         }));
       }),
+      events.analysisProgress.listen((ev) => {
+        setAnalysis({ ...ev.payload, running: ev.payload.done < ev.payload.total });
+      }),
+      events.analysisReady.listen((ev) => {
+        const id = ev.payload.imageId;
+        unwrap(commands.getImage(id))
+          .then((fresh) => patch(id, () => merge(fresh)))
+          .catch(() => {});
+      }),
+      events.analysisFinished.listen(() => {
+        setAnalysis((a) => (a ? { ...a, running: false } : a));
+        void unwrap(commands.getCatalogState()).then(setCatalog).catch(() => {});
+        // Burst groups / duplicate tags may have changed on any row.
+        void loadPage(0, Math.max(loadedRef.current, PAGE_SIZE)).catch(() => {});
+      }),
     ];
     return () => {
       unlisten.forEach((u) => void u.then((f) => f()));
@@ -141,6 +180,40 @@ export default function App() {
     [patch],
   );
 
+  async function run(fn: () => Promise<unknown>) {
+    setError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError(formatError(e));
+    }
+  }
+
+  const analyze = (kind: "pending" | "all") =>
+    run(async () => {
+      setAnalysis((a) => ({ done: 0, total: a?.total ?? 0, failed: 0, running: true }));
+      await unwrap(commands.analyzeImages({ kind }));
+    });
+
+  const changeShootType = (t: ShootType) =>
+    run(async () => {
+      await unwrap(commands.setShootType(t));
+      setCatalog(await unwrap(commands.getCatalogState()));
+    });
+
+  const toggleAuto = (enabled: boolean) =>
+    run(async () => {
+      await unwrap(commands.setAutoAnalyze(enabled));
+      setCatalog((c) => (c ? { ...c, autoAnalyze: enabled } : c));
+    });
+
+  const applyAll = () =>
+    run(async () => {
+      const n = await unwrap(commands.applySuggestions(items.map((i) => i.id)));
+      setNotice(`Applied suggestions to ${n} of ${items.length} loaded images`);
+      await loadPage(0, Math.max(loadedRef.current, PAGE_SIZE));
+    });
+
   const active = progress !== null && progress.done < progress.total;
 
   return (
@@ -161,6 +234,59 @@ export default function App() {
         </button>
       </header>
 
+      <div className="flex flex-wrap items-center gap-3 border-b border-neutral-800 px-4 py-2 text-sm">
+        <label className="flex items-center gap-2 text-xs text-neutral-400">
+          Shoot type
+          <select
+            value={catalog?.shootType ?? "general"}
+            onChange={(e) => void changeShootType(e.target.value as ShootType)}
+            disabled={!catalog}
+            className="rounded bg-neutral-800 px-2 py-1 text-sm text-neutral-200"
+          >
+            {SHOOT_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button onClick={() => void analyze("pending")} disabled={analysis?.running} className={btn}>
+          <ScanSearch className="size-4" />
+          Analyze
+        </button>
+        <button onClick={() => void analyze("all")} disabled={analysis?.running} className={btn}>
+          Re-analyze all
+        </button>
+        <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+          <input
+            type="checkbox"
+            checked={catalog?.autoAnalyze ?? false}
+            disabled={!catalog}
+            onChange={(e) => void toggleAuto(e.target.checked)}
+          />
+          Auto-analyze
+        </label>
+        <button onClick={applyAll} disabled={items.length === 0} className={`${btn} ml-auto`}>
+          <Check className="size-4" />
+          Apply suggestions
+        </button>
+      </div>
+
+      {analysis && (analysis.running || analysis.failed > 0 || analysis.done < analysis.total) && (
+        <AnalysisBar
+          a={analysis}
+          onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))}
+        />
+      )}
+      {notice && (
+        <p className="flex items-center justify-between bg-neutral-900 px-4 py-1.5 text-xs text-neutral-300">
+          {notice}
+          <button onClick={() => setNotice(null)} aria-label="Dismiss">
+            <X className="size-3.5" />
+          </button>
+        </p>
+      )}
+
       {progress && (active || progress.failed > 0) && <ProgressBar progress={progress} active={active} />}
       {error && <p className="bg-red-950 px-4 py-2 text-sm text-red-300">{error}</p>}
 
@@ -180,6 +306,32 @@ export default function App() {
         )}
       </ul>
     </main>
+  );
+}
+
+const btn =
+  "flex items-center gap-2 rounded-md bg-neutral-800 px-3 py-1 text-sm hover:bg-neutral-700 disabled:opacity-50";
+
+function AnalysisBar({ a, onCancel }: { a: AnalysisView; onCancel: () => void }) {
+  const pct = a.total > 0 ? Math.min(100, (a.done / a.total) * 100) : 0;
+  return (
+    <div className="border-b border-neutral-800 px-4 py-2">
+      <div className="mb-1 flex items-center gap-2 text-xs text-neutral-400">
+        {a.running && <Loader2 className="size-3 animate-spin" />}
+        <span>
+          {a.running ? "Analyzing" : "Analysis paused"}: {a.done} / {a.total}
+        </span>
+        {a.failed > 0 && <span className="text-red-400">{a.failed} failed</span>}
+        {a.running && (
+          <button onClick={onCancel} className="ml-auto rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700">
+            Cancel
+          </button>
+        )}
+      </div>
+      <div className="h-1.5 overflow-hidden rounded bg-neutral-800">
+        <div className="h-full bg-sky-400 transition-[width]" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
   );
 }
 
@@ -250,6 +402,7 @@ const Row = memo(function Row({
             .filter(Boolean)
             .join(" · ") || "No EXIF yet"}
         </div>
+        <CullInfo img={img} />
         {t.status === "failed" && (
           <div className="mt-1 flex items-center gap-2 text-xs text-red-400">
             <AlertTriangle className="size-3.5 shrink-0" />
@@ -270,6 +423,52 @@ const Row = memo(function Row({
     </li>
   );
 });
+
+function CullInfo({ img }: { img: RawImageEntry }) {
+  const q = img.quality;
+  if (!q && img.tags.length === 0 && img.burstGroupId == null) return null;
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+      {img.tags.map((t) => (
+        <span
+          key={t.tag}
+          title={`${t.source}, confidence ${t.confidence.toFixed(2)}${t.suppressed ? " (dismissed)" : ""}`}
+          className={
+            t.suppressed
+              ? "rounded bg-neutral-900 px-1.5 py-0.5 text-neutral-600 line-through"
+              : "rounded bg-amber-950 px-1.5 py-0.5 text-amber-300"
+          }
+        >
+          {t.tag.replace("_", " ")}
+        </span>
+      ))}
+      {q && (
+        <>
+          <span className="text-neutral-300" title="Overall quality score">
+            Q {Math.round(q.overall * 100)}
+          </span>
+          <span className="flex items-center gap-0.5 text-neutral-400" title="Suggested rating">
+            <Star className="size-3" />
+            {q.suggestedRating}
+          </span>
+          {q.suggestedPick !== "unflagged" && (
+            <span
+              className={`rounded px-1.5 py-0.5 ${q.suggestedPick === "pick" ? "bg-green-950 text-green-300" : "bg-red-950 text-red-300"}`}
+            >
+              suggest {q.suggestedPick}
+            </span>
+          )}
+        </>
+      )}
+      {img.burstGroupId != null && (
+        <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-300">
+          burst #{img.burstGroupId}
+          {img.isBurstKeeper ? " · keeper" : ""}
+        </span>
+      )}
+    </div>
+  );
+}
 
 const timeFmt = new Intl.DateTimeFormat(undefined, {
   timeZone: "UTC",
