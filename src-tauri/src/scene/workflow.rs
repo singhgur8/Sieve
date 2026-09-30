@@ -65,26 +65,96 @@ pub fn scope_images(conn: &Connection, scope: &FolderScope) -> AppResult<Vec<Pla
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Keepers whose `QualityScore.overall` is within this of the best keeper's form the pool the
+/// representative is chosen from (by typical light).
+pub const REPRESENTATIVE_QUALITY_MARGIN: f32 = 0.1;
+/// Reasons shown for automatic representatives.
+pub const REASON_TYPICAL_BEST: &str = "Best keeper, in the scene's typical light";
+pub const REASON_TYPICAL: &str = "One of the best keepers, closest to the scene's typical light";
+pub const REASON_BEST: &str = "Best-scored keeper of this scene";
+pub const REASON_FIRST: &str = "First keeper of this scene";
+
 /// Proposes the representative of a scene among its `keepers` (non-empty, capture order):
-/// `(image, user-facing reason)`. Contract: vision-ml-dev (placeholder: highest
-/// `QualityScore.overall`, then higher rating, then earlier).
+/// `(image, user-facing reason)`. vision-ml-dev.
+///
+/// "Best keeper with the most typical lighting": the pool is the keepers whose
+/// `QualityScore.overall` is within [`REPRESENTATIVE_QUALITY_MARGIN`] of the best (all keepers
+/// when none is scored); among them the one whose preview appearance (`scene_features`) is
+/// most similar on average to every member of the scene (the scene's medoid, so the edit
+/// transfers to the rest with the smallest relative corrections). Ties: higher overall, then
+/// picked, higher rating, earlier. Without features: the best-scored keeper.
 pub fn propose_representative(
     conn: &Connection,
     scene_id: SceneId,
     keepers: &[PlanImage],
 ) -> AppResult<(ImageId, String)> {
-    let _ = (conn, scene_id);
-    let best = keepers
+    if keepers.is_empty() {
+        return Err(AppError::internal("scene without keepers"));
+    }
+    let overall = |k: &PlanImage| k.overall.unwrap_or(-1.0);
+    // Ordering "a is better than b": overall, pick, rating, earlier (capture order = index).
+    let better = |(ia, a): (usize, &PlanImage), (ib, b): (usize, &PlanImage)| {
+        overall(a)
+            .total_cmp(&overall(b))
+            .then((a.pick == PickFlag::Pick).cmp(&(b.pick == PickFlag::Pick)))
+            .then(a.rating.cmp(&b.rating))
+            .then(ib.cmp(&ia))
+    };
+    let (_, best) = keepers.iter().enumerate().max_by(|a, b| better(*a, *b)).expect("non-empty");
+    let pool: Vec<(usize, &PlanImage)> = match best.overall {
+        Some(top) => keepers
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.overall.is_some_and(|o| o >= top - REPRESENTATIVE_QUALITY_MARGIN))
+            .collect(),
+        None => keepers.iter().enumerate().collect(),
+    };
+    let fallback = || {
+        let (id, reason) = if best.overall.is_some() { (best.id, REASON_BEST) } else { (keepers[0].id, REASON_FIRST) };
+        Ok((id, reason.to_owned()))
+    };
+    if pool.len() < 2 {
+        return fallback();
+    }
+    let features = member_features(conn, scene_id)?;
+    if features.len() < 2 {
+        return fallback();
+    }
+    let typicality = |id: ImageId| -> Option<f32> {
+        let f = features.iter().find(|(i, _)| *i == id).map(|(_, f)| f)?;
+        let others: Vec<f32> =
+            features.iter().filter(|(i, _)| *i != id).map(|(_, g)| super::features::similarity(f, g)).collect();
+        Some(others.iter().sum::<f32>() / others.len().max(1) as f32)
+    };
+    let scored: Vec<((usize, &PlanImage), f32)> =
+        pool.iter().filter_map(|&(i, k)| typicality(k.id).map(|t| ((i, k), t))).collect();
+    // Typicality in steps of 0.01 (differences below that are noise), then quality.
+    let chosen = scored
         .iter()
-        .enumerate()
-        .max_by(|(ia, a), (ib, b)| {
-            let (sa, sb) = (a.overall.unwrap_or(-1.0), b.overall.unwrap_or(-1.0));
-            sa.total_cmp(&sb).then(a.rating.cmp(&b.rating)).then(ib.cmp(ia))
-        })
-        .map(|(_, k)| k)
-        .ok_or_else(|| AppError::internal("scene without keepers"))?;
-    let reason = if best.overall.is_some() { "Best-scored keeper of this scene" } else { "First keeper of this scene" };
-    Ok((best.id, reason.to_owned()))
+        .max_by(|(a, ta), (b, tb)| (ta * 100.0).round().total_cmp(&(tb * 100.0).round()).then(better(*a, *b)))
+        .map(|((_, k), _)| *k);
+    let Some(chosen) = chosen else { return fallback() };
+    let reason = if chosen.id == best.id { REASON_TYPICAL_BEST } else { REASON_TYPICAL };
+    Ok((chosen.id, reason.to_owned()))
+}
+
+/// Current preview features of scene `scene_id`'s members.
+fn member_features(conn: &Connection, scene_id: SceneId) -> AppResult<Vec<(ImageId, super::SceneFeatures)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, f.features_json FROM images i JOIN scene_features f ON f.image_id = i.id
+         WHERE i.scene_id = ?1 AND f.version = ?2",
+    )?;
+    let rows = stmt.query_map(params![scene_id, super::FEATURES_VERSION], |r| {
+        Ok((r.get::<_, ImageId>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json) = row?;
+        if let Ok(f) = serde_json::from_str(&json) {
+            out.push((id, f));
+        }
+    }
+    Ok(out)
 }
 
 struct SceneRow {
@@ -417,6 +487,106 @@ mod tests {
         }
         let scene = super::super::store::create_scene(&mut conn, &ids).unwrap();
         (conn, s.project_id, scene.id, ids)
+    }
+
+    /// Preview features of a frame with mean encoded luma `luma` (0..1) and colour cast `a`.
+    fn features(luma: f32, a: f32) -> super::super::SceneFeatures {
+        let mut luma_hist = vec![0.0; 16];
+        luma_hist[((luma * 16.0) as usize).min(15)] = 1.0;
+        let mut ab_hist = vec![0.0; 64];
+        ab_hist[(((a + 0.2) / 0.4 * 8.0) as usize).min(7) * 8 + 4] = 1.0;
+        super::super::SceneFeatures {
+            log_mean_luma: luma.max(1e-3).powf(2.2).log2(),
+            luma_hist,
+            ab_hist,
+            mean_oklab: [luma, a, 0.0],
+        }
+    }
+
+    fn store_features(conn: &mut Connection, items: &[(ImageId, super::super::SceneFeatures)]) {
+        super::super::store::save_features(conn, items).unwrap();
+    }
+
+    #[test]
+    fn representative_is_the_most_typical_of_the_best_keepers() {
+        let (mut conn, project, scene, ids) = fixture();
+        // Keepers 0 (overall 0.6), 1 (0.9), 3 (0.95); pool = {1, 3} (within 0.1 of the best).
+        // 3 is the odd one out (dark, cast); 0, 1, 2 share the scene's typical light.
+        store_features(
+            &mut conn,
+            &[
+                (ids[0], features(0.5, 0.0)),
+                (ids[1], features(0.52, 0.01)),
+                (ids[2], features(0.5, 0.0)),
+                (ids[3], features(0.1, 0.12)),
+            ],
+        );
+        let plan = edit_plan(&conn, project).unwrap();
+        let e = &plan.scenes[0];
+        assert_eq!(e.scene_id, scene);
+        assert_eq!(e.representative_id, ids[1], "typical light wins inside the quality pool");
+        assert_eq!(e.representative_reason, REASON_TYPICAL);
+        // The low-scored but typical keeper 0 is never proposed over the pool.
+        let keepers: Vec<PlanImage> = scope_images(&conn, &FolderScope::resolve(&conn, None, Some(project)).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.id != ids[2])
+            .collect();
+        assert_eq!(propose_representative(&conn, scene, &keepers).unwrap().0, ids[1]);
+        // When the best keeper is also typical, it is chosen with the "best" reason.
+        store_features(&mut conn, &[(ids[3], features(0.51, 0.0))]);
+        let (id, reason) = propose_representative(&conn, scene, &keepers).unwrap();
+        assert_eq!((id, reason.as_str()), (ids[3], REASON_TYPICAL_BEST));
+    }
+
+    #[test]
+    fn redetection_keeps_representative_and_applied_state() {
+        let (mut conn, project, scene, ids) = fixture();
+        set_representative(&conn, scene, Some(ids[1])).unwrap();
+        conn.execute("UPDATE scenes SET applied_at_ms = 77, applied_params_json = '{}' WHERE id = ?1", [scene])
+            .unwrap();
+        let scope = FolderScope::resolve(&conn, None, Some(project)).unwrap();
+        let scenes = super::super::store::replace_scenes(
+            &mut conn,
+            &scope,
+            &[vec![ids[0]], vec![ids[1], ids[2]], vec![ids[3]]],
+            false,
+        )
+        .unwrap();
+        assert_eq!(scenes.len(), 3);
+        let with_rep = scenes.iter().find(|s| s.image_ids.contains(&ids[1])).unwrap();
+        type Row = (Option<ImageId>, Option<String>, Option<String>, Option<i64>, Option<String>);
+        let (rep, source, reason, applied_at, json): Row =
+            conn.query_row(
+                "SELECT representative_id, representative_source, representative_reason, applied_at_ms, applied_params_json
+                 FROM scenes WHERE id = ?1",
+                [with_rep.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(rep, Some(ids[1]));
+        assert_eq!(source.as_deref(), Some("user"));
+        assert_eq!(reason.as_deref(), Some(REASON_USER));
+        assert_eq!((applied_at, json.as_deref()), (Some(77), Some("{}")));
+        // The other new scenes start without plan state.
+        for s in scenes.iter().filter(|s| s.id != with_rep.id) {
+            let rep: Option<ImageId> =
+                conn.query_row("SELECT representative_id FROM scenes WHERE id = ?1", [s.id], |r| r.get(0)).unwrap();
+            assert_eq!(rep, None);
+        }
+        // Merging two scenes that each had a representative: the user's choice wins.
+        let a = scenes.iter().find(|s| s.image_ids == vec![ids[0]]).unwrap().id;
+        set_representative(&conn, a, Some(ids[0])).unwrap();
+        conn.execute("UPDATE scenes SET representative_source = 'auto' WHERE id = ?1", [a]).unwrap();
+        let scenes = super::super::store::replace_scenes(&mut conn, &scope, std::slice::from_ref(&ids), false).unwrap();
+        let (rep, source): (Option<ImageId>, Option<String>) = conn
+            .query_row(
+                "SELECT representative_id, representative_source FROM scenes WHERE id = ?1",
+                [scenes[0].id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rep, source.as_deref()), (Some(ids[1]), Some("user")));
     }
 
     #[test]
