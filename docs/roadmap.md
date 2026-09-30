@@ -126,6 +126,58 @@ copy subsets into `test-data/` for anything that writes.
 - [x] `pnpm tauri build` → `.app` / `.dmg`; smoke-test the bundle.
 - [x] Final report in `docs/final-report.md`: what works, known gaps, how to use; include remaining Lightroom-parity gaps, if any.
 
+## Phase 8b — User feedback round 1: guided workflow + Lightroom-style Develop (user request 2026-09-30)
+Source: the user's first hands-on test of the release build. Phase 10 (style learning) is pulled into this phase because
+the user asked for "auto edit based on what the model thinks I like".
+- [ ] **Contract** (architect): IPC v14 — catalog-wide preset/profile library imported from folders (Lightroom
+  `.xmp` develop presets + legacy `.lrtemplate`, `.xmp` creative profiles with RGB/Look tables, `.dcp`, `.cube`),
+  grouped by source folder, available in every project; `auto_tone(imageId)` / `auto_white_balance(imageId)`
+  returning adjustments; per-folder workflow step state (cull / edit / export) and per-scene edit anchors (chosen
+  representative, edited flag, applied flag); style-model commands (train from catalog/XMPs, status, predict);
+  XMP auto-sync default on for new catalogs/folders.
+- [ ] **Preset & profile library** (rust-engine-dev + frontend-dev): "Import presets & profiles…" takes a whole folder
+  (recursive); items appear in every project under their folder groups (Develop left panel "Presets", profile browser
+  next to Profile); applying a preset sets only the keys it contains (Lightroom semantics); creative profiles apply
+  their look table with an Amount slider; `.cube` files appear as profiles, not a separate LUT concept; hover preview.
+  Acceptance: import the user's Lightroom preset/profile folders (read-only copy in `test-data/`), each preset
+  applies exactly its keys; profile amount 0/100/200 behaves like Lightroom.
+- [ ] **Auto tone + Auto WB** (rust-engine-dev): Lightroom-style "Auto" in Basic (Exposure, Contrast, Highlights,
+  Shadows, Whites, Blacks, Vibrance, Saturation) and "Auto" white balance; Shift-double-click a slider = auto that
+  slider. Acceptance: on the user's frames auto results land near the user's own edits (report deltas) and never clip
+  skin; one undo step.
+- [ ] **Compare view** (frontend-dev): Compare is a view in Library and Develop (two photos side by side, synced zoom);
+  a thin filmstrip of the current filtered gallery stays at the bottom with the selection highlighted; click / arrow
+  keys pick the candidate, the other pane stays the select; editing sliders in Compare edit the active pane
+  (Lightroom "Reference view" behaviour); swap / make-select shortcuts.
+- [ ] **Masks UX** (frontend-dev): overlay colour darker red (≈ #c00000 at 55–60% opacity) so the mask is obvious;
+  overlay shows automatically while painting/dragging/adjusting a mask and fades out when done unless "Show overlay"
+  (O) is on; Add / Subtract / Intersect menus render in a portal so they are never clipped by the panel.
+- [ ] **Small fixes** (frontend-dev): stars clickable wherever shown (grid cell, loupe, Develop toolbar, filmstrip;
+  clicking the current rating clears it); scenes toggle (show/hide the scene strip and clear the scene filter, with a
+  shortcut); grid size slider track/thumb visible on the dark theme (WCAG contrast).
+- [ ] **Lightroom-style Develop layout** (ux-designer spec → frontend-dev): match Lightroom Classic positions — left
+  panel Navigator / Presets / Snapshots / History; right panel Histogram, tool strip (Crop, Masking), Basic (Profile +
+  browser, WB with Auto, Tone with Auto, Presence), Tone Curve, HSL/Color, Color Grading, Detail, Effects,
+  Calibration; bottom-left "Copy…" / "Paste", bottom-right "Previous" / "Reset"; Copy… dialog with every setting group
+  as checkboxes (Check All / Check None, remembers last choice); Cmd+Shift+C / Cmd+Shift+V / Cmd+Alt+V (paste from
+  previous); Sync… for multi-selection; filmstrip at the bottom.
+- [ ] **Guided workflow: Cull → Edit → Export** (architect → frontend-dev, vision-ml-dev): a step bar per project
+  (AfterShoot-style). Cull step = today's culling. Edit step: keepers are grouped into scenes; for each scene the app
+  proposes one representative photo to edit (best keeper, most typical lighting); a checklist shows scenes to edit /
+  edited / applied; "Auto edit (my style)" pre-fills the representative; once edited, "Apply to scene" copies the
+  edit to the rest of the scene with relative scene matching (exposure/WB normalised per frame), reviewable and
+  undoable; "Apply all edited scenes". Export step = export dialog for keepers.
+- [ ] **Style learning / auto edit** (vision-ml-dev; was Future Phase 10): learn the user's style from their edited
+  frames (the 394 proposal XMPs + future edits in the catalog) and predict full ParametricAdjustments for a new frame
+  (features: develop-source stats, scene context, camera; model on-device, retrainable from the catalog). Acceptance:
+  on held-out user edits, predicted-vs-user render ΔE2000 clearly better than Auto tone and than "no edit" (report
+  both), and slider-level errors per group.
+- [ ] **XMP auto-save** (rust-engine-dev + frontend-dev): auto-sync on by default (debounced write of ratings, flags,
+  tags and edits to sidecars, existing sidecar fields preserved); clear status (saved / pending / error) and a
+  one-time explanation of how Sieve reads existing XMP as the starting point and merges changes into it.
+- [ ] **UX review** (ux-designer): re-check the new workflow end to end; no open P0/P1.
+- [ ] **QA gate**.
+
 ---
 
 ## Future phases (notes to revisit — not part of the autonomous run)
@@ -139,7 +191,7 @@ Requested 2026-09-29. User provides a reference photo B (any source/JPEG) and a 
 - Evaluation: ΔE between graded A and B on matched regions; side-by-side UI with strength slider.
 - Depends on: Phase 5 (render engine, LUT support), Phase 7 (relative grading math).
 
-### Phase 10 — Personal style learning / auto-edit (user request 2026-09-29)
+### Phase 10 — Personal style learning / auto-edit (user request 2026-09-29) — moved into the run as Phase 8b "Style learning"
 Learn the user's editing style from their Lightroom XMPs (e.g. 394 edited frames in the Jasmit Natalie Proposal set:
 consistent parametric curve, split toning, calibration, NR) and propose full edits for new shoots, per scene/lighting.
 Approach sketch: features from the develop-source stats (Phase 7) + scene context → predict ParametricAdjustments
