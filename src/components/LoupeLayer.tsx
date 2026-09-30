@@ -4,7 +4,7 @@ import { Flag, X } from "lucide-react";
 import { commands, convertFileSrc, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
-import { Stars, XmpBadge } from "./Cell";
+import { SceneBadge, Stars, XmpBadge } from "./Cell";
 import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
 
 export interface CompareState {
@@ -194,6 +194,11 @@ function Filmstrip({ lib, activeId, onOpen }: { lib: Library; activeId: number |
               style={{ left: 0, transform: `translateX(${it.start}px)` }}
             >
               {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(id)}`} alt="" className="size-full object-cover" draggable={false} />}
+              {e && e.sceneId != null && (
+                <span className="absolute bottom-0.5 left-0.5">
+                  <SceneBadge entry={e} testPrefix="loupe-film-scene" />
+                </span>
+              )}
             </button>
           );
         })}
