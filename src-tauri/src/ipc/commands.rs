@@ -16,6 +16,7 @@ use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::{self, Analysis};
+use crate::scene;
 use crate::xmp::XmpSync;
 
 /// Managed state: the open catalog.
@@ -784,4 +785,202 @@ pub async fn set_xmp_auto_sync(
 pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>) -> AppResult<XmpStatus> {
     let running = xmp.is_running();
     catalog.run(move |c| repo::xmp_status(c, running)).await
+}
+
+// ---------------------------------------------------------------------------
+// Scenes & scene matching (Phase 7)
+// ---------------------------------------------------------------------------
+
+/// Groups the images of `folderId` (all folders for `null`) into scenes by capture-time gaps
+/// and appearance similarity (`options` `null` = defaults). Replaces the `auto` scenes in scope
+/// (and `manual` ones if `replaceManual`); members of kept manual scenes are not regrouped;
+/// anchor flags survive regrouping. Blocking until done (first run computes preview features,
+/// ~10 ms/image in parallel; later runs reuse them); progress via `sceneProgress {task:
+/// "detect"}`. Returns `list_scenes(folderId)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn detect_scenes(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    options: Option<SceneDetectOptions>,
+) -> AppResult<Vec<Scene>> {
+    let options = options.unwrap_or_default();
+    options.validate().map_err(AppError::invalid)?;
+    let replace_manual = options.replace_manual;
+    let mut frames = catalog.run(move |c| scene::store::detection_frames(c, folder_id, replace_manual)).await?;
+    let progress = scene::progress_emitter(app, SceneTask::Detect);
+    let (frames, computed) = blocking(move || {
+        let computed = scene::features::compute_missing(&mut frames, &progress);
+        Ok((frames, computed))
+    })
+    .await?;
+    catalog
+        .run(move |c| {
+            scene::store::save_features(c, &computed)?;
+            let groups = scene::detect::group(&frames, &options);
+            scene::store::replace_scenes(c, folder_id, &groups, options.replace_manual)
+        })
+        .await
+}
+
+/// Scenes with a member in `folderId` (all for `null`), in capture order.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_scenes(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<Scene>> {
+    catalog.run(move |c| scene::store::list_scenes(c, folder_id)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_scene(catalog: State<'_, Catalog>, id: SceneId) -> AppResult<Scene> {
+    catalog.run(move |c| scene::store::get_scene(c, id)).await
+}
+
+/// New `manual` scene from `imageIds` (non-empty; moved out of their current scenes; scenes
+/// left empty are deleted).
+#[tauri::command]
+#[specta::specta]
+pub async fn create_scene(catalog: State<'_, Catalog>, image_ids: Vec<ImageId>) -> AppResult<Scene> {
+    catalog.run(move |c| scene::store::create_scene(c, &image_ids)).await
+}
+
+/// Replaces the members of scene `id` (non-empty; images in other scenes are moved in).
+/// The scene becomes `manual`; anchors that stay members are kept.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_scene_members(catalog: State<'_, Catalog>, id: SceneId, image_ids: Vec<ImageId>) -> AppResult<Scene> {
+    catalog.run(move |c| scene::store::set_scene_members(c, id, &image_ids)).await
+}
+
+/// Marks the graded anchors of scene `id`: 0..=2 members (`[]` clears). Keeps the method.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_scene_anchors(catalog: State<'_, Catalog>, id: SceneId, anchor_ids: Vec<ImageId>) -> AppResult<Scene> {
+    catalog.run(move |c| scene::store::set_scene_anchors(c, id, &anchor_ids)).await
+}
+
+/// Merges `ids` (>= 2 scenes) into `ids[0]` (`manual`; anchors kept up to 2, in `ids` order).
+#[tauri::command]
+#[specta::specta]
+pub async fn merge_scenes(catalog: State<'_, Catalog>, ids: Vec<SceneId>) -> AppResult<Scene> {
+    catalog.run(move |c| scene::store::merge_scenes(c, &ids)).await
+}
+
+/// Splits scene `id` before member `firstImageId` (capture order; not the first member).
+/// Returns `[id, newScene]`, both `manual`; anchors follow their images.
+#[tauri::command]
+#[specta::specta]
+pub async fn split_scene(catalog: State<'_, Catalog>, id: SceneId, first_image_id: ImageId) -> AppResult<Vec<Scene>> {
+    catalog.run(move |c| scene::store::split_scene(c, id, first_image_id)).await
+}
+
+/// Deletes scene `id` (its images become unassigned; adjustments untouched).
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_scene(catalog: State<'_, Catalog>, id: SceneId) -> AppResult<()> {
+    catalog.run(move |c| scene::store::delete_scene(c, id)).await
+}
+
+/// Proposes relative grades for `targetIds` from 1-2 graded `anchorIds` (nothing is saved).
+/// Anchors: 1..=2 distinct images; anchors listed in `targetIds` are skipped; duplicates
+/// dropped; no targets left or more than `MatchOptions::MAX_TARGETS` -> `invalid_argument`;
+/// unknown ids -> `not_found`. Blocking until all previews are ready (renders at 640 px; the
+/// first render of an image decodes its RAW); progress via `sceneProgress {task: "match"}`.
+/// Result in `targetIds` order.
+#[tauri::command]
+#[specta::specta]
+pub async fn match_scene(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    anchor_ids: Vec<ImageId>,
+    target_ids: Vec<ImageId>,
+    options: MatchOptions,
+) -> AppResult<Vec<MatchPreview>> {
+    options.validate().map_err(AppError::invalid)?;
+    let mut anchors: Vec<ImageId> = Vec::new();
+    for id in anchor_ids {
+        if !anchors.contains(&id) {
+            anchors.push(id);
+        }
+    }
+    if anchors.is_empty() || anchors.len() > Scene::MAX_ANCHORS {
+        return Err(AppError::invalid(format!("match_scene needs 1..={} anchors", Scene::MAX_ANCHORS)));
+    }
+    let mut targets: Vec<ImageId> = Vec::new();
+    for id in target_ids {
+        if !anchors.contains(&id) && !targets.contains(&id) {
+            targets.push(id);
+        }
+    }
+    if targets.is_empty() {
+        return Err(AppError::invalid("no targets besides the anchors"));
+    }
+    if targets.len() > MatchOptions::MAX_TARGETS {
+        return Err(AppError::invalid(format!("at most {} targets per call", MatchOptions::MAX_TARGETS)));
+    }
+    let (anchors, targets) = catalog
+        .run(move |c| Ok((scene::store::match_inputs(c, &anchors)?, scene::store::match_inputs(c, &targets)?)))
+        .await?;
+    let cache = develop.inner().clone();
+    let luts = luts.inner().clone();
+    let progress = scene::progress_emitter(app, SceneTask::Match);
+    blocking(move || scene::matching::match_images(&cache, &luts, &anchors, &targets, &options, &progress)).await
+}
+
+/// Commits scene-match results: one history entry labelled `label` (default "Match Scene")
+/// per image whose adjustments change. Atomic (unknown id -> `not_found`, invalid values ->
+/// `invalid_argument`, nothing written). Marks sidecars dirty (crs:). Returns the changed ids.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_scene_match(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    applications: Vec<MatchApplication>,
+    label: Option<String>,
+) -> AppResult<Vec<ImageId>> {
+    let label = label.unwrap_or_else(|| scene::LABEL_MATCH.to_string());
+    let mut items: Vec<(ImageId, ParametricAdjustments)> = Vec::with_capacity(applications.len());
+    for a in applications {
+        if items.iter().any(|(id, _)| *id == a.image_id) {
+            return Err(AppError::invalid(format!("image {} listed twice", a.image_id)));
+        }
+        items.push((a.image_id, a.adjustments));
+    }
+    let changed = catalog.run(move |c| develop::history::commit_batch(c, &items, &label)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(changed)
+}
+
+/// Render-space statistics of image `id` rendered with `adjustments` (`null` = its stored
+/// adjustments), whole frame or `region` (oriented, normalized). Same pixels as the editor
+/// (LUT included) at 640 px. Used to verify matches (mean luma / neutral within tolerance).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_render_stats(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+    region: Option<NormRect>,
+) -> AppResult<ImageStats> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    if let Some(r) = region {
+        RenderOptions { max_edge: scene::STATS_MAX_EDGE, slot: RenderSlot::Detail, region: Some(r) }
+            .validate()
+            .map_err(AppError::invalid)?;
+    }
+    let input = catalog.run(move |c| scene::store::match_inputs(c, &[id])).await?.remove(0);
+    let adjustments = adjustments.unwrap_or_else(|| input.adjustments.clone());
+    let cache = develop.inner().clone();
+    let luts = luts.inner().clone();
+    blocking(move || scene::stats::render_stats(&cache, &luts, &input.src, &adjustments, region)).await
 }

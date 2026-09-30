@@ -130,4 +130,30 @@ mod tests {
         let items: i64 = conn.query_row("SELECT COUNT(*) FROM export_items", [], |r| r.get(0)).unwrap();
         assert_eq!(items, 0);
     }
+
+    #[test]
+    fn v7_scene_tables_and_cascades() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("cat.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                 file_size, file_mtime_ms, imported_at)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 'bayer', 1, 0, 0);
+             INSERT INTO scenes (id, folder_id, method, created_at, updated_at) VALUES (5, 1, 'auto', 0, 0);
+             UPDATE images SET scene_id = 5, scene_anchor = 1 WHERE id = 1;
+             INSERT INTO scene_features (image_id, version, features_json, computed_at) VALUES (1, 'v', '{}', 0);",
+        )
+        .unwrap();
+        assert!(conn.execute("UPDATE scenes SET method = 'bogus'", []).is_err());
+        // Scene edits must not mark sidecars dirty (scenes are not XMP-mapped).
+        let dirty: bool = conn.query_row("SELECT xmp_dirty FROM images WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert!(!dirty);
+        conn.execute("DELETE FROM scenes WHERE id = 5", []).unwrap();
+        let scene: Option<i64> = conn.query_row("SELECT scene_id FROM images WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(scene, None);
+        conn.execute("DELETE FROM images WHERE id = 1", []).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM scene_features", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
 }
