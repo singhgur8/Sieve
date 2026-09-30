@@ -676,3 +676,40 @@ migrations tracked by `PRAGMA user_version`.
 - `cargo test` fails (`bindings_are_up_to_date`) if the committed bindings are stale;
   fix with `UPDATE_BINDINGS=1 cargo test bindings`.
 - Log every contract change in `docs/ipc-changelog.md`.
+
+## Packaging (Phase 8)
+
+`pnpm tauri build` (Apple Silicon, macOS 15+) produces
+`src-tauri/target/release/bundle/macos/Sieve.app` (~58 MB) and `bundle/dmg/Sieve_<version>_aarch64.dmg` (~35 MB).
+`beforeBuildCommand` = `pnpm build && bash scripts/fetch-models.sh --culling`.
+
+- **Native libraries** (`build.rs`, macOS): LibRaw (`libraw_r`) and TurboJPEG are found in Homebrew as before,
+  then copied with their non-system transitive deps (`libomp`, `libjpeg.8`, `liblcms2.2`) into
+  `src-tauri/target/sieve-stage/Frameworks/`, install ids / references rewritten to `@rpath/<name>`, ad-hoc
+  re-signed, and linked from there. `tauri.conf.json` `bundle.macOS.frameworks` lists the staged files
+  (build.rs fails with a clear message if Homebrew's dependency graph changes); tauri-build copies them to
+  `target/Frameworks` and adds `-rpath @executable_path/../Frameworks`, the bundler ships them in
+  `Contents/Frameworks`. build.rs also copies them to `target/<profile>/Frameworks` so test/example binaries
+  (`target/<profile>/{deps,examples}`) resolve the same rpath. No `/opt/homebrew` load command remains in the
+  bundle. Homebrew bottles set the minimum OS (currently 15.0 = `minimumSystemVersion`).
+- **ONNX Runtime** is statically linked by `ort` (no dylib); the CoreML EP works from the bundle.
+- **Models**: the culling models (~27 MB: SCRFD, 2d106, open/closed eye, FaceMesh) are staged by build.rs into
+  `target/sieve-stage/models/` and bundled as `Contents/Resources/models` (resource map in tauri.conf.json;
+  release bundle builds fail if they are missing). The AI-mask models (~560 MB) are not bundled: release builds
+  read them from `<app_data_dir>/models` (`~/Library/Application Support/com.sieve.app/models`), where
+  `model_fetch::link_bundled` symlinks the bundled face models at startup (people / part masks need them) and
+  `model_fetch::fetch` downloads the segmentation set (system `curl`, resumable `.part`, SHA-256 from
+  `models/checksums.sha256`, rename only after verification). Until an IPC command exposes the download, AI
+  masks report "model file ... not installed"; `scripts/fetch-models.sh --dest <that dir>` pre-seeds them.
+  Debug builds and `SIEVE_MODELS` keep using a single directory.
+- **Signing**: ad-hoc (`signingIdentity: "-"`), hardened runtime, `Entitlements.plist` =
+  `com.apple.security.cs.disable-library-validation` only (required: without it dyld rejects the ad-hoc
+  Frameworks under the hardened runtime — verified). Not sandboxed (user-chosen folders, sidecars, Adobe
+  profiles read in place). Adobe files are never bundled. Developer ID signing + notarization need an Apple
+  Developer account (future; Tauri notarizes when `APPLE_*` env vars are set).
+- **Icon**: `src-tauri/icons/sieve.svg` → `pnpm tauri icon src-tauri/icons/sieve.svg` (then drop android/ios).
+- **Smoke test**: `cargo build --release --example bundle_smoke && scripts/bundle-smoke.sh <copied samples>
+  [work_dir]` — checks load commands and signature, launches `Contents/MacOS/sieve` with a clean env and scratch
+  catalog (migrations, dylibs mapped from `Contents/Frameworks` via `lsof`; the hardened runtime ignores
+  `DYLD_PRINT_LIBRARIES`), then runs import → thumbnails → CoreML culling → render → full-res JPEG export from
+  inside a copy of the bundle.

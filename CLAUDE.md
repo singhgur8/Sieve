@@ -62,6 +62,7 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 - Run app: `pnpm tauri dev` (set `SIEVE_CATALOG=/tmp/x.sqlite` for a scratch catalog).
 - Rust tests/lint: `cd src-tauri && cargo test && cargo clippy --all-targets && cargo fmt --check`.
 - Frontend type check + build: `pnpm build`.
+- Release bundle: `pnpm tauri build` → `src-tauri/target/release/bundle/{macos/Sieve.app,dmg/}` (self-contained, ad-hoc signed; smoke test `scripts/bundle-smoke.sh`; see architecture.md Packaging).
 - IPC contract: Rust types in `src-tauri/src/ipc/` are the source of truth; `src/ipc/bindings.ts` is generated
   (never edit it). Regenerate with `UPDATE_BINDINGS=1 cargo test bindings`; log changes in `docs/ipc-changelog.md`.
 - Architecture, ownership map and schema: `docs/architecture.md`.
