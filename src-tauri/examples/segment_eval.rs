@@ -1,5 +1,5 @@
 //! AI-mask evaluation (Phase 7c prep): runs Select Subject, Select Sky and People (+ parts)
-//! from `ml::segment` over sample previews and writes overlay visualizations.
+//! from `ml::segment` (refined against the preview) over sample previews and writes overlay visualizations.
 //!
 //! ```text
 //! scripts/fetch-models.sh
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use sieve_lib::ml::segment::{Mask, RgbImage, SegmentConfig, Segmenter};
+use sieve_lib::ml::segment::{Mask, RgbImage, SegmentConfig, SegmentEngine};
 use sieve_lib::raw::turbo;
 
 const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
@@ -110,7 +110,7 @@ fn main() {
     let mut cfg = SegmentConfig::new(models_dir);
     cfg.coreml = !cpu;
     cfg.coreml_cache = Some(PathBuf::from(format!("{ROOT}/coreml-cache")));
-    let mut seg = Segmenter::new(cfg);
+    let mut seg = SegmentEngine::new(cfg);
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&src)
         .expect("read src dir")
@@ -140,6 +140,7 @@ fn main() {
         let mut line = format!("{name} {w}x{h}:");
 
         if want("subject") {
+            seg.clear_timings();
             let t = Instant::now();
             let m = seg.subject(img).expect("subject");
             let total = t.elapsed().as_secs_f64() * 1000.0;
@@ -153,6 +154,7 @@ fn main() {
             }
         }
         if want("sky") {
+            seg.clear_timings();
             let t = Instant::now();
             let m = seg.sky(img).expect("sky");
             let total = t.elapsed().as_secs_f64() * 1000.0;
@@ -166,6 +168,7 @@ fn main() {
             }
         }
         if want("people") {
+            seg.clear_timings();
             let t = Instant::now();
             let people = seg.people(img, true).expect("people");
             let total = t.elapsed().as_secs_f64() * 1000.0;

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::masking::{PeopleDetector, PersonSummary, RegisteredModel, SegmentInput, SegmentModel, SegmentRequest};
 use super::segment::{
-    mask_lowres, union_all, Instance, LowRes, Mask, RgbImage, SegmentConfig, SegmentEngine, FACE_MODELS, PARTS_MODEL,
+    mask_lowres, union_all, Instance, LowRes, RgbImage, SegmentConfig, SegmentEngine, FACE_MODELS, PARTS_MODEL,
     PERSON_MODEL, SAM_DECODER_MODEL, SAM_ENCODER_MODEL, SKY_MODEL, SUBJECT_MODEL,
 };
 use crate::develop::masks::AlphaMask;
@@ -245,13 +245,17 @@ impl PeopleModel {
                 let mut face = LowRes { data: r.face_skin.clone(), ..g.clone() };
                 if let Some(f) = &features {
                     // Eyes, brows, lips and mouth are not skin.
-                    let cut: Vec<&Mask> = vec![&f.eyes, &f.brows, &f.lips, &f.inner];
+                    let cut: Vec<LowRes> = [&f.eyes, &f.brows, &f.lips, &f.inner]
+                        .into_iter()
+                        .filter(|m| m.width > 0 && m.height > 0)
+                        .map(mask_lowres)
+                        .collect();
                     let [x0, y0, x1, y1] = g.roi;
                     let (kx, ky) = ((x1 - x0) as f32 / g.width as f32, (y1 - y0) as f32 / g.height as f32);
                     for (i, v) in face.data.iter_mut().enumerate() {
                         let x = x0 as f32 + ((i % g.width) as f32 + 0.5) * kx;
                         let y = y0 as f32 + ((i / g.width) as f32 + 0.5) * ky;
-                        let m = cut.iter().map(|c| mask_at(c, x, y)).fold(0.0f32, f32::max);
+                        let m = cut.iter().map(|c| c.at(x, y)).fold(0.0f32, f32::max);
                         *v *= 1.0 - m;
                     }
                 }
@@ -274,14 +278,6 @@ impl PeopleModel {
         }
         Ok(union_all(&planes, UNION_EDGE).unwrap_or_else(|| LowRes::empty(img.width, img.height)))
     }
-}
-
-/// Bilinear value of an image-pixel [`Mask`] at a continuous position.
-fn mask_at(m: &Mask, x: f32, y: f32) -> f32 {
-    if m.width == 0 || m.height == 0 {
-        return 0.0;
-    }
-    mask_lowres(m).at(x, y)
 }
 
 impl SegmentModel for PeopleModel {

@@ -163,10 +163,11 @@ pub fn refine_with(stats: &GuideStats, alpha: &AlphaMask, guide: &Guide, params:
     // Output rect in guide pixels.
     let to_gx = |x: f32| (x - reg.x) / reg.width * gw as f32;
     let to_gy = |y: f32| (y - reg.y) / reg.height * gh as f32;
-    let ox0 = to_gx(b.x).floor().max(0.0) as usize;
-    let oy0 = to_gy(b.y).floor().max(0.0) as usize;
-    let ox1 = (to_gx(b.x + b.width).ceil().max(0.0) as usize).min(gw);
-    let oy1 = (to_gy(b.y + b.height).ceil().max(0.0) as usize).min(gh);
+    // Snap within 1e-3 px so float noise does not add a column.
+    let ox0 = (to_gx(b.x) + 1e-3).floor().max(0.0) as usize;
+    let oy0 = (to_gy(b.y) + 1e-3).floor().max(0.0) as usize;
+    let ox1 = ((to_gx(b.x + b.width) - 1e-3).ceil().max(0.0) as usize).min(gw);
+    let oy1 = ((to_gy(b.y + b.height) - 1e-3).ceil().max(0.0) as usize).min(gh);
     if ox1 <= ox0 || oy1 <= oy0 || alpha.width == 0 || alpha.height == 0 {
         return AlphaMask { width: 1, height: 1, bounds: b, data: vec![0] };
     }

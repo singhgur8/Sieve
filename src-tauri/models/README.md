@@ -208,9 +208,12 @@ detector at 640 (4.4 ms) for small faces in wide wedding shots, CPU EP as fallba
 
 # Segmentation models (AI masks, Phase 7c prep)
 
-Prototype: `src-tauri/src/ml/segment.rs` (`Segmenter`: `subject`, `sky`, `people(img, with_parts)`), evaluated
-by `cargo run --release --example segment_eval` (16 previews from the sample shoots, overlays in
-`test-data/segment-check/`). No IPC yet. All models are fetched by `scripts/fetch-models.sh` (pinned revisions,
+Engine: `src-tauri/src/ml/segment.rs` (`SegmentEngine`), wrapped as the v10 `SegmentModel`s in
+`ml/segment_models.rs` and served by `ml::masking::Segmenter` (`compute_ai_mask`, `detect_people`,
+`get_mask_capabilities`). Sieve stores each model's *unrefined* output (+ region) and refines edges at render time
+(`ml/refine.rs`, below). Evaluated by `cargo run --release --example segment_eval` (overlays in
+`test-data/segment-check/`) and by the ignored test `ml::masking::tests::real::real_masks_over_samples` (overlays
+in `test-data/segment-check/v2/`). All models are fetched by `scripts/fetch-models.sh` (pinned revisions,
 SHA-256 in `checksums.sha256`); about 560 MB in total.
 
 | Mask | File | Model, license | Size | Input | EP | ms (M3 Max, 2048 px preview) |
@@ -227,8 +230,9 @@ people with all parts 1.08 s** (0.6–2.2 s depending on the number of people; p
 subject 2.91 s, sky 0.31 s, people 1.43 s. First use: BiRefNet load 1.0 s; SAM encoder CoreML session 2–9 s even
 with `coreml_cache` set (the ORT CoreML cache directory is written, but the first session still takes seconds).
 Masks are meant to be computed on demand or in the background and cached per image, never per slider frame.
-Cheap speed-ups not done yet: share the guide statistics across the four part masks of a person (the guided
-filter recomputes them per part), and run parts only when a part mask is requested.
+In the app, parts run only for the selected person and only the model groups a request needs (parser for
+hair/skin/clothes, FaceMesh for features), and the guide statistics of the render-time refinement are computed
+once per render and shared by every matte (all kinds except sky use the same radius).
 
 ## Refinement (all masks)
 
