@@ -305,6 +305,48 @@ impl<'a, S: ByteSource + ?Sized> Tiff<'a, S> {
     }
 }
 
+/// EXIF colour signalling used when a raster file has no ICC profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColorSignal {
+    /// EXIF `ColorSpace` (0xA001): 1 = sRGB, 0xFFFF = uncalibrated.
+    pub color_space: Option<u32>,
+    /// Interoperability IFD `InteroperabilityIndex` ("R98" = sRGB, "R03" = Adobe RGB).
+    pub interop_index: Option<String>,
+}
+
+const EXIF_COLOR_SPACE: u16 = 0xA001;
+const INTEROP_IFD: u16 = 0xA005;
+const INTEROP_INDEX: u16 = 0x0001;
+
+impl<S: ByteSource + ?Sized> Tiff<'_, S> {
+    /// Raw bytes of an IFD0 tag of any type (e.g. XMP, tag 700), up to `max` bytes.
+    pub fn ifd0_tag_bytes(&self, tag: u16, max: u32) -> Result<Option<Vec<u8>>, String> {
+        let ifd = self.read_ifd(self.first_ifd)?;
+        let Some(e) = ifd.get(tag) else { return Ok(None) };
+        let size = Self::type_size(e.typ).ok_or("unknown TIFF type")?;
+        if size.checked_mul(e.count).is_none_or(|t| t > max) {
+            return Err(format!("tag {tag} too large"));
+        }
+        Ok(self.value_bytes(e, e.count))
+    }
+
+    /// EXIF `ColorSpace` and the interoperability index (see [`ColorSignal`]).
+    pub fn color_signal(&self) -> ColorSignal {
+        let mut out = ColorSignal::default();
+        let Ok(ifd0) = self.read_ifd(self.first_ifd) else { return out };
+        let Some(exif) = ifd0.get(EXIF_IFD).and_then(|e| self.uint(e)).and_then(|o| self.read_ifd(o).ok()) else {
+            return out;
+        };
+        out.color_space = exif.get(EXIF_COLOR_SPACE).and_then(|e| self.uint(e));
+        out.interop_index = exif
+            .get(INTEROP_IFD)
+            .and_then(|e| self.uint(e))
+            .and_then(|o| self.read_ifd(o).ok())
+            .and_then(|i| i.get(INTEROP_INDEX).and_then(|e| self.string(e)));
+        out
+    }
+}
+
 /// A raw TIFF/EXIF tag with its value bytes normalized to little-endian (for re-emitting
 /// in exported files).
 #[derive(Debug, Clone, PartialEq, Eq)]

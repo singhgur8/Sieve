@@ -220,7 +220,14 @@ fn non_empty(s: &Option<String>) -> Option<String> {
 
 fn read_sidecar(raw_path: &Path) -> Option<ExportValues> {
     let path = crate::xmp::resolve_sidecar(raw_path);
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // Non-RAW without a sidecar: the file's own (embedded) XMP, read-only.
+        Err(_) => {
+            let format = crate::raw::format_from_extension(raw_path).filter(|f| !f.is_raw())?;
+            crate::raw::raster::embedded_xmp(raw_path, format).ok().flatten()?
+        }
+    };
     packet::export_values(&text).ok()
 }
 

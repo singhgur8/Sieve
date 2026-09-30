@@ -17,15 +17,16 @@ const MAX_BOXES: usize = 256;
 const MAX_CMT: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Copy)]
-struct BoxHdr {
-    typ: [u8; 4],
-    uuid: Option<[u8; 16]>,
+pub(crate) struct BoxHdr {
+    pub typ: [u8; 4],
+    pub uuid: Option<[u8; 16]>,
     /// Payload range (after header and uuid).
-    start: u64,
-    end: u64,
+    pub start: u64,
+    pub end: u64,
 }
 
-fn children(src: &(impl ByteSource + ?Sized), start: u64, end: u64) -> Vec<BoxHdr> {
+/// ISO-BMFF child boxes of the payload `start..end` (also used by the HEIF parser).
+pub(crate) fn children(src: &(impl ByteSource + ?Sized), start: u64, end: u64) -> Vec<BoxHdr> {
     let mut out = Vec::new();
     let mut pos = start;
     while pos + 8 <= end && out.len() < MAX_BOXES {
@@ -64,7 +65,7 @@ fn children(src: &(impl ByteSource + ?Sized), start: u64, end: u64) -> Vec<BoxHd
     out
 }
 
-fn find<'a>(boxes: &'a [BoxHdr], typ: &[u8; 4]) -> Option<&'a BoxHdr> {
+pub(crate) fn find<'a>(boxes: &'a [BoxHdr], typ: &[u8; 4]) -> Option<&'a BoxHdr> {
     boxes.iter().find(|b| &b.typ == typ)
 }
 

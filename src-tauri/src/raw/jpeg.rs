@@ -84,6 +84,31 @@ pub fn exif_tiff(bytes: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Marker segments `(marker, body)` from SOI up to (excluding) SOS, e.g. APP1/APP2.
+pub fn segments(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut pos = if bytes.starts_with(&[0xFF, 0xD8]) { 2 } else { bytes.len() };
+    std::iter::from_fn(move || {
+        while bytes.get(pos) == Some(&0xFF) && bytes.get(pos + 1) == Some(&0xFF) {
+            pos += 1;
+        }
+        if *bytes.get(pos)? != 0xFF {
+            return None;
+        }
+        let marker = *bytes.get(pos + 1)?;
+        if matches!(marker, 0xDA | 0xD9) {
+            return None;
+        }
+        if matches!(marker, 0x01 | 0xD0..=0xD7) {
+            pos += 2;
+            return Some((marker, &bytes[0..0]));
+        }
+        let len = u16::from_be_bytes([*bytes.get(pos + 2)?, *bytes.get(pos + 3)?]) as usize;
+        let body = bytes.get(pos + 4..pos + 2 + len.max(2))?;
+        pos += 2 + len.max(2);
+        Some((marker, body))
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     /// Encodes a small RGB test JPEG with a distinct pattern per quadrant so tests can
