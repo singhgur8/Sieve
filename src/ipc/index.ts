@@ -2,7 +2,16 @@
 export * from "./bindings";
 export { convertFileSrc } from "@tauri-apps/api/core";
 
-import type { AdjustmentField, AppError, ExportFormatKind, ImageQuery } from "./bindings";
+import type {
+  AdjustmentField,
+  AppError,
+  ExportFormatKind,
+  HslChannels,
+  ImageQuery,
+  MatchOptions,
+  ParametricAdjustments,
+  WhiteBalance,
+} from "./bindings";
 
 type CommandResult<T> = { status: "ok"; data: T } | { status: "error"; error: AppError };
 
@@ -22,6 +31,7 @@ export const DEFAULT_QUERY: ImageQuery = {
   maxRating: null,
   colorLabels: [],
   burstGroupId: null,
+  sceneId: null,
   collapseBursts: false,
   folderId: null,
   sort: "capture_time",
@@ -72,3 +82,72 @@ export const EXPORT_EXTENSIONS: Record<ExportFormatKind, string> = {
   webp: "webp",
   heic: "heic",
 };
+
+/** Mirror of Rust `MatchOptions::default()` (scene matching). */
+export const DEFAULT_MATCH_OPTIONS: MatchOptions = {
+  matchExposure: true,
+  matchWhiteBalance: true,
+  matchTone: false,
+  strength: 1,
+  copyFields: ALL_ADJUSTMENT_FIELDS,
+};
+
+/** Mirror of Rust `scene::TOLERANCE_EV` / `scene::TOLERANCE_AB` (a match is "within tolerance"). */
+export const SCENE_MATCH_TOLERANCE = { ev: 0.15, ab: 0.012 } as const;
+
+/** At most this many anchors per scene / `matchScene` call (Rust `Scene::MAX_ANCHORS`). */
+export const MAX_SCENE_ANCHORS = 2;
+
+function lerpHsl(a: HslChannels, b: HslChannels, t: number): HslChannels {
+  const out = { ...a };
+  for (const k of Object.keys(a) as (keyof HslChannels)[]) out[k] = a[k] + (b[k] - a[k]) * t;
+  return out;
+}
+
+/**
+ * Mirror of Rust `ParametricAdjustments::lerp` (keep in sync): interpolates a (t = 0) -> b (t = 1).
+ * Scene-match strength slider: `lerpAdjustments(preview.base, preview.full, strength)`.
+ */
+export function lerpAdjustments(a: ParametricAdjustments, b: ParametricAdjustments, t: number): ParametricAdjustments {
+  t = Number.isFinite(t) ? Math.min(1, Math.max(0, t)) : 0;
+  const l = (x: number, y: number) => x + (y - x) * t;
+  const nearB = t >= 0.5;
+  let whiteBalance: WhiteBalance;
+  if (a.whiteBalance.mode === "custom" && b.whiteBalance.mode === "custom") {
+    const mired = l(1e6 / a.whiteBalance.temperatureK, 1e6 / b.whiteBalance.temperatureK);
+    whiteBalance = {
+      mode: "custom",
+      temperatureK: Math.min(50000, Math.max(2000, 1e6 / mired)),
+      tint: l(a.whiteBalance.tint, b.whiteBalance.tint),
+    };
+  } else {
+    whiteBalance = nearB ? b.whiteBalance : a.whiteBalance;
+  }
+  const lut =
+    a.lut && b.lut && a.lut.id === b.lut.id
+      ? { id: a.lut.id, amount: l(a.lut.amount, b.lut.amount) }
+      : nearB
+        ? b.lut
+        : a.lut;
+  return {
+    processVersion: a.processVersion,
+    whiteBalance,
+    exposure: l(a.exposure, b.exposure),
+    contrast: l(a.contrast, b.contrast),
+    highlights: l(a.highlights, b.highlights),
+    shadows: l(a.shadows, b.shadows),
+    whites: l(a.whites, b.whites),
+    blacks: l(a.blacks, b.blacks),
+    texture: l(a.texture, b.texture),
+    clarity: l(a.clarity, b.clarity),
+    dehaze: l(a.dehaze, b.dehaze),
+    vibrance: l(a.vibrance, b.vibrance),
+    saturation: l(a.saturation, b.saturation),
+    hsl: {
+      hue: lerpHsl(a.hsl.hue, b.hsl.hue, t),
+      saturation: lerpHsl(a.hsl.saturation, b.hsl.saturation, t),
+      luminance: lerpHsl(a.hsl.luminance, b.hsl.luminance, t),
+    },
+    lut,
+  };
+}
