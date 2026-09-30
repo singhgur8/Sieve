@@ -78,6 +78,10 @@ export interface Editor {
   reload: () => Promise<void>;
 }
 
+/** Settings that change the develop warnings: the profile / look, and which AI masks have a computed matte. */
+const warnKey = (a: CompleteAdjustments) =>
+  JSON.stringify([a.profile, a.masks.flatMap((g) => g.components.map((c) => (c.shape.kind === "ai" ? (c.shape.digest ?? "") : "")))]);
+
 export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
@@ -167,7 +171,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const setAdjBoth = useCallback((a0: ParametricAdjustments) => {
     const a = completeAdjustments(a0, optsRef.current.format);
     adjRef.current = a;
-    lastProfile.current ||= JSON.stringify(a.profile);
+    lastProfile.current ||= warnKey(a);
     setAdj(a);
   }, []);
 
@@ -182,7 +186,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       // Profile / look availability warnings depend on the saved settings.
-      const pk = JSON.stringify(snapshot.profile);
+      const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
         lastProfile.current = pk;
         setInfo(await unwrap(commands.getDevelopInfo(p.id)));
@@ -299,10 +303,11 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (cur == null) return;
     commitPending();
     await chain.current;
-    const [a, h] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur))]);
+    const [a, h, i] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur)), unwrap(commands.getDevelopInfo(cur))]);
     if (idRef.current !== cur) return;
     setAdjBoth(a);
     setHistory(h);
+    setInfo(i);
     schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     optsRef.current.onChanged(cur);
   }, [commitPending, setAdjBoth, schedule]);

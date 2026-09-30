@@ -1,0 +1,479 @@
+// Canvas layer over the Develop viewer for masking: mask overlay image, pins, gradient handles and the brush /
+// gradient / range tools. Pointer positions become displayed-frame fractions (`screenToDisp`) and are converted to the
+// sensor frame (un-oriented, uncropped) with `dispToSensor` before they reach the mask data.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { commands, unwrap, type LinearMask, type MaskGroup, type MaskShape, type NormPoint, type RadialMask, type RenderedMaskOverlay } from "../../ipc";
+import type { Editor } from "../../hooks/useEditor";
+import type { MasksApi } from "../../hooks/useMasks";
+import {
+  brushRadiusPx,
+  clamp,
+  dispRectToSensor,
+  dispToScreen,
+  dispToSensor,
+  ellipseFromDrag,
+  radialFromScreen,
+  radialToScreen,
+  screenToDisp,
+  sensorToDisp,
+  type Box,
+  type Frame,
+} from "../../lib/maskGeom";
+import { MAX_STROKE_DABS, OVERLAY_STYLES, sizeToRadius, type OverlayStyle } from "../../lib/masks";
+
+interface Props {
+  masks: MasksApi;
+  editor: Editor;
+  id: number | null;
+  frame: Frame | null;
+  box: Box | null;
+  onError: (e: unknown) => void;
+}
+
+type Pt = { x: number; y: number };
+const DEG = 180 / Math.PI;
+
+/** Luminance (CIE L* / 100) of the displayed image under `p` (displayed-frame fraction), or null when unreadable. */
+function sampleLuma(p: NormPoint): number | null {
+  const img = document.querySelector<HTMLImageElement>('[data-testid="view-main"]');
+  if (!img || !img.naturalWidth) return null;
+  try {
+    const c = document.createElement("canvas");
+    c.width = 1;
+    c.height = 1;
+    const g = c.getContext("2d", { willReadFrequently: true });
+    if (!g) return null;
+    const sx = clamp(Math.round(p.x * img.naturalWidth), 0, img.naturalWidth - 1);
+    const sy = clamp(Math.round(p.y * img.naturalHeight), 0, img.naturalHeight - 1);
+    g.drawImage(img, sx, sy, 1, 1, 0, 0, 1, 1);
+    const [r, gg, b] = g.getImageData(0, 0, 1, 1).data;
+    const lin = (v: number) => ((v / 255) ** 2.2);
+    const Y = 0.2126 * lin(r) + 0.7152 * lin(gg) + 0.0722 * lin(b);
+    return (Y > 0.008856 ? 116 * Y ** (1 / 3) - 16 : 903.3 * Y) / 100;
+  } catch {
+    return null; // tainted canvas (custom protocol without CORS)
+  }
+}
+
+export function MaskLayer({ masks, editor, id, frame, box, onError }: Props) {
+  const root = useRef<HTMLDivElement>(null);
+  const [cursor, setCursor] = useState<Pt | null>(null);
+  const [rubber, setRubber] = useState<{ a: Pt; b: Pt } | null>(null);
+  const linDrag = useRef<{ f: Pt; z: Pt; m: Pt } | null>(null);
+  const gest = useRef<{ start: Pt; last: Pt; started: boolean; erase: boolean; dabs: number } | null>(null);
+  const { tool, groups, selGroup, selComp } = masks;
+
+  const local = useCallback((e: { clientX: number; clientY: number }): Pt => {
+    const r = root.current!.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }, []);
+
+  // ---- overlay (latest-wins, one request in flight) ----
+  const [ov, setOv] = useState<RenderedMaskOverlay | null>(null);
+  const ovReq = useRef<{ busy: boolean; latest: { id: number; adj: typeof editor.adj; groupId: string; componentId: string | null; maxEdge: number } | null }>({ busy: false, latest: null });
+  const target = masks.hover ?? (selGroup ? { groupId: selGroup, componentId: null } : null);
+  const targetOk = target && groups.some((g) => g.id === target.groupId);
+  const maxEdge = box ? clamp(Math.ceil(Math.max(box.w, box.h) * (window.devicePixelRatio || 1)), 64, 1200) : 0;
+  const pump = useCallback(() => {
+    const r = ovReq.current;
+    if (r.busy || !r.latest) return;
+    const a = r.latest;
+    r.busy = true;
+    unwrap(commands.renderMaskOverlay(a.id, a.adj, { groupId: a.groupId, componentId: a.componentId }, { maxEdge: a.maxEdge, region: null }))
+      .then((res) => {
+        if (res && r.latest?.id === res.imageId) setOv(res);
+      })
+      .catch(onError)
+      .finally(() => {
+        r.busy = false;
+        if (r.latest && r.latest !== a) pump();
+      });
+  }, [onError]);
+  const adj = editor.adj;
+  useEffect(() => {
+    if (id == null || !masks.overlayOn || !targetOk || !target || maxEdge === 0) {
+      ovReq.current.latest = null;
+      setOv(null);
+      return;
+    }
+    ovReq.current.latest = { id, adj, groupId: target.groupId, componentId: target.componentId, maxEdge };
+    pump();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, masks.overlayOn, targetOk, target?.groupId, target?.componentId, adj, maxEdge, pump]);
+  useEffect(() => setOv(null), [id]);
+
+  // ---- geometry helpers ----
+  const toSensor = useCallback((p: Pt): NormPoint => dispToSensor(screenToDisp(p.x, p.y, box!), frame!), [box, frame]);
+  const toScreen = useCallback((s: NormPoint): Pt => dispToScreen(sensorToDisp(s, frame!), box!), [box, frame]);
+
+  const selected = useMemo(() => {
+    const g = groups.find((x) => x.id === selGroup);
+    const c = g?.components.find((x) => x.id === selComp) ?? null;
+    return g && c ? { g, c } : null;
+  }, [groups, selGroup, selComp]);
+
+  if (!frame || !box || box.w < 4) return <div ref={root} className="pointer-events-none absolute inset-0" data-testid="mask-layer" />;
+
+  const style: OverlayStyle = OVERLAY_STYLES[masks.overlayStyle] ?? OVERLAY_STYLES[0];
+
+  // ---- tool gestures (capture surface) ----
+  const inBox = (p: Pt) => p.x >= box.x && p.y >= box.y && p.x <= box.x + box.w && p.y <= box.y + box.h;
+
+  const onDown = (e: React.PointerEvent) => {
+    if (!tool || e.button !== 0) return;
+    const p = local(e);
+    if (!inBox(p) && tool.kind !== "brush") return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    gest.current = { start: p, last: p, started: false, erase: e.altKey, dabs: 1 };
+    if (tool.kind === "brush") {
+      masks.strokeStart(toSensor(p), { erase: e.altKey });
+      gest.current.started = true;
+    } else if (tool.kind === "color" || tool.kind === "object") setRubber({ a: p, b: p });
+  };
+
+  const onMove = (e: React.PointerEvent) => {
+    const p = local(e);
+    setCursor(p);
+    const g = gest.current;
+    if (!g || !tool) return;
+    if (tool.kind === "brush") {
+      const rPx = brushRadiusPx(sizeToRadius(masks.brush.size), frame, box);
+      const spacing = Math.max(2, rPx * 0.2);
+      if (Math.hypot(p.x - g.last.x, p.y - g.last.y) >= spacing && g.dabs < MAX_STROKE_DABS) {
+        g.last = p;
+        g.dabs++;
+        masks.strokeMove(toSensor(p));
+      }
+    } else if (tool.kind === "linear") {
+      if (!g.started && Math.hypot(p.x - g.start.x, p.y - g.start.y) < 4) return;
+      const shape: MaskShape = { kind: "linear", full: toSensor(g.start), zero: toSensor(p) };
+      if (!g.started) {
+        g.started = true;
+        masks.shapeStart("linear", shape);
+      } else masks.shapeUpdate(shape);
+    } else if (tool.kind === "radial") {
+      if (!g.started && Math.hypot(p.x - g.start.x, p.y - g.start.y) < 4) return;
+      const base: RadialMask = { top: 0, left: 0, bottom: 0, right: 0, angle: 0, midpoint: 50, roundness: 0, feather: 50, flipped: false };
+      const shape: MaskShape = { kind: "radial", ...radialFromScreen(ellipseFromDrag(g.start, p), frame, box, base) };
+      if (!g.started) {
+        g.started = true;
+        masks.shapeStart("radial", shape);
+      } else masks.shapeUpdate(shape);
+    } else if (tool.kind === "color" || tool.kind === "object") setRubber({ a: g.start, b: p });
+  };
+
+  const onUp = (e: React.PointerEvent) => {
+    const g = gest.current;
+    gest.current = null;
+    setRubber(null);
+    if (!g || !tool) return;
+    const p = local(e);
+    const dragged = Math.hypot(p.x - g.start.x, p.y - g.start.y) >= 4;
+    switch (tool.kind) {
+      case "brush":
+        masks.commit();
+        break;
+      case "linear":
+      case "radial":
+        if (g.started) {
+          masks.commit();
+          masks.endTool();
+        }
+        break;
+      case "color": {
+        const a = screenToDisp(g.start.x, g.start.y, box);
+        const b = screenToDisp(p.x, p.y, box);
+        masks.addColorSample({ point: dispToSensor(dragged ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } : a, frame), area: dragged ? dispRectToSensor(a, b, frame) : null });
+        break;
+      }
+      case "luminance": {
+        const l = sampleLuma(screenToDisp(g.start.x, g.start.y, box)) ?? 0.5;
+        masks.setLuminance((s) => ({
+          ...s,
+          low: clamp(l - 0.15, 0, 1),
+          high: clamp(l + 0.15, 0, 1),
+          featherLow: clamp(l - 0.3, 0, 1),
+          featherHigh: clamp(l + 0.3, 0, 1),
+        }));
+        masks.endTool();
+        break;
+      }
+      case "object":
+        if (dragged) void masks.createObject(dispRectToSensor(screenToDisp(g.start.x, g.start.y, box), screenToDisp(p.x, p.y, box), frame));
+        break;
+    }
+  };
+
+  // ---- pins ----
+  const pinPoint = (g: MaskGroup, index: number): Pt => {
+    const c = g.components[0];
+    let s: NormPoint | null = null;
+    if (c) {
+      const sh = c.shape;
+      if (sh.kind === "brush") s = sh.strokes[0]?.dabs[0] ?? null;
+      else if (sh.kind === "linear") s = { x: (sh.zero.x + sh.full.x) / 2, y: (sh.zero.y + sh.full.y) / 2 };
+      else if (sh.kind === "radial") s = { x: (sh.left + sh.right) / 2, y: (sh.top + sh.bottom) / 2 };
+      else if (sh.kind === "ai") s = sh.referencePoint;
+      else if (sh.kind === "color") s = sh.samples[0]?.point ?? null;
+    }
+    if (s) return toScreen(s);
+    return { x: box.x + box.w * (0.5 + 0.04 * index), y: box.y + box.h * (0.5 + 0.04 * index) };
+  };
+
+  // ---- gradient handles for the selected component ----
+  const drag = (start?: () => void) => ({
+    onPointerDown: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      start?.();
+    },
+  });
+
+  const linearHandles = (g: MaskGroup, cid: string, sh: LinearMask) => {
+    const full = toScreen(sh.full);
+    const zero = toScreen(sh.zero);
+    const mid = { x: (full.x + zero.x) / 2, y: (full.y + zero.y) / 2 };
+    const len = Math.hypot(zero.x - full.x, zero.y - full.y) || 1;
+    const d = { x: (zero.x - full.x) / len, y: (zero.y - full.y) / len };
+    const n = { x: -d.y, y: d.x };
+    const ext = Math.hypot(box.w, box.h);
+    const line = (c: Pt, cls: string, tid: string) => (
+      <line key={tid} data-testid={tid} x1={c.x - n.x * ext} y1={c.y - n.y * ext} x2={c.x + n.x * ext} y2={c.y + n.y * ext} className={cls} strokeWidth={1.25} />
+    );
+    const upd = (f: Pt, z: Pt) => masks.editShape(g.id, cid, () => ({ kind: "linear", full: toSensor(f), zero: toSensor(z) }), "Mask: Linear Gradient");
+    const hp = { r: 6, className: "cursor-pointer fill-white stroke-black", style: { pointerEvents: "all" as const } };
+    const rot = { x: mid.x + n.x * 46, y: mid.y + n.y * 46 };
+    const begin = () => {
+      linDrag.current = { f: full, z: zero, m: mid };
+    };
+    return (
+      <g data-testid="linear-handles">
+        {line(full, "stroke-white/90", "linear-line-full")}
+        {line(mid, "stroke-white/50", "linear-line-mid")}
+        {line(zero, "stroke-white/90", "linear-line-zero")}
+        <line x1={mid.x} y1={mid.y} x2={rot.x} y2={rot.y} className="stroke-white/50" />
+        <circle
+          {...hp}
+          cx={mid.x}
+          cy={mid.y}
+          data-testid="linear-handle-pin"
+          {...drag(begin)}
+          onPointerMove={(e) => {
+            const dragging = linDrag.current;
+            if (!dragging || !e.currentTarget.hasPointerCapture(e.pointerId)) return;
+            const p = local(e);
+            const dx = p.x - dragging.m.x;
+            const dy = p.y - dragging.m.y;
+            upd({ x: dragging.f.x + dx, y: dragging.f.y + dy }, { x: dragging.z.x + dx, y: dragging.z.y + dy });
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+        {(
+          [
+            ["full", full, zero],
+            ["zero", zero, full],
+          ] as const
+        ).map(([which, pt, other]) => (
+          <rect
+            key={which}
+            x={pt.x - 5}
+            y={pt.y - 5}
+            width={10}
+            height={10}
+            data-testid={`linear-handle-${which}`}
+            className="cursor-move fill-sky-300 stroke-black"
+            style={{ pointerEvents: "all" }}
+            {...drag(begin)}
+            onPointerMove={(e) => {
+              const dragging = linDrag.current;
+            if (!dragging || !e.currentTarget.hasPointerCapture(e.pointerId)) return;
+              const p = local(e);
+              const dir = { x: (pt.x - other.x) / len, y: (pt.y - other.y) / len };
+              const t = Math.max(4, (p.x - other.x) * dir.x + (p.y - other.y) * dir.y);
+              const np = { x: other.x + dir.x * t, y: other.y + dir.y * t };
+              if (which === "full") upd(np, zero);
+              else upd(full, np);
+            }}
+            onPointerUp={() => masks.commit()}
+          />
+        ))}
+        <circle
+          {...hp}
+          cx={rot.x}
+          cy={rot.y}
+          data-testid="linear-handle-rotate"
+          className="cursor-grab fill-amber-300 stroke-black"
+          {...drag(begin)}
+          onPointerMove={(e) => {
+            const dragging = linDrag.current;
+            if (!dragging || !e.currentTarget.hasPointerCapture(e.pointerId)) return;
+            const p = local(e);
+            const a = Math.atan2(p.y - mid.y, p.x - mid.x) - Math.atan2(rot.y - mid.y, rot.x - mid.x);
+            const c = Math.cos(a);
+            const s = Math.sin(a);
+            const rotate = (q: Pt): Pt => ({ x: mid.x + (q.x - mid.x) * c - (q.y - mid.y) * s, y: mid.y + (q.x - mid.x) * s + (q.y - mid.y) * c });
+            upd(rotate(full), rotate(zero));
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+      </g>
+    );
+  };
+
+  const radialHandles = (g: MaskGroup, cid: string, sh: RadialMask) => {
+    const e = radialToScreen(sh, frame, box);
+    const cos = Math.cos(e.rot / DEG);
+    const sin = Math.sin(e.rot / DEG);
+    const at = (lx: number, ly: number): Pt => ({ x: e.cx + lx * cos - ly * sin, y: e.cy + lx * sin + ly * cos });
+    const toLocal = (p: Pt): Pt => ({ x: (p.x - e.cx) * cos + (p.y - e.cy) * sin, y: -(p.x - e.cx) * sin + (p.y - e.cy) * cos });
+    const upd = (n: Partial<{ cx: number; cy: number; rx: number; ry: number; rot: number }>, extra?: Partial<RadialMask>) =>
+      masks.editShape(g.id, cid, (s) => (s.kind === "radial" ? { kind: "radial", ...radialFromScreen({ ...e, ...n }, frame, box, { ...s, ...extra }) } : s), "Mask: Radial Gradient");
+    const fk = clamp(1 - sh.feather / 100, 0.02, 1);
+    const dot = "cursor-pointer fill-white stroke-black";
+    const st = { pointerEvents: "all" as const };
+    const edge = (tid: string, lx: number, ly: number, axis: "rx" | "ry") => {
+      const p = at(lx, ly);
+      return (
+        <rect
+          key={tid}
+          x={p.x - 5}
+          y={p.y - 5}
+          width={10}
+          height={10}
+          data-testid={tid}
+          className="cursor-move fill-sky-300 stroke-black"
+          style={st}
+          {...drag()}
+          onPointerMove={(ev) => {
+            if (!ev.currentTarget.hasPointerCapture(ev.pointerId)) return;
+            const l = toLocal(local(ev));
+            upd({ [axis]: Math.max(6, Math.abs(axis === "rx" ? l.x : l.y)) });
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+      );
+    };
+    const rot = at(e.rx + 28, 0);
+    const fp = at(0, e.ry * fk);
+    return (
+      <g data-testid="radial-handles">
+        <ellipse cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} transform={`rotate(${e.rot} ${e.cx} ${e.cy})`} className="fill-none stroke-white" strokeWidth={1.25} data-testid="radial-ellipse" />
+        <ellipse cx={e.cx} cy={e.cy} rx={e.rx * fk} ry={e.ry * fk} transform={`rotate(${e.rot} ${e.cx} ${e.cy})`} className="fill-none stroke-white/60" strokeDasharray="4 3" />
+        <circle
+          cx={e.cx}
+          cy={e.cy}
+          r={6}
+          data-testid="radial-handle-center"
+          className={dot}
+          style={st}
+          {...drag()}
+          onPointerMove={(ev) => {
+            if (!ev.currentTarget.hasPointerCapture(ev.pointerId)) return;
+            const p = local(ev);
+            upd({ cx: p.x, cy: p.y });
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+        {edge("radial-handle-e", e.rx, 0, "rx")}
+        {edge("radial-handle-w", -e.rx, 0, "rx")}
+        {edge("radial-handle-n", 0, -e.ry, "ry")}
+        {edge("radial-handle-s", 0, e.ry, "ry")}
+        <circle
+          cx={fp.x}
+          cy={fp.y}
+          r={4}
+          data-testid="radial-handle-feather"
+          className="cursor-ns-resize fill-emerald-300 stroke-black"
+          style={st}
+          {...drag()}
+          onPointerMove={(ev) => {
+            if (!ev.currentTarget.hasPointerCapture(ev.pointerId)) return;
+            const l = toLocal(local(ev));
+            upd({}, { feather: Math.round(clamp(100 * (1 - Math.abs(l.y) / e.ry), 0, 100)) });
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+        <circle
+          cx={rot.x}
+          cy={rot.y}
+          r={6}
+          data-testid="radial-handle-rotate"
+          className="cursor-grab fill-amber-300 stroke-black"
+          style={st}
+          {...drag()}
+          onPointerMove={(ev) => {
+            if (!ev.currentTarget.hasPointerCapture(ev.pointerId)) return;
+            const p = local(ev);
+            upd({ rot: Math.atan2(p.y - e.cy, p.x - e.cx) * DEG });
+          }}
+          onPointerUp={() => masks.commit()}
+        />
+      </g>
+    );
+  };
+
+  const brushR = tool?.kind === "brush" ? brushRadiusPx(sizeToRadius(masks.brush.size), frame, box) : 0;
+  const showOv = ov && masks.overlayOn && targetOk;
+  const ovBox = { left: box.x, top: box.y, width: box.w, height: box.h };
+
+  return (
+    <div ref={root} className="pointer-events-none absolute inset-0 overflow-hidden" data-testid="mask-layer" data-tool={tool?.kind ?? ""} data-box={JSON.stringify(box)}>
+      {showOv &&
+        (style.mode === "color" ? (
+          <div className="absolute isolate" style={{ ...ovBox, mixBlendMode: "screen" }} data-testid="mask-overlay" data-overlay-seq={ov!.seq} data-overlay-style={style.id}>
+            <div className="absolute inset-0" style={{ backgroundColor: style.color, opacity: 0.6 }} />
+            <img src={ov!.url} alt="" draggable={false} className="absolute inset-0 size-full" style={{ mixBlendMode: "multiply" }} />
+          </div>
+        ) : (
+          <img
+            src={ov!.url}
+            alt=""
+            draggable={false}
+            className="absolute"
+            style={{ ...ovBox, opacity: style.mode === "gray" ? 0.65 : 1 }}
+            data-testid="mask-overlay"
+            data-overlay-seq={ov!.seq}
+            data-overlay-style={style.id}
+          />
+        ))}
+
+      <svg className="absolute inset-0 size-full overflow-visible" data-testid="mask-svg">
+        {selected && selected.c.active && selected.g.active && selected.c.shape.kind === "linear" && linearHandles(selected.g, selected.c.id, selected.c.shape)}
+        {selected && selected.c.active && selected.g.active && selected.c.shape.kind === "radial" && radialHandles(selected.g, selected.c.id, selected.c.shape)}
+        {masks.pins &&
+          groups.map((g, i) => {
+            const on = g.id === selGroup;
+            // The selected gradient's own centre handle is its pin.
+            if (on && selected && selected.g.id === g.id && (selected.c.shape.kind === "linear" || selected.c.shape.kind === "radial") && selected.c.active) return null;
+            const p = pinPoint(g, i);
+            return (
+              <g key={g.id} transform={`translate(${p.x} ${p.y})`} data-testid={`mask-pin-${g.id}`} data-selected={on} data-active={g.active} style={{ pointerEvents: "all", cursor: "pointer" }} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); masks.select(g.id, g.components[0]?.id ?? null); }}>
+                <circle r={9} className={on ? "fill-sky-400 stroke-white" : "fill-black/60 stroke-white"} strokeWidth={1.5} opacity={g.active ? 1 : 0.4} />
+                <circle r={3} className={on ? "fill-white" : "fill-white/80"} />
+              </g>
+            );
+          })}
+        {rubber && <rect x={Math.min(rubber.a.x, rubber.b.x)} y={Math.min(rubber.a.y, rubber.b.y)} width={Math.abs(rubber.a.x - rubber.b.x)} height={Math.abs(rubber.a.y - rubber.b.y)} className="fill-sky-400/10 stroke-sky-300" strokeDasharray="4 3" />}
+        {tool?.kind === "brush" && cursor && (
+          <g data-testid="brush-cursor" data-radius={brushR.toFixed(1)} pointerEvents="none">
+            <circle cx={cursor.x} cy={cursor.y} r={Math.max(1, brushR)} className="fill-none stroke-white" strokeWidth={1.25} />
+            <circle cx={cursor.x} cy={cursor.y} r={Math.max(1, brushR * (1 - masks.brush.feather / 100))} className="fill-none stroke-white/60" strokeDasharray="3 3" />
+            {(masks.brush.erase || gest.current?.erase) && <line x1={cursor.x - 4} x2={cursor.x + 4} y1={cursor.y} y2={cursor.y} className="stroke-white" />}
+          </g>
+        )}
+      </svg>
+
+      {tool && (
+        <div
+          className="pointer-events-auto absolute inset-0 cursor-crosshair"
+          style={{ cursor: tool.kind === "brush" ? "none" : "crosshair", touchAction: "none" }}
+          data-testid="mask-capture"
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerLeave={() => setCursor(null)}
+        />
+      )}
+    </div>
+  );
+}

@@ -17,7 +17,7 @@ const TEXT: Record<DevelopWarningCode, { short: string; long: string }> = {
 
 export const warningText = (w: DevelopWarning) => TEXT[w.code] ?? { short: w.code, long: w.detail ?? w.code };
 
-export function WarningsChip({ warnings }: { warnings: DevelopWarning[] }) {
+export function WarningsChip({ warnings, actions }: { warnings: DevelopWarning[]; actions?: Partial<Record<DevelopWarningCode, { label: string; run: () => void }>> }) {
   if (warnings.length === 0) return null;
   const label = warnings.length === 1 ? warningText(warnings[0]).short : `${warnings.length} develop warnings`;
   return (
@@ -31,13 +31,25 @@ export function WarningsChip({ warnings }: { warnings: DevelopWarning[] }) {
       triggerTestId="warnings-chip"
       title="This photo uses features Sieve cannot render yet"
     >
-      {() => (
+      {(close) => (
         <div className="w-80 space-y-2 p-3 text-xs" data-testid="warnings-popover">
           {warnings.map((w, i) => (
             <div key={`${w.code}-${i}`} data-testid={`warning-${w.code}`}>
               <div className="font-semibold text-amber-200">{warningText(w).short}</div>
               <div className="text-neutral-300">{warningText(w).long}</div>
               {w.detail && <div className="mt-0.5 text-neutral-400">{w.detail}</div>}
+              {actions?.[w.code] && (
+                <button
+                  className="mt-1 rounded bg-amber-800 px-2 py-0.5 text-amber-50 hover:bg-amber-700"
+                  data-testid={`warning-action-${w.code}`}
+                  onClick={() => {
+                    close();
+                    actions[w.code]!.run();
+                  }}
+                >
+                  {actions[w.code]!.label}
+                </button>
+              )}
             </div>
           ))}
         </div>

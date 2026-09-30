@@ -8,7 +8,12 @@ import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
 import { SceneBadge, Stars } from "../Cell";
-import { hint } from "../../lib/keymap";
+import { hint, type ActionId } from "../../lib/keymap";
+import { useMasks } from "../../hooks/useMasks";
+import { MasksPanel } from "./MasksPanel";
+import { MaskLayer } from "./MaskLayer";
+import { PeoplePicker } from "./PeoplePicker";
+import type { Frame } from "../../lib/maskGeom";
 import { LABEL_COLOR } from "../../lib/format";
 import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
 import { AdjustPanel } from "./AdjustPanel";
@@ -19,7 +24,7 @@ import type { CropApi } from "./CropPanel";
 import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, toStored } from "../../lib/crop";
 import { setSectionOpen } from "../../lib/sections";
-import { Viewer, visibleRegion, type Size, type Zoom } from "./Viewer";
+import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 
 export interface DevelopHandle {
   toggleBefore: () => void;
@@ -37,6 +42,10 @@ export interface DevelopHandle {
   cancelCrop: () => boolean;
   undo: () => void;
   redo: () => void;
+  /** Masking shortcuts (Shift+W toggles the panel; the tool keys act only while it is open). */
+  maskKey: (action: ActionId, e: KeyboardEvent) => void;
+  /** Esc: finish the active mask tool; true when one was active. */
+  cancelMaskTool: () => boolean;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -50,6 +59,15 @@ interface Props {
 }
 
 const FILM = 72;
+
+const TOOL_HELP: Record<string, string> = {
+  brush: "Brush: drag to paint, Alt erases, [ ] size, Esc done",
+  linear: "Linear gradient: drag from the strong side to the weak side",
+  radial: "Radial gradient: drag from the centre outwards",
+  color: "Color range: click or drag to sample colors, Esc done",
+  luminance: "Luminance range: click to sample a brightness",
+  object: "Objects: drag a rectangle around the object",
+};
 
 export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onBack }, ref) {
   const id = sel.active;
@@ -83,6 +101,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const { info } = editor;
   const fw = info?.fullWidth ?? 0;
   const fh = info?.fullHeight ?? 0;
+  const masks = useMasks({ editor, id, onError, onNotice });
+  const masksRef = useRef(masks);
+  masksRef.current = masks;
 
   // Region of the frame visible at 100%: committed immediately on toggle/resize, debounced after a pan.
   const latest = useRef({ zoom, size, fw, fh });
@@ -110,6 +131,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const startCrop = useCallback(() => {
     if (id == null) return;
     const c = editor.adj.crop;
+    masksRef.current.endTool();
     setZoom({ on: false, cx: 0.5, cy: 0.5 });
     setShowBefore(false);
     setSplit(false);
@@ -118,7 +140,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [id, editor.adj.crop, orientation]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
-    if (!t) return;
+    if (!t) {
+      masksRef.current.endTool(); // Enter also finishes a mask tool
+      return;
+    }
     setCropTool(null);
     const next = isFull(t.rect) && t.angle === 0 ? { ...editor.defaults.crop } : toStored(t.rect, orientation, t.angle);
     if (JSON.stringify(next) === JSON.stringify(editor.adj.crop)) return; // nothing changed: no history entry
@@ -214,6 +239,55 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       editor.change((a) => ({ ...a, lut: { id: l.id, amount: 100 } }), "LUT");
     });
 
+  const maskKey = useCallback(
+    (action: ActionId, e: KeyboardEvent) => {
+      const m = masksRef.current;
+      if (action === "maskPanel") {
+        if (m.open) m.endTool();
+        m.setOpen(!m.open);
+        return;
+      }
+      if (!m.open) return onNotice("Open the Masks panel first (Shift+W)");
+      if (cropRef.current) return;
+      const sel = m.groups.find((g) => g.id === m.selGroup);
+      const comp = sel?.components.find((c) => c.id === m.selComp);
+      const brushOn = m.tool?.kind === "brush" || comp?.shape.kind === "brush";
+      switch (action) {
+        case "maskBrush":
+          if (sel && comp?.shape.kind === "brush") m.beginTool("brush", { groupId: sel.id, mode: comp.mode }, comp.id);
+          else m.create("brush");
+          return;
+        case "maskLinear":
+          return m.create("linear");
+        case "maskRadial":
+          return m.create("radial");
+        case "maskColor":
+          return m.create("color");
+        case "maskLuminance":
+          return m.create("luminance");
+        case "maskOverlay":
+          return m.toggleOverlay();
+        case "maskOverlayStyle":
+          if (!m.overlayOn) m.toggleOverlay();
+          return m.cycleOverlayStyle();
+        case "maskPins":
+          return m.togglePins();
+        case "maskSize":
+          if (brushOn) m.patchBrush({ size: Math.max(1, Math.min(100, m.brush.size + (e.key === "[" ? -5 : 5))) });
+          return;
+        case "maskFeather":
+          if (brushOn) m.patchBrush({ feather: Math.max(0, Math.min(100, m.brush.feather + (e.key === "[" || e.key === "{" ? -10 : 10))) });
+          return;
+        case "maskAuto":
+          if (brushOn) m.patchBrush({ autoMask: !m.brush.autoMask });
+          return;
+        case "maskDelete":
+          return m.deleteSelected();
+      }
+    },
+    [onNotice],
+  );
+
   const syncTargets = useMemo(() => [...sel.selected].filter((x) => x !== id), [sel.selected, id]);
 
   useImperativeHandle(
@@ -231,8 +305,14 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       cancelCrop,
       undo: editor.undo,
       redo: editor.redo,
+      maskKey: (action, e) => maskKey(action, e),
+      cancelMaskTool: () => {
+        if (!masksRef.current.tool) return false;
+        masksRef.current.endTool();
+        return true;
+      },
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo, commitCrop, cancelCrop, startCrop],
+    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo, commitCrop, cancelCrop, startCrop, maskKey],
   );
 
   // ---- filmstrip ----
@@ -247,6 +327,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   useEffect(() => {
     if (activeIndex >= 0) virt.scrollToIndex(activeIndex, { align: "auto" });
   }, [activeIndex, virt]);
+
+  const box = frameBox(zoom, size, fw, fh, editor.main);
+  const frame: Frame | null = useMemo(() => (fw > 0 && fh > 0 ? { orientation, crop: editor.adj.crop, w: fw, h: fh } : null), [orientation, editor.adj.crop, fw, fh]);
+  const thumb = entry?.thumbnail;
+  const thumbUrl = thumb?.status === "ready" ? `${convertFileSrc(thumb.path)}?v=${id != null ? lib.version(id) : 0}` : null;
 
   const btn = (on = false) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40`;
 
@@ -294,7 +379,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             <RotateCcw className="size-3.5" /> Reset
           </button>
         </div>
-        <WarningsChip warnings={info?.warnings ?? []} />
+        <WarningsChip
+          warnings={info?.warnings ?? []}
+          actions={{ ai_mask_needs_update: { label: "Update AI masks", run: () => void masksRef.current.updateAll() } }}
+        />
         <span className="ml-auto text-[11px] tabular-nums text-neutral-400" data-testid="render-ms">
           {editor.main ? `${editor.main.width}x${editor.main.height} · ${Math.round(editor.main.renderMs)} ms` : ""}
         </span>
@@ -338,6 +426,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onPanEnd={onPanEnd}
             onToggleZoom={toggleZoom}
           />
+          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} onError={onError} />}
+          {masks.open && masks.tool && !cropTool && (
+            <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>
+              {TOOL_HELP[masks.tool.kind]}
+            </span>
+          )}
           {cropTool && imageAspect > 0 && <CropOverlay tool={cropTool} size={size} imageAspect={imageAspect} onChange={setCropTool} />}
           {cropTool && (
             <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="crop-badge">
@@ -345,8 +439,18 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             </span>
           )}
         </div>
-        <aside className="w-72 shrink-0 border-l border-neutral-800">
-          <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} />
+        <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800">
+          <div className="flex gap-1 border-b border-neutral-800 px-3 py-1.5" role="tablist" aria-label="Develop panels">
+            <button role="tab" aria-selected={!masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${!masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => { masks.endTool(); masks.setOpen(false); }} data-testid="panel-tab-adjust">
+              Adjust
+            </button>
+            <button role="tab" aria-selected={masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => masks.setOpen(true)} title={`Masks: local adjustments${hint("maskPanel")}`} data-testid="panel-tab-masks">
+              Masks{masks.groups.length > 0 ? ` (${masks.groups.length})` : ""}
+            </button>
+          </div>
+          <div className="min-h-0 flex-1">
+            {masks.open ? <MasksPanel masks={masks} /> : <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} />}
+          </div>
         </aside>
       </div>
 
@@ -392,6 +496,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         </div>
       </div>
 
+      {masks.picker && id != null && (
+        <PeoplePicker imageId={id} thumbUrl={thumbUrl} caps={masks.caps} onCreate={(pt, parts, name) => void masks.createPeople(pt, parts, name)} onCancel={masks.closePicker} onError={onError} />
+      )}
       {dialog?.kind === "copy" && (
         <FieldsDialog
           title="Copy Settings"
