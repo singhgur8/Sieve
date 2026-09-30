@@ -154,7 +154,11 @@ fn report(name: &str, frames: &[&Frame]) {
     let keepers = frames.iter().filter(|f| f.label == Label::Keeper).count();
     let non = frames.iter().filter(|f| f.label == Label::NonKeeper).count();
     let labeled = keepers + non;
-    println!("\n== {name}: {} frames ({keepers} keepers, {non} non-keepers, {} ambiguous)", frames.len(), frames.len() - labeled);
+    println!(
+        "\n== {name}: {} frames ({keepers} keepers, {non} non-keepers, {} ambiguous)",
+        frames.len(),
+        frames.len() - labeled
+    );
     println!("   keeper base rate {}", pct(keepers, labeled));
     let count = |pick: &str, label: Label| frames.iter().filter(|f| f.pick == pick && f.label == label).count();
     let (rk, rn) = (count("reject", Label::Keeper), count("reject", Label::NonKeeper));
@@ -288,7 +292,8 @@ fn main() {
     println!("rescored; {groups} bursts");
 
     let mut tags: HashMap<i64, Vec<String>> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT image_id, tag FROM image_tags WHERE source = 'auto' AND suppressed = 0").unwrap();
+    let mut stmt =
+        conn.prepare("SELECT image_id, tag FROM image_tags WHERE source = 'auto' AND suppressed = 0").unwrap();
     for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).unwrap() {
         let (id, tag) = row.unwrap();
         tags.entry(id).or_default().push(tag);
@@ -368,7 +373,10 @@ fn main() {
                 f.tags.iter().any(|t| t == &what)
             }
         }) {
-            println!("  {:14} {:?} user {} stars {} {} {:?} {}", f.name, f.label, f.user_rating, f.stars, f.pick, f.tags, f.preview);
+            println!(
+                "  {:14} {:?} user {} stars {} {} {:?} {}",
+                f.name, f.label, f.user_rating, f.stars, f.pick, f.tags, f.preview
+            );
         }
     }
     if arg(&args, "--work").is_some() {
