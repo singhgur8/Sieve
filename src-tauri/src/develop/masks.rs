@@ -66,8 +66,19 @@
 //! `ml::masking::Segmenter::compute`. Resolution of an AI component: `digest` set -> that row;
 //! else the newest `sieve` row of (image, `AiMask::cache_kind`, current model version).
 
+mod cache;
+mod eval;
+mod overlay;
+mod planes;
+
+#[cfg(test)]
+mod tests_eval;
+
+pub use eval::{crop_frame, geometry_affine, luminance_weight, Affine};
+pub use overlay::{guide_from_srgb8, linear_srgb_to_lab};
+
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -99,13 +110,46 @@ pub struct AlphaMask {
 impl AlphaMask {
     /// Bilinear sample at a sensor-frame point, 0..=1 (0 outside `bounds`).
     pub fn sample(&self, p: NormPoint) -> f32 {
-        let _ = p;
-        todo!("rust-engine-dev: AlphaMask::sample (bilinear, 0 outside bounds)")
+        self.sample_f64(f64::from(p.x), f64::from(p.y))
+    }
+
+    /// [`Self::sample`] on f64 coordinates (render loops).
+    #[inline]
+    pub fn sample_f64(&self, x: f64, y: f64) -> f32 {
+        let b = &self.bounds;
+        let (bw, bh) = (f64::from(b.width), f64::from(b.height));
+        if self.width == 0 || self.height == 0 || bw <= 0.0 || bh <= 0.0 {
+            return 0.0;
+        }
+        let u = (x - f64::from(b.x)) / bw;
+        let v = (y - f64::from(b.y)) / bh;
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return 0.0;
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        let fx = (u * w as f64 - 0.5).clamp(0.0, (w - 1) as f64);
+        let fy = (v * h as f64 - 0.5).clamp(0.0, (h - 1) as f64);
+        let (x0, y0) = (fx as usize, fy as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
+        let d = &self.data;
+        let at = |x: usize, y: usize| f32::from(d[y * w + x]);
+        let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+        let bot = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+        (top + (bot - top) * ty) / 255.0
     }
 
     /// Mean value over the whole sensor frame, 0..=1 (`AiMaskInfo.coverage`).
     pub fn coverage(&self) -> f32 {
-        todo!("rust-engine-dev: AlphaMask::coverage")
+        if self.data.is_empty() {
+            return 0.0;
+        }
+        let mean = self.data.iter().map(|&v| u64::from(v)).sum::<u64>() as f64 / (self.data.len() as f64 * 255.0);
+        let b = &self.bounds;
+        // The bitmap's area inside the frame (bitmaps may overhang it slightly).
+        let w = (f64::from(b.x + b.width).min(1.0) - f64::from(b.x).max(0.0)).max(0.0);
+        let h = (f64::from(b.y + b.height).min(1.0) - f64::from(b.y).max(0.0)).max(0.0);
+        (mean * w * h).clamp(0.0, 1.0) as f32
     }
 }
 
@@ -149,12 +193,52 @@ pub struct MaskCacheConfig {
 #[derive(Clone)]
 pub struct MaskCache {
     config: Arc<MaskCacheConfig>,
+    lru: cache::SharedLru,
 }
 
 impl MaskCache {
     /// No I/O (called during app setup).
     pub fn new(config: MaskCacheConfig) -> Self {
-        Self { config: Arc::new(config) }
+        Self { config: Arc::new(config), lru: Arc::new(Mutex::new(cache::Lru::default())) }
+    }
+
+    fn file(&self, image_id: ImageId, digest: &str) -> PathBuf {
+        self.config.cache_dir.join(cache::rel_path(image_id, digest))
+    }
+
+    /// XMP read path: decodes the sidecar's Lightroom mattes into the cache (origin
+    /// `lightroom`, model version `lr:<crs:ModelVersion>`), skipping those already cached.
+    /// Returns per-matte errors (the component then renders empty / `needs_update`).
+    pub fn import_lightroom(
+        &self,
+        conn: &Connection,
+        image_id: ImageId,
+        mattes: &[crate::xmp::masks::LightroomMatte],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for m in mattes {
+            let cached = cache::by_digest(conn, image_id, &m.digest).ok().flatten().is_some()
+                && self.file(image_id, &m.digest).exists();
+            if cached {
+                continue;
+            }
+            let result = crate::xmp::masks::decode_matte(m).and_then(|mask| {
+                let matte = NewMatte {
+                    kind: m.kind.clone(),
+                    target: m.target.clone(),
+                    reference_point: m.reference_point,
+                    origin: AiMaskOrigin::Lightroom,
+                    digest: Some(m.digest.clone()),
+                    model_version: format!("lr:{}", m.model_version.as_deref().unwrap_or("unknown")),
+                    input_digest: m.input_digest.clone(),
+                };
+                self.put(conn, image_id, &matte, &mask).map(|_| ()).map_err(|e| e.message)
+            });
+            if let Err(e) = result {
+                errors.push(format!("matte {}: {e}", m.digest));
+            }
+        }
+        errors
     }
 
     pub fn config(&self) -> &MaskCacheConfig {
@@ -175,8 +259,30 @@ impl MaskCache {
         matte: &NewMatte,
         mask: &AlphaMask,
     ) -> AppResult<AiMaskInfo> {
-        let _ = (conn, image_id, matte, mask);
-        todo!("rust-engine-dev: MaskCache::put")
+        if mask.width == 0 || mask.height == 0 || mask.data.len() != mask.width as usize * mask.height as usize {
+            return Err(crate::ipc::error::AppError::invalid("matte size does not match its data"));
+        }
+        let png = cache::encode_png(mask).map_err(crate::ipc::error::AppError::internal)?;
+        let digest = match &matte.digest {
+            Some(d) => d.trim().to_ascii_uppercase(),
+            None => crate::xmp::masks::md5_hex(&png),
+        };
+        let rel = cache::rel_path(image_id, &digest);
+        cache::write_atomic(&self.config.cache_dir.join(&rel), &png)?;
+        let row = cache::Row {
+            digest: digest.clone(),
+            kind: matte.kind.clone(),
+            origin: matte.origin,
+            model_version: matte.model_version.clone(),
+            width: mask.width,
+            height: mask.height,
+            bounds: mask.bounds,
+            coverage: mask.coverage(),
+        };
+        cache::insert(conn, image_id, &row, matte.input_digest.as_deref(), &rel, crate::db::now_ms())?;
+        cache::lock(&self.lru).put((image_id, digest), Arc::new(mask.clone()));
+        let ai = AiMask { target: matte.target.clone(), reference_point: matte.reference_point, digest: None };
+        Ok(row.info(&ai))
     }
 
     /// The cached matte row `ai` resolves to on `image_id` (module docs), if any.
@@ -188,14 +294,23 @@ impl MaskCache {
         ai: &AiMask,
         model_version: Option<&str>,
     ) -> AppResult<Option<AiMaskInfo>> {
-        let _ = (conn, image_id, ai, model_version);
-        todo!("rust-engine-dev: MaskCache::resolve")
+        let row = match &ai.digest {
+            Some(d) => cache::by_digest(conn, image_id, d)?,
+            None => cache::newest_sieve(conn, image_id, &ai.cache_kind(), model_version)?,
+        };
+        Ok(row.map(|r| r.info(ai)))
     }
 
     /// Decoded matte by digest (LRU; loads the PNG on a miss).
     pub fn load(&self, image_id: ImageId, digest: &str) -> AppResult<Option<Arc<AlphaMask>>> {
-        let _ = (image_id, digest);
-        todo!("rust-engine-dev: MaskCache::load")
+        let key = (image_id, digest.to_owned());
+        if let Some(m) = cache::lock(&self.lru).get(&key) {
+            return Ok(Some(m));
+        }
+        let Some(mask) = cache::load_file(&self.file(image_id, digest))? else { return Ok(None) };
+        let mask = Arc::new(mask);
+        cache::lock(&self.lru).put(key, mask.clone());
+        Ok(Some(mask))
     }
 
     /// `list_masks` status: one entry per AI component of `groups`, in order. `ready` when
@@ -209,22 +324,62 @@ impl MaskCache {
         groups: &[MaskGroup],
         segmenter: &Segmenter,
     ) -> AppResult<Vec<AiMaskStatus>> {
-        let _ = (conn, image_id, groups, segmenter);
-        todo!("rust-engine-dev: MaskCache::status")
+        use crate::ipc::types::AiMaskState;
+        let mut out = Vec::new();
+        for g in groups {
+            for c in &g.components {
+                let MaskShape::Ai(ai) = &c.shape else { continue };
+                let status =
+                    |state, info| AiMaskStatus { group_id: g.id.clone(), component_id: c.id.clone(), state, info };
+                // An explicit matte (Lightroom's or a computed one) renders whatever the models.
+                if ai.digest.is_some() {
+                    if let Some(info) = self.resolve(conn, image_id, ai, None)? {
+                        out.push(status(AiMaskState::Ready, Some(info)));
+                        continue;
+                    }
+                }
+                let Some(family) = ai.target.family() else {
+                    out.push(status(AiMaskState::Unavailable, None));
+                    continue;
+                };
+                let model = segmenter.model_version(family);
+                let plain = AiMask { digest: None, ..ai.clone() };
+                if let Some(mv) = &model {
+                    if let Some(info) = self.resolve(conn, image_id, &plain, Some(mv))? {
+                        out.push(status(AiMaskState::Ready, Some(info)));
+                        continue;
+                    }
+                }
+                let state = if segmenter.is_computing(image_id, &ai.cache_kind()) {
+                    AiMaskState::Computing
+                } else if model.is_none() {
+                    AiMaskState::Unavailable
+                } else {
+                    AiMaskState::NeedsUpdate
+                };
+                out.push(status(state, None));
+            }
+        }
+        Ok(out)
     }
 
     /// Deletes files of rows that no longer exist (images removed) and unreferenced Sieve
     /// mattes superseded by a newer model version. Called at startup (background).
     pub fn sweep(&self, conn: &Connection) -> AppResult<usize> {
-        let _ = conn;
-        todo!("rust-engine-dev: MaskCache::sweep")
+        cache::sweep(conn, &self.masks_dir(), &self.lru)
     }
 }
 
 impl MatteSource for MaskCache {
     fn matte(&self, image_id: ImageId, ai: &AiMask) -> Option<Arc<AlphaMask>> {
-        let _ = (image_id, ai);
-        todo!("rust-engine-dev: MatteSource for MaskCache (own read-only catalog connection)")
+        let digest = match &ai.digest {
+            Some(d) => d.clone(),
+            None => {
+                let conn = cache::open_read_only(&self.config.catalog_path).ok()?;
+                cache::newest_sieve(&conn, image_id, &ai.cache_kind(), None).ok()??.digest
+            }
+        };
+        self.load(image_id, &digest).ok().flatten()
     }
 }
 
@@ -252,13 +407,14 @@ pub struct MaskGeometry {
 impl MaskGeometry {
     /// Sensor-frame point of the centre of output pixel (`px`, `py`).
     pub fn sensor_point(&self, px: f32, py: f32) -> NormPoint {
-        let _ = (px, py);
-        todo!("rust-engine-dev: MaskGeometry::sensor_point (region -> crop/angle -> orientation)")
+        let (u, v) = eval::geometry_affine(self).apply(f64::from(px), f64::from(py));
+        NormPoint { x: u as f32, y: v as f32 }
     }
 
     /// Output pixels per sensor-frame width unit (brush radius scale).
     pub fn sensor_width_px(&self) -> f32 {
-        todo!("rust-engine-dev: MaskGeometry::sensor_width_px")
+        let t = eval::geometry_affine(self);
+        (f64::from(self.sensor_width) / eval::sensor_px_per_output_px(self, &t)) as f32
     }
 }
 
@@ -301,14 +457,12 @@ pub fn evaluate_component(
     mattes: &dyn MatteSource,
     guide: Option<&RangeGuide>,
 ) -> Option<Vec<f32>> {
-    let _ = (component, geom, image_id, mattes, guide);
-    todo!("rust-engine-dev: develop::masks::evaluate_component")
+    eval::evaluate_component(component, geom, image_id, mattes, guide)
 }
 
 /// Combines `value` into `acc` with `mode` (module docs). Both planes have equal length.
 pub fn combine(acc: &mut [f32], value: &[f32], mode: MaskBlendMode) {
-    let _ = (acc, value, mode);
-    todo!("rust-engine-dev: develop::masks::combine")
+    eval::combine(acc, value, mode)
 }
 
 /// Evaluates every active group on the output grid (rayon over rows).
@@ -319,8 +473,7 @@ pub fn evaluate(
     mattes: &dyn MatteSource,
     guide: Option<&RangeGuide>,
 ) -> GroupWeights {
-    let _ = (masks, geom, image_id, mattes, guide);
-    todo!("rust-engine-dev: develop::masks::evaluate")
+    eval::evaluate(masks, geom, image_id, mattes, guide)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,8 +529,7 @@ pub struct LocalPlanes {
 impl LocalPlanes {
     /// `None` when no group is active with a non-neutral adjustment set.
     pub fn build(masks: &[MaskGroup], weights: &GroupWeights) -> Option<LocalPlanes> {
-        let _ = (masks, weights);
-        todo!("rust-engine-dev: LocalPlanes::build")
+        planes::build(masks, weights)
     }
 
     /// The offset plane for `param` (row-major, `width * height`), if any group sets it.
@@ -390,8 +542,7 @@ impl LocalPlanes {
 /// weight, on the working image (linear Rec.2020 RGB, row-major). Called once after the
 /// global point curves.
 pub fn apply_group_blends(rgb: &mut [[f32; 3]], local: &LocalPlanes) {
-    let _ = (rgb, local);
-    todo!("rust-engine-dev: develop::masks::apply_group_blends")
+    planes::apply_group_blends(rgb, local)
 }
 
 // ---------------------------------------------------------------------------
@@ -411,8 +562,7 @@ pub fn render_overlay(
     target: &MaskOverlayTarget,
     options: &MaskOverlayOptions,
 ) -> AppResult<Option<RenderedMaskOverlay>> {
-    let _ = (develop, mattes, ticket, src, adjustments, target, options);
-    todo!("rust-engine-dev: develop::masks::render_overlay")
+    overlay::render_overlay(develop, mattes, ticket, src, adjustments, target, options)
 }
 
 #[cfg(test)]

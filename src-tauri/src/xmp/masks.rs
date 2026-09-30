@@ -83,9 +83,20 @@
 //!   `LocalCurveRefineSaturation`, like Lightroom; numbers in Lightroom's style (up to 6
 //!   decimals, no trailing zeros).
 
+mod jxl;
+mod md5;
+mod read;
+mod table;
+mod tree;
+mod write;
+
+#[cfg(test)]
+mod tests_io;
+
 use crate::develop::masks::AlphaMask;
 use crate::ipc::types::{
-    AiTarget, AiTargetKind, DevelopWarning, LandscapeCategory, MaskBlendMode, MaskGroup, NormPoint, PersonPart,
+    AiTarget, AiTargetKind, DevelopWarning, LandscapeCategory, LocalAdjustments, MaskBlendMode, MaskGroup, NormPoint,
+    PersonPart,
 };
 
 /// Adobe big-table base-85 alphabet (DNG SDK `dng_big_table`), shared with `profiles::table`.
@@ -228,28 +239,94 @@ pub struct MasksRead {
 /// Reads the top-level `crs:MaskGroupBasedCorrections` (+ legacy `*BasedCorrections` for the
 /// warning). `Ok(None)` when the packet has none of them.
 pub fn read(packet: &str) -> Result<Option<MasksRead>, String> {
-    let _ = packet;
-    todo!("rust-engine-dev: xmp::masks::read")
+    let src = packet.strip_prefix('\u{feff}').unwrap_or(packet);
+    let parsed = read::parse(src)?;
+    if !parsed.any {
+        return Ok(None);
+    }
+    Ok(Some(MasksRead { groups: parsed.models(), mattes: parsed.mattes, warnings: parsed.warnings }))
 }
 
 /// Base-85 text -> bytes (header included).
 pub fn decode_table(value: &str) -> Result<Vec<u8>, String> {
-    let _ = value;
-    todo!("rust-engine-dev: xmp::masks::decode_table")
+    table::decode_base85(value)
 }
 
 /// Decodes a Lightroom matte (table -> TIFF -> JXL tile via ImageIO) and places it in the
 /// sensor frame (`AlphaMask.bounds` from `origin` / `whole_area`).
 pub fn decode_matte(matte: &LightroomMatte) -> Result<AlphaMask, String> {
-    let _ = matte;
-    todo!("rust-engine-dev: xmp::masks::decode_matte")
+    table::decode_matte(matte)
 }
 
 /// Rewrites the packet's masks per the write rules (module docs). Returns the packet
 /// unchanged when `masks` equals what [`read`] yields.
 pub fn apply(packet: &str, masks: &[MaskGroup]) -> Result<String, String> {
-    let _ = (packet, masks);
-    todo!("rust-engine-dev: xmp::masks::apply")
+    write::apply(packet, masks)
+}
+
+/// Whether this Mac can decode Lightroom mattes (JPEG XL needs macOS 14+); `Err` = reason,
+/// reported once as a warning by the read path.
+pub fn mattes_supported() -> Result<(), String> {
+    jxl::supported()
+}
+
+/// MD5 (32 upper-case hex) of `data`: Sieve matte digests.
+pub fn md5_hex(data: &[u8]) -> String {
+    md5::md5_hex(data)
+}
+
+/// `LocalAdjustments` scalar by wire name (`LOCAL_SCALARS.field`) with its UI range.
+pub(crate) fn local_field_mut<'a>(a: &'a mut LocalAdjustments, field: &str) -> Option<(&'a mut f32, f32, f32)> {
+    Some(match field {
+        "temperature" => (&mut a.temperature, -100.0, 100.0),
+        "tint" => (&mut a.tint, -100.0, 100.0),
+        "exposure" => (&mut a.exposure, -4.0, 4.0),
+        "contrast" => (&mut a.contrast, -100.0, 100.0),
+        "highlights" => (&mut a.highlights, -100.0, 100.0),
+        "shadows" => (&mut a.shadows, -100.0, 100.0),
+        "whites" => (&mut a.whites, -100.0, 100.0),
+        "blacks" => (&mut a.blacks, -100.0, 100.0),
+        "texture" => (&mut a.texture, -100.0, 100.0),
+        "clarity" => (&mut a.clarity, -100.0, 100.0),
+        "dehaze" => (&mut a.dehaze, -100.0, 100.0),
+        "hue" => (&mut a.hue, -180.0, 180.0),
+        "saturation" => (&mut a.saturation, -100.0, 100.0),
+        "sharpness" => (&mut a.sharpness, -100.0, 100.0),
+        "noise" => (&mut a.noise, -100.0, 100.0),
+        "moire" => (&mut a.moire, -100.0, 100.0),
+        "defringe" => (&mut a.defringe, -100.0, 100.0),
+        "color.hue" => (&mut a.color.hue, 0.0, 360.0),
+        "color.saturation" => (&mut a.color.saturation, 0.0, 100.0),
+        "curveRefineSaturation" => (&mut a.curve_refine_saturation, 0.0, 100.0),
+        _ => return None,
+    })
+}
+
+/// Read-only [`local_field_mut`] (0 for unknown names).
+pub(crate) fn local_field(a: &LocalAdjustments, field: &str) -> f32 {
+    match field {
+        "temperature" => a.temperature,
+        "tint" => a.tint,
+        "exposure" => a.exposure,
+        "contrast" => a.contrast,
+        "highlights" => a.highlights,
+        "shadows" => a.shadows,
+        "whites" => a.whites,
+        "blacks" => a.blacks,
+        "texture" => a.texture,
+        "clarity" => a.clarity,
+        "dehaze" => a.dehaze,
+        "hue" => a.hue,
+        "saturation" => a.saturation,
+        "sharpness" => a.sharpness,
+        "noise" => a.noise,
+        "moire" => a.moire,
+        "defringe" => a.defringe,
+        "color.hue" => a.color.hue,
+        "color.saturation" => a.color.saturation,
+        "curveRefineSaturation" => a.curve_refine_saturation,
+        _ => 0.0,
+    }
 }
 
 #[cfg(test)]
