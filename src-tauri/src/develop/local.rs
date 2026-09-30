@@ -34,14 +34,19 @@ use super::source::ColorInfo;
 use super::tone::{ToneModel, ToneSliders};
 use super::wb;
 
-/// Mired shift of a +100 local Temperature (negative mired = warmer).
-pub const LOCAL_TEMP_MIRED: f64 = 50.0;
+/// Mired shift of a +100 local Temperature (negative mired = warmer). Fitted to Camera Raw:
+/// the user's -20 subject masks shift b* by -5.1 in ACR (10 frames, `examples/mask_render`).
+pub const LOCAL_TEMP_MIRED: f64 = 88.0;
 /// Tint units of a +100 local Tint.
 pub const LOCAL_TINT: f64 = 40.0;
 
+/// Local Clarity / Texture relative to the global sliders: Camera Raw's local detail sliders
+/// act ~2.5x weaker than the global ones (local contrast x0.93 for the user's Clarity -20 /
+/// Texture -15 subject masks vs x0.83 at global strength; 10 frames, `examples/mask_render`).
+pub const LOCAL_DETAIL_GAIN: f32 = 0.4;
 /// Pipeline scale of the local operators (as `pipeline::develop` scales the global sliders).
-const CLARITY_SCALE: f32 = 0.6 / 100.0;
-const TEXTURE_SCALE: f32 = 0.8 / 100.0;
+const CLARITY_SCALE: f32 = 0.6 / 100.0 * LOCAL_DETAIL_GAIN;
+const TEXTURE_SCALE: f32 = 0.8 / 100.0 * LOCAL_DETAIL_GAIN;
 const DEHAZE_SCALE: f32 = 1.0 / 100.0;
 
 /// Function of (local slider value, EV) sampled on a grid, bilinear.
@@ -661,8 +666,8 @@ mod tests {
             ("blacks", |a, v| a.blacks = v, |a, v| a.blacks = v, 50.0, 2),
             ("shadows", |a, v| a.shadows = v, |a, v| a.shadows = v, 70.0, 2),
             ("highlights", |a, v| a.highlights = v, |a, v| a.highlights = v, -70.0, 2),
-            ("clarity", |a, v| a.clarity = v, |a, v| a.clarity = v, 50.0, 1),
-            ("texture", |a, v| a.texture = v, |a, v| a.texture = v, 100.0, 1),
+            ("clarity", |a, v| a.clarity = v * LOCAL_DETAIL_GAIN, |a, v| a.clarity = v, 100.0, 1),
+            ("texture", |a, v| a.texture = v * LOCAL_DETAIL_GAIN, |a, v| a.texture = v, 100.0, 1),
         ];
         for (name, set, set_local, v, tol) in cases {
             let mut global = plain();
