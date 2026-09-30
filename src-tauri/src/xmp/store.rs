@@ -112,7 +112,7 @@ pub fn apply_read(
     label: Option<ColorLabel>,
     sidecar_mtime: Option<i64>,
 ) -> AppResult<bool> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let changed = tx.execute(
         "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4
          WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4)",

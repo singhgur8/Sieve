@@ -162,7 +162,7 @@ pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions)
     let folder_str = path_str(&folder)?;
     let now = now_ms();
 
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     tx.execute(
         "INSERT INTO folders (path, added_at) VALUES (?1, ?2) ON CONFLICT(path) DO NOTHING",
         params![folder_str, now],
@@ -444,6 +444,12 @@ pub fn get_image(conn: &Connection, id: ImageId) -> AppResult<RawImageEntry> {
 
 /// Entries for `ids` in the given order. Atomic: an unknown id fails with `not_found`.
 pub fn get_images(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<RawImageEntry>> {
+    load_entries(conn, ids, true)
+}
+
+/// Entries for `ids` in the given order; unknown ids fail with `not_found` when `strict`,
+/// else are skipped (a page whose rows were deleted meanwhile).
+fn load_entries(conn: &Connection, ids: &[ImageId], strict: bool) -> AppResult<Vec<RawImageEntry>> {
     let mut by_id: HashMap<ImageId, RawImageEntry> = HashMap::with_capacity(ids.len());
     for chunk in ids.chunks(500) {
         let ph = vec!["?"; chunk.len()].join(",");
@@ -453,10 +459,14 @@ pub fn get_images(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<RawImageE
             by_id.insert(e.id, e);
         }
     }
-    let mut out = ids
-        .iter()
-        .map(|id| by_id.get(id).cloned().ok_or_else(|| AppError::not_found(format!("image {id}"))))
-        .collect::<AppResult<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match by_id.get(id) {
+            Some(e) => out.push(e.clone()),
+            None if strict => return Err(AppError::not_found(format!("image {id}"))),
+            None => {}
+        }
+    }
     attach_tags(conn, &mut out)?;
     Ok(out)
 }
@@ -472,28 +482,26 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
     let mut clauses: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
 
+    // Tag filters as set membership (the subquery is evaluated once into an ephemeral
+    // index) rather than a correlated probe per image row: ~5x faster on 50k images.
     if !q.include_tags.is_empty() {
         let ph = text_list(&q.include_tags, &mut args, CullTag::as_str);
         clauses.push(match q.tag_match {
-            TagMatch::Any => format!(
-                "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
-                         AND it.suppressed = 0 AND it.tag IN ({ph}))"
-            ),
+            TagMatch::Any => {
+                format!("i.id IN (SELECT image_id FROM image_tags WHERE suppressed = 0 AND tag IN ({ph}))")
+            }
             TagMatch::All => {
                 let distinct = q.include_tags.iter().collect::<std::collections::HashSet<_>>().len();
                 format!(
-                    "(SELECT COUNT(DISTINCT it.tag) FROM image_tags it WHERE it.image_id = i.id
-                      AND it.suppressed = 0 AND it.tag IN ({ph})) = {distinct}"
+                    "i.id IN (SELECT image_id FROM image_tags WHERE suppressed = 0 AND tag IN ({ph})
+                              GROUP BY image_id HAVING COUNT(DISTINCT tag) = {distinct})"
                 )
             }
         });
     }
     if !q.exclude_tags.is_empty() {
         let ph = text_list(&q.exclude_tags, &mut args, CullTag::as_str);
-        clauses.push(format!(
-            "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
-                         AND it.suppressed = 0 AND it.tag IN ({ph}))"
-        ));
+        clauses.push(format!("i.id NOT IN (SELECT image_id FROM image_tags WHERE suppressed = 0 AND tag IN ({ph}))"));
     }
     if !q.picks.is_empty() {
         let ph = text_list(&q.picks, &mut args, PickFlag::as_str);
@@ -521,12 +529,18 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
         args.push(Value::Integer(scene));
     }
     if q.collapse_bursts {
-        clauses.push(
-            "(i.burst_group_id IS NULL OR NOT EXISTS (
-                 SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id
-                 AND b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id))"
-                .into(),
-        );
+        // Burst members other than a chosen keeper (driven from `burst_groups`, which is small).
+        let in_folder = match q.folder_id {
+            Some(f) => {
+                args.push(Value::Integer(f));
+                " AND m.folder_id = ?"
+            }
+            None => "",
+        };
+        clauses.push(format!(
+            "i.id NOT IN (SELECT m.id FROM burst_groups b JOIN images m ON m.burst_group_id = b.id
+                          WHERE b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> m.id{in_folder})"
+        ));
     }
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
@@ -537,58 +551,134 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
     Ok((where_sql, args))
 }
 
-/// `ORDER BY` terms for `q` (always ends with a unique key for stable paging).
-fn query_order(q: &ImageQuery) -> &'static str {
-    match (q.sort, q.sort_descending) {
-        (ImageSort::CaptureTime, false) => "i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-        (ImageSort::CaptureTime, true) => {
-            "i.captured_at_ms IS NULL, i.captured_at_ms DESC, i.file_name DESC, i.id DESC"
+/// Sort keys of one image for [`list_image_ids`].
+struct SortRow {
+    id: ImageId,
+    captured: Option<i64>,
+    file_name: String,
+    rating: i64,
+    overall: Option<f64>,
+}
+
+/// Orders `rows` like the SQL `ORDER BY` of `q`'s sort (always ending with a unique key):
+/// - capture time: `captured IS NULL, captured, file_name, id` (desc: every key but the
+///   null flag reversed);
+/// - file name: `file_name, id` (desc reversed);
+/// - quality: `overall IS NULL, overall DESC, id` (desc: `overall ASC, id DESC`);
+/// - rating: `rating DESC` (desc: `ASC`), then capture-time ascending order.
+///
+/// Byte-wise string order equals SQLite's default `BINARY` collation. Sorting in Rust
+/// instead of SQLite keeps the sorter from carrying wide rows (50k images: ~5x faster).
+fn sort_rows(rows: &mut [SortRow], sort: ImageSort, descending: bool) {
+    use std::cmp::Ordering;
+    let capture = |a: &SortRow, b: &SortRow| {
+        a.captured
+            .is_none()
+            .cmp(&b.captured.is_none())
+            .then(a.captured.cmp(&b.captured))
+            .then_with(|| a.file_name.cmp(&b.file_name))
+            .then(a.id.cmp(&b.id))
+    };
+    let real = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        _ => Ordering::Equal,
+    };
+    match (sort, descending) {
+        (ImageSort::CaptureTime, false) => rows.sort_unstable_by(capture),
+        (ImageSort::CaptureTime, true) => rows.sort_unstable_by(|a, b| {
+            a.captured
+                .is_none()
+                .cmp(&b.captured.is_none())
+                .then(b.captured.cmp(&a.captured))
+                .then_with(|| b.file_name.cmp(&a.file_name))
+                .then(b.id.cmp(&a.id))
+        }),
+        (ImageSort::FileName, false) => {
+            rows.sort_unstable_by(|a, b| a.file_name.cmp(&b.file_name).then(a.id.cmp(&b.id)))
         }
-        (ImageSort::FileName, false) => "i.file_name, i.id",
-        (ImageSort::FileName, true) => "i.file_name DESC, i.id DESC",
-        (ImageSort::Quality, false) => "q.overall IS NULL, q.overall DESC, i.id",
-        (ImageSort::Quality, true) => "q.overall IS NULL, q.overall, i.id DESC",
-        (ImageSort::Rating, false) => "i.rating DESC, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-        (ImageSort::Rating, true) => "i.rating, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+        (ImageSort::FileName, true) => {
+            rows.sort_unstable_by(|a, b| b.file_name.cmp(&a.file_name).then(b.id.cmp(&a.id)))
+        }
+        (ImageSort::Quality, false) => rows.sort_unstable_by(|a, b| {
+            a.overall.is_none().cmp(&b.overall.is_none()).then(real(b.overall, a.overall)).then(a.id.cmp(&b.id))
+        }),
+        (ImageSort::Quality, true) => rows.sort_unstable_by(|a, b| {
+            a.overall.is_none().cmp(&b.overall.is_none()).then(real(a.overall, b.overall)).then(b.id.cmp(&a.id))
+        }),
+        (ImageSort::Rating, false) => rows.sort_unstable_by(|a, b| b.rating.cmp(&a.rating).then_with(|| capture(a, b))),
+        (ImageSort::Rating, true) => rows.sort_unstable_by(|a, b| a.rating.cmp(&b.rating).then_with(|| capture(a, b))),
     }
 }
 
+/// One page of `q` (`offset`/`limit`, capped at [`ImageQuery::MAX_LIMIT`]) + the total.
+/// The page is cut from the sorted id list, then loaded by id, so deep pages cost the
+/// same as the first one.
 pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
-    let (where_sql, args) = query_filter(q)?;
-    let total: u32 =
-        conn.query_row(&format!("SELECT COUNT(*) FROM images i{where_sql}"), params_from_iter(args.iter()), |r| {
-            r.get(0)
-        })?;
-
-    let limit = q.limit.min(ImageQuery::MAX_LIMIT);
-    let sql = format!("{ENTRY_SELECT}{where_sql} ORDER BY {} LIMIT {limit} OFFSET {}", query_order(q), q.offset);
-    let mut items =
-        conn.prepare(&sql)?.query_map(params_from_iter(args.iter()), entry_from_row)?.collect::<Result<Vec<_>, _>>()?;
-    attach_tags(conn, &mut items)?;
-
+    let ids = list_image_ids(conn, q)?;
+    let total = ids.len() as u32;
+    let limit = q.limit.min(ImageQuery::MAX_LIMIT) as usize;
+    let page: Vec<ImageId> = ids.into_iter().skip(q.offset as usize).take(limit).collect();
+    let items = load_entries(conn, &page, false)?;
     Ok(ImagePage { items, total })
 }
 
 /// Every id matching `q` in sort order; `offset`/`limit` are ignored.
 pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageId>> {
     let (where_sql, args) = query_filter(q)?;
-    let sql = format!(
-        "SELECT i.id FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id{where_sql} ORDER BY {}",
-        query_order(q)
-    );
-    let ids = conn.prepare(&sql)?.query_map(params_from_iter(args.iter()), |r| r.get(0))?.collect::<Result<_, _>>()?;
-    Ok(ids)
+    let quality = q.sort == ImageSort::Quality;
+    let (name_col, overall_col, join) = if quality {
+        ("''", "q.overall", " LEFT JOIN quality_scores q ON q.image_id = i.id")
+    } else {
+        ("i.file_name", "NULL", "")
+    };
+    let sql =
+        format!("SELECT i.id, i.captured_at_ms, {name_col}, i.rating, {overall_col} FROM images i{join}{where_sql}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt
+        .query_map(params_from_iter(args.iter()), |r| {
+            Ok(SortRow {
+                id: r.get(0)?,
+                captured: r.get(1)?,
+                file_name: r.get(2)?,
+                rating: r.get(3)?,
+                overall: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    sort_rows(&mut rows, q.sort, q.sort_descending);
+    Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
-/// Facet counts over `folder` (or the whole catalog).
+/// Facet counts over `folder` (or the whole catalog). Separate statements per case so
+/// SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1` predicate cannot).
 pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<FilterCounts> {
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
+    let (pick_sql, tag_sql, burst_sql) = match folder {
+        None => (
+            // Grouping by folder first follows a (folder_id, pick, rating) index without a
+            // temp B-tree; the per-folder rows are summed below.
+            "SELECT pick, rating, COUNT(*) FROM images GROUP BY folder_id, pick, rating",
+            "SELECT tag, COUNT(*) FROM image_tags WHERE suppressed = 0 GROUP BY tag ORDER BY tag",
+            "SELECT COUNT(DISTINCT i.burst_group_id),
+                    COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
+             FROM images i JOIN burst_groups b ON b.id = i.burst_group_id",
+        ),
+        Some(_) => (
+            "SELECT pick, rating, COUNT(*) FROM images WHERE folder_id = ?1 GROUP BY pick, rating",
+            "SELECT tag, COUNT(*) FROM image_tags
+             WHERE suppressed = 0 AND image_id IN (SELECT id FROM images WHERE folder_id = ?1)
+             GROUP BY tag ORDER BY tag",
+            "SELECT COUNT(DISTINCT i.burst_group_id),
+                    COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
+             FROM images i JOIN burst_groups b ON b.id = i.burst_group_id WHERE i.folder_id = ?1",
+        ),
+    };
+    let args: Vec<FolderId> = folder.into_iter().collect();
     {
-        let mut stmt = conn.prepare(
-            "SELECT pick, rating, COUNT(*) FROM images WHERE ?1 IS NULL OR folder_id = ?1 GROUP BY pick, rating",
-        )?;
-        let rows =
-            stmt.query_map([folder], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?, r.get::<_, u32>(2)?)))?;
+        let mut stmt = conn.prepare_cached(pick_sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?, r.get::<_, u32>(2)?))
+        })?;
         for row in rows {
             let (pick, rating, n) = row?;
             c.total += n;
@@ -603,25 +693,15 @@ pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<F
         }
     }
     c.tags = conn
-        .prepare(
-            "SELECT it.tag, COUNT(*) FROM image_tags it JOIN images i ON i.id = it.image_id
-             WHERE it.suppressed = 0 AND (?1 IS NULL OR i.folder_id = ?1)
-             GROUP BY it.tag ORDER BY it.tag",
-        )?
-        .query_map([folder], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?
+        .prepare_cached(tag_sql)?
+        .query_map(params_from_iter(args.iter()), |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?
         .filter_map(|r| match r {
             Ok((tag, count)) => CullTag::parse(&tag).map(|tag| Ok(TagCount { tag, count })),
             Err(e) => Some(Err(e)),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    (c.burst_groups, c.burst_non_keepers) = conn.query_row(
-        "SELECT COUNT(DISTINCT i.burst_group_id),
-                COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
-         FROM images i JOIN burst_groups b ON b.id = i.burst_group_id
-         WHERE ?1 IS NULL OR i.folder_id = ?1",
-        [folder],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    (c.burst_groups, c.burst_non_keepers) =
+        conn.prepare_cached(burst_sql)?.query_row(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(c)
 }
 
@@ -631,7 +711,7 @@ pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<F
 
 /// Runs `sql` with `(value, id)` for every id in one transaction; errors if any id is unknown.
 fn update_each(conn: &mut Connection, ids: &[ImageId], sql: &str, value: Value) -> AppResult<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     {
         let mut stmt = tx.prepare(sql)?;
         for &id in ids {
@@ -663,7 +743,7 @@ pub fn set_color_label(conn: &mut Connection, ids: &[ImageId], label: Option<Col
 /// Adds or removes a tag as the user. Removing an auto tag suppresses it rather than
 /// deleting it, so re-running analysis does not bring it back.
 pub fn set_user_tag(conn: &mut Connection, ids: &[ImageId], tag: CullTag, present: bool) -> AppResult<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     for &id in ids {
         let exists: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)", [id], |r| r.get(0))?;
         if !exists {
@@ -811,7 +891,7 @@ pub fn record_extraction(
     meta: Option<&raw::meta::ImageMeta>,
     outcome: Result<&ThumbFiles, &str>,
 ) -> AppResult<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     if let Some(m) = meta {
         tx.prepare_cached(
             "UPDATE images SET
@@ -863,7 +943,7 @@ pub fn record_extraction(
 /// Atomic; unknown ids fail the batch with `not_found`. Returns the old cache paths
 /// so the caller can delete them.
 pub fn reset_thumbnails(conn: &mut Connection, ids: &[ImageId]) -> AppResult<Vec<String>> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let mut old = Vec::new();
     {
         let mut select = tx.prepare(
@@ -953,7 +1033,7 @@ pub fn apply_suggestions(
     ids: &[ImageId],
     only_unset: bool,
 ) -> AppResult<ApplySuggestionsResult> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let mut applied = 0;
     {
         let mut stmt = tx.prepare(
@@ -1004,7 +1084,7 @@ pub fn restore_cull_snapshot(conn: &mut Connection, snapshots: &[CullSnapshot]) 
     if let Some(s) = snapshots.iter().find(|s| s.rating > 5) {
         return Err(AppError::invalid(format!("rating {} is outside 0..=5", s.rating)));
     }
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let mut changed = Vec::new();
     {
         let mut stmt = tx.prepare(
@@ -1068,6 +1148,136 @@ mod tests {
 
     fn all_ids(conn: &Connection) -> Vec<ImageId> {
         list_images(conn, &ImageQuery::default()).unwrap().items.iter().map(|e| e.id).collect()
+    }
+
+    /// The Rust-side sort + set-membership filters return exactly what the SQL
+    /// `ORDER BY` / correlated `EXISTS` formulation did (ties, NULLs, both directions).
+    #[test]
+    fn rust_sort_matches_sql_order_by() {
+        let conn = open_in_memory();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/a', 0), (2, '/b', 0);
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, captured_at_ms, rating, pick,
+                                 file_size, file_mtime_ms, imported_at)
+             SELECT x, 1 + x % 2, '/p/' || x, 'F' || (x * 37 % 23) || CASE WHEN x % 5 = 0 THEN 'b' ELSE '' END,
+                    'arw', 'sony', CASE WHEN x % 7 = 0 THEN NULL ELSE (x * 13) % 40 END, x % 6,
+                    CASE x % 4 WHEN 0 THEN 'pick' WHEN 1 THEN 'reject' ELSE 'unflagged' END, 1, 0, 0 FROM s;
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+             INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                                         clipped_shadows_pct, mean_luma, model_version, analyzed_at)
+             SELECT x, (x * 11 % 9) / 10.0, 0, 0, 0, 0, 'v', 0 FROM s WHERE x % 3 <> 0;
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+             INSERT INTO image_tags (image_id, tag, source, suppressed)
+             SELECT x, CASE x % 3 WHEN 0 THEN 'blink' WHEN 1 THEN 'missed_focus' ELSE 'motion_blur' END, 'auto',
+                    CASE WHEN x % 10 = 0 THEN 1 ELSE 0 END FROM s WHERE x % 4 <> 0;
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+             INSERT INTO image_tags (image_id, tag, source) SELECT x, 'duplicate_burst', 'auto' FROM s WHERE x % 5 < 2;
+             WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 30)
+             INSERT INTO burst_groups (id, started_at_ms, ended_at_ms, keeper_image_id)
+             SELECT x, 0, 0, CASE WHEN x % 3 = 0 THEN NULL ELSE x * 10 + 1 END FROM s;
+             UPDATE images SET burst_group_id = id / 10 WHERE id % 10 < 4 AND id >= 10;",
+        )
+        .unwrap();
+        let order = |sort: ImageSort, desc: bool| match (sort, desc) {
+            (ImageSort::CaptureTime, false) => "i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+            (ImageSort::CaptureTime, true) => {
+                "i.captured_at_ms IS NULL, i.captured_at_ms DESC, i.file_name DESC, i.id DESC"
+            }
+            (ImageSort::FileName, false) => "i.file_name, i.id",
+            (ImageSort::FileName, true) => "i.file_name DESC, i.id DESC",
+            (ImageSort::Quality, false) => "q.overall IS NULL, q.overall DESC, i.id",
+            (ImageSort::Quality, true) => "q.overall IS NULL, q.overall, i.id DESC",
+            (ImageSort::Rating, false) => {
+                "i.rating DESC, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id"
+            }
+            (ImageSort::Rating, true) => "i.rating, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+        };
+        // The pre-Phase-8 filter formulation.
+        let legacy_where = |q: &ImageQuery| {
+            let tags = |t: &[CullTag]| t.iter().map(|t| format!("'{}'", t.as_str())).collect::<Vec<_>>().join(",");
+            let mut c = Vec::new();
+            if !q.include_tags.is_empty() {
+                c.push(match q.tag_match {
+                    TagMatch::Any => format!(
+                        "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.suppressed = 0
+                                 AND it.tag IN ({}))",
+                        tags(&q.include_tags)
+                    ),
+                    TagMatch::All => format!(
+                        "(SELECT COUNT(DISTINCT it.tag) FROM image_tags it WHERE it.image_id = i.id
+                          AND it.suppressed = 0 AND it.tag IN ({})) = {}",
+                        tags(&q.include_tags),
+                        q.include_tags.len()
+                    ),
+                });
+            }
+            if !q.exclude_tags.is_empty() {
+                c.push(format!(
+                    "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.suppressed = 0
+                                 AND it.tag IN ({}))",
+                    tags(&q.exclude_tags)
+                ));
+            }
+            if q.collapse_bursts {
+                c.push(
+                    "(i.burst_group_id IS NULL OR NOT EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id
+                      AND b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id))"
+                        .to_owned(),
+                );
+            }
+            if let Some(f) = q.folder_id {
+                c.push(format!("i.folder_id = {f}"));
+            }
+            if c.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", c.join(" AND "))
+            }
+        };
+        let filters = [
+            ImageQuery::default(),
+            ImageQuery { include_tags: vec![CullTag::Blink, CullTag::MotionBlur], ..Default::default() },
+            ImageQuery {
+                include_tags: vec![CullTag::Blink, CullTag::DuplicateBurst],
+                tag_match: TagMatch::All,
+                ..Default::default()
+            },
+            ImageQuery { exclude_tags: vec![CullTag::MissedFocus], folder_id: Some(2), ..Default::default() },
+            ImageQuery { collapse_bursts: true, ..Default::default() },
+        ];
+        for f in &filters {
+            for sort in [ImageSort::CaptureTime, ImageSort::FileName, ImageSort::Quality, ImageSort::Rating] {
+                for desc in [false, true] {
+                    let q = ImageQuery { sort, sort_descending: desc, ..f.clone() };
+                    let sql = format!(
+                        "SELECT i.id FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id{} ORDER BY {}",
+                        legacy_where(&q),
+                        order(sort, desc)
+                    );
+                    let want: Vec<ImageId> =
+                        conn.prepare(&sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+                    assert!(!want.is_empty());
+                    assert_eq!(list_image_ids(&conn, &q).unwrap(), want, "{sort:?} desc={desc} {f:?}");
+                    let page = list_images(&conn, &ImageQuery { offset: 7, limit: 50, ..q.clone() }).unwrap();
+                    assert_eq!(page.total as usize, want.len());
+                    let got: Vec<ImageId> = page.items.iter().map(|e| e.id).collect();
+                    assert_eq!(got, want.iter().skip(7).take(50).copied().collect::<Vec<_>>());
+                }
+            }
+        }
+        // Facet counts: whole catalog = sum over folders.
+        let (all, a, b) = (
+            filter_counts(&conn, None).unwrap(),
+            filter_counts(&conn, Some(1)).unwrap(),
+            filter_counts(&conn, Some(2)).unwrap(),
+        );
+        assert_eq!(all.total, 300);
+        assert_eq!(a.total + b.total, 300);
+        assert_eq!(a.picked + b.picked, all.picked);
+        let tag_sum = |c: &FilterCounts| c.tags.iter().map(|t| t.count).sum::<u32>();
+        assert_eq!(tag_sum(&a) + tag_sum(&b), tag_sum(&all));
+        assert_eq!(a.burst_non_keepers + b.burst_non_keepers, all.burst_non_keepers);
     }
 
     #[test]

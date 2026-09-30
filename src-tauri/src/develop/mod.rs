@@ -277,6 +277,19 @@ impl Entry {
     }
 }
 
+/// Half-size decode of an original with user-facing errors: a missing/moved file is
+/// `not_found` ("Original file is missing ..."), a decoder failure says so (`io`).
+fn decode_source(path: &std::path::Path) -> AppResult<(LinearImage, SourceMeta)> {
+    crate::raw::access::require_original(path)?;
+    source::decode_half_size_meta(path).map_err(|e| match e.kind {
+        crate::ipc::error::ErrorKind::Internal => {
+            let prefix = format!("{}: ", path.display());
+            crate::raw::access::decode_failed(path, e.message.strip_prefix(&prefix).unwrap_or(&e.message))
+        }
+        _ => e,
+    })
+}
+
 fn quality_for(max_edge: u32) -> pipeline::Quality {
     if max_edge <= DRAFT_EDGE {
         pipeline::Quality::Draft
@@ -325,8 +338,14 @@ pub struct DevelopCache {
     config: DevelopConfig,
     /// Newest ticket issued per (image, slot).
     latest: Arc<Mutex<HashMap<(ImageId, RenderSlot), u32>>>,
+    /// Catalog facts (path, orientation) of recently edited images, so slider renders skip
+    /// the catalog (and its lock) entirely. Filled by the commands; see [`Self::source`].
+    sources: Arc<Mutex<HashMap<ImageId, SourceImage>>>,
     inner: Arc<Inner>,
 }
+
+/// Remembered [`SourceImage`]s (cleared wholesale when exceeded; each is ~100 bytes).
+pub const MAX_SOURCES: usize = 4096;
 
 impl DevelopCache {
     pub fn new(config: DevelopConfig) -> Self {
@@ -336,6 +355,7 @@ impl DevelopCache {
         Self {
             config,
             latest: Arc::new(Mutex::new(HashMap::new())),
+            sources: Arc::new(Mutex::new(HashMap::new())),
             inner: Arc::new(Inner {
                 lru: Mutex::new(Lru::default()),
                 decoding: Mutex::new(HashMap::new()),
@@ -349,6 +369,33 @@ impl DevelopCache {
 
     pub fn config(&self) -> &DevelopConfig {
         &self.config
+    }
+
+    /// The remembered catalog facts of image `id` (see [`Self::remember_source`]).
+    pub fn source(&self, id: ImageId) -> Option<SourceImage> {
+        lock(&self.sources).get(&id).cloned()
+    }
+
+    /// Remembers `src` for [`Self::source`]. Callers only remember images whose metadata is
+    /// settled (thumbnail extraction finished: orientation known).
+    pub fn remember_source(&self, src: SourceImage) {
+        let mut map = lock(&self.sources);
+        if map.len() >= MAX_SOURCES && !map.contains_key(&src.id) {
+            map.clear();
+        }
+        map.insert(src.id, src);
+    }
+
+    /// Forgets remembered sources: `Some(ids)` (e.g. thumbnails regenerated: orientation
+    /// may change) or all (`None`, e.g. after an import re-registered files).
+    pub fn forget_sources(&self, ids: Option<&[ImageId]>) {
+        let mut map = lock(&self.sources);
+        match ids {
+            Some(ids) => ids.iter().for_each(|id| {
+                map.remove(id);
+            }),
+            None => map.clear(),
+        }
     }
 
     /// Issues the next ticket for (image, slot). Call on the async side, before any
@@ -390,7 +437,14 @@ impl DevelopCache {
         if let Some(e) = self.cached(src) {
             return Ok(e);
         }
-        let (image, meta) = source::decode_half_size_meta(&src.path)?;
+        let decoded = decode_source(&src.path);
+        let (image, meta) = match decoded {
+            Ok(d) => d,
+            Err(e) => {
+                lock(&self.inner.decoding).remove(&src.id);
+                return Err(e);
+            }
+        };
         let entry = Arc::new(Entry {
             path: src.path.clone(),
             image,
@@ -1019,6 +1073,51 @@ mod tests {
     fn render_url_format() {
         let url = render_url(42, RenderSlot::Detail, 7);
         assert!(url.ends_with("/render/42/detail?v=7"), "{url}");
+    }
+
+    /// Phase 8 error states: renders of a moved original / an undecodable file fail with
+    /// actionable messages (no panic, nothing cached), and the decode lock is released.
+    #[test]
+    fn missing_and_undecodable_originals_have_actionable_errors() {
+        use crate::ipc::error::ErrorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let luts = LutLibrary::new(dir.path().join("luts"));
+        let opts = RenderOptions { max_edge: 512, slot: RenderSlot::Main, region: None };
+        let adj = ParametricAdjustments::default();
+
+        let gone = SourceImage { id: 1, path: dir.path().join("DSC0001.ARW"), orientation: None };
+        let e = cache.render(cache.ticket(1, RenderSlot::Main), &gone, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert!(e.message.starts_with(crate::raw::access::MISSING_PREFIX), "{}", e.message);
+        assert_eq!(cache.info(&gone).unwrap_err().kind, ErrorKind::NotFound);
+
+        let junk = dir.path().join("DSC0002.ARW");
+        std::fs::write(&junk, b"II*\0not a raw at all").unwrap();
+        let bad = SourceImage { id: 2, path: junk, orientation: None };
+        let e = cache.render(cache.ticket(2, RenderSlot::Main), &bad, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Io);
+        assert!(e.message.starts_with("Could not decode") && e.message.contains("damaged"), "{}", e.message);
+        assert_eq!(cache.cached_count(), 0);
+        assert!(lock(&cache.inner.decoding).is_empty(), "decode locks released on failure");
+    }
+
+    #[test]
+    fn remembered_sources_are_bounded_and_forgotten() {
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let src = |id: ImageId| SourceImage { id, path: PathBuf::from(format!("/x/{id}.arw")), orientation: Some(6) };
+        assert_eq!(cache.source(1), None);
+        cache.remember_source(src(1));
+        cache.remember_source(src(2));
+        assert_eq!(cache.source(1), Some(src(1)));
+        cache.forget_sources(Some(&[1]));
+        assert_eq!((cache.source(1), cache.source(2)), (None, Some(src(2))));
+        cache.forget_sources(None);
+        assert_eq!(cache.source(2), None);
+        for id in 0..(MAX_SOURCES as i64 + 10) {
+            cache.remember_source(src(id));
+        }
+        assert!(lock(&cache.sources).len() <= MAX_SOURCES);
     }
 
     fn get(cache: &DevelopCache, uri: &str) -> http::Response<Vec<u8>> {

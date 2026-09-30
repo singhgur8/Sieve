@@ -365,6 +365,28 @@ mod tests {
         assert_eq!(s, ImportStatus { total: 3, pending: 1, ready: 1, failed: 1, running: true });
     }
 
+    /// Phase 8: a file that vanished between import and extraction (card pulled, folder
+    /// moved) fails with the missing-original message; the pipeline carries on.
+    #[test]
+    fn vanished_file_fails_with_missing_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = IngestConfig { catalog_path: dir.path().join("cat.sqlite"), cache_dir: dir.path().join("cache") };
+        let conn = db::open(&config.catalog_path).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms, imported_at)
+             VALUES (1, 1, '{}', 'gone.arw', 'arw', 'sony', 1, 0, 0);
+             INSERT INTO thumbnails (image_id) VALUES (1);",
+            dir.path().join("gone.arw").display()
+        ))
+        .unwrap();
+        let rec = Recorder::default();
+        let stats = run_until_idle(&config, &rec, &AtomicBool::new(true)).unwrap();
+        assert_eq!((stats.done, stats.failed), (1, 1));
+        let failed = rec.failed.lock().unwrap();
+        assert!(failed[0].reason.starts_with(crate::raw::access::MISSING_PREFIX), "{}", failed[0].reason);
+    }
+
     #[derive(Default)]
     struct Recorder {
         ready: Mutex<Vec<ThumbnailReady>>,
