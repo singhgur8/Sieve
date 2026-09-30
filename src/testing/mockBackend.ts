@@ -6,6 +6,8 @@ import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
 import { completeAdjustments, lerpAdjustments } from "../ipc";
 import type {
+  DevelopWarning,
+  LookProfileInfo,
   BurstGroup,
   CatalogState,
   CullSnapshot,
@@ -110,6 +112,14 @@ function rng(seed: number) {
   };
 }
 
+const MOCK_LOOKS: LookProfileInfo[] = [
+  { uuid: "B952C231111CD8E0ECCF14B86BAA7077", name: "Adobe Color", group: "Adobe Raw", supportsAmount: false, monochrome: false, cameraProfile: "Adobe Standard", available: true },
+  { uuid: "0CFE8F8AB5F63B2A73CE0B0077D20817", name: "Adobe Monochrome", group: "Adobe Raw", supportsAmount: false, monochrome: true, cameraProfile: "Adobe Standard", available: true },
+  { uuid: "AAAA0000000000000000000000000001", name: "Vintage 01", group: "Vintage", supportsAmount: true, monochrome: false, cameraProfile: null, available: true },
+  { uuid: "AAAA0000000000000000000000000002", name: "Vintage 02", group: "Vintage", supportsAmount: true, monochrome: false, cameraProfile: null, available: true },
+  { uuid: "BBBB0000000000000000000000000001", name: "Modern 05", group: "Modern", supportsAmount: true, monochrome: false, cameraProfile: null, available: false },
+];
+
 export function installMockBackend(count: number) {
   window.__ipcLog = [];
   const rand = rng(42);
@@ -152,8 +162,9 @@ export function installMockBackend(count: number) {
       isBurstKeeper: inBurst && i % 25 === 1,
       sceneId: null,
       isSceneAnchor: false,
-      companionPath: null,
-      developWarnings: [],
+      // Every 9th frame has a camera JPEG sibling; every 10th carries Lightroom masks (unsupported).
+      companionPath: id % 9 === 0 ? `/shoot/DSC${String(id).padStart(5, "0")}.JPG` : null,
+      developWarnings: id % 10 === 0 ? [{ code: "masks_unsupported", detail: "2 mask groups" }] : [],
       tags,
       quality: {
         overall,
@@ -363,7 +374,8 @@ export function installMockBackend(count: number) {
       seq,
       url: `/mock/render/${id}/${o.slot}?${q}`,
       width: o.maxEdge,
-      height: Math.round(o.maxEdge * (o.region ? 1 : 2 / 3)),
+      // A crop changes the frame's aspect (mock frames are 3:2, orientation 1).
+      height: Math.round(o.maxEdge * (o.region ? 1 : a.crop?.enabled ? (a.crop.bottom - a.crop.top) / (1.5 * (a.crop.right - a.crop.left)) : 2 / 3)),
       histogram: histogram(a),
       renderMs: 7 + (seq % 5),
       lutMissing: !!a.lut && !luts.some((l) => l.id === a.lut!.id),
@@ -683,20 +695,23 @@ export function installMockBackend(count: number) {
           const h = histOf(args.id as number);
           return jump(args.id as number, h.entries.findIndex((e) => e.id === args.entryId));
         }
-        case "get_develop_info":
-          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000, warnings: [] };
+        case "get_develop_info": {
+          const look = completeAdjustments(getAdj(args.id as number)).profile.look;
+          const warnings: DevelopWarning[] = [...(byId.get(args.id as number)?.developWarnings ?? [])];
+          if (look && !MOCK_LOOKS.find((l) => l.uuid === look.uuid)?.available) warnings.push({ code: "look_unavailable", detail: look.name });
+          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000, warnings };
+        }
         case "list_profiles":
           return {
             imageId: args.id,
             cameraModel: "Sony ILCE-7M4",
             cameraProfiles: [
               { name: "Adobe Standard", group: "Adobe Raw" },
-              { name: "Camera ST", group: "Camera Matching" },
+              { name: "Camera Standard", group: "Camera Matching" },
+              { name: "Camera Portrait", group: "Camera Matching" },
+              { name: "Camera Neutral", group: "Camera Matching" },
             ],
-            looks: [
-              { uuid: "B952C231111CD8E0ECCF14B86BAA7077", name: "Adobe Color", group: "Profiles", supportsAmount: false, monochrome: false, cameraProfile: "Adobe Standard", available: true },
-              { uuid: "0CFE8F8AB5F63B2A73CE0B0077D20817", name: "Adobe Monochrome", group: "Profiles", supportsAmount: false, monochrome: true, cameraProfile: "Adobe Standard", available: true },
-            ],
+            looks: MOCK_LOOKS,
             searchDirs: ["/Library/Application Support/Adobe/CameraRaw/CameraProfiles"],
           };
         case "prepare_develop":
@@ -931,6 +946,8 @@ export function installMockBackend(count: number) {
           }
           return changed;
         }
+        case "import_folder":
+          return { folderId: 1, added: 0, skipped: rows.length, invalid: 0, sidecarsRead: 0, companions: 0 };
         case "get_render_stats":
           return mockStats(args.id as number, 0.5, 0.01);
         case "plugin:dialog|open":

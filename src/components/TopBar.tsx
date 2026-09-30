@@ -1,7 +1,7 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
 import { Aperture, Check, ChevronDown, CloudUpload, Columns2, DownloadCloud, FolderOpen, Grid3x3, Keyboard, Maximize, MoreHorizontal, ScanSearch, Share, SlidersHorizontal, Layers3 } from "lucide-react";
-import type { CatalogState, ShootType, XmpStatus } from "../ipc";
+import type { CatalogState, ImportOptions, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
 import { Menu, menuItem } from "./Menu";
@@ -22,6 +22,8 @@ interface Props {
   hasImages: boolean;
   detecting: boolean;
   onImport: () => void;
+  importOptions: ImportOptions;
+  onImportOptions: (patch: Partial<ImportOptions>) => void;
   onShootType: (t: ShootType) => void;
   onAnalyze: (kind: "pending" | "all") => void;
   onAutoAnalyze: (v: boolean) => void;
@@ -62,10 +64,36 @@ export function TopBar(p: Props) {
     <div className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 px-3" data-testid="top-bar">
       <Aperture className="size-5 shrink-0 text-amber-400" />
       <h1 className="mr-1 font-semibold tracking-tight">Sieve</h1>
-      <button onClick={p.onImport} disabled={p.busy} className={btn} data-testid="import-button" title={`Import a shoot folder${hint("import")}`}>
-        <FolderOpen className="size-4" />
-        {p.busy ? "Importing…" : "Import"}
-      </button>
+      <div className="flex" data-testid="import-split">
+        <button onClick={p.onImport} disabled={p.busy} className={`${btn} rounded-r-none`} data-testid="import-button" title={`Import a shoot folder${hint("import")}`}>
+          <FolderOpen className="size-4" />
+          {p.busy ? "Importing…" : "Import"}
+        </button>
+        <Menu trigger={<ChevronDown className="size-4" />} triggerClass={`${btn} rounded-l-none border-l border-neutral-700 px-1.5`} triggerTestId="import-options" title="Import options" disabled={p.busy}>
+          {(close) => (
+            <div className="w-64 py-1" data-testid="import-options-popover">
+              <label className={`${menuItem} cursor-pointer`}>
+                <input type="checkbox" data-testid="import-include-nonraw" checked={!!p.importOptions.includeNonRaw} onChange={(e) => p.onImportOptions({ includeNonRaw: e.target.checked })} />
+                Include JPEG, HEIC, TIFF, PNG
+              </label>
+              <label className={`${menuItem} cursor-pointer ${p.importOptions.includeNonRaw ? "" : "opacity-40"}`} title="A camera JPEG next to a RAW with the same name is shown as +JPG on the RAW instead of a separate photo">
+                <input type="checkbox" data-testid="import-pair-jpeg" disabled={!p.importOptions.includeNonRaw} checked={!!p.importOptions.pairJpegWithRaw} onChange={(e) => p.onImportOptions({ pairJpegWithRaw: e.target.checked })} />
+                Pair JPEG with its RAW
+              </label>
+              <button
+                className={`${menuItem} border-t border-neutral-800`}
+                data-testid="import-choose"
+                onClick={() => {
+                  close();
+                  p.onImport();
+                }}
+              >
+                <FolderOpen className="size-4" /> Choose folder...
+              </button>
+            </div>
+          )}
+        </Menu>
+      </div>
       <label className="flex items-center gap-1 text-xs text-neutral-400">
         Shoot
         <select

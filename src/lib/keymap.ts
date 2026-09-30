@@ -30,6 +30,8 @@ export type ActionId =
   | "anchor"
   | "before"
   | "split"
+  | "crop"
+  | "cropCommit"
   | "undoAdj"
   | "redoAdj"
   | "undoCull"
@@ -97,7 +99,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "toggleLoupe", group: "Navigate", label: "Grid to Loupe and back", chords: [c(" "), c("Enter"), c("e")], modes: LIB, display: ["Space", "Enter", "E"], where: "Grid, Loupe, Compare" },
   { id: "devToLoupe", group: "Navigate", label: "Open in Loupe", chords: [c("e")], modes: ["develop"], display: ["E"], where: "Develop" },
   { id: "toGrid", group: "Navigate", label: "Back to Grid", chords: [c("g")], modes: ["loupe", "compare", "develop"], display: ["G"], where: "Outside Grid" },
-  { id: "escape", group: "Navigate", label: "Back to Grid (in Grid: clear selection)", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Everywhere (never with a dialog open)" },
+  { id: "escape", group: "Navigate", label: "Back to Grid (in Grid: clear selection; while cropping: cancel the crop)", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Everywhere (never with a dialog open)" },
   { id: "develop", group: "Navigate", label: "Develop", chords: [c("d")], modes: LIB, display: ["D"], where: "Grid, Loupe, Compare" },
   { id: "compare", group: "Navigate", label: "Compare (from Compare: back to Loupe)", chords: [c("c")], modes: LIB, display: ["C"], where: "Grid, Loupe, Compare" },
   { id: "tab", group: "Navigate", label: "Switch the focused Compare pane", chords: [c("Tab")], modes: ["compare"], display: ["Tab"], where: "Compare" },
@@ -114,6 +116,8 @@ export const KEYMAP: KeyDef[] = [
   // ---- develop ----
   { id: "before", group: "Develop", label: "Before / after", chords: [c("\\")], modes: ["develop"], display: ["\\"], where: "Develop" },
   { id: "split", group: "Develop", label: "Split view", chords: [c("y")], modes: ["develop"], display: ["Y"], where: "Develop" },
+  { id: "crop", group: "Develop", label: "Crop tool (again: apply)", chords: [c("r")], modes: ["develop"], display: ["R"], where: "Develop" },
+  { id: "cropCommit", group: "Develop", label: "Apply crop (Esc cancels it)", chords: [c("Enter")], modes: ["develop"], display: ["Enter"], where: "While cropping" },
   { id: "undoAdj", group: "Develop", label: "Undo adjustment", chords: [c("z", { mod: true })], modes: ["develop"], display: ["Cmd+Z"], where: "Develop" },
   { id: "redoAdj", group: "Develop", label: "Redo adjustment", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
   { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },

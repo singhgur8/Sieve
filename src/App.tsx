@@ -14,6 +14,7 @@ import { PhotoGrid } from "./components/PhotoGrid";
 import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
 import { DevelopView, type DevelopHandle } from "./components/develop/DevelopView";
 import { AnalysisBar, ImportBar } from "./components/ProgressBars";
+import { useImportOptions } from "./lib/importOptions";
 import { ExportDialog } from "./components/export/ExportDialog";
 import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
 import { useExportJobs } from "./hooks/useExportJobs";
@@ -38,6 +39,9 @@ export default function App() {
   const [size, setSize] = useState(200);
   const [autoAdvance, setAutoAdvance] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [importOpts, setImportOpts] = useImportOptions();
+  const importOptsRef = useRef(importOpts);
+  importOptsRef.current = importOpts;
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ ids: number[]; scope: string } | null>(null);
@@ -362,8 +366,8 @@ export default function App() {
         if (typeof path !== "string") return;
         setBusy(true);
         try {
-          const s = await unwrap(commands.importFolder(path, { recursive: true }));
-          setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read)`);
+          const s = await unwrap(commands.importFolder(path, importOptsRef.current));
+          setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read${s.companions > 0 ? `, ${s.companions} JPEG pairs` : ""})`);
           await status.refreshCatalog();
           await lib.reload();
         } finally {
@@ -487,6 +491,7 @@ export default function App() {
       case "toGrid":
         return changeMode("grid");
       case "escape":
+        if (mode === "develop" && develop.current?.cancelCrop()) return;
         if (mode !== "grid") changeMode("grid");
         else sel.clear();
         return;
@@ -524,6 +529,10 @@ export default function App() {
         return loupe.current?.cycleFace(e.shiftKey ? -1 : 1);
       case "info":
         return loupe.current?.cycleInfo();
+      case "crop":
+        return develop.current?.toggleCrop();
+      case "cropCommit":
+        return void develop.current?.commitCrop();
       case "before":
         return develop.current?.toggleBefore();
       case "split":
@@ -573,6 +582,8 @@ export default function App() {
         hasImages={ids.length > 0}
         detecting={scenes.detecting}
         onImport={importFolder}
+        importOptions={importOpts}
+        onImportOptions={setImportOpts}
         onShootType={(t: ShootType) =>
           void run(async () => {
             await unwrap(commands.setShootType(t));
