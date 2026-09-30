@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod models;
 pub mod pose;
 pub mod scoring;
+pub mod segment;
 pub mod store;
 pub mod thresholds;
 pub mod worker;
