@@ -1,4 +1,4 @@
-import { Aperture, Check, CloudUpload, DownloadCloud, FolderOpen, ScanSearch } from "lucide-react";
+import { Aperture, Check, CloudUpload, DownloadCloud, FolderOpen, Share, ScanSearch } from "lucide-react";
 import type { CatalogState, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 
@@ -20,6 +20,8 @@ interface Props {
   onApplySuggestions: () => void;
   onWriteXmp: () => void;
   onReadXmp: () => void;
+  onExport: () => void;
+  exportsRunning: number;
 }
 
 export function TopBar(p: Props) {
@@ -76,6 +78,10 @@ export function TopBar(p: Props) {
         <button onClick={p.onReadXmp} disabled={!p.hasSelection} className={btn} title="Read XMP sidecars of the selection into the catalog">
           <DownloadCloud className="size-4" />
           Read from file
+        </button>
+        <button onClick={p.onExport} disabled={!p.hasImages} data-testid="export-button" className={btn} title="Export the selection or the filtered set (Cmd+Shift+E)">
+          <Share className="size-4" />
+          Export{p.exportsRunning > 0 ? ` (${p.exportsRunning} running)` : ""}
         </button>
         <label className="flex items-center gap-1.5 text-xs text-neutral-400">
           <input type="checkbox" data-testid="xmp-auto" checked={c?.xmpAutoSync ?? false} disabled={!c} onChange={(e) => p.onAutoXmp(e.target.checked)} />
