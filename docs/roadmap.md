@@ -117,6 +117,7 @@ copy subsets into `test-data/` for anything that writes.
 - [ ] **QA gate**: the user's 50 AI subject masks (Adaptive: Subject presets; mattes embedded as JPEG XL in crs:Table_*) import and render like Lightroom (decoded mattes); new brush/gradient/range/AI masks work end to end; round trip preserves Lightroom mask data byte-for-byte when unchanged.
 
 ## Phase 8 — Hardening + packaging
+- [ ] **Parity round 2** (rust-engine-dev): halo-free local Shadows at strong edges without losing fit; highlight reconstruction for raw-clipped skies (removes the green/magenta arc, IMG_5698/5674); night/low-key frames (DSCF5919 4.18, DSCF5923 4.56); calibrate Clarity/Texture/Dehaze and Whites+ against Camera Raw. Acceptance: held-out mean ≤ 2.5, no frame > 4, halo ≤ 4/255 on the step probe.
 - [ ] **Crop straighten preview** (frontend-dev + rust-engine-dev): live rotation preview while dragging the crop angle (Lightroom parity); currently applied only on commit.
 - [ ] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
 - [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
