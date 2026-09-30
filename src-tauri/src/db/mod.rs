@@ -167,10 +167,12 @@ fn check_on_first_open(path: &Path) -> CatalogHealth {
             return CatalogHealth::Ok;
         }
     }
-    // Healthy: back up before migrations and at most once per interval.
+    // Healthy: back up before migrations and at most once per interval. A catalog without
+    // images is never backed up, so a fresh catalog (e.g. after a damaged one was replaced)
+    // cannot rotate the good backups away.
     let pending = schema_version(path).map(|v| (v as usize) < schema::MIGRATIONS.len()).unwrap_or(false);
     let stale = list_backups(path).first().is_none_or(|b| now_ms() - b.modified_ms >= BACKUP_INTERVAL_MS);
-    if pending || stale {
+    if (pending || stale) && has_images(path) {
         if let Err(e) = backup(path) {
             eprintln!("catalog {}: backup failed: {}", path.display(), e.message);
         }
@@ -197,6 +199,13 @@ pub fn integrity(path: &Path) -> rusqlite::Result<Option<String>> {
 fn schema_version(path: &Path) -> rusqlite::Result<i64> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     conn.pragma_query_value(None, "user_version", |r| r.get(0))
+}
+
+/// The catalog holds at least one image (`false` if unreadable or pre-schema).
+fn has_images(path: &Path) -> bool {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .and_then(|c| c.query_row("SELECT EXISTS (SELECT 1 FROM images)", [], |r| r.get(0)))
+        .unwrap_or(false)
 }
 
 fn aside_path(path: &Path) -> PathBuf {
@@ -427,6 +436,13 @@ mod tests {
                 tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
                 tx.commit().unwrap();
             }
+            conn.execute_batch(
+                "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0);",
+            )
+            .unwrap();
         }
         backup(&old).unwrap();
         let conn = open(&old).unwrap();
@@ -496,6 +512,11 @@ mod tests {
         assert!(moved_to.exists());
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(v as usize, schema::MIGRATIONS.len());
+        // The fresh (empty) catalog never rotates older backups away.
+        drop(conn);
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert!(list_backups(&path).is_empty());
     }
 
     #[test]
