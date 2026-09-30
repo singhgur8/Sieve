@@ -51,7 +51,7 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 - [x] Phase 2: Ultra-fast embedded thumbnail extraction pipeline (Sony, Fuji, Canon)
 - [x] Phase 3: Culling & Burst detection worker with tag emission
 - [x] Phase 4: Virtualized Photo Grid + Tag Filter + Loupe Zoom View
-- [ ] Phase 5: Parametric Slider Engine, .CUBE LUT Parser & XMP Exporter
+- [x] Phase 5: Parametric Slider Engine, .CUBE LUT Parser & XMP Exporter
 - [ ] Phase 6: Full RAW internal demosaic & JPEG export engine
 - [ ] Phase 7: Anchor-photo scene matching (One-Shot relative grading)
 
