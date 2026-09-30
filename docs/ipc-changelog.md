@@ -502,3 +502,7 @@ Who updates what
   `defaultAdjustments(entry.format)` for "neutral" / before, `completeAdjustments` when reading, and
   `DEFAULT_SYNC_FIELDS` as the Sync default. Replace `neutralAdjustments()` in `src/lib/adjust.ts` with
   `defaultAdjustments(format)`.
+
+## v11.1 — 2026-09-30 (doc-only)
+- `CullThresholds.overexposedClipPct` now means the share of a subject face's skin that is blown (every channel ≥ 250); a frame > 60% blown also counts. Saved overrides from earlier versions are read with the new meaning (stricter).
+- `QualityScore.suggestedPick`: burst non-keepers are capped below the keeper, never rejected for being duplicates. No type changes.

@@ -72,7 +72,10 @@ export const commands = {
 	underexposedMeanLuma: number,
 	/**  Share of shadow-clipped pixels above this means `underexposed`. 0..=1. */
 	underexposedClipPct: number,
-	/**  Share of highlight-clipped pixels above this means `overexposed`. 0..=1. */
+	/**
+	 *  Share of a subject face's skin that is blown (every channel >= 250) above which the frame is
+	 *  `overexposed`; a frame more than 60% blown also counts. 0..=1.
+	 */
 	overexposedClipPct: number,
 	/**  Max Hamming distance (0..=64) between 64-bit perceptual hashes of frames in one burst. */
 	burstHashDistance: number,
@@ -728,7 +731,10 @@ export type CullThresholds = {
 	underexposedMeanLuma: number,
 	/**  Share of shadow-clipped pixels above this means `underexposed`. 0..=1. */
 	underexposedClipPct: number,
-	/**  Share of highlight-clipped pixels above this means `overexposed`. 0..=1. */
+	/**
+	 *  Share of a subject face's skin that is blown (every channel >= 250) above which the frame is
+	 *  `overexposed`; a frame more than 60% blown also counts. 0..=1.
+	 */
 	overexposedClipPct: number,
 	/**  Max Hamming distance (0..=64) between 64-bit perceptual hashes of frames in one burst. */
 	burstHashDistance: number,
@@ -1724,7 +1730,8 @@ export type QualityScore = {
 	 */
 	suggestedRating: number,
 	/**
-	 *  Engine's suggested flag (burst non-keepers and hard defects lean `reject`).
+	 *  Engine's suggested flag. Only unrecoverable defects suggest `reject`; burst non-keepers are
+	 *  capped below the keeper (never `pick`) but not rejected.
 	 *  Never written to `RawImageEntry.pick` except through `apply_suggestions`.
 	 */
 	suggestedPick: PickFlag,
