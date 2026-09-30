@@ -16,3 +16,8 @@ dist-ssr/
 test-data/
 playwright-report/
 test-results/
+
+# ONNX models are downloaded by scripts/fetch-models.sh (not committed)
+src-tauri/models/*
+!src-tauri/models/README.md
+!src-tauri/models/checksums.sha256
