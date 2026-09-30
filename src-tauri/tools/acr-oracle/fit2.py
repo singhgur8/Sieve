@@ -68,13 +68,15 @@ def solve(X, Y, W, zero):
     X, Y, W = np.vstack(X), np.concatenate(Y), np.concatenate(W)
     K = X.shape[1]
     D = np.diff(np.eye(K), 2, axis=0)
+    Xw = X * W[:, None]
+    G = Xw.T @ Xw
+    # Anchor the inactive side at exactly 0 (strong relative to the data term).
     P = np.zeros(K)
     if zero == "bright":
-        P[fl.KNOTS >= 2.5] = 1e6
+        P[fl.KNOTS >= 3.0] = 1e4 * np.mean(np.diag(G))
     else:
-        P[fl.KNOTS <= -9.0] = 1e6
-    Xw = X * W[:, None]
-    A = Xw.T @ Xw + 3e-2 * (W ** 2).sum() / K * D.T @ D + np.diag(P) + 1e-6 * np.eye(K)
+        P[fl.KNOTS <= -9.0] = 1e4 * np.mean(np.diag(G))
+    A = G + (3e-2 if zero == "bright" else 3e-1) * (W ** 2).sum() / K * D.T @ D + np.diag(P) + 1e-6 * np.eye(K)
     return np.linalg.solve(A, Xw.T @ (Y * W))
 
 

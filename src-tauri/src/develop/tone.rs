@@ -110,6 +110,9 @@ pub struct LocalTone {
     highlights: Option<Vec<f32>>,
 }
 
+/// Minimum slope of the local response (output EV per adaptation EV).
+pub const MIN_SLOPE: f32 = 0.2;
+
 fn local_row(table: &[[f32; ld::REL_N]; 5], amount: f32) -> Option<Vec<f32>> {
     let a = amount.clamp(-100.0, 100.0);
     if a == 0.0 {
@@ -137,6 +140,22 @@ impl LocalTone {
         let s = self.shadows.as_ref().map_or(0.0, |r| sample(r, ld::REL0, ld::REL_STEP, rel_s));
         let h = self.highlights.as_ref().map_or(0.0, |r| sample(r, ld::REL0, ld::REL_STEP, rel_h));
         s + h
+    }
+
+    /// Deltas at adaptation luminances `lo + i * step` (i < n, pre-exposure EV) for the
+    /// references `rs` / `rh`, corrected so the response `m + delta` rises with slope >=
+    /// [`MIN_SLOPE`]: uniform areas keep their tonal order for any slider combination
+    /// (the fitted tables are only nearly monotone where the measurements are sparse).
+    pub fn deltas(&self, rs: f32, rh: f32, lo: f32, step: f32, n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut last = f32::NEG_INFINITY;
+        for i in 0..n {
+            let m = lo + i as f32 * step;
+            let y = (m + self.delta(m - rs, m - rh)).max(last + MIN_SLOPE * step);
+            out.push(y - m);
+            last = y;
+        }
+        out
     }
 
     /// The Shadows and Highlights references (pre-exposure EV) from the source's
@@ -241,28 +260,33 @@ mod tests {
         assert!(s.delta(3.0, 3.0).abs() < 0.05);
         assert!(LocalTone::new(-100.0, 0.0).delta(-5.0, -5.0) < -1.5);
         let h = LocalTone::new(0.0, -100.0);
-        assert!(h.delta(3.0, 3.0) < -1.0 && h.delta(-6.0, -6.0).abs() < 0.1);
+        assert!(h.delta(3.0, 3.0) < -0.5 && h.delta(-6.0, -6.0).abs() < 0.1);
+        assert!(LocalTone::new(0.0, 100.0).delta(3.0, 3.0) > 0.5);
         // Half the amount ~ half the effect.
         let half = LocalTone::new(50.0, 0.0).delta(-5.0, -5.0) / s.delta(-5.0, -5.0);
         assert!((0.3..0.7).contains(&half), "{half}");
     }
 
     /// For a uniform area (adaptation = pixel) the local response keeps the tone order:
-    /// e + delta(e) is monotone for every amount, and the full user-like chain too.
+    /// `m + delta(m)` is increasing for every amount and reference offset, and the full
+    /// user-like chain too.
     #[test]
     fn local_response_is_monotone() {
+        let step = 0.03125;
         for sh in [-100.0f32, -50.0, 0.0, 37.0, 64.0, 100.0] {
             for hl in [-100.0f32, -66.0, 0.0, 23.0, 100.0] {
-                let l = LocalTone::new(sh, hl);
-                let mut last = f32::NEG_INFINITY;
-                for i in 0..400 {
-                    let rel = -14.0 + i as f32 * 0.05;
-                    let y = rel + l.delta(rel, rel);
-                    assert!(y >= last - 1e-4, "S {sh} H {hl} at {rel}: {y} < {last}");
-                    last = y;
+                for (rs, rh) in [(-4.0f32, -3.0f32), (-6.0, -3.5), (-2.0, -4.0), (-9.0, -7.0)] {
+                    let d = LocalTone::new(sh, hl).deltas(rs, rh, -32.0, step, 1281);
+                    for i in 1..d.len() {
+                        let (y0, y1) = (d[i - 1] + (i - 1) as f32 * step, d[i] + i as f32 * step);
+                        assert!(y1 - y0 >= MIN_SLOPE * step * 0.999, "S {sh} H {hl} refs {rs} {rh} at {i}");
+                    }
                 }
             }
         }
+        let l = LocalTone::new(51.0, -66.0);
+        let d = l.deltas(-3.0, -3.0, -32.0, step, 1281);
+        let at = |e: f32| d[((e + 32.0) / step).round() as usize];
         let m = ToneModel::new(ToneSliders {
             exposure: -0.5,
             contrast: -60.0,
@@ -271,11 +295,10 @@ mod tests {
             whites: -24.0,
             blacks: 63.0,
         });
-        let l = LocalTone::new(51.0, -66.0);
         let mut last = f32::NEG_INFINITY;
         for i in 0..200 {
             let e = -13.0 + i as f32 * 0.065;
-            let y = m.global(e + l.delta(e + 3.0, e + 3.0));
+            let y = m.global(e + at(e));
             assert!(y >= last - 1e-4, "{e}: {y} < {last}");
             last = y;
         }

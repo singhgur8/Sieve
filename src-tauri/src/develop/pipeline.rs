@@ -210,11 +210,6 @@ struct EvTable {
 }
 
 impl EvTable {
-    fn new(lo: f32, hi: f32, n: usize, f: impl Fn(f32) -> f32) -> Self {
-        let step = (hi - lo) / (n - 1) as f32;
-        EvTable { lo, inv_step: 1.0 / step, values: (0..n).map(|i| f(lo + i as f32 * step)).collect() }
-    }
-
     #[inline]
     fn eval(&self, x: f32) -> f32 {
         let t = ((x - self.lo) * self.inv_step).max(0.0);
@@ -880,7 +875,11 @@ fn develop(
     let ctx = input.tone.or(own_ctx.as_ref());
     if let Some(c) = ctx.filter(|_| need_base) {
         let (rs, rh) = LocalTone::references(&c.stats, adj.exposure + profile.baseline_ev);
-        local.tone_local = Some(EvTable::new(-32.0, 8.0, 1280, |m| local_tone.delta(m - rs, m - rh)));
+        const LO: f32 = -32.0;
+        const N: usize = 1281;
+        let step = 40.0 / (N - 1) as f32;
+        let values = local_tone.deltas(rs, rh, LO, step, N);
+        local.tone_local = Some(EvTable { lo: LO, inv_step: 1.0 / step, values });
     }
     let need_clar = local.clarity != 0.0;
     let need_tex = local.texture != 0.0;
@@ -976,9 +975,7 @@ fn develop(
             let p = &mut row[x * 3..x * 3 + 3];
             let mut v = [p[0], p[1], p[2]];
             let adapt = match (&local.tone_local, ctx) {
-                (Some(_), Some(c)) => {
-                    Some(c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy))
-                }
+                (Some(_), Some(c)) => Some(c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy)),
                 _ => None,
             };
             if adapt.is_some() || clar.is_some() || tex.is_some() || haze.is_some() || local.dehaze < 0.0 {
@@ -1141,8 +1138,7 @@ impl ToneContext {
             LO + NB as f32 / BINS_PER_EV
         };
         let key = (total / n as f64) as f32;
-        let stats =
-            ToneStats { key, p50: pct(0.5), p90: pct(0.9), p95: pct(0.95), p99: pct(0.99), white: pct(0.995) };
+        let stats = ToneStats { key, p50: pct(0.5), p90: pct(0.9), p95: pct(0.95), p99: pct(0.99), white: pct(0.995) };
         // Guided filters on the centred field (f32 variance precision).
         grid.iter_mut().for_each(|v| *v -= key);
         let long = gw.max(gh) as f32;

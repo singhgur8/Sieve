@@ -25,6 +25,7 @@
 
 pub mod camera;
 pub mod history;
+mod local_tone_data;
 mod param_data;
 pub mod parity;
 pub mod pipeline;
@@ -32,7 +33,6 @@ pub mod presets;
 pub mod source;
 pub mod tone;
 mod tone_data;
-mod local_tone_data;
 pub mod wb;
 
 use std::collections::{HashMap, VecDeque};
