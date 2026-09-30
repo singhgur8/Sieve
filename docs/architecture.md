@@ -581,6 +581,17 @@ per-group curves / colour tint blend after the global point curves. Mask weights
 components) so local slider drags only rebuild the planes. Range masks read a guide image after global WB +
 exposure. Unmasked images pay nothing (`LocalPlanes::build` returns `None`).
 
+Implementation (Phase 7c integration): `develop/masks/render.rs` resolves + loads the mattes of a render
+(`ResolvedMattes`, Sieve mattes refined once against a neutral sensor-frame render), evaluates / caches the group
+weights (`local_planes`) and is called by `DevelopCache::{render, render_image}` (preview, scene stats) and by the
+export (`export_one`, after `compute_missing` has run the Segmenter). `develop/local.rs` (`LocalOps`) is the
+per-pixel side inside `pipeline::develop`: stage A local WB (matrix), stage C Shadows/Highlights/Clarity/Texture/
+Dehaze amounts, stage D local tone as an input gain before the global LUT (exact global slider response), Hue /
+Saturation in Oklab, group curves/colour after the LUT (display-linear ProPhoto), stage E Sharpness/Noise.
+Moire/Defringe are stored and round-tripped but not rendered. Scales fitted to Camera Raw: `docs/decisions.md`.
+Tools: `examples/mask_render.rs` (renders the user's masked frames with/without masks, ΔE vs Camera Raw),
+`examples/mask_bench.rs` (latency through `DevelopCache`).
+
 ### AI mattes
 - Stored in `mask_cache` + PNG files (`<cacheDir>/masks/<id>/<digest>.png`), with sensor-frame bounds; sampled
   bilinearly at render resolution.
