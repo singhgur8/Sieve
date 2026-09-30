@@ -5,7 +5,7 @@
 //! drains (and ingest is idle) it rescores every analyzed image from stored metrics and
 //! regroups bursts in one transaction, then emits `AnalysisFinished`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex};
@@ -19,11 +19,11 @@ use tauri_specta::Event;
 use super::bursts::{apply_pins, demote, group_bursts};
 use super::store::{self, BurstRow};
 use super::{score, AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
-use crate::db::{self, now_ms, repo};
+use crate::db::{self, now_ms, projects, repo};
 use crate::ingest::Ingest;
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::events::{AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady};
-use crate::ipc::types::{AnalysisScope, ImageId};
+use crate::ipc::types::{AnalysisScope, CullThresholds, ImageId, ShootType};
 
 /// Images fetched per round trip.
 const BATCH: u32 = 32;
@@ -202,10 +202,11 @@ pub fn run_until_idle(config: &AnalysisConfig, sink: &dyn AnalysisSink, flags: &
         }
         progress.maybe_emit(&conn, sink, true)?;
 
-        let (shoot_type, thresholds) = {
-            let st = repo::shoot_type(&conn)?;
-            (st, repo::cull_thresholds(&conn, st)?)
-        };
+        // Each image is scored with its project's shoot type (IPC v14).
+        let mut shoot = ShootTypes::default();
+        for (id, _) in &batch {
+            shoot.of_image(&conn, *id)?;
+        }
         let (tx, rx) = mpsc::channel::<Outcome>();
         let cancel = &flags.cancel;
         std::thread::scope(|s| -> AppResult<()> {
@@ -226,6 +227,7 @@ pub fn run_until_idle(config: &AnalysisConfig, sink: &dyn AnalysisSink, flags: &
             for out in rx {
                 match out.result {
                     Ok(metrics) => {
+                        let (shoot_type, thresholds) = shoot.of_image(&conn, out.id)?;
                         let scored = score(&metrics, &thresholds, shoot_type);
                         store::record_measured(&mut conn, out.id, &metrics, &scored)?;
                         stats.analyzed += 1;
@@ -282,14 +284,17 @@ impl Progress {
 /// thresholds, regroup bursts per folder, demote non-keepers, write everything in one
 /// transaction. Returns the number of burst groups.
 pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
-    let shoot_type = repo::shoot_type(conn)?;
-    let thresholds = repo::cull_thresholds(conn, shoot_type)?;
+    let mut shoot = ShootTypes::default();
     let window: u32 = conn
         .query_row("SELECT value FROM catalog_meta WHERE key = 'burst_window_ms'", [], |r| r.get::<_, String>(0))?
         .parse()
         .unwrap_or(1500);
     let analyzed = store::load_analyzed(conn)?;
-    let mut scored: Vec<_> = analyzed.iter().map(|a| score(&a.metrics, &thresholds, shoot_type)).collect();
+    let mut scored = Vec::with_capacity(analyzed.len());
+    for a in &analyzed {
+        let (shoot_type, thresholds) = shoot.of_folder(conn, a.folder_id, a.id)?;
+        scored.push(score(&a.metrics, &thresholds, shoot_type));
+    }
 
     let mut by_folder: BTreeMap<i64, Vec<(BurstFrame, usize)>> = BTreeMap::new();
     for (i, a) in analyzed.iter().enumerate() {
@@ -301,12 +306,14 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     }
     let pins = store::pinned_keepers(conn)?;
     let mut rows = Vec::new();
-    for frames in by_folder.values() {
+    for (folder, frames) in &by_folder {
+        let Some((first, _)) = frames.first() else { continue };
+        let burst_hash_distance = shoot.of_folder(conn, *folder, first.id)?.1.burst_hash_distance;
         let index: std::collections::HashMap<ImageId, usize> = frames.iter().map(|(f, i)| (f.id, *i)).collect();
         let times: std::collections::HashMap<ImageId, i64> =
             frames.iter().map(|(f, _)| (f.id, f.captured_at_ms)).collect();
         let plain: Vec<BurstFrame> = frames.iter().map(|(f, _)| *f).collect();
-        for mut b in group_bursts(&plain, window, thresholds.burst_hash_distance) {
+        for mut b in group_bursts(&plain, window, burst_hash_distance) {
             apply_pins(&mut b, &pins, |m| scored[index[&m]].quality.overall);
             let keeper_rating = scored[index[&b.keeper]].quality.suggested_rating;
             for &m in &b.members {
@@ -333,6 +340,53 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     Ok(n)
 }
 
+/// Shoot type + thresholds per image, from its project (`db::projects::shoot_type_of_image`;
+/// the catalog default for images outside a project), memoized per image / folder and per
+/// shoot type. A folder belongs to exactly one project, so bursts (grouped per folder) use
+/// one shoot type.
+#[derive(Default)]
+struct ShootTypes {
+    by_image: HashMap<ImageId, ShootType>,
+    by_folder: HashMap<i64, ShootType>,
+    thresholds: HashMap<ShootType, CullThresholds>,
+}
+
+impl ShootTypes {
+    fn thresholds(&mut self, conn: &Connection, st: ShootType) -> AppResult<(ShootType, CullThresholds)> {
+        if let Some(t) = self.thresholds.get(&st) {
+            return Ok((st, t.clone()));
+        }
+        let t = repo::cull_thresholds(conn, st)?;
+        self.thresholds.insert(st, t.clone());
+        Ok((st, t))
+    }
+
+    fn of_image(&mut self, conn: &Connection, id: ImageId) -> AppResult<(ShootType, CullThresholds)> {
+        let st = match self.by_image.get(&id) {
+            Some(st) => *st,
+            None => {
+                let st = projects::shoot_type_of_image(conn, id)?;
+                self.by_image.insert(id, st);
+                st
+            }
+        };
+        self.thresholds(conn, st)
+    }
+
+    /// Shoot type of `folder`, resolved through one of its images (`image`).
+    fn of_folder(&mut self, conn: &Connection, folder: i64, image: ImageId) -> AppResult<(ShootType, CullThresholds)> {
+        let st = match self.by_folder.get(&folder) {
+            Some(st) => *st,
+            None => {
+                let st = projects::shoot_type_of_image(conn, image)?;
+                self.by_folder.insert(folder, st);
+                st
+            }
+        };
+        self.thresholds(conn, st)
+    }
+}
+
 /// Runs the worker synchronously on the calling thread (eval tool, tests).
 pub fn run_blocking(config: &AnalysisConfig, sink: &dyn AnalysisSink) -> AppResult<RunStats> {
     let flags = WorkerFlags::default();
@@ -343,6 +397,7 @@ pub fn run_blocking(config: &AnalysisConfig, sink: &dyn AnalysisSink) -> AppResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::types::ShootType;
     use crate::ml::scoring::tests::{face, metrics};
     use crate::ml::MODEL_VERSION;
     use std::path::PathBuf;
@@ -436,6 +491,48 @@ mod tests {
             params![id, MODEL_VERSION, m.phash as i64, serde_json::to_string(m).unwrap()],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rescore_scores_each_image_with_its_project_shoot_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 4, &[]);
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        repo::set_shoot_type(&conn, ShootType::General).unwrap();
+        // Folder 1 (images 1, 2) -> wedding project; folder 2 (images 3, 4) -> sports project.
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, shoot_type, created_at) VALUES (10, 'w', 'wedding', 0), (11, 's', 'sports', 0);
+             UPDATE folders SET project_id = 10 WHERE id = 1;
+             INSERT INTO folders (id, path, added_at, project_id) VALUES (2, '/g', 0, 11);
+             UPDATE images SET folder_id = 2, captured_at_ms = captured_at_ms + 60000 WHERE id IN (3, 4);",
+        )
+        .unwrap();
+        // Same metrics everywhere (a soft, closed-eye face), phashes far apart (no bursts).
+        let mut m = metrics(vec![face(0.4, 0.15, 0.2, 0.05)]);
+        for id in 1..=4 {
+            m.phash = [0u64, !0, 0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0][id as usize - 1];
+            store_metrics(&conn, id, &m);
+        }
+        rescore_all(&mut conn).unwrap();
+        let overall = |id: ImageId| -> f32 {
+            db::open(&config.catalog_path)
+                .unwrap()
+                .query_row("SELECT overall FROM quality_scores WHERE image_id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        let expect = |st: ShootType| score(&m, &repo::cull_thresholds(&conn, st).unwrap(), st).quality.overall;
+        let (wedding, sports) = (expect(ShootType::Wedding), expect(ShootType::Sports));
+        assert_ne!(wedding, sports, "test metrics must score differently per shoot type");
+        for (id, want) in [(1, wedding), (2, wedding), (3, sports), (4, sports)] {
+            assert!((overall(id) - want).abs() < 1e-6, "image {id}: {} vs {want}", overall(id));
+        }
+        // Changing a project's shoot type changes only its images at the next rescore.
+        db::open(&config.catalog_path)
+            .unwrap()
+            .execute("UPDATE projects SET shoot_type = 'wedding' WHERE id = 11", [])
+            .unwrap();
+        rescore_all(&mut db::open(&config.catalog_path).unwrap()).unwrap();
+        assert!((overall(3) - wedding).abs() < 1e-6);
     }
 
     #[test]

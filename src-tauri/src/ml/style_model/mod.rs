@@ -24,6 +24,7 @@
 //! - Features ([`features`]): neutral-render statistics, camera/EXIF, scene context.
 //! - Crop and masks are never predicted (framing and subject are per photo).
 
+pub mod eval;
 pub mod features;
 pub mod learn;
 pub mod targets;
@@ -192,6 +193,10 @@ pub struct StyleModel {
     pub outputs: Vec<TargetModel>,
     pub templates: Vec<CameraTemplate>,
     pub global_template: CameraTemplate,
+    /// Median distance (standardized features) of a training frame to its nearest training
+    /// frame of another scene fold; the scale of [`StyleModel::confidence`]. 0 = unknown.
+    #[serde(default)]
+    pub typical_nn_distance: f32,
 }
 
 /// Summary of a training run (for `getStyleStatus` / logs).
@@ -563,8 +568,10 @@ pub fn train(
                     m.cv_mae = *e;
                     cv.insert(format!("{}+knn", m.name), (*e, m.cv_mae_mean));
                 }
-                knn = Some(Knn { k: kk, x: x.clone(), w: w.clone(), y: ys });
             }
+            // Kept even when every blend weight is 0: [`StyleModel::confidence`] measures the
+            // distance to the training frames with it.
+            knn = Some(Knn { k: kk, x: x.clone(), w: w.clone(), y: ys });
         }
     }
 
@@ -596,6 +603,7 @@ pub fn train(
         outputs,
         templates,
         global_template,
+        typical_nn_distance: typical_nn_distance(&x, &fold),
     };
     let report = TrainReport {
         samples: samples.len() as u32,
@@ -608,7 +616,54 @@ pub fn train(
     Ok((model, report))
 }
 
+/// Median over `x` of the Euclidean distance to the nearest row of *another fold* (folds =
+/// scenes, so this is how far a frame of a new scene typically is from the training frames;
+/// at most 2000 rows sampled evenly).
+fn typical_nn_distance(x: &[Vec<f32>], fold: &[usize]) -> f32 {
+    let step = x.len().div_ceil(2000).max(1);
+    let mut d: Vec<f32> = (0..x.len())
+        .step_by(step)
+        .filter_map(|i| {
+            x.iter()
+                .enumerate()
+                .filter(|(j, _)| fold[*j] != fold[i])
+                .map(|(_, r)| dist2(&x[i], r))
+                .min_by(f32::total_cmp)
+                .map(f32::sqrt)
+        })
+        .filter(|v| v.is_finite())
+        .collect();
+    if d.is_empty() {
+        return 0.0;
+    }
+    d.sort_by(f32::total_cmp);
+    d[d.len() / 2]
+}
+
+fn dist2(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).filter(|v| v.is_finite()).sum()
+}
+
 impl StyleModel {
+    /// How well the training edits cover this frame, 0..=1: 1 while the nearest training frame
+    /// is no farther than a new scene's typically is ([`Self::typical_nn_distance`]), decaying
+    /// beyond (0.61 at twice that distance); x0.6 for a camera without training edits.
+    pub fn confidence(&self, ctx: &FrameContext) -> f32 {
+        let camera = if self.templates.iter().any(|t| t.camera_key == ctx.camera_key()) { 1.0 } else { 0.6 };
+        let (Some(knn), true) = (self.knn.as_ref(), self.typical_nn_distance > 0.0) else {
+            return 0.8 * camera;
+        };
+        let q = self.standardizer.apply(&features::feature_vector(ctx));
+        let d = knn.x.iter().map(|r| dist2(r, &q)).min_by(f32::total_cmp).map_or(f32::INFINITY, f32::sqrt);
+        let excess = (d / self.typical_nn_distance - 1.0).max(0.0);
+        let c = (-0.5 * excess).exp() * camera;
+        if c.is_finite() {
+            c.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     /// Predicted settings for a frame: the camera's template + regressed sliders. Crop and
     /// masks are left empty (the caller keeps the frame's own crop if it wants).
     pub fn predict(&self, ctx: &FrameContext) -> StylePrediction {
@@ -796,4 +851,4 @@ fn linear_curve(c: &[[f32; 2]], x: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -408,7 +408,9 @@ pub fn save_features(conn: &mut Connection, items: &[(ImageId, SceneFeatures)]) 
 /// Detection result writer. In one transaction: deletes the `auto` scenes (and `manual` ones
 /// if `replace_manual`) with a member in `scope`, then creates one `auto` scene per group.
 /// Anchor flags of regrouped images survive (up to `Scene::MAX_ANCHORS` per new scene, capture
-/// order). Returns `list_scenes(scope)`.
+/// order), and so does the edit plan: a new scene containing an old scene's representative
+/// takes over its `representative_*` and `applied_*` (user choice first, then an applied one).
+/// Returns `list_scenes(scope)`.
 pub fn replace_scenes(
     conn: &mut Connection,
     scope: impl Into<FolderScope>,
@@ -442,6 +444,20 @@ pub fn replace_scenes(
         let rows = stmt.query_map(params![replace_manual], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
+    // Plan state of every scene the regrouped images leave (deleted ones and any emptied by
+    // the moves).
+    let mut left = doomed.clone();
+    {
+        let mut stmt = tx.prepare_cached("SELECT scene_id FROM images WHERE id = ?1 AND scene_id IS NOT NULL")?;
+        for &id in &all {
+            if let Some(s) = stmt.query_row([id], |r| r.get::<_, SceneId>(0)).optional()? {
+                if !left.contains(&s) {
+                    left.push(s);
+                }
+            }
+        }
+    }
+    let plans = plan_states(&tx, &left)?;
     for chunk in doomed.chunks(500) {
         let ph = vec!["?"; chunk.len()].join(",");
         tx.execute(
@@ -461,9 +477,69 @@ pub fn replace_scenes(
             .collect();
         write_anchors(&tx, id, &keep)?;
         refresh(&tx, id, true, now)?;
+        // Edit-plan state follows the representative into its new scene: a user choice first,
+        // then one with an applied edit, then an automatic one (earliest old scene).
+        let carried = plans
+            .iter()
+            .filter(|p| group.contains(&p.representative_id))
+            .min_by_key(|p| (p.source.as_deref() != Some("user"), p.applied_params_json.is_none(), p.scene_id));
+        if let Some(p) = carried {
+            tx.execute(
+                "UPDATE scenes SET representative_id = ?2, representative_source = ?3, representative_reason = ?4,
+                     applied_at_ms = ?5, applied_params_json = ?6, applied_batch_id = ?7
+                 WHERE id = ?1",
+                params![
+                    id,
+                    p.representative_id,
+                    p.source,
+                    p.reason,
+                    p.applied_at_ms,
+                    p.applied_params_json,
+                    p.applied_batch_id
+                ],
+            )?;
+        }
     }
     let out = list_scenes(&tx, &scope)?;
     tx.commit()?;
+    Ok(out)
+}
+
+/// Guided-workflow state of a scene (IPC v14 `scenes.representative_*` / `applied_*`).
+struct PlanState {
+    scene_id: SceneId,
+    representative_id: ImageId,
+    source: Option<String>,
+    reason: Option<String>,
+    applied_at_ms: Option<i64>,
+    applied_params_json: Option<String>,
+    applied_batch_id: Option<i64>,
+}
+
+/// Plan state of the `scenes` that have a representative.
+fn plan_states(conn: &Connection, scenes: &[SceneId]) -> AppResult<Vec<PlanState>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT representative_id, representative_source, representative_reason, applied_at_ms,
+                applied_params_json, applied_batch_id
+         FROM scenes WHERE id = ?1 AND representative_id IS NOT NULL",
+    )?;
+    let mut out = Vec::new();
+    for &scene_id in scenes {
+        let row = stmt
+            .query_row([scene_id], |r| {
+                Ok(PlanState {
+                    scene_id,
+                    representative_id: r.get(0)?,
+                    source: r.get(1)?,
+                    reason: r.get(2)?,
+                    applied_at_ms: r.get(3)?,
+                    applied_params_json: r.get(4)?,
+                    applied_batch_id: r.get(5)?,
+                })
+            })
+            .optional()?;
+        out.extend(row);
+    }
     Ok(out)
 }
 

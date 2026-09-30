@@ -1,7 +1,7 @@
 use super::*;
 use crate::ipc::types::{WhiteBalance, WhiteBalanceValues};
 
-fn ctx(i: usize, make: &str) -> FrameContext {
+pub(crate) fn ctx(i: usize, make: &str) -> FrameContext {
     let luma = -4.0 + (i % 17) as f32 * 0.25;
     FrameContext {
         format: ImageFormat::Arw,
@@ -31,7 +31,7 @@ fn ctx(i: usize, make: &str) -> FrameContext {
 
 /// A user whose preset sets HSL + vibrance, who brings every frame to the same brightness
 /// and sets a fixed 5600 K.
-fn user_edit(c: &FrameContext) -> ParametricAdjustments {
+pub(crate) fn user_edit(c: &FrameContext) -> ParametricAdjustments {
     let mut a = ParametricAdjustments::default();
     a.hsl.saturation.green = -40.0;
     a.vibrance = 20.0;
@@ -165,4 +165,27 @@ fn refine_solves_exposure_to_the_predicted_output_brightness() {
     let want = -2.0 - c.render.log_mean_luma;
     assert!((out.exposure - want).abs() < 0.1, "exposure {} want {want}", out.exposure);
     assert!(renders <= 8);
+}
+
+#[test]
+fn confidence_drops_away_from_the_training_frames() {
+    let (model, _) = train(&samples(80), &TrainOptions::default(), &|_| {}).unwrap();
+    assert!(model.typical_nn_distance > 0.0);
+    let near = model.confidence(&ctx(7, "Sony"));
+    assert!(near > 0.9, "{near}");
+    let mut far = ctx(7, "Sony");
+    far.render.log_mean_luma = 6.0;
+    far.render.log_percentiles = [4.0; 5];
+    far.render.luma_hist = {
+        let mut h = vec![0.0; 16];
+        h[15] = 1.0;
+        h
+    };
+    let c = model.confidence(&far);
+    assert!(c < near * 0.5, "{c} vs {near}");
+    // Unknown camera: scaled down.
+    assert!(model.confidence(&ctx(7, "Canon")) < near);
+    // Round trip keeps the scale.
+    let back = StyleModel::from_json(&model.to_json()).unwrap();
+    assert_eq!(back.typical_nn_distance, model.typical_nn_distance);
 }
