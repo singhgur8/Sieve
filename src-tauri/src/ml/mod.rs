@@ -23,9 +23,11 @@
 //!   `source = 'user'` rows. Never write `images.rating` / `images.pick`.
 
 pub mod bursts;
+pub mod canonical_face;
 pub mod imgproc;
 pub mod metrics;
 pub mod models;
+pub mod pose;
 pub mod scoring;
 pub mod store;
 pub mod thresholds;
@@ -47,7 +49,7 @@ use crate::ipc::types::{
 
 /// Stored in `image_analysis.model_version` / `quality_scores.model_version`. Bump when
 /// models or measurement code change: rows with another version count as pending.
-pub const MODEL_VERSION: &str = "scrfd10g-2d106-v1";
+pub const MODEL_VERSION: &str = "scrfd10g-2d106-eyecnn-mesh-v3";
 
 // ---------------------------------------------------------------------------
 // Managed state (fixed surface)
@@ -158,6 +160,20 @@ pub struct FaceMetrics {
     /// Frontal enough for EAR / eye-region sharpness (landmarks present and
     /// inter-ocular distance >= `metrics::FRONTAL_MIN` x face height).
     pub frontal: bool,
+    /// Detector box reaches the frame edge (face cut off by the frame).
+    pub truncated: bool,
+    /// Eye-state CNN probability that the *more-open* eye is open (both must look
+    /// closed for a blink).
+    pub eye_open_prob: Option<f32>,
+    /// 3D head pose from FaceMesh V2 (degrees): pitch > 0 = face turned down.
+    pub head_pitch: Option<f32>,
+    pub head_yaw: Option<f32>,
+    /// EAR of the more-open eye from FaceMesh V2 (independent of `ear_*`).
+    pub mesh_ear: Option<f32>,
+    /// Mean luminance 0..=1 of the central face crop (silhouettes / deep shadow are dark).
+    pub face_luma: f32,
+    /// Mouth width / outer eye-corner span (wide = smiling).
+    pub mouth_width: Option<f32>,
 }
 
 /// Tiled whole-frame sharpness over textured tiles (~1024 px luma).
