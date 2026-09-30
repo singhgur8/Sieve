@@ -1,26 +1,32 @@
-//! AI masks for local adjustments (Phase 7c prototype; no IPC surface yet): Select Subject /
-//! Background, Select Sky and People (per-person instances plus face/skin/hair/clothes/eye/
-//! brow/lip/teeth parts). Models, licenses, tensor layouts and measured quality/timings are in
-//! `src-tauri/models/README.md` ("Segmentation models").
+//! AI-mask segmentation engine (Phase 7c): Select Subject / Background, Select Sky, People
+//! (per-person instances plus face/skin/hair/clothes/eye/brow/lip/teeth parts) and Objects
+//! (box prompt). Models, licenses, tensor layouts and measured quality/timings are in
+//! `src-tauri/models/README.md` ("Segmentation models"). The IPC seam is `ml::masking`; the
+//! `SegmentModel` implementations over this engine are in `ml::segment_models`.
 //!
 //! | Mask | Model (license) | Input | EP |
 //! |---|---|---|---|
 //! | subject / background | BiRefNet_lite (MIT) | 1024x1024 | CPU (CoreML rejects the export) |
 //! | sky | skyseg U2-Net (MIT) | 320x320 | CPU (CoreML slower) |
 //! | person boxes | YOLOX-m COCO (Apache-2.0) | 640x640 letterbox | CoreML |
-//! | person instances | EfficientSAM-Ti (Apache-2.0), box + face-point prompts | 1024x1024 | encoder CoreML, decoder CPU |
+//! | person instances, objects | EfficientSAM-Ti (Apache-2.0), box + face-point prompts | 1024x1024 | encoder CoreML, decoder CPU |
 //! | hair / face skin / body skin / clothes | MediaPipe selfie multiclass (Apache-2.0) | 256x256 per person/head crop | CPU |
 //! | eyes / iris / brows / lips / teeth | MediaPipe FaceMesh V2 landmarks (Apache-2.0, `models.rs`) | polygons | CPU |
 //!
-//! Every network output is upsampled to image resolution with a fast *colour guided filter*
-//! (He et al.): the filter coefficients are solved at <= [`WORK_EDGE`] px over the mask's region
-//! and applied with the full-resolution image as guide, which snaps soft low-res masks to real
-//! edges (hair strands, tree/sky boundaries) without a dedicated matting model.
+//! The `*_raw` methods return the **unrefined** network output ([`LowRes`]: a probability
+//! plane at the model's resolution over a region of interest). That is what Sieve stores;
+//! edges are snapped to the render at evaluation time by `ml::refine`. The refined
+//! convenience methods ([`SegmentEngine::subject`], [`SegmentEngine::sky`],
+//! [`SegmentEngine::people`]) refine against the input image (evaluation example).
 //!
-//! Masks are returned as [`Mask`]: an f32 alpha plane (0..1) over a region of interest in
-//! image pixels, so per-person part masks cost only their bounding box.
+//! Work is cached per input image (content key): the subject output (background reuses it),
+//! the SAM image embedding (people and objects share it), person instances, and per person
+//! the parser planes and the FaceMesh features, each computed only when a request needs them.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use fast_image_resize::images::{Image, ImageRef};
@@ -30,7 +36,10 @@ use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use super::models::{nms, Detection, Models, Provider, DET_SIZE};
+use super::models::{nms, Detection, Models, Provider, DET_SIZE, DET_MODEL, EYE_MODEL, LMK_MODEL, MESH_MODEL};
+use super::refine::{self, sample, Guide, RefineParams};
+use crate::develop::masks::AlphaMask;
+use crate::ipc::types::NormRect;
 
 pub const SUBJECT_MODEL: &str = "birefnet_lite.onnx";
 pub const SKY_MODEL: &str = "skyseg.onnx";
@@ -38,14 +47,18 @@ pub const PERSON_MODEL: &str = "yolox_m.onnx";
 pub const SAM_ENCODER_MODEL: &str = "efficientsam_ti_encoder.onnx";
 pub const SAM_DECODER_MODEL: &str = "efficientsam_ti_decoder.onnx";
 pub const PARTS_MODEL: &str = "selfie_multiclass_256x256.onnx";
+/// Files the face pipeline (`models::Models::load`) needs.
+pub const FACE_MODELS: [&str; 4] = [DET_MODEL, LMK_MODEL, EYE_MODEL, MESH_MODEL];
 
 const SUBJECT_SIZE: usize = 1024;
 const SKY_SIZE: usize = 320;
 const PERSON_SIZE: usize = 640;
 const SAM_SIZE: usize = 1024;
 const PARTS_SIZE: usize = 256;
-/// Long edge of the working resolution for guided refinement and SAM mask decoding.
+/// Long edge of the grid SAM masks are decoded on.
 pub const WORK_EDGE: usize = 1024;
+/// Long-edge cap of a person's part grid (the ROI at input resolution below that).
+const PARTS_GRID_EDGE: usize = 1536;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
@@ -57,7 +70,8 @@ const PERSON_NMS: f32 = 0.5;
 const MIN_PERSON_H: f32 = 0.04;
 /// Faces used as person seeds / for FaceMesh parts must be at least this tall (fraction of h).
 const MIN_SEED_FACE: f32 = 0.012;
-const MIN_MESH_FACE_PX: f32 = 40.0;
+/// Faces smaller than this (px) get no FaceMesh features (eyes, brows, lips, teeth).
+pub const MIN_MESH_FACE_PX: f32 = 40.0;
 const MAX_PEOPLE: usize = 24;
 
 // MediaPipe FaceMesh (468 + 10 iris) contours, from `face_mesh_connections.py`.
@@ -79,6 +93,16 @@ pub struct RgbImage<'a> {
     pub data: &'a [u8],
     pub width: usize,
     pub height: usize,
+}
+
+/// Content key of an input image (size + a strided sample of its bytes): the engine's
+/// per-image caches are keyed by it.
+pub fn image_key(img: RgbImage) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (img.width, img.height).hash(&mut h);
+    let stride = (img.data.len() / 65_536).max(1);
+    img.data.iter().step_by(stride).for_each(|b| b.hash(&mut h));
+    h.finish()
 }
 
 /// Soft alpha (0..1) over `[x0, x0 + width) x [y0, y0 + height)` of the image; 0 outside.
@@ -135,13 +159,182 @@ impl Mask {
     }
 }
 
-/// One person: instance mask plus optional parts (same image coordinates).
+/// Unrefined model output: a probability plane (`width x height`, 0..1) stretched over the
+/// image-pixel region `roi = [x0, y0, x1, y1]` (0 outside it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LowRes {
+    pub roi: [usize; 4],
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<f32>,
+}
+
+impl LowRes {
+    /// Empty (all-zero) output over the whole image.
+    pub fn empty(img_w: usize, img_h: usize) -> LowRes {
+        LowRes { roi: [0, 0, img_w.max(1), img_h.max(1)], width: 1, height: 1, data: vec![0.0] }
+    }
+
+    fn scale(&self) -> (f32, f32) {
+        let [x0, y0, x1, y1] = self.roi;
+        (self.width as f32 / (x1 - x0).max(1) as f32, self.height as f32 / (y1 - y0).max(1) as f32)
+    }
+
+    /// Bilinear value at a continuous image-pixel position (0 outside `roi`).
+    pub fn at(&self, x: f32, y: f32) -> f32 {
+        let [x0, y0, x1, y1] = self.roi;
+        if x < x0 as f32 || y < y0 as f32 || x > x1 as f32 || y > y1 as f32 {
+            return 0.0;
+        }
+        let (sx, sy) = self.scale();
+        sample(&self.data, self.width, self.height, (x - x0 as f32) * sx - 0.5, (y - y0 as f32) * sy - 0.5)
+    }
+
+    /// Selected area in image pixels.
+    pub fn area(&self) -> f32 {
+        let (sx, sy) = self.scale();
+        self.data.iter().sum::<f32>() / (sx * sy)
+    }
+
+    /// Placement in the image, normalized.
+    pub fn bounds(&self, img_w: usize, img_h: usize) -> NormRect {
+        let [x0, y0, x1, y1] = self.roi;
+        let (w, h) = (img_w.max(1) as f32, img_h.max(1) as f32);
+        NormRect { x: x0 as f32 / w, y: y0 as f32 / h, width: (x1 - x0) as f32 / w, height: (y1 - y0) as f32 / h }
+    }
+
+    /// 8-bit matte placed in the input image's frame.
+    pub fn to_alpha(&self, img_w: usize, img_h: usize) -> AlphaMask {
+        AlphaMask {
+            width: self.width as u32,
+            height: self.height as u32,
+            bounds: self.bounds(img_w, img_h),
+            data: self.data.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect(),
+        }
+    }
+
+    /// `1 - p` over the whole image.
+    pub fn inverted(&self, img_w: usize, img_h: usize) -> LowRes {
+        if self.roi == [0, 0, img_w, img_h] {
+            return LowRes { data: self.data.iter().map(|v| 1.0 - v).collect(), ..self.clone() };
+        }
+        let mut out = self.resampled([0, 0, img_w, img_h], (self.scale().0 * img_w as f32).ceil() as usize, (self.scale().1 * img_h as f32).ceil() as usize);
+        out.data.iter_mut().for_each(|v| *v = 1.0 - *v);
+        out
+    }
+
+    /// This output sampled onto another grid.
+    pub fn resampled(&self, roi: [usize; 4], width: usize, height: usize) -> LowRes {
+        let (width, height) = (width.max(1), height.max(1));
+        let (kx, ky) = ((roi[2] - roi[0]) as f32 / width as f32, (roi[3] - roi[1]) as f32 / height as f32);
+        let data = (0..width * height)
+            .map(|i| self.at(roi[0] as f32 + ((i % width) as f32 + 0.5) * kx, roi[1] as f32 + ((i / width) as f32 + 0.5) * ky))
+            .collect();
+        LowRes { roi, width, height, data }
+    }
+
+    /// Image-pixel mask (input resolution) over `roi` (refinement input for [`Mask`]s).
+    fn from_mask(m: &Mask) -> LowRes {
+        LowRes { roi: [m.x0, m.y0, m.x0 + m.width, m.y0 + m.height], width: m.width.max(1), height: m.height.max(1), data: if m.data.is_empty() { vec![0.0] } else { m.data.clone() } }
+    }
+
+    /// Tight bounds (image px) of `p > thresh`, if any.
+    pub fn tight_box(&self, thresh: f32) -> Option<[f32; 4]> {
+        let (sx, sy) = self.scale();
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.data[y * self.width + x] > thresh {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        (x0 != usize::MAX).then(|| {
+            [
+                self.roi[0] as f32 + x0 as f32 / sx,
+                self.roi[1] as f32 + y0 as f32 / sy,
+                self.roi[0] as f32 + x1 as f32 / sx,
+                self.roi[1] as f32 + y1 as f32 / sy,
+            ]
+        })
+    }
+}
+
+/// Pixel-wise max of several outputs on one grid (union ROI, finest density, capped at
+/// `max_edge` on the long side).
+pub fn union_all(parts: &[LowRes], max_edge: usize) -> Option<LowRes> {
+    match parts {
+        [] => None,
+        [one] => Some(one.clone()),
+        _ => {
+            let roi = parts.iter().fold([usize::MAX, usize::MAX, 0, 0], |a, p| {
+                [a[0].min(p.roi[0]), a[1].min(p.roi[1]), a[2].max(p.roi[2]), a[3].max(p.roi[3])]
+            });
+            let density = parts.iter().map(|p| p.scale().0.max(p.scale().1)).fold(0.0f32, f32::max);
+            let (rw, rh) = ((roi[2] - roi[0]) as f32, (roi[3] - roi[1]) as f32);
+            let k = density.min(max_edge as f32 / rw.max(rh));
+            let (w, h) = (((rw * k).round() as usize).max(1), ((rh * k).round() as usize).max(1));
+            let mut out = LowRes { roi, width: w, height: h, data: vec![0.0; w * h] };
+            for p in parts {
+                let r = p.resampled(roi, w, h);
+                out.data.iter_mut().zip(&r.data).for_each(|(a, b)| *a = a.max(*b));
+            }
+            Some(out)
+        }
+    }
+}
+
+/// One person instance (unrefined).
 #[derive(Debug, Clone)]
-pub struct Person {
+pub struct Instance {
     /// x0, y0, x1, y1 in image pixels (detector box, or a face-derived box for `from_face`).
     pub bbox: [f32; 4],
     pub score: f32,
     /// True when no person box was detected and the instance was seeded from a face.
+    pub from_face: bool,
+    pub face: Option<Detection>,
+    /// SAM probability over the person's ROI at the [`WORK_EDGE`] grid.
+    pub alpha: LowRes,
+}
+
+impl Instance {
+    /// FaceMesh features (eyes, brows, lips, teeth) can be computed for this person.
+    pub fn has_features(&self) -> bool {
+        self.face.is_some_and(|f| f.bbox[3] - f.bbox[1] >= MIN_MESH_FACE_PX)
+    }
+}
+
+/// Parser output for one person (unrefined; `grid`'s ROI / size).
+#[derive(Debug, Clone)]
+pub struct RegionPlanes {
+    pub grid: LowRes,
+    pub hair: Vec<f32>,
+    pub face_skin: Vec<f32>,
+    pub body_skin: Vec<f32>,
+    pub clothes: Vec<f32>,
+}
+
+/// FaceMesh feature masks (image pixels, over the face ROI).
+#[derive(Debug, Clone)]
+pub struct Features {
+    pub eyes: Mask,
+    pub sclera: Mask,
+    pub iris: Mask,
+    pub brows: Mask,
+    pub lips: Mask,
+    /// Inner-mouth polygon.
+    pub inner: Mask,
+    pub teeth: Mask,
+}
+
+/// One person: refined instance mask plus optional parts (same image coordinates).
+#[derive(Debug, Clone)]
+pub struct Person {
+    pub bbox: [f32; 4],
+    pub score: f32,
     pub from_face: bool,
     pub face: Option<Detection>,
     pub mask: Mask,
@@ -179,8 +372,19 @@ impl SegmentConfig {
     }
 }
 
+/// Per-image work shared between requests (see the module docs).
+#[derive(Default)]
+struct ImageCache {
+    key: u64,
+    subject: Option<Arc<LowRes>>,
+    sam: Option<Arc<Vec<f32>>>,
+    instances: Option<Arc<Vec<Instance>>>,
+    regions: HashMap<usize, Arc<RegionPlanes>>,
+    features: HashMap<usize, Option<Arc<Features>>>,
+}
+
 /// Lazily loaded sessions; each mask type loads only what it needs.
-pub struct Segmenter {
+pub struct SegmentEngine {
     cfg: SegmentConfig,
     subject: Option<Session>,
     sky: Option<Session>,
@@ -190,7 +394,8 @@ pub struct Segmenter {
     parts: Option<Session>,
     faces: Option<Models>,
     resizer: Resizer,
-    /// Wall time per step of the last call, in ms.
+    cache: ImageCache,
+    /// Wall time per step since the last [`Self::clear_timings`], in ms.
     pub timings: Vec<(&'static str, f64)>,
 }
 
@@ -257,7 +462,8 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-impl Segmenter {
+impl SegmentEngine {
+    /// No I/O; sessions load on first use.
     pub fn new(cfg: SegmentConfig) -> Self {
         Self {
             cfg,
@@ -269,8 +475,17 @@ impl Segmenter {
             parts: None,
             faces: None,
             resizer: Resizer::new(),
+            cache: ImageCache::default(),
             timings: Vec::new(),
         }
+    }
+
+    pub fn models_dir(&self) -> &Path {
+        &self.cfg.models_dir
+    }
+
+    pub fn clear_timings(&mut self) {
+        self.timings.clear();
     }
 
     /// Execution providers of the sessions loaded so far (for logs / benchmarks).
@@ -300,6 +515,14 @@ impl Segmenter {
         v
     }
 
+    /// Switches the per-image cache to `img` (dropping the previous image's work).
+    fn enter(&mut self, img: RgbImage) {
+        let key = image_key(img);
+        if self.cache.key != key {
+            self.cache = ImageCache { key, ..Default::default() };
+        }
+    }
+
     /// Stretches `crop` (x, y, w, h in image px; whole image if `None`) to `dw x dh` RGB8.
     fn resize(&mut self, img: RgbImage, crop: Option<[f64; 4]>, dw: usize, dh: usize) -> Result<Vec<u8>, String> {
         let mut out = vec![0u8; dw * dh * 3];
@@ -316,22 +539,24 @@ impl Segmenter {
     }
 
     // -----------------------------------------------------------------------------------
-    // Subject / background
+    // Subject / background / sky
     // -----------------------------------------------------------------------------------
 
-    /// Select Subject: salient foreground matte over the whole image (background = inverse).
-    pub fn subject(&mut self, img: RgbImage) -> Result<Mask, String> {
-        self.timings.clear();
+    /// Select Subject: salient-foreground probability over the whole image at 1024x1024
+    /// (background = inverse). Cached per image.
+    pub fn subject_raw(&mut self, img: RgbImage) -> Result<Arc<LowRes>, String> {
+        self.enter(img);
+        if let Some(s) = &self.cache.subject {
+            return Ok(s.clone());
+        }
         let t = Instant::now();
         if self.subject.is_none() {
             self.subject = Some(cpu_session(&self.cfg, SUBJECT_MODEL)?);
+            self.timings.push(("subject_load", ms(t)));
         }
-        self.timings.push(("subject_load", ms(t)));
         let t = Instant::now();
         let small = self.resize(img, None, SUBJECT_SIZE, SUBJECT_SIZE)?;
         let input = to_nchw(&small, SUBJECT_SIZE * SUBJECT_SIZE, IMAGENET_MEAN, IMAGENET_STD, false);
-        self.timings.push(("subject_pre", ms(t)));
-        let t = Instant::now();
         let session = self.subject.as_mut().expect("loaded");
         let tensor = TensorRef::from_array_view(([1usize, 3, SUBJECT_SIZE, SUBJECT_SIZE], &input[..]))
             .map_err(|e| e.to_string())?;
@@ -340,28 +565,22 @@ impl Segmenter {
         if out.len() != SUBJECT_SIZE * SUBJECT_SIZE {
             return Err(format!("subject: unexpected output size {}", out.len()));
         }
-        let p: Vec<f32> = out.iter().map(|&v| sigmoid(v)).collect();
+        let data: Vec<f32> = out.iter().map(|&v| sigmoid(v)).collect();
         drop(outputs);
         self.timings.push(("subject_infer", ms(t)));
-        let t = Instant::now();
-        let roi = [0, 0, img.width, img.height];
-        let m = self.refine(img, roi, &p, SUBJECT_SIZE, SUBJECT_SIZE, Refine::SUBJECT)?;
-        self.timings.push(("subject_refine", ms(t)));
-        Ok(m)
+        let lr = Arc::new(LowRes { roi: [0, 0, img.width, img.height], width: SUBJECT_SIZE, height: SUBJECT_SIZE, data });
+        self.cache.subject = Some(lr.clone());
+        Ok(lr)
     }
 
-    // -----------------------------------------------------------------------------------
-    // Sky
-    // -----------------------------------------------------------------------------------
-
-    /// Select Sky over the whole image.
-    pub fn sky(&mut self, img: RgbImage) -> Result<Mask, String> {
-        self.timings.clear();
+    /// Select Sky probability over the whole image at 320x320 (not min-max normalised, so
+    /// frames without sky stay near 0).
+    pub fn sky_raw(&mut self, img: RgbImage) -> Result<LowRes, String> {
         let t = Instant::now();
         if self.sky.is_none() {
             self.sky = Some(cpu_session(&self.cfg, SKY_MODEL)?);
+            self.timings.push(("sky_load", ms(t)));
         }
-        self.timings.push(("sky_load", ms(t)));
         let t = Instant::now();
         let small = self.resize(img, None, SKY_SIZE, SKY_SIZE)?;
         let input = to_nchw(&small, SKY_SIZE * SKY_SIZE, IMAGENET_MEAN, IMAGENET_STD, false);
@@ -374,13 +593,22 @@ impl Segmenter {
         if out.len() != SKY_SIZE * SKY_SIZE {
             return Err(format!("sky: unexpected output size {}", out.len()));
         }
-        let p = out.to_vec();
+        let data = out.to_vec();
         drop(outputs);
         self.timings.push(("sky_infer", ms(t)));
-        let t = Instant::now();
-        let m = self.refine(img, [0, 0, img.width, img.height], &p, SKY_SIZE, SKY_SIZE, Refine::SKY)?;
-        self.timings.push(("sky_refine", ms(t)));
-        Ok(m)
+        Ok(LowRes { roi: [0, 0, img.width, img.height], width: SKY_SIZE, height: SKY_SIZE, data })
+    }
+
+    /// Refined subject matte over the whole image (evaluation / overlays).
+    pub fn subject(&mut self, img: RgbImage) -> Result<Mask, String> {
+        let lr = self.subject_raw(img)?;
+        Ok(self.refine_lowres(img, &lr, RefineParams::SUBJECT))
+    }
+
+    /// Refined sky matte over the whole image (evaluation / overlays).
+    pub fn sky(&mut self, img: RgbImage) -> Result<Mask, String> {
+        let lr = self.sky_raw(img)?;
+        Ok(self.refine_lowres(img, &lr, RefineParams::SKY))
     }
 
     // -----------------------------------------------------------------------------------
@@ -390,7 +618,9 @@ impl Segmenter {
     /// Person boxes from YOLOX-m (COCO class 0), in image pixels, NMS applied.
     pub fn detect_people(&mut self, img: RgbImage) -> Result<Vec<([f32; 4], f32)>, String> {
         if self.person.is_none() {
+            let t = Instant::now();
             self.person = Some(coreml_session(&self.cfg, PERSON_MODEL, &[])?);
+            self.timings.push(("person_det_load", ms(t)));
         }
         let s = PERSON_SIZE;
         let ratio = (s as f32 / img.width as f32).min(s as f32 / img.height as f32);
@@ -430,11 +660,18 @@ impl Segmenter {
             .collect())
     }
 
+    fn faces_loaded(&mut self) -> Result<&mut Models, String> {
+        if self.faces.is_none() {
+            let t = Instant::now();
+            self.faces = Some(Models::load(&self.cfg.models_dir)?);
+            self.timings.push(("face_load", ms(t)));
+        }
+        Ok(self.faces.as_mut().expect("loaded"))
+    }
+
     /// SCRFD faces (the culling detector, `models.rs`), largest first.
     pub fn detect_faces(&mut self, img: RgbImage) -> Result<Vec<Detection>, String> {
-        if self.faces.is_none() {
-            self.faces = Some(Models::load(&self.cfg.models_dir)?);
-        }
+        self.faces_loaded()?;
         let long = img.width.max(img.height);
         let k = (DET_SIZE as f32 / long as f32).min(1.0);
         let (sw, sh) =
@@ -451,33 +688,12 @@ impl Segmenter {
         Ok(dets)
     }
 
-    /// People: one instance mask per person (optionally with parts), largest first.
-    ///
-    /// Instances come from YOLOX person boxes; faces without a box (close-ups, people seen from
-    /// behind a partner) seed a synthetic box. Each instance is EfficientSAM prompted with its
-    /// box plus the face centre as a positive point; overlaps go to the most confident
-    /// instance, then each mask is guided-refined at full resolution.
-    pub fn people(&mut self, img: RgbImage, with_parts: bool) -> Result<Vec<Person>, String> {
-        self.timings.clear();
-        let (w, h) = (img.width, img.height);
-        let t = Instant::now();
-        let boxes = self.detect_people(img)?;
-        self.timings.push(("person_det", ms(t)));
-        let t = Instant::now();
-        let faces = self.detect_faces(img)?;
-        self.timings.push(("face_det", ms(t)));
-
-        let mut people = assign_faces(&boxes, &faces, w as f32, h as f32);
-        if std::env::var("SIEVE_SEG_DEBUG").is_ok() {
-            eprintln!("[segment] person boxes {boxes:?}");
-            eprintln!("[segment] faces {:?}", faces.iter().map(|f| (f.bbox, f.score)).collect::<Vec<_>>());
+    /// EfficientSAM image embedding (`[1,256,64,64]`), cached per image.
+    fn sam_embedding(&mut self, img: RgbImage) -> Result<Arc<Vec<f32>>, String> {
+        self.enter(img);
+        if let Some(e) = &self.cache.sam {
+            return Ok(e.clone());
         }
-        people.truncate(MAX_PEOPLE);
-        if people.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // SAM image embedding (square stretch; prompts live in the working-res frame).
         let t = Instant::now();
         if self.sam_enc.is_none() {
             let dims = [("batch", 1), ("height", SAM_SIZE as i64), ("width", SAM_SIZE as i64)];
@@ -498,14 +714,99 @@ impl Segmenter {
         if emb.len() != 256 * 64 * 64 {
             return Err(format!("sam encoder: unexpected output size {}", emb.len()));
         }
-        let emb = emb.to_vec();
+        let emb = Arc::new(emb.to_vec());
         drop(outputs);
         self.timings.push(("sam_encode", ms(t)));
+        self.cache.sam = Some(emb.clone());
+        Ok(emb)
+    }
+
+    /// Best SAM mask logits (`ww x wh`) for point/box prompts in working-grid pixels
+    /// (labels: 1 positive, 0 negative, 2 / 3 box corners).
+    fn sam_decode(&mut self, emb: &[f32], pts: &[f32], labels: &[f32], ww: usize, wh: usize) -> Result<Vec<f32>, String> {
+        let n = labels.len();
+        let dec = self.sam_dec.as_mut().ok_or("sam decoder not loaded")?;
+        let size = [wh as i64, ww as i64];
+        let outputs = dec
+            .run(ort::inputs![
+                TensorRef::from_array_view(([1usize, 256, 64, 64], emb)).map_err(|e| e.to_string())?,
+                TensorRef::from_array_view(([1usize, 1, n, 2], pts)).map_err(|e| e.to_string())?,
+                TensorRef::from_array_view(([1usize, 1, n], labels)).map_err(|e| e.to_string())?,
+                TensorRef::from_array_view(([2usize], &size[..])).map_err(|e| e.to_string())?
+            ])
+            .map_err(|e| format!("sam decoder: {e}"))?;
+        let (_, masks) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        let (_, iou) = outputs[1].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        let plane = ww * wh;
+        let k = iou.len().min(masks.len() / plane.max(1));
+        if k == 0 {
+            return Err("sam decoder: empty output".into());
+        }
+        let best = (0..k).max_by(|&a, &b| iou[a].total_cmp(&iou[b])).unwrap_or(0);
+        Ok(masks[best * plane..(best + 1) * plane].to_vec())
+    }
+
+    fn work_grid(img: RgbImage) -> (usize, usize) {
+        let ws = WORK_EDGE as f32 / img.width.max(img.height) as f32;
+        (((img.width as f32 * ws).round() as usize).max(1), ((img.height as f32 * ws).round() as usize).max(1))
+    }
+
+    /// Objects: SAM with a box prompt (`bbox` in image px); unrefined, over the box ROI.
+    pub fn object_raw(&mut self, img: RgbImage, bbox: [f32; 4]) -> Result<LowRes, String> {
+        let emb = self.sam_embedding(img)?;
+        let t = Instant::now();
+        let (w, h) = (img.width, img.height);
+        let (ww, wh) = Self::work_grid(img);
+        let (sx, sy) = (ww as f32 / w as f32, wh as f32 / h as f32);
+        let pts = [bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy];
+        let mut m = self.sam_decode(&emb, &pts, &[2.0, 3.0], ww, wh)?;
+        clip_to_box(&mut m, ww, wh, bbox, sx, sy);
+        let prob: Vec<f32> = m.iter().map(|&v| sigmoid(v)).collect();
+        self.timings.push(("object_decode", ms(t)));
+        Ok(match roi_of(&prob, ww, wh, 0.05, w, h) {
+            Some(roi) => {
+                let (data, lw, lh) = crop_plane(&prob, ww, wh, roi, w, h);
+                LowRes { roi, width: lw, height: lh, data }
+            }
+            None => LowRes::empty(w, h),
+        })
+    }
+
+    /// People instances (unrefined), largest first; cached per image.
+    ///
+    /// Instances come from YOLOX person boxes; faces without a box (close-ups, people seen from
+    /// behind a partner) seed a synthetic box. Each instance is EfficientSAM prompted with its
+    /// box plus the face centre as a positive point (other people's faces in the box are
+    /// negative points); overlaps go to the smallest instance.
+    pub fn instances(&mut self, img: RgbImage) -> Result<Arc<Vec<Instance>>, String> {
+        self.enter(img);
+        if let Some(i) = &self.cache.instances {
+            return Ok(i.clone());
+        }
+        let (w, h) = (img.width, img.height);
+        let t = Instant::now();
+        let boxes = self.detect_people(img)?;
+        self.timings.push(("person_det", ms(t)));
+        let t = Instant::now();
+        let faces = self.detect_faces(img)?;
+        self.timings.push(("face_det", ms(t)));
+
+        let mut people = assign_faces(&boxes, &faces, w as f32, h as f32);
+        if std::env::var("SIEVE_SEG_DEBUG").is_ok() {
+            eprintln!("[segment] person boxes {boxes:?}");
+            eprintln!("[segment] faces {:?}", faces.iter().map(|f| (f.bbox, f.score)).collect::<Vec<_>>());
+        }
+        people.truncate(MAX_PEOPLE);
+        if people.is_empty() {
+            let none = Arc::new(Vec::new());
+            self.cache.instances = Some(none.clone());
+            return Ok(none);
+        }
+        let emb = self.sam_embedding(img)?;
 
         // Decode each instance at the working resolution.
         let t = Instant::now();
-        let ws = WORK_EDGE as f32 / w.max(h) as f32;
-        let (ww, wh) = (((w as f32 * ws).round() as usize).max(1), ((h as f32 * ws).round() as usize).max(1));
+        let (ww, wh) = Self::work_grid(img);
         let (sx, sy) = (ww as f32 / w as f32, wh as f32 / h as f32);
         let mut logits: Vec<Vec<f32>> = Vec::with_capacity(people.len());
         let centre = |f: &Detection| ((f.bbox[0] + f.bbox[2]) * 0.5, (f.bbox[1] + f.bbox[3]) * 0.5);
@@ -528,49 +829,10 @@ impl Segmenter {
                     }
                 }
             }
-            let n = labels.len();
-            let dec = self.sam_dec.as_mut().expect("loaded");
-            let size = [wh as i64, ww as i64];
-            let outputs = dec
-                .run(ort::inputs![
-                    TensorRef::from_array_view(([1usize, 256, 64, 64], &emb[..])).map_err(|e| e.to_string())?,
-                    TensorRef::from_array_view(([1usize, 1, n, 2], &pts[..])).map_err(|e| e.to_string())?,
-                    TensorRef::from_array_view(([1usize, 1, n], &labels[..])).map_err(|e| e.to_string())?,
-                    TensorRef::from_array_view(([2usize], &size[..])).map_err(|e| e.to_string())?
-                ])
-                .map_err(|e| format!("sam decoder: {e}"))?;
-            let (_, masks) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            let (_, iou) = outputs[1].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            let plane = ww * wh;
-            let k = iou.len().min(masks.len() / plane.max(1));
-            if k == 0 {
-                return Err("sam decoder: empty output".into());
-            }
-            let best = (0..k).max_by(|&a, &b| iou[a].total_cmp(&iou[b])).unwrap_or(0);
-            let mut m = masks[best * plane..(best + 1) * plane].to_vec();
+            let mut m = self.sam_decode(&emb, &pts, &labels, ww, wh)?;
             // Keep the instance inside its (padded) prompt box: SAM sometimes leaks into a
             // neighbour of similar colour.
-            let pad = 0.08 * (p.bbox[3] - p.bbox[1]).max(p.bbox[2] - p.bbox[0]);
-            let (bx0, by0) = (((p.bbox[0] - pad) * sx).max(0.0), ((p.bbox[1] - pad) * sy).max(0.0));
-            let (bx1, by1) = ((p.bbox[2] + pad) * sx, (p.bbox[3] + pad) * sy);
-            for y in 0..wh {
-                for x in 0..ww {
-                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-                    if fx < bx0 || fy < by0 || fx > bx1 || fy > by1 {
-                        m[y * ww + x] = -20.0;
-                    }
-                }
-            }
-            if std::env::var("SIEVE_SEG_DEBUG").is_ok() {
-                let fg = m.iter().filter(|&&v| v > 0.0).count();
-                eprintln!(
-                    "[segment] person {pi} box {:?} face {} labels {labels:?} iou {:?} best {best} fg {:.1}%",
-                    p.bbox,
-                    p.face.is_some(),
-                    &iou[..k],
-                    100.0 * fg as f32 / plane as f32
-                );
-            }
+            clip_to_box(&mut m, ww, wh, p.bbox, sx, sy);
             logits.push(m);
         }
         self.timings.push(("sam_decode", ms(t)));
@@ -579,7 +841,6 @@ impl Segmenter {
         // smallest mask. Overlaps are mostly a large prompt (an embrace, a group) swallowing
         // a partner, and the smaller instance is the more specific one; it is also usually the
         // one in front.
-        let t = Instant::now();
         let plane = ww * wh;
         let sizes: Vec<usize> = logits.iter().map(|l| l.iter().filter(|&&v| v > 0.0).count()).collect();
         let mut owner = vec![usize::MAX; plane];
@@ -597,32 +858,27 @@ impl Segmenter {
             let prob: Vec<f32> = (0..plane)
                 .map(|i| if owner[i] == k || owner[i] == usize::MAX { sigmoid(logits[k][i]) } else { 0.0 })
                 .collect();
-            let roi = roi_of(&prob, ww, wh, 0.05, w, h);
-            let Some(roi) = roi else { continue };
-            let (lr, lw, lh) = crop_plane(&prob, ww, wh, roi, w, h);
-            let mask = self.refine(img, roi, &lr, lw, lh, Refine::PERSON)?;
+            let Some(roi) = roi_of(&prob, ww, wh, 0.05, w, h) else { continue };
+            let (data, lw, lh) = crop_plane(&prob, ww, wh, roi, w, h);
+            let alpha = LowRes { roi, width: lw, height: lh, data };
             // Drop slivers: tiny masks, or boxes whose pixels were almost all won by others.
-            if mask.area() < 0.0005 * (w * h) as f32 || mask.area() < 0.12 * area(&p.bbox) {
+            let a = alpha.area();
+            if a < 0.0005 * (w * h) as f32 || a < 0.12 * area(&p.bbox) {
                 continue;
             }
-            out.push(Person { bbox: p.bbox, score: p.score, from_face: p.from_face, face: p.face, mask, parts: None });
+            out.push(Instance { bbox: p.bbox, score: p.score, from_face: p.from_face, face: p.face, alpha });
         }
-        self.timings.push(("person_refine", ms(t)));
-
-        if with_parts {
-            let t = Instant::now();
-            for person in out.iter_mut() {
-                person.parts = Some(self.person_parts(img, person)?);
-            }
-            self.timings.push(("parts", ms(t)));
-        }
+        let out = Arc::new(out);
+        self.cache.instances = Some(out.clone());
         Ok(out)
     }
 
     /// Selfie-multiclass probabilities (6 x 256 x 256, softmaxed) for an image crop.
     fn parts_probs(&mut self, img: RgbImage, crop: [usize; 4]) -> Result<Vec<f32>, String> {
         if self.parts.is_none() {
+            let t = Instant::now();
             self.parts = Some(cpu_session(&self.cfg, PARTS_MODEL)?);
+            self.timings.push(("parts_load", ms(t)));
         }
         let [x0, y0, x1, y1] = crop;
         let s = PARTS_SIZE;
@@ -650,17 +906,26 @@ impl Segmenter {
         Ok(probs)
     }
 
-    fn person_parts(&mut self, img: RgbImage, p: &Person) -> Result<PersonParts, String> {
+    /// Hair / face skin / body skin / clothes of instance `idx` (unrefined, on the person's
+    /// part grid); cached per person, computed only when asked for.
+    pub fn region_planes(&mut self, img: RgbImage, idx: usize) -> Result<Arc<RegionPlanes>, String> {
+        let insts = self.instances(img)?;
+        if let Some(r) = self.cache.regions.get(&idx) {
+            return Ok(r.clone());
+        }
+        let p = insts.get(idx).ok_or("no such person")?;
+        let t = Instant::now();
         let (w, h) = (img.width, img.height);
-        let roi = [p.mask.x0, p.mask.y0, p.mask.x0 + p.mask.width, p.mask.y0 + p.mask.height];
+        let roi = p.alpha.roi;
         let [rx0, ry0, rx1, ry1] = roi;
         let (rw, rh) = (rx1 - rx0, ry1 - ry0);
-        // Class planes over the ROI at working resolution. The selfie model expects roughly
-        // square, upper-body framing, so tall (or wide) people are parsed in overlapping
-        // near-square tiles; the head crop (finer hair / face skin) is blended in with a
-        // higher weight. Tiles are feathered and normalised by the summed weight.
-        let k = (WORK_EDGE as f32 / rw.max(rh) as f32).min(1.0);
+        // Class planes over the ROI. The selfie model expects roughly square, upper-body
+        // framing, so tall (or wide) people are parsed in overlapping near-square tiles; the
+        // head crop (finer hair / face skin) is blended in with a higher weight. Tiles are
+        // feathered and normalised by the summed weight.
+        let k = (PARTS_GRID_EDGE as f32 / rw.max(rh) as f32).min(1.0);
         let (lw, lh) = (((rw as f32 * k).round() as usize).max(1), ((rh as f32 * k).round() as usize).max(1));
+        let (kx, ky) = (lw as f32 / rw as f32, lh as f32 / rh as f32);
         let mut crops: Vec<([usize; 4], f32)> = tiles(roi).into_iter().map(|c| (c, 1.0)).collect();
         if let Some(f) = &p.face {
             let fs = (f.bbox[2] - f.bbox[0]).max(f.bbox[3] - f.bbox[1]);
@@ -680,14 +945,14 @@ impl Segmenter {
         let n = lw * lh;
         let mut planes = vec![0.0f32; 6 * n];
         let mut wsum = vec![0.0f32; n];
+        let ss = PARTS_SIZE * PARTS_SIZE;
         for (crop, prio) in crops {
             let probs = self.parts_probs(img, crop)?;
             let (cw, ch) = ((crop[2] - crop[0]) as f32, (crop[3] - crop[1]) as f32);
-            let ss = PARTS_SIZE * PARTS_SIZE;
             for y in 0..lh {
                 for x in 0..lw {
-                    let u = (rx0 as f32 + (x as f32 + 0.5) / k - crop[0] as f32) / cw;
-                    let v = (ry0 as f32 + (y as f32 + 0.5) / k - crop[1] as f32) / ch;
+                    let u = (rx0 as f32 + (x as f32 + 0.5) / kx - crop[0] as f32) / cw;
+                    let v = (ry0 as f32 + (y as f32 + 0.5) / ky - crop[1] as f32) / ch;
                     if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                         continue;
                     }
@@ -709,13 +974,13 @@ impl Segmenter {
                 planes[i] = 1.0; // uncovered: background
             }
         }
-        // Person alpha at the same working grid.
+        let grid = LowRes { roi, width: lw, height: lh, data: vec![0.0; n] };
+        let pos = |i: usize| (rx0 as f32 + ((i % lw) as f32 + 0.5) / kx, ry0 as f32 + ((i / lw) as f32 + 0.5) / ky);
+        // Person alpha on the same grid.
         let alpha: Vec<f32> = (0..n)
             .map(|i| {
-                let (x, y) = (i % lw, i / lw);
-                let ix = ((rx0 as f32 + (x as f32 + 0.5) / k) as usize).min(w - 1);
-                let iy = ((ry0 as f32 + (y as f32 + 0.5) / k) as usize).min(h - 1);
-                p.mask.at(ix, iy)
+                let (x, y) = pos(i);
+                p.alpha.at(x, y)
             })
             .collect();
         // Face skin far from the detected face is body skin (arms/hands get confused with
@@ -726,8 +991,7 @@ impl Segmenter {
                 let (cx, cy) = ((f.bbox[0] + f.bbox[2]) * 0.5, (f.bbox[1] + f.bbox[3]) * 0.5);
                 (0..n)
                     .map(|i| {
-                        let ix = rx0 as f32 + ((i % lw) as f32 + 0.5) / k;
-                        let iy = ry0 as f32 + ((i / lw) as f32 + 0.5) / k;
+                        let (ix, iy) = pos(i);
                         let d = ((ix - cx).powi(2) + (iy - cy).powi(2)).sqrt() / fs;
                         1.0 - smoothstep(0.7, 1.1, d)
                     })
@@ -735,124 +999,134 @@ impl Segmenter {
             }
             None => vec![1.0; n],
         };
-        let hair_p: Vec<f32> = (0..n).map(|i| planes[n + i] * alpha[i]).collect();
-        let body_p: Vec<f32> =
+        let hair = (0..n).map(|i| planes[n + i] * alpha[i]).collect();
+        let body_skin =
             (0..n).map(|i| (planes[2 * n + i] + planes[3 * n + i] * (1.0 - near_face[i])) * alpha[i]).collect();
-        let face_p: Vec<f32> = (0..n).map(|i| planes[3 * n + i] * near_face[i] * alpha[i]).collect();
+        let face_skin = (0..n).map(|i| planes[3 * n + i] * near_face[i] * alpha[i]).collect();
         // Clothes also takes accessories (turbans, hats, bags) and the parts of the person
         // instance the parser calls background, so the parts cover the whole person.
-        let clothes_p: Vec<f32> =
-            (0..n).map(|i| (planes[4 * n + i] + planes[5 * n + i] + planes[i]) * alpha[i]).collect();
-        let hair = self.refine(img, roi, &hair_p, lw, lh, Refine::PART)?;
-        let body_skin = self.refine(img, roi, &body_p, lw, lh, Refine::PART)?;
-        let mut face_skin = self.refine(img, roi, &face_p, lw, lh, Refine::PART)?;
-        let clothes = self.refine(img, roi, &clothes_p, lw, lh, Refine::PART)?;
-
-        // Facial features from FaceMesh polygons.
-        let empty = || Mask::zeros(0, 0, 0, 0);
-        let (mut sclera, mut iris, mut brows, mut lips, mut teeth) = (empty(), empty(), empty(), empty(), empty());
-        if let Some(f) = p.face.filter(|f| f.bbox[3] - f.bbox[1] >= MIN_MESH_FACE_PX) {
-            let models = self.faces.as_mut().expect("faces loaded by people()");
-            let (mesh, m) = models.face_mesh(img.data, w, h, &f)?;
-            let pts: Vec<[f32; 2]> = mesh
-                .iter()
-                .map(|q| {
-                    let (x, y) = m.apply(q[0], q[1]);
-                    [x, y]
-                })
-                .collect();
-            let fs = (f.bbox[2] - f.bbox[0]).max(f.bbox[3] - f.bbox[1]);
-            let froi = [
-                (f.bbox[0] - 0.3 * fs).max(0.0) as usize,
-                (f.bbox[1] - 0.3 * fs).max(0.0) as usize,
-                ((f.bbox[2] + 0.3 * fs) as usize).min(w),
-                ((f.bbox[3] + 0.3 * fs) as usize).min(h),
-            ];
-            let poly = |idx: &[usize]| -> Vec<[f32; 2]> { idx.iter().map(|&i| pts[i]).collect() };
-            let eyes = union(&raster_poly(&poly(&EYE_R), froi), &raster_poly(&poly(&EYE_L), froi));
-            let discs = union(&raster_disc(&pts, &IRIS_R, froi), &raster_disc(&pts, &IRIS_L, froi));
-            iris = intersect(&discs, &eyes);
-            sclera = subtract(&eyes, &iris);
-            brows = union(&raster_poly(&poly(&BROW_R), froi), &raster_poly(&poly(&BROW_L), froi));
-            let inner = raster_poly(&poly(&LIPS_INNER), froi);
-            lips = subtract(&raster_poly(&poly(&LIPS_OUTER), froi), &inner);
-            teeth = teeth_mask(img, &inner);
-            for feat in [&eyes, &brows, &lips, &inner] {
-                face_skin = subtract_into(face_skin, feat);
-            }
-        }
-        Ok(PersonParts { hair, face_skin, body_skin, clothes, sclera, iris, brows, lips, teeth })
+        let clothes = (0..n).map(|i| (planes[4 * n + i] + planes[5 * n + i] + planes[i]) * alpha[i]).collect();
+        let r = Arc::new(RegionPlanes { grid, hair, face_skin, body_skin, clothes });
+        self.timings.push(("parts_regions", ms(t)));
+        self.cache.regions.insert(idx, r.clone());
+        Ok(r)
     }
 
-    // -----------------------------------------------------------------------------------
-    // Guided refinement
-    // -----------------------------------------------------------------------------------
-
-    /// Upsamples `p` (`pw x ph`, covering `roi` of the image) to a full-resolution [`Mask`]
-    /// over `roi` with a fast colour guided filter.
-    fn refine(
-        &mut self,
-        img: RgbImage,
-        roi: [usize; 4],
-        p: &[f32],
-        pw: usize,
-        ph: usize,
-        r: Refine,
-    ) -> Result<Mask, String> {
-        let [x0, y0, x1, y1] = roi;
-        let (rw, rh) = (x1 - x0, y1 - y0);
-        let k = (WORK_EDGE as f32 / rw.max(rh) as f32).min(1.0);
-        let (lw, lh) = (((rw as f32 * k).round() as usize).max(1), ((rh as f32 * k).round() as usize).max(1));
-        let guide = self.resize(img, Some([x0 as f64, y0 as f64, rw as f64, rh as f64]), lw, lh)?;
-        let p_lr = if (pw, ph) == (lw, lh) { p.to_vec() } else { resize_plane(p, pw, ph, lw, lh) };
-        let radius = ((r.radius * lw.max(lh) as f32).round() as usize).max(1);
-        let (ca, cb) = guided_coeffs(&guide, &p_lr, lw, lh, radius, r.eps);
-        let mut out = Mask::zeros(x0, y0, rw, rh);
-        let (fx, fy) = (lw as f32 / rw as f32, lh as f32 / rh as f32);
-        for y in 0..rh {
-            let v = (y as f32 + 0.5) * fy - 0.5;
-            let row = ((y + y0) * img.width + x0) * 3;
-            for x in 0..rw {
-                let u = (x as f32 + 0.5) * fx - 0.5;
-                let px = &img.data[row + x * 3..row + x * 3 + 3];
-                let mut q = sample(&cb, lw, lh, u, v);
-                for c in 0..3 {
-                    q += sample(&ca[c * lw * lh..(c + 1) * lw * lh], lw, lh, u, v) * (px[c] as f32 / 255.0);
-                }
-                out.data[y * rw + x] = q.clamp(0.0, 1.0);
+    /// FaceMesh feature masks of instance `idx` (`None` without a face of at least
+    /// [`MIN_MESH_FACE_PX`]); cached per person.
+    pub fn features(&mut self, img: RgbImage, idx: usize) -> Result<Option<Arc<Features>>, String> {
+        let insts = self.instances(img)?;
+        if let Some(f) = self.cache.features.get(&idx) {
+            return Ok(f.clone());
+        }
+        let p = insts.get(idx).ok_or("no such person")?;
+        let out = match p.face.filter(|_| p.has_features()) {
+            None => None,
+            Some(f) => {
+                let t = Instant::now();
+                let (w, h) = (img.width, img.height);
+                let (mesh, m) = self.faces_loaded()?.face_mesh(img.data, w, h, &f)?;
+                let pts: Vec<[f32; 2]> = mesh
+                    .iter()
+                    .map(|q| {
+                        let (x, y) = m.apply(q[0], q[1]);
+                        [x, y]
+                    })
+                    .collect();
+                let fs = (f.bbox[2] - f.bbox[0]).max(f.bbox[3] - f.bbox[1]);
+                let froi = [
+                    (f.bbox[0] - 0.3 * fs).max(0.0) as usize,
+                    (f.bbox[1] - 0.3 * fs).max(0.0) as usize,
+                    ((f.bbox[2] + 0.3 * fs) as usize).min(w),
+                    ((f.bbox[3] + 0.3 * fs) as usize).min(h),
+                ];
+                let poly = |idx: &[usize]| -> Vec<[f32; 2]> { idx.iter().map(|&i| pts[i]).collect() };
+                let eyes = union(&raster_poly(&poly(&EYE_R), froi), &raster_poly(&poly(&EYE_L), froi));
+                let discs = union(&raster_disc(&pts, &IRIS_R, froi), &raster_disc(&pts, &IRIS_L, froi));
+                let iris = intersect(&discs, &eyes);
+                let sclera = subtract(&eyes, &iris);
+                let brows = union(&raster_poly(&poly(&BROW_R), froi), &raster_poly(&poly(&BROW_L), froi));
+                let inner = raster_poly(&poly(&LIPS_INNER), froi);
+                let lips = subtract(&raster_poly(&poly(&LIPS_OUTER), froi), &inner);
+                let teeth = teeth_mask(img, &inner);
+                self.timings.push(("parts_features", ms(t)));
+                Some(Arc::new(Features { eyes, sclera, iris, brows, lips, inner, teeth }))
             }
-        }
-        if r.gamma != 1.0 {
-            // Contrast around 0.5 to counter the guided filter's softening of confident masks.
-            out.data.iter_mut().for_each(|v| *v = contrast(*v, r.gamma));
-        }
+        };
+        self.cache.features.insert(idx, out.clone());
         Ok(out)
     }
-}
 
-/// Guided-filter parameters: window radius as a fraction of the working long edge, and eps
-/// (regularisation on [0,1] intensities: larger = smoother, follows the input mask more).
-#[derive(Clone, Copy)]
-struct Refine {
-    radius: f32,
-    eps: f32,
-    gamma: f32,
-}
-
-impl Refine {
-    const SUBJECT: Refine = Refine { radius: 0.004, eps: 1e-4, gamma: 1.0 };
-    const SKY: Refine = Refine { radius: 0.012, eps: 1e-4, gamma: 1.5 };
-    const PERSON: Refine = Refine { radius: 0.006, eps: 1e-4, gamma: 1.3 };
-    const PART: Refine = Refine { radius: 0.008, eps: 5e-4, gamma: 1.3 };
-}
-
-/// S-curve around 0.5: `g > 1` pushes values towards 0 / 1.
-fn contrast(v: f32, g: f32) -> f32 {
-    if v <= 0.5 {
-        0.5 * (2.0 * v).powf(g)
-    } else {
-        1.0 - 0.5 * (2.0 * (1.0 - v)).powf(g)
+    /// Refined people (instances + optionally all parts), largest first (evaluation /
+    /// overlays; the app stores the unrefined outputs).
+    pub fn people(&mut self, img: RgbImage, with_parts: bool) -> Result<Vec<Person>, String> {
+        let insts = self.instances(img)?;
+        let t = Instant::now();
+        let mut out = Vec::with_capacity(insts.len());
+        for (idx, inst) in insts.iter().enumerate() {
+            let mask = self.refine_lowres(img, &inst.alpha, RefineParams::PERSON);
+            let parts = if with_parts {
+                let r = self.region_planes(img, idx)?;
+                let f = self.features(img, idx)?;
+                let plane = |d: &Vec<f32>| LowRes { data: d.clone(), ..r.grid.clone() };
+                let hair = self.refine_lowres(img, &plane(&r.hair), RefineParams::PARTS);
+                let body_skin = self.refine_lowres(img, &plane(&r.body_skin), RefineParams::PARTS);
+                let mut face_skin = self.refine_lowres(img, &plane(&r.face_skin), RefineParams::PARTS);
+                let clothes = self.refine_lowres(img, &plane(&r.clothes), RefineParams::PARTS);
+                let empty = || Mask::zeros(0, 0, 0, 0);
+                let (sclera, iris, brows, lips, teeth) = match &f {
+                    Some(f) => {
+                        for feat in [&f.eyes, &f.brows, &f.lips, &f.inner] {
+                            face_skin = subtract(&face_skin, feat);
+                        }
+                        (f.sclera.clone(), f.iris.clone(), f.brows.clone(), f.lips.clone(), f.teeth.clone())
+                    }
+                    None => (empty(), empty(), empty(), empty(), empty()),
+                };
+                Some(PersonParts { hair, face_skin, body_skin, clothes, sclera, iris, brows, lips, teeth })
+            } else {
+                None
+            };
+            out.push(Person { bbox: inst.bbox, score: inst.score, from_face: inst.from_face, face: inst.face, mask, parts });
+        }
+        self.timings.push(("people_refine", ms(t)));
+        Ok(out)
     }
+
+    /// Guided refinement of `lr` against the input image, as an image-pixel [`Mask`].
+    pub fn refine_lowres(&mut self, img: RgbImage, lr: &LowRes, params: RefineParams) -> Mask {
+        let (w, h) = (img.width, img.height);
+        let full = NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let guide = Guide { width: w as u32, height: h as u32, rgb: img.data, region: full };
+        let a = refine::refine(&lr.to_alpha(w, h), &guide, params);
+        let x0 = (a.bounds.x * w as f32).round() as usize;
+        let y0 = (a.bounds.y * h as f32).round() as usize;
+        let (mw, mh) = (a.width as usize, a.height as usize);
+        if x0 + mw > w || y0 + mh > h || mw * mh <= 1 {
+            return Mask::zeros(0, 0, 0, 0);
+        }
+        Mask { x0, y0, width: mw, height: mh, data: a.data.iter().map(|&v| v as f32 / 255.0).collect() }
+    }
+}
+
+/// Logit plane clipped (-20) outside the prompt box padded by 8% of its long side.
+fn clip_to_box(m: &mut [f32], ww: usize, wh: usize, bbox: [f32; 4], sx: f32, sy: f32) {
+    let pad = 0.08 * (bbox[3] - bbox[1]).max(bbox[2] - bbox[0]);
+    let (bx0, by0) = (((bbox[0] - pad) * sx).max(0.0), ((bbox[1] - pad) * sy).max(0.0));
+    let (bx1, by1) = ((bbox[2] + pad) * sx, (bbox[3] + pad) * sy);
+    for y in 0..wh {
+        for x in 0..ww {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            if fx < bx0 || fy < by0 || fx > bx1 || fy > by1 {
+                m[y * ww + x] = -20.0;
+            }
+        }
+    }
+}
+
+/// Image-pixel mask as [`LowRes`] (features are already at input resolution).
+pub fn mask_lowres(m: &Mask) -> LowRes {
+    LowRes::from_mask(m)
 }
 
 /// Near-square, 25%-overlapping tiles covering `roi` along its long axis.
@@ -1011,48 +1285,6 @@ fn to_nchw(rgb: &[u8], plane: usize, mean: [f32; 3], std: [f32; 3], bgr: bool) -
     out
 }
 
-/// Bilinear sample with clamp-to-edge at continuous pixel coordinates (pixel centres at
-/// integers).
-#[inline]
-fn sample(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
-    let x = x.clamp(0.0, (w - 1) as f32);
-    let y = y.clamp(0.0, (h - 1) as f32);
-    let (x0, y0) = (x as usize, y as usize);
-    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-    let top = p[y0 * w + x0] * (1.0 - fx) + p[y0 * w + x1] * fx;
-    let bot = p[y1 * w + x0] * (1.0 - fx) + p[y1 * w + x1] * fx;
-    top * (1.0 - fy) + bot * fy
-}
-
-/// Bilinear resize of a float plane (half-pixel centres). Downscaling by more than 2x
-/// box-averages first to avoid aliasing.
-fn resize_plane(p: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
-    let (fx, fy) = (w as f32 / dw as f32, h as f32 / dh as f32);
-    let mut out = vec![0.0f32; dw * dh];
-    for y in 0..dh {
-        for x in 0..dw {
-            let (cx, cy) = ((x as f32 + 0.5) * fx - 0.5, (y as f32 + 0.5) * fy - 0.5);
-            out[y * dw + x] = if fx > 2.0 || fy > 2.0 {
-                // Average a small grid of bilinear taps over the footprint.
-                let (nx, ny) = (fx.ceil() as usize, fy.ceil() as usize);
-                let mut s = 0.0;
-                for j in 0..ny {
-                    for i in 0..nx {
-                        let sx = cx - fx / 2.0 + (i as f32 + 0.5) * fx / nx as f32;
-                        let sy = cy - fy / 2.0 + (j as f32 + 0.5) * fy / ny as f32;
-                        s += sample(p, w, h, sx, sy);
-                    }
-                }
-                s / (nx * ny) as f32
-            } else {
-                sample(p, w, h, cx, cy)
-            };
-        }
-    }
-    out
-}
-
 /// Bounding ROI (image px, padded by `pad` of its size) of `prob > 0.1` on a `ww x wh` plane
 /// covering the whole `w x h` image.
 fn roi_of(prob: &[f32], ww: usize, wh: usize, pad: f32, w: usize, h: usize) -> Option<[usize; 4]> {
@@ -1097,85 +1329,6 @@ fn crop_plane(p: &[f32], ww: usize, wh: usize, roi: [usize; 4], w: usize, h: usi
         }
     }
     (out, lw, lh)
-}
-
-/// Mean over a `(2r+1)^2` window, clamped at the borders (divides by the valid count).
-fn box_mean(p: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
-    let mut tmp = vec![0.0f32; w * h];
-    let mut row = vec![0.0f64; w + 1];
-    for y in 0..h {
-        for x in 0..w {
-            row[x + 1] = row[x] + p[y * w + x] as f64;
-        }
-        for x in 0..w {
-            let (a, b) = (x.saturating_sub(r), (x + r + 1).min(w));
-            tmp[y * w + x] = ((row[b] - row[a]) / (b - a) as f64) as f32;
-        }
-    }
-    let mut out = vec![0.0f32; w * h];
-    let mut col = vec![0.0f64; h + 1];
-    for x in 0..w {
-        for y in 0..h {
-            col[y + 1] = col[y] + tmp[y * w + x] as f64;
-        }
-        for y in 0..h {
-            let (a, b) = (y.saturating_sub(r), (y + r + 1).min(h));
-            out[y * w + x] = ((col[b] - col[a]) / (b - a) as f64) as f32;
-        }
-    }
-    out
-}
-
-/// Colour guided filter coefficients (He, Sun & Tang 2013, eq. 19-21): returns the
-/// box-averaged `a` (3 planes) and `b` so that `q = a . I + b`, with `I` in [0, 1].
-fn guided_coeffs(guide: &[u8], p: &[f32], w: usize, h: usize, r: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
-    let n = w * h;
-    let ch: Vec<Vec<f32>> = (0..3).map(|c| (0..n).map(|i| guide[i * 3 + c] as f32 / 255.0).collect()).collect();
-    let mean = |v: &[f32]| box_mean(v, w, h, r);
-    let prod = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| x * y).collect() };
-    let m_i: Vec<Vec<f32>> = ch.iter().map(|c| mean(c)).collect();
-    let m_p = mean(p);
-    let m_ip: Vec<Vec<f32>> = ch.iter().map(|c| mean(&prod(c, p))).collect();
-    // Covariance entries rr, rg, rb, gg, gb, bb.
-    let pairs = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)];
-    let var: Vec<Vec<f32>> = pairs.iter().map(|&(a, b)| mean(&prod(&ch[a], &ch[b]))).collect();
-    let mut a = vec![0.0f32; 3 * n];
-    let mut b = vec![0.0f32; n];
-    for i in 0..n {
-        let mi = [m_i[0][i], m_i[1][i], m_i[2][i]];
-        let cov = [m_ip[0][i] - mi[0] * m_p[i], m_ip[1][i] - mi[1] * m_p[i], m_ip[2][i] - mi[2] * m_p[i]];
-        let s = |k: usize, x: usize, y: usize| var[k][i] - mi[x] * mi[y];
-        let (rr, rg, rb, gg, gb, bb) =
-            (s(0, 0, 0) + eps, s(1, 0, 1), s(2, 0, 2), s(3, 1, 1) + eps, s(4, 1, 2), s(5, 2, 2) + eps);
-        // Inverse of the symmetric 3x3 via the adjugate.
-        let inv = [
-            gg * bb - gb * gb,
-            gb * rb - rg * bb,
-            rg * gb - gg * rb,
-            rr * bb - rb * rb,
-            rg * rb - rr * gb,
-            rr * gg - rg * rg,
-        ];
-        let det = rr * inv[0] + rg * inv[1] + rb * inv[2];
-        let (ar, ag, ab) = if det.abs() > 1e-12 {
-            (
-                (inv[0] * cov[0] + inv[1] * cov[1] + inv[2] * cov[2]) / det,
-                (inv[1] * cov[0] + inv[3] * cov[1] + inv[4] * cov[2]) / det,
-                (inv[2] * cov[0] + inv[4] * cov[1] + inv[5] * cov[2]) / det,
-            )
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        a[i] = ar;
-        a[n + i] = ag;
-        a[2 * n + i] = ab;
-        b[i] = m_p[i] - ar * mi[0] - ag * mi[1] - ab * mi[2];
-    }
-    let mut ma = Vec::with_capacity(3 * n);
-    for c in 0..3 {
-        ma.extend(mean(&a[c * n..(c + 1) * n]));
-    }
-    (ma, mean(&b))
 }
 
 /// Anti-aliased polygon coverage (4x4 supersampling, even-odd rule) over `roi`.
@@ -1263,10 +1416,6 @@ fn subtract(a: &Mask, b: &Mask) -> Mask {
     combine(a, b, |x, y| x * (1.0 - y))
 }
 
-fn subtract_into(a: Mask, b: &Mask) -> Mask {
-    subtract(&a, b)
-}
-
 /// Teeth inside the inner-lip polygon: bright, low-saturation pixels relative to the mouth.
 fn teeth_mask(img: RgbImage, inner: &Mask) -> Mask {
     let mut lum = Vec::new();
@@ -1314,57 +1463,6 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn box_mean_matches_brute_force() {
-        let (w, h, r) = (7, 5, 2);
-        let p: Vec<f32> = (0..w * h).map(|i| ((i * 37) % 11) as f32).collect();
-        let m = box_mean(&p, w, h, r);
-        for y in 0..h {
-            for x in 0..w {
-                let (mut s, mut n) = (0.0, 0);
-                for yy in y.saturating_sub(r)..(y + r + 1).min(h) {
-                    for xx in x.saturating_sub(r)..(x + r + 1).min(w) {
-                        s += p[yy * w + xx];
-                        n += 1;
-                    }
-                }
-                assert!((m[y * w + x] - s / n as f32).abs() < 1e-4);
-            }
-        }
-    }
-
-    /// A blurry, upsampled low-res mask of a sharp colour edge becomes sharp at full
-    /// resolution (bilinear alone gives 0.78 / 0.22 at the probe points).
-    #[test]
-    fn guided_refine_snaps_to_edges() {
-        let (w, h) = (1024, 32);
-        let edge = 404;
-        let mut data = vec![0u8; w * h * 3];
-        for y in 0..h {
-            for x in 0..w {
-                let p = (y * w + x) * 3;
-                // Blue sky left of the edge, green trees right of it.
-                data[p..p + 3].copy_from_slice(if x < edge { &[120, 170, 230] } else { &[40, 110, 40] });
-            }
-        }
-        let img = RgbImage { data: &data, width: w, height: h };
-        // 1/8-res mask: column 50 straddles the edge (404 / 8 = 50.5) and is 0.5.
-        let (pw, ph) = (w / 8, h / 8);
-        let p: Vec<f32> = (0..pw * ph)
-            .map(|i| match (i % pw).cmp(&50) {
-                std::cmp::Ordering::Less => 1.0,
-                std::cmp::Ordering::Equal => 0.5,
-                std::cmp::Ordering::Greater => 0.0,
-            })
-            .collect();
-        let mut seg = Segmenter::new(SegmentConfig::new("/nonexistent"));
-        let m = seg.refine(img, [0, 0, w, h], &p, pw, ph, Refine::SKY).unwrap();
-        assert_eq!((m.width, m.height), (w, h));
-        let row = &m.data[16 * w..17 * w];
-        assert!(row[edge - 4] > 0.9, "sky side {}", row[edge - 4]);
-        assert!(row[edge + 4] < 0.1, "tree side {}", row[edge + 4]);
-    }
 
     #[test]
     fn polygon_coverage_is_area() {
