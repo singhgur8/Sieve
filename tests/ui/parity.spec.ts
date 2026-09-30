@@ -317,6 +317,9 @@ test.describe("crop tool", () => {
     await page.keyboard.press("r");
     await expect(page.getByTestId("crop-overlay")).toBeVisible();
     await expect(page.getByTestId("crop-panel")).toHaveAttribute("data-active", "true");
+    await expect(page.getByTestId("crop-aspect")).toHaveValue("original"); // UX2 P1-3: starts locked to Original
+    await page.keyboard.press("a"); // A unlocks (Free) for this free-form drag
+    await expect(page.getByTestId("crop-aspect")).toHaveValue("free");
     // The tool asks for the uncropped frame.
     await expect.poll(async () => (await calls(page, "render_preview")).some((c) => c.args.adjustments.crop.enabled === false)).toBe(true);
 
@@ -362,8 +365,10 @@ test.describe("crop tool", () => {
     await expect(page.getByTestId("develop-view")).toBeVisible();
     await page.waitForTimeout(200);
     expect((await saved(page)).length).toBe(0);
-    // Second Esc goes back to the Grid as before.
+    // UX2 P0-1: a second Esc does nothing in Develop (G goes back to the Grid).
     await page.keyboard.press("Escape");
+    await expect(page.getByTestId("develop-view")).toBeVisible();
+    await page.keyboard.press("g");
     await expect(page.getByTestId("develop-view")).toHaveCount(0);
   });
 
@@ -413,9 +418,9 @@ test.describe("warnings", () => {
     await expect(page.getByTestId("develop-view")).toHaveAttribute("data-image-id", "10");
     const chip = page.getByTestId("warnings-chip");
     await expect(chip).toBeVisible();
-    await expect(chip).toContainText("Masks not supported yet");
+    await expect(chip).toContainText("Some masks can't be rendered");
     await chip.click();
-    await expect(page.getByTestId("warning-masks_unsupported")).toContainText("local adjustments");
+    await expect(page.getByTestId("warning-masks_unsupported")).toContainText("mask types");
     await expect(page.getByTestId("warning-masks_unsupported")).toContainText("2 mask groups");
     await shot(page, "6x-parity-07-warnings");
     await page.keyboard.press("Escape");

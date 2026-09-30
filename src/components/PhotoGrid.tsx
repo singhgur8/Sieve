@@ -86,7 +86,7 @@ export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onC
           <button onClick={onImport} data-testid="empty-import" className="flex items-center gap-2 rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600">
             <FolderOpen className="size-4" /> Import folder{hint("import")}
           </button>
-          <p className="text-xs text-neutral-400">Supported: Sony ARW, Fujifilm RAF, Canon CR3</p>
+          <p className="text-xs text-neutral-400">Sony ARW, Fujifilm RAF, Canon CR3 · JPEG, HEIC, TIFF, PNG when enabled in Import ▾</p>
         </div>
       );
     }

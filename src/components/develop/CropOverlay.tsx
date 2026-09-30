@@ -1,6 +1,6 @@
 // Crop tool overlay: dimmed outside, rule-of-thirds grid, 8 resize handles and a movable body over the fitted frame.
 import { useRef } from "react";
-import { HANDLES, fractionRatio, moveRect, resizeRect, type AspectId, type Handle, type Rect, ASPECTS } from "../../lib/crop";
+import { HANDLES, ASPECTS, fitRatio, fractionRatio, lastLockedAspect, moveRect, resizeRect, saveCropAspect, type AspectId, type Handle, type Rect } from "../../lib/crop";
 
 export interface CropTool {
   rect: Rect;
@@ -9,13 +9,41 @@ export interface CropTool {
   aspect: AspectId;
   /** Swap width and height of the aspect ratio (portrait <-> landscape). */
   flip: boolean;
+  /** Pixel ratio (w / h) of aspect "custom". */
+  customRatio?: number;
 }
 
 /** Fraction-unit ratio (w / h) that the tool's aspect preset locks the rect to, or null when free. */
-export function lockRatio(tool: Pick<CropTool, "aspect" | "flip">, imageAspect: number): number | null {
+export function lockRatio(tool: Pick<CropTool, "aspect" | "flip" | "customRatio">, imageAspect: number): number | null {
   if (tool.aspect === "free") return null;
-  const base = tool.aspect === "original" ? imageAspect : ASPECTS.find((a) => a.id === tool.aspect)!.ratio!;
+  const base = tool.aspect === "original" ? imageAspect : tool.aspect === "custom" ? (tool.customRatio ?? imageAspect) : ASPECTS.find((a) => a.id === tool.aspect)!.ratio!;
   return fractionRatio(tool.flip ? 1 / base : base, imageAspect);
+}
+
+/** Re-fits the rectangle to the tool's locked ratio (no-op when free). */
+export function refit(tool: CropTool, imageAspect: number): CropTool {
+  const fr = lockRatio(tool, imageAspect);
+  return fr == null ? tool : { ...tool, rect: fitRatio(tool.rect, fr) };
+}
+
+/** X / the swap button: landscape <-> portrait. A free rectangle is first locked to its current ratio. */
+export function swapTool(tool: CropTool, imageAspect: number): CropTool {
+  if (tool.aspect === "free") {
+    const r = tool.rect;
+    const ratio = ((r.r - r.l) / (r.b - r.t)) * imageAspect;
+    return refit({ ...tool, aspect: "custom", customRatio: ratio, flip: true }, imageAspect);
+  }
+  return refit({ ...tool, flip: !tool.flip }, imageAspect);
+}
+
+/** A: Free <-> the last locked aspect (Original by default). */
+export function toggleLockTool(tool: CropTool, imageAspect: number): CropTool {
+  if (tool.aspect === "free") {
+    return refit({ ...tool, aspect: lastLockedAspect(), customRatio: undefined }, imageAspect);
+  }
+  saveCropAspect(tool.aspect);
+  saveCropAspect("free");
+  return { ...tool, aspect: "free" };
 }
 
 interface Props {

@@ -25,6 +25,7 @@
 pub mod bursts;
 pub mod canonical_face;
 pub mod imgproc;
+pub mod masking;
 pub mod metrics;
 pub mod models;
 pub mod pose;

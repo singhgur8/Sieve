@@ -7,3 +7,46 @@
 body {
   @apply bg-neutral-950 text-neutral-200 antialiased;
 }
+
+/* Slider: the native range input stays (keyboard, pointer, a11y) but is drawn as a bare 10 px white thumb over the custom track. */
+input[type="range"].sieve-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  margin: 0;
+}
+input[type="range"].sieve-range:focus {
+  outline: none;
+}
+input[type="range"].sieve-range::-webkit-slider-runnable-track {
+  background: transparent;
+  height: 12px;
+}
+input[type="range"].sieve-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: 1px;
+  border-radius: 9999px;
+  background: #fff;
+  border: 0;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5);
+}
+input[type="range"].sieve-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px #38bdf8;
+}
+input[type="range"].sieve-range:disabled::-webkit-slider-thumb {
+  background: #737373;
+}
+input[type="range"].sieve-range::-moz-range-track {
+  background: transparent;
+  height: 12px;
+}
+input[type="range"].sieve-range::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: #fff;
+  border: 0;
+}

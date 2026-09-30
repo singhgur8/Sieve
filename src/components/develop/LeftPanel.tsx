@@ -12,9 +12,11 @@ interface Props {
   onUndo: () => void;
   onRedo: () => void;
   onGoto: (entryId: number) => void;
+  /** Photos a preset / reset would hit (> 1 shows a "-> n" hint). */
+  targetCount?: number;
 }
 
-export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto }: Props) {
+export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1 }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const entries = history ? [...history.entries].reverse() : [];
   return (
@@ -33,6 +35,11 @@ export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDel
               <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
                 {p.name}
               </button>
+              {targetCount > 1 && (
+                <span className="invisible mr-1 shrink-0 text-sky-300 group-hover:visible" data-testid={`preset-hint-${p.id}`}>
+                  → {targetCount}
+                </span>
+              )}
               {confirming === p.id ? (
                 <span className="flex shrink-0 items-center gap-1">
                   <button

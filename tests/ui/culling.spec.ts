@@ -4,7 +4,7 @@ import { calls, clearCalls, openApp, shot } from "./helpers";
 test.describe("grid", () => {
   test("renders 5000 items with a bounded DOM and scrolls smoothly", async ({ page }) => {
     await openApp(page, 5000);
-    await expect(page.getByTestId("shown-count")).toContainText("5000 of 5000");
+    await expect(page.getByTestId("selection-count")).toContainText("5000 photos");
 
     const domCount = () => page.locator('[data-testid^="cell-"]').count();
     const initial = await domCount();
@@ -104,11 +104,11 @@ test.describe("filters", () => {
   test("tag include / exclude, picks, rating, labels, bursts and folder change the query", async ({ page }) => {
     await openApp(page, 2000);
     const lastQuery = async () => (await calls(page, "list_image_ids")).at(-1)!.args.query;
-    const shown = page.getByTestId("shown-count");
+    const shown = page.getByTestId("selection-count");
 
     await page.getByTestId("tag-blink").click();
     await expect.poll(async () => (await lastQuery()).includeTags).toEqual(["blink"]);
-    await expect(shown).not.toContainText("2000 of");
+    await expect(shown).toContainText(" of 2000");
     const blinkOnly = await page.locator('[data-testid^="cell-"]').count();
     expect(blinkOnly).toBeGreaterThan(0);
     await shot(page, "04-filter-blink");
@@ -137,7 +137,7 @@ test.describe("filters", () => {
     await expect.poll(async () => (await lastQuery()).folderId).toBe(2);
 
     await page.getByTestId("clear-filters").click();
-    await expect(shown).toContainText("2000 of 2000");
+    await expect(shown).toContainText("2000 photos");
     const q = await lastQuery();
     expect(q.includeTags).toEqual([]);
     expect(q.folderId).toBeNull();
@@ -147,7 +147,7 @@ test.describe("filters", () => {
     await openApp(page, 1000);
     await page.getByTestId("collapse-bursts").check();
     // 4 burst members per 25 frames: 3 hidden each -> 1000 - 40*3 = 880
-    await expect(page.getByTestId("shown-count")).toContainText("880 of 1000");
+    await expect(page.getByTestId("selection-count")).toContainText("880 of 1000");
   });
 });
 

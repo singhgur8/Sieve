@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { AdjustmentField } from "../../ipc";
-import { ALL_ADJUSTMENT_FIELDS } from "../../ipc";
+import { ALL_ADJUSTMENT_FIELDS, DEFAULT_SYNC_FIELDS } from "../../ipc";
 import { FIELD_LABEL } from "../../lib/adjust";
 import { Dialog } from "../Dialog";
 
@@ -18,7 +18,7 @@ interface Props {
 
 /** Lightroom-style "which settings" checklist (fields mask) used by copy, sync and save-preset. */
 export function FieldsDialog({ title, confirm, withName, initialName = "", initial, onConfirm, onCancel }: Props) {
-  const [fields, setFields] = useState<Set<AdjustmentField>>(new Set(initial ?? ALL_ADJUSTMENT_FIELDS));
+  const [fields, setFields] = useState<Set<AdjustmentField>>(new Set(initial ?? DEFAULT_SYNC_FIELDS));
   const [name, setName] = useState(initialName);
   const toggle = (f: AdjustmentField) =>
     setFields((s) => {
