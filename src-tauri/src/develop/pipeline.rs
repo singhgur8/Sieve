@@ -35,6 +35,8 @@ use crate::profiles::dcp::{self as dcpm, HsvTable};
 use crate::profiles::table::{BigTable, RgbTable};
 
 use super::camera::{self, ColorSetup, Profile, PROPHOTO_TO_XYZ};
+use super::local::LocalOps;
+use super::masks::{LocalParam, LocalPlanes};
 use super::parity::{self, CurveLuts, Grade, GrainGen, Vignette, Working, PROPHOTO_Y};
 use super::source::ColorInfo;
 use super::tone::{self, LocalTone, ToneModel, ToneSliders};
@@ -137,6 +139,11 @@ const LOG2_GREY: f32 = -2.473_931_2;
 const SIGMA_MASK: f32 = 0.012;
 const SIGMA_TEXTURE: f32 = 0.0022;
 const SIGMA_HAZE: f32 = 0.02;
+/// Grid of the Shadows/Highlights delta tables over the adaptation luminance (pre-exposure
+/// EV): `TONE_LOCAL_N` nodes from `TONE_LOCAL_LO` over `TONE_LOCAL_SPAN` EV.
+pub(crate) const TONE_LOCAL_LO: f32 = -32.0;
+pub(crate) const TONE_LOCAL_SPAN: f32 = 40.0;
+pub(crate) const TONE_LOCAL_N: usize = 1281;
 
 const XYZ_FROM_SRGB: [[f64; 3]; 3] =
     [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]];
@@ -837,6 +844,7 @@ fn develop(
     cube: Option<&Lut>,
     space: &OutputSpace,
     quality: Quality,
+    masks: Option<&LocalPlanes>,
 ) -> Developed {
     let profile = input.profile;
     let adj = effective(adjustments, profile);
@@ -846,6 +854,12 @@ fn develop(
 
     // A. camera -> linear ProPhoto (pre-exposure; neutral clip = 1).
     let mut rgb = to_working(input, &setup);
+
+    // Local adjustments (Phase 7c, `develop::local`): None for unmasked renders.
+    let mut lops = masks.map(|p| LocalOps::new(p, &adj, input.color, profile, &setup));
+    if let Some(o) = &lops {
+        o.apply_white_balance(&mut rgb, w);
+    }
 
     // B. Noise reduction.
     {
@@ -871,21 +885,26 @@ fn develop(
         dehaze: adj.dehaze / 100.0,
     };
     let edge = input.frame_long_edge.max(1.0);
-    let need_base = !local_tone.is_identity();
+    let need_global_base = !local_tone.is_identity();
+    let need_base = need_global_base || lops.as_ref().is_some_and(LocalOps::needs_base);
     // Whole-frame adaptation (given by region renders; else computed from this input).
     let own_ctx = (need_base && input.tone.is_none()).then(|| ToneContext::from_working(&rgb, w, h));
     let ctx = input.tone.or(own_ctx.as_ref());
     if let Some(c) = ctx.filter(|_| need_base) {
         let (rs, rh) = LocalTone::references(&c.stats, adj.exposure + profile.baseline_ev);
-        const LO: f32 = -32.0;
-        const N: usize = 1281;
-        let step = 40.0 / (N - 1) as f32;
-        let values = local_tone.deltas(rs, rh, LO, step, N);
-        local.tone_local = Some(EvTable { lo: LO, inv_step: 1.0 / step, values });
+        let step = TONE_LOCAL_SPAN / (TONE_LOCAL_N - 1) as f32;
+        if need_global_base {
+            let values = local_tone.deltas(rs, rh, TONE_LOCAL_LO, step, TONE_LOCAL_N);
+            local.tone_local = Some(EvTable { lo: TONE_LOCAL_LO, inv_step: 1.0 / step, values });
+        }
+        if let Some(o) = &mut lops {
+            o.set_tone_references(rs, rh, TONE_LOCAL_LO, step, TONE_LOCAL_N);
+        }
     }
-    let need_clar = local.clarity != 0.0;
-    let need_tex = local.texture != 0.0;
-    let need_haze = local.dehaze > 0.0;
+    let lneeds = |p| lops.as_ref().is_some_and(|o| o.needs(p));
+    let need_clar = local.clarity != 0.0 || lneeds(LocalParam::Clarity);
+    let need_tex = local.texture != 0.0 || lneeds(LocalParam::Texture);
+    let need_haze = local.dehaze > 0.0 || lneeds(LocalParam::Dehaze);
     let (clar, tex, haze) = if need_clar || need_tex || need_haze {
         let f0 = if w.min(h) >= 1024 {
             4
@@ -971,19 +990,31 @@ fn develop(
     let grain = GrainGen::new(&adj.effects.grain, input.seed);
     let aspect = view.frame_w / view.frame_h.max(1e-3);
     let foot = 1.0 / scale;
+    let lops = lops.as_ref();
+    let lops_c = lops.filter(|o| o.any_local_operator());
+    let lops_base = lops.is_some_and(LocalOps::has_tone_local);
+    let adapt_ctx = ctx.filter(|_| local.tone_local.is_some() || lops_base);
     rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         let fy = (y as f32 + 0.5 - view.frame_y) / view.frame_h.max(1e-3);
         for x in 0..w {
             let p = &mut row[x * 3..x * 3 + 3];
             let mut v = [p[0], p[1], p[2]];
-            let adapt = match (&local.tone_local, ctx) {
-                (Some(_), Some(c)) => Some(c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy)),
-                _ => None,
-            };
-            if adapt.is_some() || clar.is_some() || tex.is_some() || haze.is_some() || local.dehaze < 0.0 {
-                v = apply_local(v, x, y, &local, adapt, clar.as_ref(), tex.as_ref(), haze.as_ref());
+            let i = y * w + x;
+            let adapt = adapt_ctx.map(|c| c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy));
+            if adapt.is_some()
+                || clar.is_some()
+                || tex.is_some()
+                || haze.is_some()
+                || local.dehaze < 0.0
+                || lops_c.is_some()
+            {
+                let px = lops_c.map(|o| (o, i));
+                v = apply_local(v, x, y, &local, adapt, clar.as_ref(), tex.as_ref(), haze.as_ref(), px);
             }
-            let mut e = out.apply(lut.eval(v));
+            let mut e = match lops {
+                None => out.apply(lut.eval(v)),
+                Some(o) => out.apply(o.blend(lut.eval(o.pointwise(v, i)), i)),
+            };
             if vig.is_some() || grain.is_some() {
                 let fx = (x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3);
                 if let Some(vg) = &vig {
@@ -1002,6 +1033,9 @@ fn develop(
     {
         let mut work = Working { width: w, height: h, rgb: &mut rgb };
         parity::sharpen(&mut work, &adj.detail.sharpening, scale);
+        if let Some(o) = lops {
+            o.apply_detail(&mut work, scale);
+        }
     }
     Developed { width: w, height: h, rgb }
 }
@@ -1270,34 +1304,43 @@ fn apply_local(
     clar: Option<&Field>,
     tex: Option<&Field>,
     haze: Option<&Field>,
+    px: Option<(&LocalOps, usize)>,
 ) -> [f32; 3] {
     let mut v = v;
     let yl = dot(PROPHOTO_Y, v).max(1e-9);
     let ev = yl.log2();
     let mut delta = 0.0f32;
-    if let (Some(t), Some(m)) = (&k.tone_local, adapt) {
-        delta += t.eval(m);
+    if let Some(m) = adapt {
+        if let Some(t) = &k.tone_local {
+            delta += t.eval(m);
+        }
+        if let Some((o, i)) = px {
+            delta += o.tone_local(i, m);
+        }
     }
     if let Some(c) = clar {
         let evb = c.sample(x, y);
         let rel = ev - LOG2_GREY + 2.5;
         let mid = 1.0 / (1.0 + (rel / 3.0) * (rel / 3.0));
-        delta += k.clarity * (ev - evb) * mid;
+        let amount = k.clarity + px.map_or(0.0, |(o, i)| o.clarity(i));
+        delta += amount * (ev - evb) * mid;
     }
     if let Some(t) = tex {
-        delta += k.texture * (ev - t.sample(x, y));
+        let amount = k.texture + px.map_or(0.0, |(o, i)| o.texture(i));
+        delta += amount * (ev - t.sample(x, y));
     }
     if delta != 0.0 {
         let g = delta.clamp(-12.0, 12.0).exp2();
         v = v.map(|c| c * g);
     }
-    if let Some(hz) = haze {
+    let dehaze = k.dehaze + px.map_or(0.0, |(o, i)| o.dehaze(i));
+    if let (Some(hz), true) = (haze, dehaze > 0.0) {
         // Remove the locally estimated veil (scene white ~1).
-        let veil = (hz.sample(x, y).max(0.0) * k.dehaze * 0.9).min(0.9);
+        let veil = (hz.sample(x, y).max(0.0) * dehaze * 0.9).min(0.9);
         let t = 1.0 - veil;
         v = v.map(|c| (c - veil).max(0.0) / t);
-    } else if k.dehaze < 0.0 {
-        let a = -k.dehaze * 0.6;
+    } else if dehaze < 0.0 {
+        let a = (-dehaze * 0.6).min(1.0);
         let fog = 0.12;
         v = v.map(|c| c + (fog - c) * a);
     }
@@ -1307,8 +1350,19 @@ fn apply_local(
 /// Renders `input` with `adjustments` for the preview (8-bit sRGB + histogram); `lut` is the
 /// resolved `adjustments.lut` (if present in the library).
 pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Option<&Lut>) -> RenderedImage {
+    render_masked(input, adjustments, lut, None)
+}
+
+/// [`render`] with the local adjustments of `adjustments.masks` evaluated on this input's
+/// grid (`develop::masks::LocalPlanes`; `None` = no active mask group).
+pub fn render_masked(
+    input: &RenderInput,
+    adjustments: &ParametricAdjustments,
+    lut: Option<&Lut>,
+    masks: Option<&LocalPlanes>,
+) -> RenderedImage {
     let srgb = OutputSpace::srgb();
-    let dev = develop(input, adjustments, lut, &srgb, input.quality);
+    let dev = develop(input, adjustments, lut, &srgb, input.quality, masks);
     let (w, h) = (dev.width, dev.height);
     const BAND: usize = 8;
     let mut rgb = vec![0u8; w * h * 3];
@@ -1356,7 +1410,18 @@ pub fn render_output(
     lut: Option<&Lut>,
     space: &OutputSpace,
 ) -> Vec<u16> {
-    let dev = develop(input, adjustments, lut, space, Quality::Export);
+    render_output_masked(input, adjustments, lut, space, None)
+}
+
+/// [`render_output`] with local adjustments (see [`render_masked`]).
+pub fn render_output_masked(
+    input: &RenderInput,
+    adjustments: &ParametricAdjustments,
+    lut: Option<&Lut>,
+    space: &OutputSpace,
+    masks: Option<&LocalPlanes>,
+) -> Vec<u16> {
+    let dev = develop(input, adjustments, lut, space, Quality::Export, masks);
     dev.rgb.par_iter().map(|&c| (c * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16).collect()
 }
 

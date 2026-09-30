@@ -23,7 +23,7 @@ import {
   type ParametricAdjustments,
   type RenderSlot,
 } from "../ipc";
-import { neutralAdjustments } from "../lib/adjust";
+import { labelWithValue, neutralAdjustments } from "../lib/adjust";
 
 export interface RenderView {
   imageId: number;
@@ -76,13 +76,21 @@ export interface Editor {
   goto: (entryId: number) => void;
   /** Re-read adjustments + history from the backend (after batch operations). */
   reload: () => Promise<void>;
+  /** Time (ms) of the adjustment Cmd+Z would undo; 0 when there is nothing to undo. */
+  lastCommitAt: () => number;
+  /** True when a redo entry exists. */
+  canRedo: () => boolean;
 }
+
+/** Settings that change the develop warnings: the profile / look, and which AI masks have a computed matte. */
+const warnKey = (a: CompleteAdjustments) =>
+  JSON.stringify([a.profile, a.masks.flatMap((g) => g.components.map((c) => (c.shape.kind === "ai" ? (c.shape.digest ?? "") : "")))]);
 
 export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
   const [info, setInfo] = useState<DevelopInfo | null>(null);
-  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null });
+  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null, mask: null });
   const [histogram, setHistogram] = useState<Histogram | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -94,12 +102,14 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const lastProfile = useRef("");
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
-  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false });
+  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false });
   const inflight = useRef(new Set<string>());
   const nullStreak = useRef(new Map<string, number>());
   const draft = useRef(false);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const chain = useRef<Promise<unknown>>(Promise.resolve());
+  const historyRef = useRef<AdjustmentHistory | null>(null);
+  historyRef.current = history;
 
   const enqueue = useCallback((fn: () => Promise<unknown>) => {
     chain.current = chain.current.then(fn).catch((e) => optsRef.current.onError(e));
@@ -167,7 +177,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const setAdjBoth = useCallback((a0: ParametricAdjustments) => {
     const a = completeAdjustments(a0, optsRef.current.format);
     adjRef.current = a;
-    lastProfile.current ||= JSON.stringify(a.profile);
+    lastProfile.current ||= warnKey(a);
     setAdj(a);
   }, []);
 
@@ -178,11 +188,11 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     endDraft();
     const snapshot = adjRef.current;
     enqueue(async () => {
-      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, p.label));
+      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       // Profile / look availability warnings depend on the saved settings.
-      const pk = JSON.stringify(snapshot.profile);
+      const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
         lastProfile.current = pk;
         setInfo(await unwrap(commands.getDevelopInfo(p.id)));
@@ -195,7 +205,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (id == null) return;
     let stale = false;
     setLoading(true);
-    setViews({ main: null, before: null, detail: null });
+    setViews({ main: null, before: null, detail: null, mask: null });
     setHistogram(null);
     setInfo(null);
     setHistory(null);
@@ -299,16 +309,25 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (cur == null) return;
     commitPending();
     await chain.current;
-    const [a, h] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur))]);
+    const [a, h, i] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur)), unwrap(commands.getDevelopInfo(cur))]);
     if (idRef.current !== cur) return;
     setAdjBoth(a);
     setHistory(h);
+    setInfo(i);
     schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     optsRef.current.onChanged(cur);
   }, [commitPending, setAdjBoth, schedule]);
 
+  const lastCommitAt = useCallback(() => {
+    if (pending.current) return Date.now();
+    const h = historyRef.current;
+    if (!h || !h.canUndo) return 0;
+    return h.entries.find((e) => e.id === h.currentEntryId)?.createdAtMs ?? 0;
+  }, []);
+  const canRedo = useCallback(() => !!historyRef.current?.canRedo, []);
+
   return useMemo(
-    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload }),
-    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload],
+    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
+    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
   );
 }

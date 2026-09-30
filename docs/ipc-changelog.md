@@ -503,6 +503,108 @@ Who updates what
   `DEFAULT_SYNC_FIELDS` as the Sync default. Replace `neutralAdjustments()` in `src/lib/adjust.ts` with
   `defaultAdjustments(format)`.
 
+## v10 — 2026-09-29 (Phase 7c: local adjustments / masks)
+Model = Lightroom's `crs:MaskGroupBasedCorrections`, 1:1. Types in `src-tauri/src/ipc/masks.rs` (re-exported from
+`ipc::types`); design, frames and XMP mapping in `docs/architecture.md` "Masks (Phase 7c, IPC v10)".
+
+Types
+- `ParametricAdjustments.masks: MaskGroup[]` (`#[serde(default)]`, TS-optional, backend always sends it; default
+  `[]`). History, undo, presets, copy/paste/sync cover masks. `AdjustmentField` += `masks` (label "Masking"); not in
+  `DEFAULT_SYNC` / `DEFAULT_SYNC_FIELDS` (per-frame, like crop). `copy_fields(masks)` drops AI digests
+  (`MaskGroup::transferable`, TS `transferableMaskGroup`): the target recomputes its mattes. `lerp`: nearer side's.
+- `MaskGroup {id, name, active, amount (0..=2), adjustments: LocalAdjustments, components: MaskComponent[]}`;
+  `MaskComponent {id, name, active, mode: MaskBlendMode (add|subtract|intersect), inverted, opacity (0..=1),
+  shape: MaskShape}`; ids = Lightroom SyncIDs (32 upper hex; TS `newMaskId()`).
+- `MaskShape` (tag `kind`): `brush {strokes: BrushStroke[] {radius, flow, feather, density, erase, autoMask,
+  dabs: NormPoint[]}}`, `linear {zero, full}`, `radial {top, left, bottom, right, angle, midpoint, roundness,
+  feather, flipped}`, `luminance {featherLow, low, high, featherHigh, smoothness}`, `color {samples: ColorSample[]
+  {point, area, lightroomModel}, amount}`, `ai {target: AiTarget, referencePoint, digest}`, `unsupported {what}`
+  (Lightroom kinds Sieve does not model; preserved, not creatable).
+- `AiTarget` (tag `kind`): `subject | sky | background | people {parts: PersonPart[]} | object {region} |
+  landscape {category} | other {subType, subCategory}`. `PersonPart` (face_skin, body_skin, eyebrows, eye_sclera,
+  iris_pupil, lips, teeth, hair, clothes), `LandscapeCategory`, `AiTargetKind`.
+- `LocalAdjustments` (UI units: temperature, tint, exposure -4..=4 EV, contrast, highlights, shadows, whites, blacks,
+  texture, clarity, dehaze, hue -180..=180, saturation, sharpness, noise, moire, defringe, color {hue, saturation},
+  curveRefineSaturation (default 100), toneCurve: PointCurves); generated constant `DEFAULT_LOCAL_ADJUSTMENTS`.
+- **Frame**: every mask coordinate is in the *sensor frame* (un-oriented, uncropped, normalized), like Lightroom;
+  brush radius = fraction of the sensor width. Helpers `orient_point` / `unorient_point` (TS `orientPoint`,
+  `unorientPoint`).
+- Command types: `AiMaskRequest`, `AiMaskInfo`, `AiMaskOrigin` (lightroom|sieve), `AiMaskState`
+  (ready|needs_update|computing|unavailable), `AiMaskStatus`, `MaskList`, `DetectedPerson`, `MaskOverlayTarget`,
+  `MaskOverlayOptions`, `RenderedMaskOverlay`, `AiCapability`, `MaskCapabilities`. Limits `MaskLimits` (TS
+  `MASK_LIMITS`): 100 groups, 64 components/group, 200k dabs, 5 colour samples, 64-char names.
+- `RenderSlot` += `mask` (overlays only; `render_preview` rejects it). `DevelopWarningCode` += `ai_mask_needs_update`;
+  `masks_unsupported` now means "components Sieve cannot render" once the v10 reader lands.
+- `validate()` covers masks (`validate_masks`). TS helpers: `newMaskGroup`, `newMaskComponent`,
+  `defaultLocalAdjustments`, `completeAdjustments` fills `masks`.
+
+Commands
+- `list_masks(id) -> MaskList` (stored groups + AI component status).
+- `save_masks(id, masks, label) -> AdjustmentHistory` (replaces only `masks`; one history entry; XMP dirty).
+  Implemented (thin glue over `repo::get_adjustments` + `history::commit`).
+- `compute_ai_mask(id, request: AiMaskRequest) -> AiMaskInfo` (blocking pool; cached per image + kind + model).
+- `detect_people(id) -> DetectedPerson[]`.
+- `render_mask_overlay(id, adjustments, target, options) -> RenderedMaskOverlay | null` (grayscale JPEG on
+  `sieve://localhost/render/<id>/mask?v=<seq>`, latest-wins; same frame as `render_preview`).
+- `get_mask_capabilities() -> MaskCapabilities`.
+- Live preview: masks travel inside `render_preview`'s `adjustments` (no extra call per frame).
+
+Schema (migration `0010_masks.sql`, user_version 10)
+- `mask_cache (image_id, digest, kind, origin, model_version, input_digest, path, width, height, bounds_x/y/w/h,
+  coverage, created_at)`, PK (image_id, digest), index (image_id, kind, model_version), cascade on image delete.
+  Mattes = PNG files under `<cacheDir>/masks/`.
+- `images.masks_pending_import` (1 = sidecar had masks at a pre-v10 read; set by the migration from
+  `develop_warnings`). The XMP writer must not touch masks while it is 1.
+
+Managed state (lib.rs): `develop::masks::MaskCache` (config: catalog path, cache dir) and `ml::masking::Segmenter`
+(models dir, catalog path; holds a `MaskCache`). Both constructors do no I/O.
+
+Who updates what
+- architect (done): types, validation, tests, generated constant, commands + registration, migration + test,
+  stubs below, TS helpers, mock backend (`list_masks`, `save_masks`, `compute_ai_mask`, `detect_people`,
+  `render_mask_overlay`, `get_mask_capabilities`), minimal frontend compile fixes (`useEditor` slot records +
+  `mask`, `WarningsChip` text for `ai_mask_needs_update`).
+- rust-engine-dev: every `todo!()` in `develop/masks.rs` (`AlphaMask::{sample, coverage}`, `MaskCache::{put,
+  resolve, load, status, sweep}`, `MatteSource for MaskCache`, `MaskGeometry`, `evaluate_component`, `combine`,
+  `evaluate`, `LocalPlanes::build`, `apply_group_blends`, `render_overlay`) and `xmp/masks.rs` (`read`,
+  `decode_table`, `decode_matte` (JXL via ImageIO), `apply`); pipeline integration at the seam documented in
+  `develop/masks.rs` (steps 1-6) for preview **and** export (export computes missing AI mattes via
+  `Segmenter::compute` first); `DevelopCache` access to `MaskCache` (add `mask_cache` to `DevelopConfig`; the
+  architect approves the one-line change in `lib.rs`); XMP read path: import masks + store Lightroom mattes +
+  clear `masks_pending_import`; one-off catch-up for flagged images (XmpSync at launch + `read_xmp`); write path:
+  run `xmp::masks::apply` after `packet::merge` unless `masks_pending_import`; `crs::unsupported_warnings`:
+  replace the blanket `masks_unsupported` with `xmp::masks::MasksRead.warnings`; `DevelopCache::info` adds
+  `ai_mask_needs_update`. Acceptance: roadmap Phase 7c (user's masks import and render; round trip preserves them).
+- vision-ml-dev: `ml/masking.rs` (`Segmenter::{capabilities, model_version, compute, is_computing,
+  detect_people}`) and concrete `SegmentModel`s (e.g. `ml/segment.rs`); models + licences in `docs/decisions.md`.
+- frontend-dev: Masks panel + tools (API summary in `docs/architecture.md` "Masks"): groups list (add, rename,
+  toggle, delete, reorder, amount), component list with add/subtract/intersect, invert, opacity; local sliders
+  (`LocalAdjustments`); tools: brush (size/feather/flow/density/auto-mask, eraser with Alt), linear + radial
+  handles, luminance/colour range, AI buttons from `getMaskCapabilities` (People picker via `detectPeople`,
+  "Update" for `needs_update`); overlay via `renderMaskOverlay`; shortcuts. Live edits go through
+  `renderPreview(adjustments with masks)`; commit with `saveMasks` (or `saveAdjustments`). Convert pointer
+  positions with `unorientPoint` (+ crop mapping). Replace the `mask: null/false` placeholders in `useEditor.ts`
+  if the editor state is restructured; `RenderSlot` records must include `mask`.
+
+## v11 — 2026-09-30 (UX review 2: white balance picker, P1-12)
+Commands
+- New `sample_white_balance(id, point: NormPoint, adjustments: ParametricAdjustments) -> WhiteBalanceValues`
+  (TS `commands.sampleWhiteBalance(id, point, adjustments)`). `point` is in the **sensor frame** (normalized,
+  un-oriented, uncropped; same convention as masks: convert a viewer click with `unorientPoint` + crop mapping).
+  Averages the 5x5 develop-source pixels (linear camera RGB, before WB) around the point and returns the Temp/Tint
+  that neutralizes them, through the same colour path as `DevelopInfo.asShot` (DCP of `adjustments.profile`, else
+  the camera matrix), clamped to 2000..=50000 K / -150..=150. Errors: `invalid_argument` with a user-facing message
+  when the point is outside 0..=1, any sample pixel is clipped ("...clipped (overexposed)...") or the sample is too
+  dark ("...too dark to measure..."). Decodes the source if not cached.
+- No type or schema changes. `develop::camera::values_of_multipliers` factored out of `as_shot_values`.
+
+Who updates what
+- architect (done): command + registration, body (`DevelopCache::sample_white_balance`, `develop::sample_multipliers`;
+  thin, rust-engine-dev owns it from here), tests, bindings, mock backend (`sample_white_balance`: temperature
+  `3000 + 5000·x`, tint `(y − 0.5)·40`, clipped error for `y < 0.05`).
+- frontend-dev: P1-12 UI (W toggles the picker; click -> `sampleWhiteBalance` -> commit
+  `whiteBalance: {custom: values}` with history label "White Balance: Picker"; show the error message on failure).
+
 ## v11.1 — 2026-09-30 (doc-only)
 - `CullThresholds.overexposedClipPct` now means the share of a subject face's skin that is blown (every channel ≥ 250); a frame > 60% blown also counts. Saved overrides from earlier versions are read with the new meaning (stricter).
 - `QualityScore.suggestedPick`: burst non-keepers are capped below the keeper, never rejected for being duplicates. No type changes.

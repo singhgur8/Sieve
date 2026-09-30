@@ -153,6 +153,18 @@ export const commands = {
 	 */
 	getDevelopInfo: (id: number) => typedError<DevelopInfo, AppError>(__TAURI_INVOKE("get_develop_info", { id })),
 	/**
+	 *  White balance picker (IPC v11): the Temp/Tint that neutralizes the 5x5 develop-source
+	 *  pixel neighbourhood around `point`. `point` is in the **sensor frame** (normalized 0..=1
+	 *  of the un-oriented, uncropped image; same convention as masks: convert a viewer click with
+	 *  `unorientPoint` + the crop mapping). `adjustments` = the live (unsaved) edit; only its
+	 *  `profile` matters (colour matrices, as for `DevelopInfo.asShot`). The result is clamped to
+	 *  the slider ranges; the caller commits `whiteBalance: custom` itself. Errors:
+	 *  `invalid_argument` if the point is outside 0..=1 or the sample is clipped / too dark
+	 *  (message is user-facing). Body: architect (thin wrapper over
+	 *  `DevelopCache::sample_white_balance`; rust-engine-dev owns it from here).
+	 */
+	sampleWhiteBalance: (id: number, point: NormPoint, adjustments: ParametricAdjustments) => typedError<WhiteBalanceValues, AppError>(__TAURI_INVOKE("sample_white_balance", { id, point, adjustments })),
+	/**
 	 *  Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
 	 *  the image being edited). Returns immediately.
 	 */
@@ -315,6 +327,11 @@ export const commands = {
 	crop?: CropSettings,
 	/**  Camera profile + look (see [`ProfileSettings`]). */
 	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
 } | null, region: {
 	x: number,
 	y: number,
@@ -360,6 +377,43 @@ export const commands = {
 	 *  when none are installed). Select one by saving `adjustments.profile`.
 	 */
 	listProfiles: (id: number) => typedError<ProfileCatalog, AppError>(__TAURI_INVOKE("list_profiles", { id })),
+	/**
+	 *  The image's stored mask groups (`getAdjustments(id).masks`) + the render status of each
+	 *  AI component (`MaskCache::status`, rust-engine-dev).
+	 */
+	listMasks: (id: number) => typedError<MaskList, AppError>(__TAURI_INVOKE("list_masks", { id })),
+	/**
+	 *  Replaces the image's mask groups (everything else in its adjustments is kept) with one
+	 *  history entry labelled `label` (e.g. "Mask: Brush", "Mask: Exposure"; same-label saves
+	 *  within 1.5 s coalesce, so saving on every stroke / slider release is fine). XMP dirty.
+	 */
+	saveMasks: (id: number, masks: MaskGroup[], label: string) => typedError<AdjustmentHistory, AppError>(__TAURI_INVOKE("save_masks", { id, masks, label })),
+	/**
+	 *  Computes (or returns the cached) AI matte for `request` on image `id`; resolves when
+	 *  done (first run per image and kind: model load + inference; cached: instant). Put
+	 *  `digest` into the component's `AiMask.digest` and save. `invalid` when the family is
+	 *  unavailable (`getMaskCapabilities`).
+	 */
+	computeAiMask: (id: number, request: AiMaskRequest) => typedError<AiMaskInfo, AppError>(__TAURI_INVOKE("compute_ai_mask", { id, request })),
+	/**  People in image `id` for the People mask picker (left to right). */
+	detectPeople: (id: number) => typedError<DetectedPerson[], AppError>(__TAURI_INVOKE("detect_people", { id })),
+	/**
+	 *  Renders the mask of `target` (a group, or one component, of `adjustments.masks`: live
+	 *  and unsaved) as a grayscale JPEG matching `render_preview`'s frame for the same
+	 *  `maxEdge` / `region`. Latest-wins per image on the `mask` slot: `null` = superseded.
+	 */
+	renderMaskOverlay: (id: number, adjustments: ParametricAdjustments, target: MaskOverlayTarget, options: MaskOverlayOptions) => typedError<{
+	imageId: number,
+	seq: number,
+	url: string,
+	width: number,
+	height: number,
+	/**  Mean mask value of the rendered frame, 0..=1. */
+	coverage: number,
+	renderMs: number,
+} | null, AppError>(__TAURI_INVOKE("render_mask_overlay", { id, adjustments, target, options })),
+	/**  Which AI mask families can be computed on this Mac (model files present). */
+	getMaskCapabilities: () => typedError<MaskCapabilities, AppError>(__TAURI_INVOKE("get_mask_capabilities")),
 };
 
 /** Events */
@@ -379,9 +433,11 @@ export const events = {
 };
 
 /* Constants */
-export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
-export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+
+export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"hue":0.0,"saturation":0.0},"contrast":0.0,"curveRefineSaturation":100.0,"defringe":0.0,"dehaze":0.0,"exposure":0.0,"highlights":0.0,"hue":0.0,"moire":0.0,"noise":0.0,"saturation":0.0,"shadows":0.0,"sharpness":0.0,"temperature":0.0,"texture":0.0,"tint":0.0,"toneCurve":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]},"whites":0.0} as const;
 
 /* Types */
 /**
@@ -418,7 +474,12 @@ export type AdjustmentField =
 /**  `crop` (v9). Not in [`AdjustmentField::DEFAULT_SYNC`]. */
 "crop" | 
 /**  `profile` (camera profile + look) (v9). */
-"profile";
+"profile" | 
+/**
+ *  `masks` (all mask groups; AI mattes are recomputed on the target) (v10). Not in
+ *  [`AdjustmentField::DEFAULT_SYNC`].
+ */
+"masks";
 
 /**
  *  Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
@@ -433,6 +494,126 @@ export type AdjustmentHistory = {
 	canUndo: boolean,
 	canRedo: boolean,
 };
+
+/**  Availability of one AI selection family. */
+export type AiCapability = {
+	kind: AiTargetKind,
+	available: boolean,
+	/**  Model id when available. */
+	model: string | null,
+	/**  Why not (e.g. "model file sky.onnx not installed"), when unavailable. */
+	reason: string | null,
+};
+
+/**
+ *  AI selection. The pixels are a matte computed once per image (Sieve's models) or read
+ *  from Lightroom's sidecar bitmap, stored in the mask cache (`mask_cache`, migration 0010)
+ *  and referenced by `digest`.
+ */
+export type AiMask = {
+	target: AiTarget,
+	/**
+	 *  Sensor-frame point identifying the instance (`crs:ReferencePoint`): which person for
+	 *  `people`, the clicked subject otherwise. `null` = all instances.
+	 */
+	referencePoint: NormPoint | null,
+	/**
+	 *  Mask-cache key of the matte this component uses (`crs:MaskDigest` for Lightroom
+	 *  bitmaps; 32 upper-case hex). `null` = not computed for this image yet: the renderer
+	 *  uses a cached Sieve matte for (image, [`AiMask::cache_kind`]) if one exists, else the
+	 *  component is empty and `ai_mask_needs_update` is reported. Set it from
+	 *  `computeAiMask(...).digest`.
+	 */
+	digest: string | null,
+};
+
+/**  A cached AI matte. */
+export type AiMaskInfo = {
+	/**  Put this into `AiMask.digest`. */
+	digest: string,
+	target: AiTarget,
+	referencePoint: NormPoint | null,
+	origin: AiMaskOrigin,
+	/**  Sieve model id (`SegmentModel::id`) or `lr:<crs:ModelVersion>`. */
+	modelVersion: string,
+	/**  Stored bitmap size in px. */
+	width: number,
+	height: number,
+	/**
+	 *  Placement of the bitmap in the sensor frame (Lightroom crops mattes to their
+	 *  bounding box: `crs:Origin` / `crs:WholeImageArea`).
+	 */
+	bounds: NormRect,
+	/**  Mean matte value over the whole frame, 0..=1 (0 = nothing found). */
+	coverage: number,
+};
+
+/**  Where a cached matte came from (`mask_cache.origin`). */
+export type AiMaskOrigin = 
+/**  Decoded from the sidecar's `crs:Table_<MaskDigest>` (Lightroom's own model). */
+"lightroom" | 
+/**  Computed by Sieve's segmentation models. */
+"sieve";
+
+/**  `compute_ai_mask` input. */
+export type AiMaskRequest = {
+	target: AiTarget,
+	/**  Sensor frame; for `people` from `detectPeople(...)[i].referencePoint`. */
+	referencePoint: NormPoint | null,
+	/**  Recompute even when a matte for this (image, kind, current model) is cached. */
+	force: boolean,
+};
+
+export type AiMaskState = 
+/**  The component's matte is cached and will render. */
+"ready" | 
+/**
+ *  No matte for this image yet (pasted/synced/preset mask, or Lightroom mask without
+ *  a bitmap): call `computeAiMask` (Lightroom's "Update").
+ */
+"needs_update" | 
+/**  A `computeAiMask` for it is running. */
+"computing" | 
+/**
+ *  The model for this kind is not installed (`MaskCapabilities`); a Lightroom
+ *  bitmap, if any, still renders (then the state is `ready`).
+ */
+"unavailable";
+
+/**  Render status of one AI component. */
+export type AiMaskStatus = {
+	groupId: string,
+	componentId: string,
+	state: AiMaskState,
+	/**  The matte that renders (when `ready`). */
+	info: AiMaskInfo | null,
+};
+
+/**
+ *  What an AI component selects (`Mask/Image`, `crs:MaskSubType` + `crs:MaskSubCategoryID`;
+ *  value mapping in `xmp/masks.rs` `AI_SUBTYPES`: subject = 1 verified on 50 of the user's
+ *  sidecars, the rest provisional).
+ */
+export type AiTarget = 
+/**  Main subject(s) ("Select Subject"). */
+{ kind: "subject" } | { kind: "sky" } | 
+/**  Everything but the subject ("Select Background"). */
+{ kind: "background" } | 
+/**
+ *  A person (identified by `AiMask.referencePoint`; `null` = all people) or some of
+ *  their parts (empty = entire person).
+ */
+{ kind: "people"; parts: PersonPart[] } | 
+/**  The object inside `region` (sensor frame), Lightroom "Objects". */
+{ kind: "object"; region: NormRect } | { kind: "landscape"; category: LandscapeCategory } | 
+/**
+ *  A Lightroom AI kind Sieve does not model: rendered only from Lightroom's own bitmap
+ *  (when present), preserved on write.
+ */
+{ kind: "other"; subType: number; subCategory: number | null };
+
+/**  AI selection families, for capability reporting (`MaskCapabilities.ai`). */
+export type AiTargetKind = "subject" | "sky" | "background" | "people" | "object" | "landscape";
 
 /**  Analysis failed for an image (unreadable preview, model error). */
 export type AnalysisFailed = {
@@ -537,6 +718,38 @@ export type BitDepth = "8" | "16";
 export type BlackAndWhite = {
 	enabled: boolean,
 	mixer: HslChannels,
+};
+
+/**  Brush strokes of one brush component. */
+export type BrushMask = {
+	strokes: BrushStroke[],
+};
+
+/**
+ *  One stroke = one `Mask/Paint` item: constant brush settings + a dab polyline.
+ *  XMP: `crs:Radius`, `crs:Flow`, `crs:CenterWeight` (= 1 - feather, provisional),
+ *  `crs:MaskValue` (density; 0 for erase strokes, provisional), `crs:Dabs` = `rdf:Seq` of
+ *  `"d <x> <y>"` (and rarely `"r <radius>"`, a radius change for the following dabs; the
+ *  reader splits the stroke there).
+ */
+export type BrushStroke = {
+	/**  Fraction of the sensor-frame width, > 0 and <= 1 (verified scale). */
+	radius: number,
+	/**  0..=1: fraction of the stroke's opacity each dab adds (Lightroom "Flow"). */
+	flow: number,
+	/**  0..=1: soft edge width as a fraction of the radius (Lightroom "Feather" / 100). */
+	feather: number,
+	/**  0..=1: maximum opacity this stroke can reach (Lightroom "Density" / 100). */
+	density: number,
+	/**  Eraser stroke: removes `density` from the brush component instead of adding. */
+	erase: boolean,
+	/**
+	 *  Lightroom "Auto Mask": confine the stroke to edges similar to the colour under the
+	 *  dabs (edge-aware refine at evaluation time).
+	 */
+	autoMask: boolean,
+	/**  Dab centres (sensor frame). Coordinates may lie slightly outside 0..=1. */
+	dabs: NormPoint[],
 };
 
 /**  A cluster of near-identical frames shot in quick succession. */
@@ -655,6 +868,31 @@ export type ColorGrading = {
 export type ColorLabel = "red" | "yellow" | "green" | "blue" | "purple";
 
 /**
+ *  Colour range: pixels whose colour is close to any sample (1..=5 samples).
+ *  XMP: `Mask/RangeMask` + `crs:CorrectionRangeMask` (`Type` colour, `ColorAmount` =
+ *  amount / 100, `PointModels` / `AreaModels`; provisional).
+ */
+export type ColorRange = {
+	samples: ColorSample[],
+	/**  0..=100: selection width (Lightroom "Refine", default 50). */
+	amount: number,
+};
+
+/**  One eyedropper sample (point, or a dragged rectangle when `area` is set). */
+export type ColorSample = {
+	/**  Sensor frame. */
+	point: NormPoint,
+	/**  Dragged sample area (sensor frame), if any. */
+	area: NormRect | null,
+	/**
+	 *  Lightroom's stored colour model for this sample (the raw `PointModels` / `AreaModels`
+	 *  item), kept verbatim so an unmodified sample round-trips; Sieve re-derives the colour
+	 *  from `point`/`area` when rendering and writes `null` samples without a model.
+	 */
+	lightroomModel: string | null,
+};
+
+/**
  *  One Color Grading wheel. `hue` 0..=360 degrees, `saturation` 0..=100,
  *  `luminance` -100..=100.
  */
@@ -750,6 +988,16 @@ export type DetailAdjustments = {
 	noiseReduction: NoiseReduction,
 };
 
+/**  A person found by `detect_people` (Lightroom's People thumbnails). */
+export type DetectedPerson = {
+	/**  Sensor frame; use as `AiMaskRequest.referencePoint` / `AiMask.referencePoint`. */
+	referencePoint: NormPoint,
+	/**  Person bounds in the *displayed* frame (orientation applied), like `FaceInfo.bbox`. */
+	bbox: NormRect,
+	/**  Face bounds (displayed frame), for the thumbnail, if a face was found. */
+	face: NormRect | null,
+};
+
 /**  Facts about an image's develop source, for initializing the editor. */
 export type DevelopInfo = {
 	imageId: number,
@@ -795,10 +1043,19 @@ export type DevelopWarningCode =
  */
 "look_unavailable" | 
 /**
- *  `crs:MaskGroupBasedCorrections` (local adjustments / AI masks, Phase 7c):
- *  preserved in the sidecar, not rendered yet. `detail` = number of mask groups.
+ *  Local corrections Sieve cannot render (v10: `MaskShape::Unsupported` components
+ *  such as depth ranges, legacy pre-2021 `crs:GradientBasedCorrections` /
+ *  `CircularGradientBasedCorrections` / `PaintBasedCorrections`): preserved in the
+ *  sidecar. `detail` = number of affected components / corrections. (Until the v10
+ *  mask reader lands, every `crs:MaskGroupBasedCorrections`; `detail` = group count.)
  */
 "masks_unsupported" | 
+/**
+ *  AI mask components without a matte for this image (pasted/synced masks, or the
+ *  model for that kind is not installed): rendered as empty until `computeAiMask`
+ *  succeeds. `detail` = number of components (v10).
+ */
+"ai_mask_needs_update" | 
 /**  `crs:RetouchAreas` (spot heal/clone): preserved, not rendered. */
 "retouch_unsupported" | 
 /**
@@ -1298,6 +1555,85 @@ export type ImportSummary = {
 	companions: number,
 };
 
+/**  Landscape categories of an AI "Landscape" selection (Lightroom 13; sky is `AiTarget::Sky`). */
+export type LandscapeCategory = "water" | "vegetation" | "mountains" | "architecture" | "natural_ground" | "artificial_ground";
+
+/**
+ *  Linear gradient: 0 % effect at `zero`, 100 % at `full`, linear ramp between, constant
+ *  beyond (`crs:ZeroX/ZeroY/FullX/FullY`).
+ */
+export type LinearMask = {
+	zero: NormPoint,
+	full: NormPoint,
+};
+
+/**
+ *  Per-mask adjustment set: Lightroom's local sliders in **UI units** (what the panel shows).
+ *  Values are *offsets added to the global settings* where the mask is 1 (Lightroom's model),
+ *  scaled by the mask weight and `MaskGroup.amount`. All default to 0 (no effect) except
+ *  `curveRefineSaturation` (100) and `toneCurve` (identity).
+ * 
+ *  XMP (`crs:` on the Correction item; scale = XMP / UI, see `xmp/masks.rs` `LOCAL_SCALARS`):
+ *  | field | property | range (UI) | XMP scale |
+ *  |---|---|---|---|
+ *  | temperature | LocalTemperature | -100..=100 | 1/100 |
+ *  | tint | LocalTint | -100..=100 | 1/100 |
+ *  | exposure | LocalExposure2012 | -4..=4 EV | 1/4 (provisional) |
+ *  | contrast, highlights, shadows, whites, blacks | Local{Contrast,Highlights,Shadows,Whites,Blacks}2012 | -100..=100 | 1/100 |
+ *  | texture, dehaze | LocalTexture, LocalDehaze | -100..=100 | 1/100 |
+ *  | clarity | LocalClarity2012 | -100..=100 | 1/100 |
+ *  | hue | LocalHue | -180..=180 deg | 1/180 (provisional) |
+ *  | saturation | LocalSaturation | -100..=100 | 1/100 |
+ *  | sharpness | LocalSharpness | -100..=100 | 1/100 |
+ *  | noise | LocalLuminanceNoise | -100..=100 | 1/100 |
+ *  | moire | LocalMoire | -100..=100 | 1/100 |
+ *  | defringe | LocalDefringe | -100..=100 | 1/100 |
+ *  | color | LocalToningHue / LocalToningSaturation | 0..=360 / 0..=100 | 1 / 1/100 |
+ *  | curveRefineSaturation | LocalCurveRefineSaturation | 0..=100 | 1 |
+ *  | toneCurve | MainCurve / RedCurve / GreenCurve / BlueCurve (`rdf:Seq` "x, y") | as `PointCurves` | 1 |
+ *  Legacy PV2010 properties (`LocalExposure`, `LocalBrightness`, `LocalContrast`,
+ *  `LocalClarity`, `LocalToning*` pre-2012 ...) are written as 0 for new groups and
+ *  preserved for existing ones.
+ */
+export type LocalAdjustments = {
+	temperature: number,
+	tint: number,
+	/**  EV offset, -4..=4. */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	/**  Degrees, -180..=180. */
+	hue: number,
+	saturation: number,
+	sharpness: number,
+	/**  Luminance noise reduction offset. */
+	noise: number,
+	moire: number,
+	defringe: number,
+	color: LocalColor,
+	/**  0..=100, default 100 (Lightroom's curve "Refine Saturation"). */
+	curveRefineSaturation: number,
+	/**  Per-mask point curves (identity = no change). */
+	toneCurve?: PointCurves,
+};
+
+/**
+ *  Colour tint of a local adjustment (Lightroom's "Color" swatch):
+ *  `crs:LocalToningHue` (degrees, plain) + `crs:LocalToningSaturation` (0..=1 in XMP).
+ */
+export type LocalColor = {
+	/**  0..=360 degrees. */
+	hue: number,
+	/**  0..=100 (0 = no tint). */
+	saturation: number,
+};
+
 /**
  *  A look / creative profile installed on this Mac (Lightroom's Profile browser entries
  *  other than bare DCPs).
@@ -1358,6 +1694,22 @@ export type LumaPercentiles = {
 	p99: number,
 };
 
+/**
+ *  Luminance range: selects pixels whose luminance (CIE L* / 100 of the image after global
+ *  white balance and exposure, before local adjustments) lies in `low..=high`, fading to 0
+ *  at `featherLow` / `featherHigh`. `0 <= featherLow <= low <= high <= featherHigh <= 1`.
+ *  XMP: `Mask/RangeMask` with `crs:CorrectionRangeMask` (`Type` luminance, `LumRange`
+ *  "featherLow low high featherHigh", `LumFeather` = smoothness / 100; provisional).
+ */
+export type LuminanceRange = {
+	featherLow: number,
+	low: number,
+	high: number,
+	featherHigh: number,
+	/**  0..=100: edge smoothing of the selection (Lightroom "Smoothness", default 50). */
+	smoothness: number,
+};
+
 /**  A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$SIEVE_LUTS`). */
 export type LutInfo = {
 	id: string,
@@ -1389,6 +1741,139 @@ export type LutRef = {
 	/**  Blend amount 0..=100 (100 = full LUT output). */
 	amount: number,
 };
+
+/**
+ *  How a component combines with the mask built so far (`crs:MaskBlendMode`; value
+ *  mapping in `xmp/masks.rs` `BLEND_MODES`: 0 = add verified on the user's files, the
+ *  others provisional).
+ */
+export type MaskBlendMode = 
+/**  `max(acc, c)` (Lightroom "Add"). */
+"add" | 
+/**  `acc * (1 - c)` (Lightroom "Subtract"). */
+"subtract" | 
+/**  `acc * c` (Lightroom "Intersect"). */
+"intersect";
+
+/**  `get_mask_capabilities` result. */
+export type MaskCapabilities = {
+	/**  One entry per [`AiTargetKind`], in `AiTargetKind::ALL` order. */
+	ai: AiCapability[],
+	/**  People parts the installed models can separate (empty = entire person only). */
+	personParts: PersonPart[],
+	landscape: LandscapeCategory[],
+};
+
+/**
+ *  One mask component ("Subject 1", "Brush 1"): an item of `crs:CorrectionMasks`.
+ *  Its value at a pixel is `opacity * (inverted ? 1 - shape : shape)`, then combined with
+ *  the group's mask by `mode`.
+ */
+export type MaskComponent = {
+	/**  `crs:MaskSyncID` (32 upper-case hex, unique within the image). */
+	id: string,
+	/**  `crs:MaskName`; may be empty (Lightroom names them "<Kind> <n>"). */
+	name: string,
+	/**  `crs:MaskActive`. Inactive components are skipped. */
+	active: boolean,
+	mode: MaskBlendMode,
+	/**  `crs:MaskInverted`. */
+	inverted: boolean,
+	/**  `crs:MaskValue`, 0..=1. */
+	opacity: number,
+	shape: MaskShape,
+};
+
+/**
+ *  One Masks-panel entry ("Mask 1"): `crs:What="Correction"` in
+ *  `crs:MaskGroupBasedCorrections`. Groups apply in list order (later groups see earlier
+ *  groups' results only through the shared per-pixel parameter sums; Lightroom's model).
+ */
+export type MaskGroup = {
+	/**
+	 *  `crs:CorrectionSyncID`: 32 upper-case hex digits, unique within the image. Kept
+	 *  when read from Lightroom (the XMP writer matches items by it to preserve unmodelled
+	 *  attributes); new groups get a random one (TS `newMaskId()`).
+	 */
+	id: string,
+	/**  `crs:CorrectionName` ("Mask 1", "Cool Soft"); may be empty. */
+	name: string,
+	/**  `crs:CorrectionActive` (the panel's visibility toggle). Inactive groups do not render. */
+	active: boolean,
+	/**  `crs:CorrectionAmount`, 0..=2 (1 = 100 %): scales every local slider of the group. */
+	amount: number,
+	adjustments: LocalAdjustments,
+	/**
+	 *  Combined in order; the first component's `mode` is ignored (it starts the mask).
+	 *  Empty = the group has no area (renders nothing).
+	 */
+	components: MaskComponent[],
+};
+
+/**  `list_masks` result: the image's stored masks + AI status. */
+export type MaskList = {
+	imageId: number,
+	/**  Same as `getAdjustments(id).masks`. */
+	groups: MaskGroup[],
+	/**  One per AI component of `groups`, in order. */
+	ai: AiMaskStatus[],
+};
+
+/**
+ *  Overlay render options. The overlay covers exactly the frame `render_preview` produces
+ *  for the same `maxEdge` / `region` and adjustments (crop and orientation applied), so it
+ *  can be stacked on the preview.
+ */
+export type MaskOverlayOptions = {
+	/**  64..=8192 (as `RenderOptions.maxEdge`). */
+	maxEdge: number,
+	region: NormRect | null,
+};
+
+/**  What to visualize with `render_mask_overlay`. */
+export type MaskOverlayTarget = {
+	groupId: string,
+	/**
+	 *  `null` = the group's combined mask (before `amount`); else this component alone
+	 *  (its `inverted` and `opacity` applied, blend mode not).
+	 */
+	componentId: string | null,
+};
+
+/**  Component geometry / selection. Coordinates are in the sensor frame (module docs). */
+export type MaskShape = 
+/**  `Mask/Paint` items (one per stroke). */
+{
+	kind: "brush",
+} & BrushMask | 
+/**  `Mask/Gradient`. */
+{
+	kind: "linear",
+} & LinearMask | 
+/**  `Mask/CircularGradient`. */
+{
+	kind: "radial",
+} & RadialMask | 
+/**  `Mask/RangeMask` luminance range. */
+{
+	kind: "luminance",
+} & LuminanceRange | 
+/**  `Mask/RangeMask` colour range. */
+{
+	kind: "color",
+} & ColorRange | 
+/**  `Mask/Image` (AI selection). */
+{
+	kind: "ai",
+} & AiMask | 
+/**
+ *  A Lightroom component Sieve does not model (depth range, future kinds). Preserved in
+ *  the sidecar byte-for-byte (matched by `MaskComponent.id`), contributes nothing to the
+ *  render and raises `masks_unsupported`. Cannot be created by the frontend.
+ */
+{
+	kind: "unsupported",
+} & UnsupportedMask;
 
 /**  One image's adjustments to commit via `apply_scene_match`. */
 export type MatchApplication = {
@@ -1570,11 +2055,8 @@ export type OutputSharpening = {
 /**
  *  Parametric develop settings. Field names and ranges mirror Adobe Camera Raw
  *  Process 2012+ (`crs:` XMP namespace) so XMP export is a 1:1 mapping.
- *  Phase 7c (masking) will add `masks: Vec<MaskGroup>` (`#[serde(default)]`, group `masks`),
- *  each with a *local* parameter set mirroring Lightroom's `crs:Local*` (exposure, contrast,
- *  highlights, shadows, whites, blacks, temperature/tint deltas, texture, clarity, dehaze,
- *  saturation, hue, sharpness, luminance noise, moire, defringe, toning colour, curve
- *  refine saturation); those reuse this struct's ranges and names, not a second model.
+ *  Local adjustments (Phase 7c, IPC v10) are `masks`: mask groups with per-mask parameter
+ *  sets mirroring Lightroom's `crs:MaskGroupBasedCorrections` (see `ipc/masks.rs`).
  *  Stored JSON missing newer fields loads as neutral (see `db::repo::get_adjustments`).
  */
 export type ParametricAdjustments = {
@@ -1604,6 +2086,11 @@ export type ParametricAdjustments = {
 	crop?: CropSettings,
 	/**  Camera profile + look (see [`ProfileSettings`]). */
 	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
 };
 
 /**
@@ -1619,6 +2106,9 @@ export type ParametricCurve = {
 	midtoneSplit: number,
 	highlightSplit: number,
 };
+
+/**  Body parts of an AI "People" selection (Lightroom's list; empty = entire person). */
+export type PersonPart = "face_skin" | "body_skin" | "eyebrows" | "eye_sclera" | "iris_pupil" | "lips" | "teeth" | "hair" | "clothes";
 
 export type PickFlag = "pick" | "reject" | "unflagged";
 
@@ -1737,6 +2227,28 @@ export type QualityScore = {
 	suggestedPick: PickFlag,
 };
 
+/**
+ *  Radial gradient (`crs:Top/Left/Bottom/Right` = ellipse bounds before rotation,
+ *  `crs:Angle`, `crs:Midpoint`, `crs:Roundness`, `crs:Feather`, `crs:Flipped`). Bounds are
+ *  in the sensor frame and may extend beyond 0..=1.
+ */
+export type RadialMask = {
+	top: number,
+	left: number,
+	bottom: number,
+	right: number,
+	/**  Rotation in degrees, -360..=360 (sensor frame; add the orientation's rotation to show it). */
+	angle: number,
+	/**  0..=100 (Lightroom default 50). */
+	midpoint: number,
+	/**  -100..=100 (default 0). */
+	roundness: number,
+	/**  0..=100: soft edge width (default 50). */
+	feather: number,
+	/**  Legacy "effect outside" flag (`crs:Flipped`); new masks use `MaskComponent.inverted`. */
+	flipped: boolean,
+};
+
 /**  One RAW file in the catalog, with everything the grid and loupe need. */
 export type RawImageEntry = {
 	id: number,
@@ -1807,7 +2319,29 @@ export type RenderSlot =
 /**  Before/after view (the frontend sends the "before" adjustments, e.g. neutral). */
 "before" | 
 /**  A zoomed region (`RenderOptions.region`), e.g. 1:1 loupe detail. */
-"detail";
+"detail" | 
+/**
+ *  Mask overlays (`render_mask_overlay`, v10): grayscale JPEG mattes. Not accepted
+ *  by `render_preview`.
+ */
+"mask";
+
+/**
+ *  A rendered overlay: an 8-bit **grayscale JPEG** of the mask (white = 1) served on the
+ *  `mask` render slot (`sieve://localhost/render/<id>/mask?v=<seq>`, latest-wins per image).
+ *  Composite it as a luminance mask (CSS `mask-image` + `mask-mode: luminance`, or canvas)
+ *  over a colour layer for Lightroom's overlay styles.
+ */
+export type RenderedMaskOverlay = {
+	imageId: number,
+	seq: number,
+	url: string,
+	width: number,
+	height: number,
+	/**  Mean mask value of the rendered frame, 0..=1. */
+	coverage: number,
+	renderMs: number,
+};
 
 /**
  *  A finished preview render. Pixels are an in-memory JPEG (sRGB, quality ~90, 4:4:4)
@@ -2033,6 +2567,12 @@ export type ToneCurve = {
 export type UiPrefs = {
 	/**  Folder last chosen in the export dialog (absolute path). */
 	lastExportFolder?: string | null,
+};
+
+/**  See [`MaskShape::Unsupported`]. */
+export type UnsupportedMask = {
+	/**  `crs:What` of the item (e.g. `Mask/RangeMask` with a depth range). */
+	what: string,
 };
 
 /**  Post-crop vignette style (`crs:PostCropVignetteStyle` 1 / 2 / 3). */

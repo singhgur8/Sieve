@@ -213,7 +213,7 @@ fn main() {
     let mut user = Vec::new();
     let mut draft = Vec::new();
 
-    let cache = DevelopCache::new(DevelopConfig { cache_bytes: 2048 << 20 });
+    let cache = DevelopCache::new(DevelopConfig { cache_bytes: 2048 << 20, mask_cache: None });
     let (mut decode, mut prepare, mut warm, mut pipe, mut enc, mut region) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     if let Some(dir) = &check {

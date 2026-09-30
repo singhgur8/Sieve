@@ -52,6 +52,7 @@
 
 pub mod crs;
 pub mod looks;
+pub mod masks;
 pub mod packet;
 mod store;
 
@@ -162,6 +163,9 @@ pub struct XmpSync {
     state: Arc<(Mutex<DebounceState>, Condvar)>,
     /// Serializes sidecar file I/O between commands and the auto-sync worker.
     io_lock: Arc<Mutex<()>>,
+    /// Where Lightroom AI mattes read from sidecars go (v10); `None` = masks import without
+    /// their mattes (AI components then report `needs_update`).
+    mask_cache: Option<develop::masks::MaskCache>,
 }
 
 impl XmpSync {
@@ -172,7 +176,14 @@ impl XmpSync {
             debounce: DEBOUNCE,
             state: Arc::new((Mutex::new(DebounceState::default()), Condvar::new())),
             io_lock: Arc::new(Mutex::new(())),
+            mask_cache: None,
         }
+    }
+
+    /// Stores Lightroom mattes found at XMP read time in `cache` (v10).
+    pub fn with_mask_cache(mut self, cache: develop::masks::MaskCache) -> Self {
+        self.mask_cache = Some(cache);
+        self
     }
 
     /// Overrides the auto-sync debounce (tests).
@@ -356,6 +367,70 @@ impl XmpSync {
         Ok(read)
     }
 
+    /// Launch catch-up (migration 0010): images whose sidecar masks were read before v10
+    /// (`masks_pending_import`) get those masks imported (only `masks`; every other setting
+    /// stays as it is in the catalog), their Lightroom mattes cached, and the flag cleared.
+    /// Images without a sidecar (or without masks in it) just clear the flag. Per-image
+    /// errors are logged and leave the flag set (retried next launch / on `read_xmp`).
+    /// Returns the number of images whose masks were imported. Blocking.
+    pub fn import_pending_masks(&self) -> AppResult<u32> {
+        let mut conn = db::open(&self.config.catalog_path)?;
+        let mut imported = 0;
+        for id in store::masks_pending_ids(&conn)? {
+            let Some(row) = store::load(&conn, id)? else { continue };
+            match self.import_masks_only(&mut conn, &row) {
+                Ok(true) => imported += 1,
+                Ok(false) => {}
+                Err(reason) => eprintln!("masks catch-up, image {id}: {reason}"),
+            }
+        }
+        Ok(imported)
+    }
+
+    fn import_masks_only(&self, conn: &mut Connection, row: &ImageRow) -> Result<bool, String> {
+        let _io = lock_ignore_poison(&self.io_lock);
+        let path = resolve_sidecar(&row.path);
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+                return Ok(false);
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let Some(read) = masks::read(&text).map_err(|e| format!("{}: {e}", path.display()))? else {
+            store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+            return Ok(false);
+        };
+        if let (Some(cache), false) = (&self.mask_cache, read.mattes.is_empty()) {
+            match masks::mattes_supported() {
+                Ok(()) => {
+                    for e in cache.import_lightroom(conn, row.id, &read.mattes) {
+                        eprintln!("{}: {e}", path.display());
+                    }
+                }
+                Err(e) => eprintln!("{}: Lightroom masks not decoded: {e}", path.display()),
+            }
+        }
+        let current = repo::get_adjustments(conn, row.id).map_err(|e| e.message)?;
+        let changed = current.masks != read.groups;
+        if changed {
+            let was_dirty = store::is_dirty(conn, row.id).map_err(|e| e.message)?;
+            let adj = ParametricAdjustments { masks: read.groups.clone(), ..current };
+            develop::history::commit(conn, row.id, &adj, develop::history::LABEL_READ_XMP).map_err(|e| e.message)?;
+            if !was_dirty {
+                // The masks came from the sidecar: nothing new to write back.
+                store::clear_dirty(conn, row.id).map_err(|e| e.message)?;
+            }
+        }
+        let mut warnings = store::develop_warnings(conn, row.id).map_err(|e| e.message)?;
+        warnings.retain(|w| w.code != crate::ipc::types::DevelopWarningCode::MasksUnsupported);
+        warnings.extend(read.warnings.iter().cloned());
+        store::set_develop_warnings(conn, row.id, &warnings).map_err(|e| e.message)?;
+        store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+        Ok(changed)
+    }
+
     /// Syncs one image. `Err` carries a per-file reason (catalog errors included).
     fn sync_one(&self, conn: &mut Connection, row: &ImageRow, policy: SyncPolicy) -> Result<Outcome, String> {
         let _io = lock_ignore_poison(&self.io_lock);
@@ -379,7 +454,8 @@ impl XmpSync {
             Action::Write => {
                 let tags = store::visible_tags(conn, row.id).map_err(|e| e.message)?;
                 let develop = store::develop_settings(conn, row.id).map_err(|e| e.message)?;
-                write_sidecar(&path, row, &tags, develop.as_ref())?;
+                let pending = store::masks_pending(conn, row.id).map_err(|e| e.message)?;
+                write_sidecar(&path, row, &tags, develop.as_ref(), pending)?;
                 store::mark_written(conn, row, file_mtime_ms(&path)).map_err(|e| e.message)?;
                 Ok(Outcome::Written)
             }
@@ -388,11 +464,45 @@ impl XmpSync {
                     Some(t) => t,
                     None => fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
                 };
-                let values = match format {
+                let mut values = match format {
                     Some(f) => packet::parse_for(&text, f),
                     None => packet::parse(&text),
                 }
                 .map_err(|e| format!("{}: {e}", path.display()))?;
+                // Masks (v10): the sidecar's groups replace the catalog's (sidecar wins, like
+                // every other develop setting); Lightroom mattes go to the matte cache.
+                let masks = masks::read(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                values.warnings.retain(|w| w.code != crate::ipc::types::DevelopWarningCode::MasksUnsupported);
+                let groups = match &masks {
+                    Some(m) => {
+                        values.warnings.extend(m.warnings.iter().cloned());
+                        m.groups.clone()
+                    }
+                    None => Vec::new(),
+                };
+                if let (Some(m), Some(cache)) = (&masks, &self.mask_cache) {
+                    if !m.mattes.is_empty() {
+                        match masks::mattes_supported() {
+                            Ok(()) => {
+                                for e in cache.import_lightroom(conn, row.id, &m.mattes) {
+                                    eprintln!("{}: {e}", path.display());
+                                }
+                            }
+                            Err(e) => eprintln!("{}: Lightroom masks not decoded: {e}", path.display()),
+                        }
+                    }
+                }
+                if values.develop_error.is_none() {
+                    match values.develop.as_mut() {
+                        Some(adj) => adj.masks = groups,
+                        None if !groups.is_empty() => {
+                            let mut current = repo::get_adjustments(conn, row.id).map_err(|e| e.message)?;
+                            current.masks = groups;
+                            values.develop = Some(current);
+                        }
+                        None => {}
+                    }
+                }
                 if let Some(e) = &values.develop_error {
                     // Ratings still sync; develop settings stay as they are in the catalog.
                     eprintln!("{}: develop settings not imported: {e}", path.display());
@@ -409,6 +519,9 @@ impl XmpSync {
                     }
                 }
                 store::set_develop_warnings(conn, row.id, &values.warnings).map_err(|e| e.message)?;
+                if values.develop_error.is_none() {
+                    store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+                }
                 let (rating, pick, label) = catalog_values(&values, row.rating);
                 let changed = store::apply_read(conn, row.id, rating, pick, label, file_mtime_ms(&path))
                     .map_err(|e| e.message)?;
@@ -419,7 +532,8 @@ impl XmpSync {
                     if !same_tags(&values, &tags) {
                         let fresh = store::load(conn, row.id).map_err(|e| e.message)?.ok_or("image vanished")?;
                         let develop = store::develop_settings(conn, row.id).map_err(|e| e.message)?;
-                        write_sidecar(&path, &fresh, &tags, develop.as_ref())?;
+                        let pending = store::masks_pending(conn, row.id).map_err(|e| e.message)?;
+                        write_sidecar(&path, &fresh, &tags, develop.as_ref(), pending)?;
                         store::mark_written(conn, &fresh, file_mtime_ms(&path)).map_err(|e| e.message)?;
                     }
                 }
@@ -536,12 +650,14 @@ fn parse_label(s: &str) -> Option<ColorLabel> {
 }
 
 /// Merges the catalog state into the sidecar (creating it if missing) and replaces it
-/// atomically (`<name>.xmp.tmp`, fsync, rename).
+/// atomically (`<name>.xmp.tmp`, fsync, rename). Masks are written after the merge
+/// (`masks::apply`) unless `masks_pending` (sidecar masks not imported yet, migration 0010).
 fn write_sidecar(
     path: &Path,
     row: &ImageRow,
     tags: &[String],
     develop: Option<&ParametricAdjustments>,
+    masks_pending: bool,
 ) -> Result<(), String> {
     let shown = path.display();
     let existing = match fs::read(path) {
@@ -549,8 +665,11 @@ fn write_sidecar(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{shown}: {e}")),
     };
-    let merged =
+    let mut merged =
         packet::merge(existing.as_deref(), &desired(row, tags, develop)).map_err(|e| format!("{shown}: {e}"))?;
+    if let (Some(adj), false) = (develop, masks_pending) {
+        merged = masks::apply(&merged, &adj.masks).map_err(|e| format!("{shown}: masks: {e}"))?;
+    }
     write_atomic(path, merged.as_bytes()).map_err(|e| format!("{shown}: {e}"))
 }
 

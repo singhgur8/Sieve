@@ -194,6 +194,13 @@ pub fn as_shot_values(color: &ColorInfo, profile: &Profile) -> Option<WhiteBalan
     if profile.display_referred {
         return Some(WhiteBalanceValues { temperature_k: 6500.0, tint: 0.0 });
     }
+    values_of_multipliers(mul, color, profile)
+}
+
+/// Temperature/tint of camera multipliers (R, G, B; > 0) through the profile's colour
+/// matrices when a DCP is resolved, else LibRaw's `cam_xyz` ([`wb::values_for`]). The path
+/// [`as_shot_values`] uses; also the white balance picker (`sample_white_balance`).
+pub fn values_of_multipliers(mul: [f32; 3], color: &ColorInfo, profile: &Profile) -> Option<WhiteBalanceValues> {
     match &profile.dcp {
         Some(d) => {
             let n = neutral_of_multipliers(mul)?;

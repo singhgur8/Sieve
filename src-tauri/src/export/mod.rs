@@ -184,6 +184,16 @@ pub struct Exporter {
     config: ExportConfig,
     luts: LutLibrary,
     inner: Arc<Inner>,
+    /// Matte cache + segmenter for masked exports (Phase 7c); `None` = AI mask components
+    /// render empty.
+    masks: Option<ExportMasks>,
+}
+
+/// What an export needs for AI masks: computes missing mattes, then renders them.
+#[derive(Clone)]
+pub struct ExportMasks {
+    pub cache: crate::develop::masks::MaskCache,
+    pub segmenter: crate::ml::masking::Segmenter,
 }
 
 impl Exporter {
@@ -193,7 +203,18 @@ impl Exporter {
             config,
             luts,
             inner: Arc::new(Inner { state: Mutex::new(State::default()), idle: Condvar::new(), budget }),
+            masks: None,
         }
+    }
+
+    /// Enables AI masks in exports: missing mattes are computed with `segmenter` first.
+    pub fn with_masks(
+        mut self,
+        cache: crate::develop::masks::MaskCache,
+        segmenter: crate::ml::masking::Segmenter,
+    ) -> Self {
+        self.masks = Some(ExportMasks { cache, segmenter });
+        self
     }
 
     pub fn config(&self) -> &ExportConfig {
@@ -552,9 +573,10 @@ impl Exporter {
                         break;
                     }
                     let _ = tx.send(Msg::Started(item.entry.file_name.clone()));
-                    let outcome =
-                        catch_unwind(AssertUnwindSafe(|| export_one(item, settings, path, &self.luts, &cancelled)))
-                            .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        export_one(item, settings, path, &self.luts, self.masks.as_ref(), &cancelled)
+                    }))
+                    .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
                     budget.release(need);
                     let _ = tx.send(Msg::Done(*i, outcome));
                 });
@@ -699,12 +721,28 @@ fn export_one(
     settings: &ExportSettings,
     path: &Path,
     luts: &LutLibrary,
+    masks: Option<&ExportMasks>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, Failure> {
+    use crate::develop::masks::{self as dmasks, render as mrender};
     let check = || if cancelled() { Err(Failure::Cancelled) } else { Ok(()) };
     let raw = Path::new(&item.entry.path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
+    }
+    // Masks (Phase 7c): AI mattes the image does not have yet are computed first.
+    let masked = mrender::any_rendered(&item.adjustments.masks);
+    let source =
+        crate::develop::SourceImage { id: item.entry.id, path: raw.to_path_buf(), orientation: item.entry.orientation };
+    if let (true, Some(m)) = (masked, masks) {
+        let preview = match &item.entry.thumbnail {
+            crate::ipc::types::ThumbnailState::Ready { preview_path: Some(p), .. } => Some(PathBuf::from(p)),
+            _ => None,
+        };
+        for e in mrender::compute_missing(&m.segmenter, &source, preview.as_deref(), &item.adjustments.masks) {
+            eprintln!("export {}: AI mask not computed: {e}", raw.display());
+        }
+        check()?;
     }
     let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
     check()?;
@@ -724,6 +762,15 @@ fn export_one(
         &item.adjustments,
         &profile,
     );
+    let mut mattes = if masked {
+        mrender::ResolvedMattes::resolve(masks.map(|m| &m.cache), item.entry.id, &item.adjustments.masks)
+    } else {
+        mrender::ResolvedMattes::none(item.entry.id)
+    };
+    if mattes.needs_guide() {
+        mattes.refine(|| Some(develop::sensor_guide(&src, &profile)));
+    }
+    let (sensor_width, sensor_height) = (src.full_width, src.full_height);
     let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
@@ -739,7 +786,36 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64, tone: Some(&tone) };
+    let (local, _) = if masked {
+        let geom = dmasks::MaskGeometry {
+            sensor_width,
+            sensor_height,
+            orientation: orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1),
+            crop: *crop,
+            region: None,
+            width: size.0,
+            height: size.1,
+        };
+        mrender::local_planes(
+            &item.adjustments.masks,
+            &geom,
+            item.entry.id,
+            &mattes,
+            || crate::develop::local::range_guide(&pixels, &color, &profile, &item.adjustments),
+            0,
+            None,
+        )
+    } else {
+        (None, Vec::new())
+    };
+    drop(mattes);
+    let ctx = develop::DevelopContext {
+        profile: &profile,
+        scale,
+        seed: item.entry.id as u64,
+        tone: Some(&tone),
+        masks: local.as_ref(),
+    };
     let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;
@@ -1081,6 +1157,145 @@ mod tests {
         assert_eq!(t.map(|i| (i.width, i.height, i.bit_depth)).unwrap(), (200, 100, 16));
         #[cfg(not(target_os = "macos"))]
         let _ = t;
+    }
+
+    /// Phase 7c: an export of an image with an AI mask that has no matte yet computes it with
+    /// the segmenter first, then renders the local adjustment only where the matte selects.
+    #[test]
+    fn masked_export_computes_missing_ai_mattes() {
+        use crate::develop::masks::{AlphaMask, MaskCache, MaskCacheConfig};
+        use crate::ipc::types::{
+            AiMask, AiTarget, AiTargetKind, LocalAdjustments, MaskBlendMode, MaskComponent, MaskGroup, MaskShape,
+            NormRect,
+        };
+        use crate::ml::masking::{
+            CatalogMatteStore, RegisteredModel, SegmentInput, SegmentModel, SegmentRequest, Segmenter, SegmenterConfig,
+            SegmenterParts, SourcePixels,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// "Subject" = the left half of the frame.
+        struct LeftHalf(Arc<AtomicUsize>);
+        impl SegmentModel for LeftHalf {
+            fn id(&self) -> &str {
+                "left-half@1"
+            }
+            fn families(&self) -> &[AiTargetKind] {
+                &[AiTargetKind::Subject]
+            }
+            fn run(&self, _: &SegmentRequest, input: &SegmentInput) -> Result<AlphaMask, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let (w, h) = (input.width, input.height);
+                let data = (0..w * h).map(|i| if i % w < w / 2 { 255 } else { 0 }).collect();
+                Ok(AlphaMask {
+                    width: w,
+                    height: h,
+                    bounds: NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+                    data,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let px: Vec<u16> = (0..200 * 100).flat_map(|_| [16000u16, 16000, 16000]).collect();
+        std::fs::write(
+            src.join("grey.png"),
+            crate::raw::png::test_support::encode(200, 100, Some(&px), None, None, None, None),
+        )
+        .unwrap();
+        let catalog = dir.path().join("cat.sqlite");
+        let id = {
+            let mut conn = db::open(&catalog).unwrap();
+            let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+            assert_eq!(repo::import_folder(&mut conn, &src, &opts).unwrap().added, 1);
+            conn.query_row("SELECT id FROM images", [], |r| r.get::<_, ImageId>(0)).unwrap()
+        };
+        let cache =
+            MaskCache::new(MaskCacheConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parts = SegmenterParts {
+            models: vec![RegisteredModel {
+                model: Arc::new(LeftHalf(calls.clone())),
+                required: vec![],
+                parts: vec![],
+                people: None,
+            }],
+            store: Arc::new(CatalogMatteStore { cache: cache.clone(), catalog_path: catalog.clone() }),
+            loader: Arc::new(|_, _| Ok(SourcePixels { width: 200, height: 100, rgb: vec![128; 200 * 100 * 3] })),
+        };
+        let segmenter = Segmenter::with_parts(
+            SegmenterConfig { models_dir: dir.path().join("models"), catalog_path: catalog.clone() },
+            cache.clone(),
+            parts,
+        );
+        let ex = Exporter::new(
+            ExportConfig { catalog_path: catalog.clone(), memory_budget_mb: Some(1024) },
+            LutLibrary::new(dir.path().join("luts")),
+        )
+        .with_masks(cache, segmenter);
+        let out = dir.path().join("out");
+        let mut s = settings(&out);
+        s.resize.mode = ResizeMode::None;
+        s.format = ExportFormat::Jpeg { quality: 100, chroma_subsampling: ChromaSubsampling::Yuv444 };
+        let sink = Arc::new(Sink::default());
+        let export = |sink: &Arc<Sink>| {
+            let _ = std::fs::remove_dir_all(&out);
+            ex.enqueue_with(sink.clone(), vec![id], s.clone(), None).unwrap();
+            assert!(ex.wait_idle(Duration::from_secs(60)));
+            let fin = lock(&sink.finished).last().cloned().unwrap();
+            assert_eq!(fin.succeeded, 1, "{:?}", fin.failed);
+            let jpeg = std::fs::read(out.join("Web").join("grey.jpg")).unwrap();
+            let d = crate::raw::turbo::decode_rgb(&jpeg, 100_000, 1 << 30).unwrap();
+            let mean = |x0: u32, x1: u32| {
+                let mut sum = 0u64;
+                for y in 0..d.height {
+                    for x in x0..x1 {
+                        sum += u64::from(d.pixels[((y * d.width + x) * 3 + 1) as usize]);
+                    }
+                }
+                sum as f32 / ((x1 - x0) * d.height) as f32
+            };
+            (mean(10, 80), mean(120, 190))
+        };
+        let (base_l, base_r) = export(&sink);
+        assert!((base_l - base_r).abs() < 1.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no masks, no segmentation");
+
+        let group = MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Subject".into(),
+            active: true,
+            amount: 1.0,
+            adjustments: LocalAdjustments { exposure: 1.5, ..Default::default() },
+            components: vec![MaskComponent {
+                id: format!("{:032X}", 2),
+                name: String::new(),
+                active: true,
+                mode: MaskBlendMode::Add,
+                inverted: false,
+                opacity: 1.0,
+                shape: MaskShape::Ai(AiMask { target: AiTarget::Subject, reference_point: None, digest: None }),
+            }],
+        };
+        {
+            let mut conn = db::open(&catalog).unwrap();
+            let adj = ParametricAdjustments { masks: vec![group], ..repo::get_adjustments(&conn, id).unwrap() };
+            crate::develop::history::commit(&mut conn, id, &adj, "Mask").unwrap();
+        }
+        let (l, r) = export(&sink);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "matte computed before rendering");
+        let conn = db::open(&catalog).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mask_cache WHERE image_id = ?1 AND origin = 'sieve'", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(l > base_l + 20.0, "subject brighter: {base_l} -> {l}");
+        assert!((r - base_r).abs() < 1.5, "outside unchanged: {base_r} -> {r}");
+        // Second export reuses the cached matte.
+        export(&sink);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

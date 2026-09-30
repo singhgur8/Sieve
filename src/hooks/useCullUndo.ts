@@ -10,6 +10,8 @@ export interface CullEntry {
   ids: number[];
   /** State to restore when this entry is applied. */
   snaps: CullSnapshot[];
+  /** When the change was made (ms), so Develop can undo the newest of culling vs adjustment. */
+  at: number;
 }
 
 export const snapOf = (e: RawImageEntry): CullSnapshot => ({ imageId: e.id, rating: e.rating, pick: e.pick, colorLabel: e.colorLabel });
@@ -45,7 +47,7 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
 
   /** Records a change made with `before` as the previous state. */
   const record = useCallback((label: string, before: CullSnapshot[]): CullEntry => {
-    const entry: CullEntry = { label, ids: before.map((s) => s.imageId), snaps: before };
+    const entry: CullEntry = { label, ids: before.map((s) => s.imageId), snaps: before, at: Date.now() };
     undoStack.current = [...undoStack.current, entry].slice(-MAX);
     redoStack.current = [];
     return entry;
@@ -58,7 +60,7 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
       try {
         const current = await unwrap(commands.getCullSnapshot(entry.ids));
         const changed = await unwrap(commands.restoreCullSnapshot(entry.snaps));
-        const opposite: CullEntry = { label: entry.label, ids: entry.ids, snaps: current };
+        const opposite: CullEntry = { label: entry.label, ids: entry.ids, snaps: current, at: Date.now() };
         if (from === "undo") {
           undoStack.current = undoStack.current.filter((x) => x !== entry);
           redoStack.current = [...redoStack.current, opposite].slice(-MAX);
@@ -98,5 +100,9 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
     [apply, toast],
   );
 
-  return { capture, record, undo, redo, undoEntry };
+  /** Timestamp of the entry Cmd+Z would undo / Cmd+Shift+Z would redo (0 = none). */
+  const undoAt = useCallback(() => undoStack.current[undoStack.current.length - 1]?.at ?? 0, []);
+  const redoAt = useCallback(() => redoStack.current[redoStack.current.length - 1]?.at ?? 0, []);
+
+  return { capture, record, undo, redo, undoEntry, undoAt, redoAt };
 }

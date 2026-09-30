@@ -2,7 +2,7 @@
 export * from "./bindings";
 export { convertFileSrc } from "@tauri-apps/api/core";
 
-import { DEFAULT_ADJUSTMENTS, DEFAULT_ADJUSTMENTS_NON_RAW } from "./bindings";
+import { DEFAULT_ADJUSTMENTS, DEFAULT_ADJUSTMENTS_NON_RAW, DEFAULT_LOCAL_ADJUSTMENTS } from "./bindings";
 import type {
   AdjustmentField,
   AppError,
@@ -13,7 +13,12 @@ import type {
   HslChannels,
   ImageFormat,
   ImageQuery,
+  LocalAdjustments,
+  MaskComponent,
+  MaskGroup,
+  MaskShape,
   MatchOptions,
+  NormPoint,
   ParametricAdjustments,
   PointCurves,
   ProfileSettings,
@@ -73,6 +78,7 @@ export function completeAdjustments(adj: ParametricAdjustments, format?: ImageFo
     blackAndWhite: adj.blackAndWhite ?? d.blackAndWhite,
     crop: adj.crop ?? d.crop,
     profile: adj.profile ?? d.profile,
+    masks: adj.masks ?? d.masks,
   };
 }
 
@@ -131,6 +137,7 @@ const ADJUSTMENT_FIELD_SET: Record<AdjustmentField, true> = {
   black_and_white: true,
   crop: true,
   profile: true,
+  masks: true,
 };
 
 /** Every `AdjustmentField`, in panel order (fields mask "select all"). */
@@ -164,6 +171,7 @@ export const ADJUSTMENT_FIELD_LABELS: Record<AdjustmentField, string> = {
   black_and_white: "Black & white",
   crop: "Crop",
   profile: "Profile",
+  masks: "Masking",
 };
 
 /**
@@ -224,6 +232,9 @@ export function copyAdjustmentFields(
       case "profile":
         out.profile = s.profile;
         break;
+      case "masks":
+        out.masks = s.masks.map(transferableMaskGroup);
+        break;
       default:
         out[f] = s[f];
     }
@@ -232,10 +243,10 @@ export function copyAdjustmentFields(
 }
 
 /**
- * Everything except `crop` (mirror of Rust `AdjustmentField::DEFAULT_SYNC`): the default
- * selection for Sync / Copy Settings and scene matching (crops are per frame).
+ * Everything except `crop` and `masks` (mirror of Rust `AdjustmentField::DEFAULT_SYNC`): the
+ * default selection for Sync / Copy Settings and scene matching (per-frame geometry).
  */
-export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter((f) => f !== "crop");
+export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter((f) => f !== "crop" && f !== "masks");
 
 /** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */
 export const EXPORT_FILENAME_TOKENS: { token: string; description: string }[] = [
@@ -419,5 +430,100 @@ export function lerpAdjustments(a0: ParametricAdjustments, b0: ParametricAdjustm
     },
     crop: lerpCrop(a.crop, b.crop, t),
     profile: lerpProfile(a.profile, b.profile, t),
+    masks: nearB ? b.masks : a.masks,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Masks / local adjustments (IPC v10). Coordinates are in the sensor frame (un-oriented,
+// uncropped, normalized): see `src-tauri/src/ipc/masks.rs` and docs/architecture.md "Masks".
+// ---------------------------------------------------------------------------
+
+/** Limits enforced by the backend (mirror of Rust `MaskLimits`). */
+export const MASK_LIMITS = {
+  maxGroups: 100,
+  maxComponents: 64,
+  maxDabs: 200_000,
+  maxColorSamples: 5,
+  maxName: 64,
+} as const;
+
+/** Lightroom-style id for a new group / component: 32 upper-case hex digits. */
+export function newMaskId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
+}
+
+/** Default local slider set (all 0, refine saturation 100, identity curves). */
+export function defaultLocalAdjustments(): LocalAdjustments {
+  return structuredClone(DEFAULT_LOCAL_ADJUSTMENTS) as unknown as LocalAdjustments;
+}
+
+/** A new, active component (opacity 1, add, not inverted). */
+export function newMaskComponent(shape: MaskShape, name = ""): MaskComponent {
+  return { id: newMaskId(), name, active: true, mode: "add", inverted: false, opacity: 1, shape };
+}
+
+/** A new, active mask group at 100 % with default local sliders. */
+export function newMaskGroup(name: string, components: MaskComponent[] = []): MaskGroup {
+  return { id: newMaskId(), name, active: true, amount: 1, adjustments: defaultLocalAdjustments(), components };
+}
+
+/**
+ * Copy of a group for another image (paste / sync / presets): AI components lose their
+ * `digest` so the target recomputes its own matte (mirror of Rust `MaskGroup::transferable`).
+ */
+export function transferableMaskGroup(g: MaskGroup): MaskGroup {
+  const out = structuredClone(g);
+  for (const c of out.components) if (c.shape.kind === "ai") c.shape.digest = null;
+  return out;
+}
+
+/** Sensor frame -> displayed (EXIF-oriented) frame (mirror of Rust `orient_point`). */
+export function orientPoint(p: NormPoint, orientation: number | null | undefined): NormPoint {
+  const { x: u, y: v } = p;
+  switch (orientation) {
+    case 2:
+      return { x: 1 - u, y: v };
+    case 3:
+      return { x: 1 - u, y: 1 - v };
+    case 4:
+      return { x: u, y: 1 - v };
+    case 5:
+      return { x: v, y: u };
+    case 6:
+      return { x: 1 - v, y: u };
+    case 7:
+      return { x: 1 - v, y: 1 - u };
+    case 8:
+      return { x: v, y: 1 - u };
+    default:
+      return { x: u, y: v };
+  }
+}
+
+/** Displayed (EXIF-oriented) frame -> sensor frame (mirror of Rust `unorient_point`). */
+export function unorientPoint(p: NormPoint, orientation: number | null | undefined): NormPoint {
+  const { x, y } = p;
+  switch (orientation) {
+    case 2:
+      return { x: 1 - x, y };
+    case 3:
+      return { x: 1 - x, y: 1 - y };
+    case 4:
+      return { x, y: 1 - y };
+    case 5:
+      return { x: y, y: x };
+    case 6:
+      return { x: y, y: 1 - x };
+    case 7:
+      return { x: 1 - y, y: 1 - x };
+    case 8:
+      return { x: 1 - y, y: x };
+    default:
+      return { x, y };
+  }
 }

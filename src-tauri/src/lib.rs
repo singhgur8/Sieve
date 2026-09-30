@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
+use develop::masks::{MaskCache, MaskCacheConfig};
 use develop::{DevelopCache, DevelopConfig};
 use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
@@ -25,6 +26,7 @@ use ipc::events::{
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
+use ml::masking::{Segmenter, SegmenterConfig};
 use ml::{Analysis, AnalysisConfig};
 use xmp::{XmpSync, XmpSyncConfig};
 
@@ -81,6 +83,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::get_xmp_status,
             commands::render_preview,
             commands::get_develop_info,
+            commands::sample_white_balance,
             commands::prepare_develop,
             commands::get_history,
             commands::undo_adjustments,
@@ -124,6 +127,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::reveal_in_finder,
             commands::write_xmp_all_dirty,
             commands::list_profiles,
+            commands::list_masks,
+            commands::save_masks,
+            commands::compute_ai_mask,
+            commands::detect_people,
+            commands::render_mask_overlay,
+            commands::get_mask_capabilities,
         ])
         .events(collect_events![
             ImportProgress,
@@ -145,6 +154,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             "DEFAULT_ADJUSTMENTS_NON_RAW",
             ipc::types::ParametricAdjustments::defaults_for(ipc::types::ImageFormat::Jpeg),
         )
+        // Local adjustment defaults for new mask groups (IPC v10).
+        .constant("DEFAULT_LOCAL_ADJUSTMENTS", ipc::types::LocalAdjustments::default())
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -207,18 +218,52 @@ pub fn run() {
             // covers a `SIEVE_CACHE` override (and is a no-op widening otherwise).
             app.asset_protocol_scope().allow_directory(config.thumbs_dir(), true)?;
 
+            // AI mattes + segmentation (IPC v10); no I/O or model loading here.
+            let mask_cache =
+                MaskCache::new(MaskCacheConfig { catalog_path: path.clone(), cache_dir: config.cache_dir.clone() });
+            let segmenter = Segmenter::new(
+                SegmenterConfig { models_dir: models_dir.clone(), catalog_path: path.clone() },
+                mask_cache.clone(),
+            );
+
             let catalog = Catalog::open(path.clone())?;
             let auto_analyze = catalog.auto_analyze_blocking()?;
             app.manage(catalog);
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
-            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }));
-            app.manage(DevelopCache::new(DevelopConfig { cache_bytes: develop_cache_mb * 1024 * 1024 }));
+            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }).with_mask_cache(mask_cache.clone()));
+            app.manage(DevelopCache::new(DevelopConfig {
+                cache_bytes: develop_cache_mb * 1024 * 1024,
+                mask_cache: Some(mask_cache.clone()),
+            }));
             // Adobe DCPs / looks installed on this Mac, read in place (never copied).
             app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
             let luts = LutLibrary::new(luts_dir);
-            let exporter =
-                Exporter::new(ExportConfig { catalog_path: path, memory_budget_mb: export_memory_mb }, luts.clone());
+            let exporter = Exporter::new(
+                ExportConfig { catalog_path: path.clone(), memory_budget_mb: export_memory_mb },
+                luts.clone(),
+            )
+            .with_masks(mask_cache.clone(), segmenter.clone());
+            // Masks catch-up (migration 0010) + orphaned matte sweep, off the startup path.
+            {
+                let xmp = app.state::<XmpSync>().inner().clone();
+                let cache = mask_cache.clone();
+                let catalog_path = path.clone();
+                let _ = std::thread::Builder::new().name("masks-catch-up".into()).spawn(move || {
+                    match xmp.import_pending_masks() {
+                        Ok(n) if n > 0 => eprintln!("imported sidecar masks of {n} image(s)"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("masks catch-up: {}", e.message),
+                    }
+                    if let Ok(conn) = db::open(&catalog_path) {
+                        if let Err(e) = cache.sweep(&conn) {
+                            eprintln!("mask cache sweep: {}", e.message);
+                        }
+                    }
+                });
+            }
+            app.manage(mask_cache);
+            app.manage(segmenter);
             // Jobs cut off by a previous quit become `interrupted` (never resumed).
             exporter.recover_interrupted()?;
             app.manage(luts);

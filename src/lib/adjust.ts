@@ -1,5 +1,6 @@
 // Slider definitions, neutral adjustments and helpers for the Develop module.
 import type { AdjustmentField, HslChannels, ImageFormat, ParametricAdjustments } from "../ipc";
+import { LOCAL_GROUPS } from "./masks";
 import { ADJUSTMENT_FIELD_LABELS, copyAdjustmentFields, defaultAdjustments, type CompleteAdjustments } from "../ipc";
 
 export type Band = keyof HslChannels;
@@ -72,3 +73,28 @@ export function copyFields(dst: ParametricAdjustments, src: ParametricAdjustment
 }
 
 export const sameAdjustments = (a: ParametricAdjustments, b: ParametricAdjustments) => JSON.stringify(a) === JSON.stringify(b);
+
+const signed = (v: number, digits: number) => `${v > 0 ? "+" : ""}${v.toFixed(digits)}`;
+
+/**
+ * History entry label with the final value ("Exposure +0.35", "Temp 5600 K", "Mask: Subject 1 Exposure +0.50").
+ * The editor keys coalescing on the plain label and applies this only when the entry is saved.
+ */
+export function labelWithValue(label: string, a: CompleteAdjustments): string {
+  const simple = [...BASIC, ...PRESENCE].find((d) => d.label === label);
+  if (simple) return `${label} ${signed(a[simple.key], simple.digits)}`;
+  if (label === "Temp" && a.whiteBalance.mode === "custom") return `Temp ${a.whiteBalance.temperatureK} K`;
+  if (label === "Tint" && a.whiteBalance.mode === "custom") return `Tint ${signed(a.whiteBalance.tint, 0)}`;
+  if (label.startsWith("Mask: ")) {
+    const rest = label.slice(6);
+    for (const g of a.masks) {
+      if (!rest.startsWith(`${g.name} `)) continue;
+      const what = rest.slice(g.name.length + 1);
+      for (const grp of LOCAL_GROUPS) {
+        const d = grp.defs.find((x) => x.label === what);
+        if (d) return `${label} ${signed(g.adjustments[d.key], d.digits)}`;
+      }
+    }
+  }
+  return label;
+}
