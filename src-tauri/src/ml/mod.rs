@@ -34,6 +34,7 @@ pub mod scoring;
 pub mod segment;
 pub mod segment_models;
 pub mod store;
+pub mod style;
 pub mod thresholds;
 pub mod worker;
 

@@ -319,7 +319,11 @@ impl ProfileLibrary {
         let mut camera_profiles: Vec<CameraProfileInfo> = Vec::new();
         for d in dcps {
             if !camera_profiles.iter().any(|p| p.name == d.name) {
-                camera_profiles.push(CameraProfileInfo { name: d.name.clone(), group: d.group.clone() });
+                camera_profiles.push(CameraProfileInfo {
+                    name: d.name.clone(),
+                    group: d.group.clone(),
+                    style_id: None,
+                });
             }
         }
         let order = |g: &str| match g {
@@ -350,6 +354,7 @@ impl ProfileLibrary {
                     monochrome: i.monochrome,
                     camera_profile: i.camera_profile.clone(),
                     available: restriction_ok && source_ok,
+                    style_id: None,
                 }
             })
             .collect();
@@ -361,7 +366,7 @@ impl ProfileLibrary {
             .chain(&self.inner.config.look_dirs)
             .map(|p| p.display().to_string())
             .collect();
-        ProfileCatalog { image_id, camera_model, camera_profiles, looks, search_dirs }
+        ProfileCatalog { image_id, camera_model, camera_profiles, looks, luts: Vec::new(), search_dirs }
     }
 
     /// The parsed DCP named `profile_name` (`crs:CameraProfile`) for `camera`, if installed.
@@ -494,7 +499,7 @@ mod tests {
         assert_eq!(cat.camera_model.as_deref(), Some("Sony ILCE-7M4"));
         assert_eq!(
             cat.camera_profiles,
-            vec![CameraProfileInfo { name: "Adobe Standard".into(), group: "Adobe Raw".into() }]
+            vec![CameraProfileInfo { name: "Adobe Standard".into(), group: "Adobe Raw".into(), style_id: None }]
         );
         assert_eq!(cat.looks.len(), 1);
         assert_eq!(cat.looks[0].group, "Mine", "directory name when crs:Group is absent");

@@ -38,6 +38,11 @@ pub const MAX_ENTRIES: usize = 200;
 /// Labels used by backend batch operations.
 pub const LABEL_PASTE: &str = "Paste Settings";
 pub const LABEL_SYNC: &str = "Sync Settings";
+/// `paste_previous` (IPC v14).
+pub const LABEL_PASTE_PREVIOUS: &str = "Paste from Previous";
+/// `auto_tone` / `auto_white_balance` results committed by the UI (IPC v14).
+pub const LABEL_AUTO_TONE: &str = "Auto Tone";
+pub const LABEL_AUTO_WB: &str = "Auto White Balance";
 pub const LABEL_RESET: &str = "Reset";
 pub const LABEL_READ_XMP: &str = "Read from XMP";
 /// Preset label: `format!("{LABEL_PRESET_PREFIX}{name}")`.
@@ -200,18 +205,29 @@ pub fn commit_batch(
     items: &[(ImageId, ParametricAdjustments)],
     label: &str,
 ) -> AppResult<Vec<ImageId>> {
+    let tx = conn.savepoint()?;
+    let changed = commit_batch_in(&tx, items, label)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// [`commit_batch`] inside a transaction the caller owns (v14 edit batches record their
+/// items in the same transaction).
+pub(crate) fn commit_batch_in(
+    conn: &Connection,
+    items: &[(ImageId, ParametricAdjustments)],
+    label: &str,
+) -> AppResult<Vec<ImageId>> {
     validate_label(label)?;
     for (_, adj) in items {
         adj.validate().map_err(AppError::invalid)?;
     }
-    let tx = conn.savepoint()?;
     let mut changed = Vec::new();
     for (id, adj) in items {
-        if commit_in(&tx, *id, adj, label, false)? {
+        if commit_in(conn, *id, adj, label, false)? {
             changed.push(*id);
         }
     }
-    tx.commit()?;
     Ok(changed)
 }
 

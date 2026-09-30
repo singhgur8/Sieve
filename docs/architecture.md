@@ -18,6 +18,9 @@ src-tauri/
   migrations/0009_parity_sources.sql v9: images.format CHECK += jpeg/heic/tiff/png (in place), companion_path, develop_warnings
   migrations/0010_masks.sql    v10: mask_cache (AI mattes), images.masks_pending_import
   migrations/0011_hardening.sql v11: filter-bar indexes, images.missing_since_ms (+ partial index)
+  migrations/0012_workflow_styles.sql v12: projects (+ folders.project_id, export_jobs.project_id), style library
+                               (style_groups, style_profiles, presets per group), edit_batches, scene edit plan
+                               columns, style_models/style_features, keeper_rule, XMP auto-sync on
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -82,7 +85,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | Path | Owner |
 |---|---|
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
-| rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
+| rest of `src-tauri/` (incl. `db/repo.rs`, `db/projects.rs`, `styles/`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
 | `src-tauri/src/scene/` (surface in `scene/mod.rs` + `store.rs` fixed by the architect) | vision-ml-dev |
 | `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/`, `src-tauri/src/profiles/` | rust-engine-dev |
@@ -185,6 +188,36 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `cancel_model_download` / `cancelModelDownload` (v12) | – | `null` (no-op when idle) |
 | `relocate_folder` / `relocateFolder` (v13) | `folderId: number, newPath: string` | `RelocateResult` (`{matched, stillMissing}`; `invalid_argument` if none found) |
 | `restore_catalog_backup` / `restoreCatalogBackup` (v13) | `index: number` (1 = newest) | `CatalogHealth` (`restorePending: true`; applied at next launch) |
+| `list_projects` / `listProjects` (v14) | – | `Project[]` (last opened first, then newest) |
+| `get_project` / `getProject` (v14) | `projectId: number` | `Project` |
+| `create_project` / `createProject` (v14) | `path: string, name: string \| null, shootType: ShootType \| null, options: ImportOptions` | `CreateProjectResult` (`existing: true` if the folder is already in the catalog) |
+| `open_project` / `openProject` (v14) | `projectId: number` | `Project` (stamps `lastOpenedAtMs`) |
+| `rename_project` / `renameProject` (v14) | `projectId: number, name: string` | `Project` |
+| `set_project_cover` / `setProjectCover` (v14) | `projectId: number, imageId: number \| null` | `Project` (`null` = automatic cover) |
+| `set_project_shoot_type` / `setProjectShootType` (v14) | `projectId: number, shootType: ShootType` | `null` (kicks a rescore) |
+| `remove_project` / `removeProject` (v14) | `projectId: number` | `RemoveProjectResult` (catalog rows + cached thumbnails only; files untouched) |
+| `get_workflow_step` / `set_workflow_step` (v14) | `projectId: number` (+ `step: WorkflowStep`) | `WorkflowStep` / `null` |
+| `set_keeper_rule` / `setKeeperRule` (v14) | `rule: KeeperRule` | `null` |
+| `get_edit_plan` / `getEditPlan` (v14) | `projectId: number` | `EditPlan` |
+| `set_scene_representative` / `setSceneRepresentative` (v14) | `sceneId: number, imageId: number \| null` | `SceneEditEntry` |
+| `apply_scene_edit` / `applySceneEdit` (v14) | `sceneId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (one undoable batch) |
+| `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` |
+| `undo_edit_batch` / `undoEditBatch` (v14) | `batchId: number` | `UndoBatchResult` |
+| `paste_previous` / `pastePrevious` (v14) | `targetIds: number[], previousId: number, fields: AdjustmentField[] \| null` | `null` |
+| `import_style_folder` / `importStyleFolder` (v14) | `path: string` | `ImportStyleReport` |
+| `list_styles` / `listStyles` (v14) | – | `StyleLibrary` |
+| `remove_style_group` / `removeStyleGroup` (v14) | `groupId: number` | `null` (built-ins -> `invalid_argument`) |
+| `resolve_preset` / `resolvePreset` (v14) | `id: number, presetId: number, adjustments: ParametricAdjustments \| null` | `ParametricAdjustments` (nothing saved) |
+| `auto_tone` / `autoTone` (v14) | `id: number, adjustments: ParametricAdjustments \| null, keys: AdjustmentField[] \| null` | `AutoToneValues` (nothing saved) |
+| `auto_white_balance` / `autoWhiteBalance` (v14) | `id: number, adjustments: ParametricAdjustments \| null` | `WhiteBalanceValues` (nothing saved) |
+| `style_model_status` / `styleModelStatus` (v14) | – | `StyleModelStatus` |
+| `train_style_model` / `trainStyleModel`, `cancel_style_training` (v14) | – | `null` (background; `styleModel*` events) |
+| `predict_style` / `predictStyle` (v14) | `imageIds: number[]` | `StylePrediction[]` (nothing saved) |
+| `apply_style_prediction` / `applyStylePrediction` (v14) | `imageIds: number[]` | `EditBatchResult` |
+
+v14 project scoping: `import_folder(path, options, projectId | null)`, `get_filter_counts(folderId, projectId)`,
+`list_burst_groups(folderId, projectId)`, `list_scenes(folderId, projectId)`, `detect_scenes(folderId, projectId,
+options)`, `ImageQuery.projectId`, `AnalysisScope::project` (folder AND project; `null` = no constraint).
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -200,6 +233,8 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `sceneProgress {task: "detect" | "match", done, total}` (Phase 7).
 `modelDownloadProgress {group,name,fileIndex,fileCount,bytesDone,bytesTotal}`,
 `modelDownloadFinished {group,ok,cancelled,error}` (v12).
+`styleModelProgress {phase,done,total}`, `styleModelFinished {ok,cancelled,error,status}` (v14);
+`sceneProgress` task `"apply"` (v14).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -666,8 +701,9 @@ migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |
 |---|---|
-| `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
-| `folders` | imported roots |
+| `catalog_meta` | `shoot_type` (default for new projects), `burst_window_ms`, `auto_analyze`, `xmp_auto_sync` (+ `xmp_auto_sync_user_set`, v12), `keeper_rule` (JSON `KeeperRule`, v12), `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
+| `projects` | one shoot (v12): name, `cover_image_id` (NULL = automatic), `shoot_type`, `workflow_step`, `created_at`, `last_opened_at` |
+| `folders` | imported roots; `project_id` (v12, every folder in exactly one project; cascade on project delete) |
 | `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
@@ -677,11 +713,14 @@ migrations tracked by `PRAGMA user_version`.
 | `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
 | `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated) |
-| `presets` | name (unique, NOCASE), params JSON, fields JSON |
+| `presets` | `group_id` (style group, v12), name (unique per group, NOCASE), params JSON, fields JSON, `source_format`, `settings_json` + `setting_keys_json` (imported crs: settings), `supports_amount`, `warnings_json` |
+| `style_groups` / `style_profiles` | style library (v12): groups per imported source folder + built-ins 1 "User Presets" / 2 "LUTs"; looks / DCPs (read in place) / LUTs (library copies) |
+| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene) |
+| `style_models` / `style_features` | personal style model blobs + validation; per-image features (v12, owned by `ml::style`) |
 | `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
-| `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps |
+| `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps, `project_id` (v12: all images in one project, else NULL) |
 | `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
-| `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`) |
+| `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`); v12 edit plan: `representative_id/_source/_reason`, `applied_at_ms`, `applied_params_json`, `applied_batch_id` |
 | `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
 | `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
 
@@ -710,6 +749,26 @@ first open, the replaced file kept as `.corrupt-<ms>`). Clean shutdown: `RunEven
 `<catalog>.clean` (`db::mark_clean_shutdown`, never for a read-only catalog); the next first open removes it and,
 if it was present, the file has the SQLite header and no restore was applied, skips `quick_check` (124 ms at
 50k images). Backups follow the usual rules either way.
+
+### Projects (v14)
+A project (`db::projects`) is one shoot: `projects` row + its `folders` (`folders.project_id`). Import decides the
+project with `ImportTarget`: `Auto` (`import_folder(path, null)`: the folder's project, or a new one named after
+the folder), `New` (`create_project`: new project with name / shoot type, unless the folder is already known),
+`Existing(id)` (`import_folder(path, id)`, "Add folder"). A path equal to or inside a catalog folder reuses that
+folder row (and so its project). Migration 0012 creates one project per existing folder (same id).
+
+Scoping: `FolderScope::resolve(folderId, projectId)` turns the pair into a folder-id set (`None` = whole catalog,
+empty = nothing) used by `repo::filter_counts`, `repo::list_burst_groups`, `scene::store::{list_scenes,
+detection_frames, replace_scenes}` and `scene::workflow::edit_plan` (predicates with inlined integer ids);
+`ImageQuery.projectId` becomes `i.folder_id IN (SELECT id FROM folders WHERE project_id = ?)`. Scenes never span
+folders (detection groups per folder), so they never span projects. Project counts (`list_projects`) are one grouped
+query over projects ⟕ folders ⟕ images ⟕ quality_scores with the keeper rule inlined (mirror of
+`KeeperRule::is_keeper_values`). Removal deletes the project row; folders -> images -> every per-image table
+cascade; empty burst groups and scenes are deleted; the command removes the images' cached thumbnails/previews
+(image ids can be reused by the next import) and forgets their develop sources. Files on disk are never touched.
+
+The guided-workflow step (`projects.workflow_step`) is per project; the edit plan, keepers and the Export step's
+jobs (`export_jobs.project_id`) are per project too.
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

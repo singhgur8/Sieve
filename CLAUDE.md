@@ -83,6 +83,10 @@ The main session is the orchestrator. It runs `docs/roadmap.md` to completion wi
    write `docs/BLOCKED.md` with what is needed, then stop.
 6. Never modify anything under `/Users/gurjotsingh/Pictures/`. Copy sample files into `test-data/` (gitignored)
    before any test that writes XMP or exports.
+   Disk hygiene (user request 2026-09-30): the app never copies photos (edits go to XMP next to the originals);
+   only tests copy samples. Delete test outputs (renders, exports, QA runs) once their numbers are recorded, copy
+   only the RAWs a test actually needs, and after merging an agent's branch remove its worktree
+   (`git worktree remove --force`) so its multi-GB `target/` goes with it.
 7. Verify with evidence: run the commands, view screenshots/previews, inspect outputs. Never tick a task on
    assumption. Do not push (no remote configured) unless the user adds one.
 8. Items under "Future phases" in the roadmap are notes only; do not start them unless the user asks.

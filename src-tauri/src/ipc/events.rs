@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
 
-use super::types::{ExportFailure, ExportJobId, ImageId, SceneTask};
+use super::types::{ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase};
 
 /// Progress of the ingest pipeline (thumbnail + EXIF extraction).
 /// Counts cover the current pipeline run: images queued since the pipeline was last
@@ -177,4 +177,26 @@ pub struct ModelDownloadFinished {
     /// Set when `download_models` was stopped by `cancel_model_download`.
     pub cancelled: bool,
     pub error: Option<String>,
+}
+
+/// Progress of `train_style_model` (IPC v14). Throttled (~5/s, plus one per phase change).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleModelProgress {
+    pub phase: StyleTrainPhase,
+    pub done: u32,
+    pub total: u32,
+}
+
+/// A `train_style_model` run ended (IPC v14). Emitted exactly once per accepted call.
+/// `status` is `style_model_status()` after the run.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleModelFinished {
+    pub ok: bool,
+    /// Stopped by `cancel_style_training` (the previous model, if any, stays in use).
+    pub cancelled: bool,
+    /// User-facing reason when not `ok` (e.g. "Edit at least 20 photos first").
+    pub error: Option<String>,
+    pub status: StyleModelStatus,
 }

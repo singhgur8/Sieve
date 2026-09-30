@@ -221,7 +221,7 @@ export default function App() {
         if (a == null) return;
         const entry = lib.getEntry(a);
         if (entry?.burstGroupId != null) {
-          const groups = await unwrap(commands.listBurstGroups(query.folderId));
+          const groups = await unwrap(commands.listBurstGroups(query.folderId, query.projectId ?? null));
           const g = groups.find((x) => x.id === entry.burstGroupId);
           if (g) {
             b = g.keeperImageId != null && g.keeperImageId !== a ? g.keeperImageId : g.imageIds.find((x) => x !== a);
@@ -476,7 +476,7 @@ export default function App() {
         if (typeof path !== "string") return;
         setBusy(true);
         try {
-          const s = await unwrap(commands.importFolder(path, importOptsRef.current));
+          const s = await unwrap(commands.importFolder(path, importOptsRef.current, null));
           setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read${s.companions > 0 ? `, ${s.companions} JPEG pairs` : ""})`);
           await status.refreshCatalog();
           await lib.reload();
@@ -571,7 +571,7 @@ export default function App() {
     const entry = id != null ? lib.getEntry(id) : undefined;
     if (id == null || entry?.burstGroupId == null) return setNotice("The active photo is not part of a burst");
     try {
-      const groups = await unwrap(commands.listBurstGroups(query.folderId));
+      const groups = await unwrap(commands.listBurstGroups(query.folderId, query.projectId ?? null));
       const g = groups.find((x) => x.id === entry.burstGroupId);
       const members = g ? g.imageIds.filter((x) => ids.includes(x)) : [];
       if (members.length === 0) return setNotice("Burst members are hidden by the current filters");
