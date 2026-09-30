@@ -227,6 +227,8 @@ mod tests {
             color_label: None,
             burst_group_id: None,
             is_burst_keeper: false,
+            scene_id: None,
+            is_scene_anchor: false,
             tags: Vec::new(),
             quality: None,
             has_edits: false,
