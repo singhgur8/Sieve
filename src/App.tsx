@@ -21,7 +21,10 @@ import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
 import { MatchPanel } from "./components/scenes/MatchPanel";
-import { Toasts, useToasts } from "./components/Toasts";
+import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ModelsDialog } from "./components/ModelsCard";
+import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
@@ -47,6 +50,8 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  useModels(); // keeps the download listeners alive so mask capabilities refresh even when no panel is open
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
   const [caps, setCaps] = useState(false);
@@ -634,6 +639,7 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col">
+      {status.catalogIssue && <IssueBanner issue={status.catalogIssue} onDismiss={() => status.setCatalogIssue(null)} />}
       <TopBar
         catalog={catalog}
         analysis={status.analysis}
@@ -674,18 +680,22 @@ export default function App() {
         onReadXmp={() => void readXmp()}
         onExport={openExport}
         onCheatSheet={() => setCheatOpen(true)}
+        onModels={() => setModelsOpen(true)}
         exportPct={exportPct}
       />
       <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
       {exportOpen && (
-        <ExportDialog
-          selectionIds={exportOpen}
-          filteredIds={ids}
-          sampleEntry={(id) => lib.getEntry(id)}
-          onClose={() => setExportOpen(null)}
-          onStarted={exportJobs.track}
-        />
+        <ErrorBoundary view="Export" overlay onExit={() => setExportOpen(null)}>
+          <ExportDialog
+            selectionIds={exportOpen}
+            filteredIds={ids}
+            sampleEntry={(id) => lib.getEntry(id)}
+            onClose={() => setExportOpen(null)}
+            onStarted={exportJobs.track}
+          />
+        </ErrorBoundary>
       )}
+      {modelsOpen && <ModelsDialog onClose={() => setModelsOpen(false)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
           selected={applyOpen.selected}
@@ -749,6 +759,7 @@ export default function App() {
       />
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
+        <ErrorBoundary view="Library" onReload={() => void lib.reload()}>
         <PhotoGrid
           lib={lib}
           targetSize={size}
@@ -762,7 +773,9 @@ export default function App() {
           onImport={importFolder}
           onClearFilters={clearFilters}
         />
+        </ErrorBoundary>
         {mode === "develop" && (
+          <ErrorBoundary view="Develop" overlay onExit={() => changeMode("grid")}>
           <DevelopView
             key={devEpoch}
             ref={develop}
@@ -773,8 +786,10 @@ export default function App() {
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBack={() => changeMode("grid")}
           />
+          </ErrorBoundary>
         )}
         {(mode === "loupe" || mode === "compare") && (
+          <ErrorBoundary view="Library" overlay onExit={() => changeMode("grid")}>
           <LoupeLayer
             ref={loupe}
             mode={mode}
@@ -788,6 +803,7 @@ export default function App() {
             }}
             onOpen={(id) => sel.set([id], id)}
           />
+          </ErrorBoundary>
         )}
       </div>
       {matchScene && (

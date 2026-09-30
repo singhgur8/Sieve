@@ -10,13 +10,15 @@ import {
   type ImportStatus,
   type XmpStatus,
 } from "../ipc";
-import { formatError } from "../lib/format";
+import { describeError, noteFailure, type ErrorInfo } from "../lib/errors";
 
 export interface AnalysisView {
   done: number;
   total: number;
   failed: number;
   running: boolean;
+  /** Reason of the most recent failure (analysisFailed), for the bar's tooltip. */
+  lastReason?: string;
 }
 
 export function useBackendStatus(onLibraryChanged: () => void) {
@@ -24,9 +26,16 @@ export function useBackendStatus(onLibraryChanged: () => void) {
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisView | null>(null);
   const [xmp, setXmp] = useState<XmpStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrorInfo | null>(null);
+  /** Persistent catalog problem (read-only / damaged): shown as an inline banner until the app restarts. */
+  const [catalogIssue, setCatalogIssue] = useState<ErrorInfo | null>(null);
 
-  const reportError = useCallback((e: unknown) => setError(formatError(e)), []);
+  const reportError = useCallback((e: unknown) => {
+    const info = describeError(e);
+    noteFailure(info.message);
+    if (info.persistent) setCatalogIssue(info);
+    else setError(info);
+  }, []);
   const refreshCatalog = useCallback(async () => {
     try {
       setCatalog(await unwrap(commands.getCatalogState()));
@@ -66,12 +75,14 @@ export function useBackendStatus(onLibraryChanged: () => void) {
           onLibraryChanged();
         }
       }),
-      events.analysisProgress.listen((ev) => setAnalysis({ ...ev.payload, running: ev.payload.done < ev.payload.total })),
+      events.analysisProgress.listen((ev) => setAnalysis((a) => ({ ...ev.payload, running: ev.payload.done < ev.payload.total, lastReason: a?.lastReason }))),
       events.analysisFinished.listen(() => {
         setAnalysis((a) => (a ? { ...a, running: false } : a));
         void refreshCatalog();
         onLibraryChanged();
       }),
+      events.analysisFailed.listen((ev) => setAnalysis((a) => (a ? { ...a, lastReason: ev.payload.reason } : a))),
+      events.thumbnailFailed.listen((ev) => noteFailure(ev.payload.reason)),
       events.xmpSynced.listen(refreshXmp),
       events.xmpWriteFailed.listen(refreshXmp),
     ];
@@ -80,5 +91,5 @@ export function useBackendStatus(onLibraryChanged: () => void) {
     };
   }, [refreshCatalog, refreshXmp, onLibraryChanged]);
 
-  return { catalog, setCatalog, refreshCatalog, progress, analysis, setAnalysis, xmp, refreshXmp, error, setError, reportError };
+  return { catalog, setCatalog, refreshCatalog, progress, analysis, setAnalysis, xmp, refreshXmp, error, setError, reportError, catalogIssue, setCatalogIssue };
 }

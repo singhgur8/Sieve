@@ -55,6 +55,12 @@ export interface Busy {
 }
 
 let capsPromise: Promise<MaskCapabilities> | null = null;
+const capsListeners = new Set<() => void>();
+/** Drops the cached capabilities (models were installed) and makes every mounted panel refetch. */
+export function invalidateMaskCapabilities() {
+  capsPromise = null;
+  capsListeners.forEach((l) => l());
+}
 
 export interface MasksApi {
   open: boolean;
@@ -170,7 +176,13 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
   edRef.current = editor;
   const gesture = useRef<{ gid: string; cid: string } | null>(null);
 
-  // Capabilities once per session.
+  // Capabilities once per session (and again after the AI models were downloaded).
+  const [capsEpoch, setCapsEpoch] = useState(0);
+  useEffect(() => {
+    const bump = () => setCapsEpoch((n) => n + 1);
+    capsListeners.add(bump);
+    return () => void capsListeners.delete(bump);
+  }, []);
   useEffect(() => {
     capsPromise ??= unwrap(commands.getMaskCapabilities());
     let stale = false;
@@ -181,7 +193,7 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
     return () => {
       stale = true;
     };
-  }, [onError]);
+  }, [onError, capsEpoch]);
 
   // New image: reset selection and tool.
   useEffect(() => {
