@@ -609,6 +609,7 @@ fn desired(row: &ImageRow, tags: &[String], develop: Option<&ParametricAdjustmen
         develop,
         seqs,
         profile,
+        format: crate::raw::format_from_extension(&row.path),
     }
 }
 
@@ -716,3 +717,5 @@ mod tests;
 
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod tests_minimal;

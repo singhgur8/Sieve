@@ -21,6 +21,7 @@ fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
         develop: Vec::new(),
         seqs: Vec::new(),
         profile: None,
+        format: None,
     }
 }
 
