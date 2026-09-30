@@ -106,7 +106,7 @@ test.describe("scenes", () => {
     await expect(page.getByTestId("match-summary")).toContainText("36 targets");
     await expect(page.getByTestId("match-include-rejected")).toBeVisible();
     await expect(page.getByTestId("match-anchor-1")).toContainText("DSC00001.ARW");
-    await expect(page.getByTestId("match-copy-fields")).toContainText("Also copy from anchor: All settings");
+    await expect(page.getByTestId("match-copy-fields")).toContainText("Also copy from anchor: All settings except crop");
     await page.getByTestId("match-include-rejected").check();
     await expect(page.getByTestId("match-summary")).toContainText("39 targets");
     await expect(page.getByTestId("match-exposure")).toBeChecked();

@@ -229,6 +229,8 @@ mod tests {
             is_burst_keeper: false,
             scene_id: None,
             is_scene_anchor: false,
+            companion_path: None,
+            develop_warnings: Vec::new(),
             tags: Vec::new(),
             quality: None,
             has_edits: false,

@@ -178,21 +178,76 @@ pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions)
              ON CONFLICT(path) DO NOTHING",
         )?;
         let mut insert_thumb = tx.prepare("INSERT INTO thumbnails (image_id, status) VALUES (?1, 'pending')")?;
+        let mut exists = tx.prepare("SELECT 1 FROM images WHERE path = ?1")?;
+        let mut set_companion = tx.prepare(
+            "UPDATE images SET companion_path = ?2
+             WHERE path = ?1 AND companion_path IS NOT ?2",
+        )?;
 
-        let walker = WalkDir::new(&folder).max_depth(if opts.recursive { usize::MAX } else { 1 });
+        // Pass 1: candidate files (sorted, so pairing and ids are deterministic).
+        let walker = WalkDir::new(&folder).max_depth(if opts.recursive { usize::MAX } else { 1 }).sort_by_file_name();
+        let mut files: Vec<(walkdir::DirEntry, ImageFormat)> = Vec::new();
         for entry in walker.into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
                 continue;
             }
+            let Some(format) = raw::format_from_extension(entry.path()) else { continue };
+            if !format.is_raw() && !opts.include_non_raw {
+                continue;
+            }
+            files.push((entry, format));
+        }
+        // RAWs by (directory, lower-case stem) -> path, for companion pairing.
+        let pair_key = |p: &Path| -> Option<(std::path::PathBuf, String)> {
+            Some((p.parent()?.to_path_buf(), p.file_stem()?.to_str()?.to_lowercase()))
+        };
+        let pairing = opts.include_non_raw && opts.pair_jpeg_with_raw;
+        let mut raw_by_stem: HashMap<(std::path::PathBuf, String), std::path::PathBuf> = HashMap::new();
+        if pairing {
+            for (entry, format) in &files {
+                if format.is_raw() {
+                    if let Some(k) = pair_key(entry.path()) {
+                        raw_by_stem.entry(k).or_insert_with(|| entry.path().to_path_buf());
+                    }
+                }
+            }
+        }
+        // JPEG before HEIC when a RAW has several siblings (first companion wins).
+        files.sort_by_key(|(e, f)| (!f.is_raw(), *f != ImageFormat::Jpeg, e.path().to_path_buf()));
+
+        // Pass 2: register.
+        let mut paired: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        for (entry, format) in files {
             let path = entry.path();
-            let format = match raw::identify(path) {
-                Ok(Some(f)) => f,
-                Ok(None) => continue,
+            match raw::identify(path) {
+                Ok(Some(f)) if f == format => {}
+                Ok(_) => continue,
                 Err(_) => {
                     summary.invalid += 1;
                     continue;
                 }
-            };
+            }
+            if pairing && format.pairs_with_raw() {
+                let raw_path = pair_key(path).and_then(|k| raw_by_stem.get(&k).cloned());
+                if let Some(raw_path) = raw_path {
+                    let path_s = path_str(path)?;
+                    // A sibling already registered as its own image (earlier import without
+                    // pairing) stays an image; never pair twice for one RAW.
+                    if !exists.exists([&path_s])? && !paired.contains(&raw_path) {
+                        let changed = set_companion.execute(params![path_str(&raw_path)?, path_s])?;
+                        paired.insert(raw_path);
+                        if changed > 0 {
+                            summary.companions += 1;
+                        } else {
+                            // Already recorded by an earlier import.
+                            summary.skipped += 1;
+                        }
+                    } else {
+                        summary.skipped += 1;
+                    }
+                    continue;
+                }
+            }
             let meta = entry.metadata().map_err(|e| AppError::internal(e.to_string()))?;
             let mtime_ms = meta
                 .modified()
@@ -247,7 +302,8 @@ const ENTRY_SELECT: &str = "
            q.suggested_rating, q.suggested_pick,
            EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id),
            i.xmp_dirty, i.xmp_synced_at, i.xmp_error,
-           i.scene_id, i.scene_anchor
+           i.scene_id, i.scene_anchor,
+           i.companion_path, i.develop_warnings
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -333,6 +389,12 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         xmp: XmpSyncState { dirty: r.get(43)?, synced_at_ms: r.get(44)?, error: r.get(45)? },
         scene_id: r.get(46)?,
         is_scene_anchor: r.get(47)?,
+        companion_path: r.get(48)?,
+        // Unreadable JSON reads as no warnings (never blocks listing).
+        develop_warnings: r
+            .get::<_, Option<String>>(49)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -633,23 +695,30 @@ pub fn set_user_tag(conn: &mut Connection, ids: &[ImageId], tag: CullTag, presen
 // Adjustments
 // ---------------------------------------------------------------------------
 
-/// Stored adjustments, or neutral defaults if the image has never been edited.
+/// Source format of image `id` (`not_found` if absent).
+pub fn image_format(conn: &Connection, id: ImageId) -> AppResult<ImageFormat> {
+    let s: Option<String> = conn.query_row("SELECT format FROM images WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+    let s = s.ok_or_else(|| AppError::not_found(format!("image {id}")))?;
+    ImageFormat::parse(&s).ok_or_else(|| AppError::internal(format!("image {id}: unknown format {s:?}")))
+}
+
+/// Stored adjustments, or the format's neutral defaults
+/// (`ParametricAdjustments::defaults_for`) if the image has never been edited.
 pub fn get_adjustments(conn: &Connection, id: ImageId) -> AppResult<ParametricAdjustments> {
+    // Also distinguishes "unedited" from "no such image".
+    let format = image_format(conn, id)?;
     let json: Option<String> =
         conn.query_row("SELECT params_json FROM adjustments WHERE image_id = ?1", [id], |r| r.get(0)).optional()?;
+    let defaults = ParametricAdjustments::defaults_for(format);
     match json {
         Some(json) => {
-            // Overlay stored values on neutral defaults so JSON written before a
-            // slider existed still loads.
-            let mut merged = serde_json::to_value(ParametricAdjustments::default())?;
+            // Overlay stored values on the defaults so JSON written before a slider or
+            // group existed (e.g. pre-v9 rows without `toneCurve`) still loads.
+            let mut merged = serde_json::to_value(defaults)?;
             merge_json(&mut merged, serde_json::from_str(&json)?);
             Ok(serde_json::from_value(merged)?)
         }
-        None => {
-            // Distinguish "unedited" from "no such image".
-            get_image(conn, id)?;
-            Ok(ParametricAdjustments::default())
-        }
+        None => Ok(defaults),
     }
 }
 
@@ -673,6 +742,7 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 /// command path). Keeps `neutral` in step with the values.
 pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustments) -> AppResult<()> {
     adj.validate().map_err(AppError::invalid)?;
+    let neutral = adj.is_neutral_for(image_format(conn, id)?);
     let json = serde_json::to_string(adj)?;
     let changed = conn.execute(
         "INSERT INTO adjustments (image_id, params_json, process_version, updated_at, neutral)
@@ -682,7 +752,7 @@ pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustme
              process_version = excluded.process_version,
              updated_at = excluded.updated_at,
              neutral = excluded.neutral",
-        params![id, json, adj.process_version, now_ms(), adj.is_neutral()],
+        params![id, json, adj.process_version, now_ms(), neutral],
     )?;
     if changed == 0 {
         return Err(AppError::not_found(format!("image {id}")));
@@ -993,7 +1063,7 @@ mod tests {
     }
 
     fn import(conn: &mut Connection, dir: &Path, recursive: bool) -> ImportSummary {
-        import_folder(conn, dir, &ImportOptions { recursive }).unwrap()
+        import_folder(conn, dir, &ImportOptions::raw_only(recursive)).unwrap()
     }
 
     fn all_ids(conn: &Connection) -> Vec<ImageId> {
@@ -1034,6 +1104,108 @@ mod tests {
         assert_eq!(state.burst_window_ms, 1500);
     }
 
+    /// RAW + camera JPEG siblings, lone non-RAW files, a bad JPEG.
+    fn mixed_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("DSCF0010.RAF"), stub_header(RawFormat::Raf)).unwrap();
+        std::fs::write(p.join("DSCF0010.JPG"), stub_header(RawFormat::Jpeg)).unwrap();
+        std::fs::write(p.join("dscf0010.hif"), stub_header(RawFormat::Heic)).unwrap();
+        std::fs::write(p.join("IMG_0020.CR3"), stub_header(RawFormat::Cr3)).unwrap();
+        std::fs::write(p.join("IMG_0021.jpeg"), stub_header(RawFormat::Jpeg)).unwrap();
+        std::fs::write(p.join("scan.tif"), stub_header(RawFormat::Tiff)).unwrap();
+        std::fs::write(p.join("IMG_0020.png"), stub_header(RawFormat::Png)).unwrap();
+        std::fs::write(p.join("broken.jpg"), b"not a jpeg").unwrap();
+        dir
+    }
+
+    #[test]
+    fn non_raw_import_and_companion_pairing() {
+        let dir = mixed_dir();
+        let opts = |include: bool, pair: bool| ImportOptions {
+            recursive: false,
+            include_non_raw: include,
+            pair_jpeg_with_raw: pair,
+        };
+        let names = |conn: &Connection| -> Vec<(String, ImageFormat, Option<String>)> {
+            let q = ImageQuery { sort: ImageSort::FileName, ..Default::default() };
+            list_images(conn, &q)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|e| {
+                    let companion =
+                        e.companion_path.map(|c| Path::new(&c).file_name().unwrap().to_string_lossy().into_owned());
+                    (e.file_name, e.format, companion)
+                })
+                .collect()
+        };
+
+        // Default (RAW only): the pre-v9 behaviour.
+        let mut conn = open_in_memory();
+        let s = import_folder(&mut conn, dir.path(), &ImportOptions::raw_only(false)).unwrap();
+        assert_eq!((s.added, s.companions, s.invalid), (2, 0, 0));
+
+        // Non-RAW + pairing: the JPEG (preferred over HEIC) becomes the RAF's companion; the
+        // HEIC sibling is skipped; TIFF/PNG never pair; the bad JPEG is invalid.
+        let mut conn = open_in_memory();
+        let s = import_folder(&mut conn, dir.path(), &opts(true, true)).unwrap();
+        assert_eq!((s.added, s.companions, s.skipped, s.invalid), (5, 1, 1, 1), "{s:?}");
+        assert_eq!(
+            names(&conn),
+            [
+                ("DSCF0010.RAF".to_owned(), ImageFormat::Raf, Some("DSCF0010.JPG".to_owned())),
+                ("IMG_0020.CR3".to_owned(), ImageFormat::Cr3, None),
+                ("IMG_0020.png".to_owned(), ImageFormat::Png, None),
+                ("IMG_0021.jpeg".to_owned(), ImageFormat::Jpeg, None),
+                ("scan.tif".to_owned(), ImageFormat::Tiff, None),
+            ]
+        );
+        let jpeg = list_images(&conn, &ImageQuery::default())
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|e| e.format == ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!((jpeg.camera.make, jpeg.camera.sensor_layout), (CameraMake::Other, SensorLayout::Unknown));
+        // Neutral defaults depend on the format.
+        assert_eq!(get_adjustments(&conn, jpeg.id).unwrap(), ParametricAdjustments::defaults_for(ImageFormat::Jpeg));
+        save_adjustments(&conn, jpeg.id, &ParametricAdjustments::defaults_for(ImageFormat::Jpeg)).unwrap();
+        assert!(!get_image(&conn, jpeg.id).unwrap().has_edits, "non-RAW defaults are neutral for a JPEG");
+        save_adjustments(&conn, jpeg.id, &ParametricAdjustments::default()).unwrap();
+        assert!(get_image(&conn, jpeg.id).unwrap().has_edits, "RAW sharpening on a JPEG is an edit");
+        // Re-import is idempotent.
+        let s = import_folder(&mut conn, dir.path(), &opts(true, true)).unwrap();
+        assert_eq!((s.added, s.companions), (0, 0));
+
+        // Pairing off: every sibling is its own image.
+        let mut conn = open_in_memory();
+        let s = import_folder(&mut conn, dir.path(), &opts(true, false)).unwrap();
+        assert_eq!((s.added, s.companions, s.invalid), (7, 0, 1));
+        assert!(names(&conn).iter().all(|(_, _, c)| c.is_none()));
+    }
+
+    #[test]
+    fn develop_warnings_column_round_trips() {
+        let mut conn = open_in_memory();
+        let dir = fixture_dir();
+        import(&mut conn, dir.path(), false);
+        let id = all_ids(&conn)[0];
+        assert!(get_image(&conn, id).unwrap().develop_warnings.is_empty());
+        let w = vec![DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some("2".into()) }];
+        // What `xmp::store::set_develop_warnings` writes.
+        conn.execute(
+            "UPDATE images SET develop_warnings = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&w).unwrap()],
+        )
+        .unwrap();
+        let e = get_image(&conn, id).unwrap();
+        assert_eq!(e.develop_warnings, w);
+        assert!(!e.xmp.dirty, "warnings are not XMP-mapped");
+        conn.execute("UPDATE images SET develop_warnings = NULL WHERE id = ?1", [id]).unwrap();
+        assert!(get_image(&conn, id).unwrap().develop_warnings.is_empty());
+    }
+
     #[test]
     fn pagination() {
         let mut conn = open_in_memory();
@@ -1049,7 +1221,9 @@ mod tests {
         let mut conn = open_in_memory();
         let dir = fixture_dir();
         import(&mut conn, dir.path(), true);
-        let ids = all_ids(&conn);
+        // Ascending ids: `query` returns sorted ids (import order is by path since v9).
+        let mut ids = all_ids(&conn);
+        ids.sort();
         let (a, b, c) = (ids[0], ids[1], ids[2]);
 
         // a: blink + motion_blur, b: blink, c: auto motion_blur later suppressed.

@@ -2,14 +2,21 @@
 export * from "./bindings";
 export { convertFileSrc } from "@tauri-apps/api/core";
 
+import { DEFAULT_ADJUSTMENTS, DEFAULT_ADJUSTMENTS_NON_RAW } from "./bindings";
 import type {
   AdjustmentField,
   AppError,
+  ColorGrading,
+  ColorWheel,
+  CropSettings,
   ExportFormatKind,
   HslChannels,
+  ImageFormat,
   ImageQuery,
   MatchOptions,
   ParametricAdjustments,
+  PointCurves,
+  ProfileSettings,
   WhiteBalance,
 } from "./bindings";
 
@@ -21,6 +28,62 @@ export async function unwrap<T>(result: Promise<CommandResult<T>>): Promise<T> {
   if (r.status === "error") throw r.error;
   return r.data;
 }
+
+/** Tone-curve point `[input, output]`, 0..=255 (Rust `CurvePoint`, inlined by the generator). */
+export type CurvePoint = [number, number];
+
+/** Pre-v9 name of `ImageFormat` (IPC v9 renamed it and added non-RAW formats). */
+export type RawFormat = ImageFormat;
+
+/** RAW formats (mirror of Rust `ImageFormat::RAW`). */
+export const RAW_FORMATS: readonly ImageFormat[] = ["arw", "raf", "cr3"];
+
+/** Mirror of Rust `ImageFormat::is_raw`. */
+export function isRawFormat(format: ImageFormat): boolean {
+  return RAW_FORMATS.includes(format);
+}
+
+/**
+ * `ParametricAdjustments` with every v9 group present. The backend always sends complete
+ * objects; the groups are optional in the generated type only for older callers.
+ */
+export type CompleteAdjustments = Required<ParametricAdjustments>;
+
+/**
+ * Neutral settings for a source format (Lightroom defaults; mirror of Rust
+ * `ParametricAdjustments::defaults_for`, generated from Rust as `DEFAULT_ADJUSTMENTS*`).
+ * RAW (or unknown format): profile "Adobe Color", sharpening 40, color NR 25; non-RAW: no
+ * profile, no default sharpening / color NR.
+ */
+export function defaultAdjustments(format?: ImageFormat): CompleteAdjustments {
+  const src = format !== undefined && !isRawFormat(format) ? DEFAULT_ADJUSTMENTS_NON_RAW : DEFAULT_ADJUSTMENTS;
+  return structuredClone(src) as unknown as CompleteAdjustments;
+}
+
+/** Fills groups missing from `adj` (e.g. built by pre-v9 code) with the format's defaults. */
+export function completeAdjustments(adj: ParametricAdjustments, format?: ImageFormat): CompleteAdjustments {
+  const d = defaultAdjustments(format);
+  return {
+    ...adj,
+    toneCurve: adj.toneCurve ?? d.toneCurve,
+    colorGrading: adj.colorGrading ?? d.colorGrading,
+    calibration: adj.calibration ?? d.calibration,
+    detail: adj.detail ?? d.detail,
+    effects: adj.effects ?? d.effects,
+    blackAndWhite: adj.blackAndWhite ?? d.blackAndWhite,
+    crop: adj.crop ?? d.crop,
+    profile: adj.profile ?? d.profile,
+  };
+}
+
+/** Identity point curve `[[0, 0], [255, 255]]` (mirror of Rust `PointCurves::IDENTITY`). */
+export const IDENTITY_CURVE: readonly CurvePoint[] = [
+  [0, 0],
+  [255, 255],
+];
+
+/** Max points per curve (mirror of Rust `PointCurves::MAX_POINTS`). */
+export const MAX_CURVE_POINTS = 32;
 
 export const DEFAULT_QUERY: ImageQuery = {
   includeTags: [],
@@ -58,10 +121,121 @@ const ADJUSTMENT_FIELD_SET: Record<AdjustmentField, true> = {
   hsl_saturation: true,
   hsl_luminance: true,
   lut: true,
+  tone_curve: true,
+  color_grading: true,
+  calibration: true,
+  sharpening: true,
+  noise_reduction: true,
+  vignette: true,
+  grain: true,
+  black_and_white: true,
+  crop: true,
+  profile: true,
 };
 
 /** Every `AdjustmentField`, in panel order (fields mask "select all"). */
 export const ALL_ADJUSTMENT_FIELDS = Object.keys(ADJUSTMENT_FIELD_SET) as AdjustmentField[];
+
+/** Display names for fields-mask checkboxes (Lightroom's Copy Settings wording). */
+export const ADJUSTMENT_FIELD_LABELS: Record<AdjustmentField, string> = {
+  white_balance: "White balance",
+  exposure: "Exposure",
+  contrast: "Contrast",
+  highlights: "Highlights",
+  shadows: "Shadows",
+  whites: "Whites",
+  blacks: "Blacks",
+  texture: "Texture",
+  clarity: "Clarity",
+  dehaze: "Dehaze",
+  vibrance: "Vibrance",
+  saturation: "Saturation",
+  hsl_hue: "HSL hue",
+  hsl_saturation: "HSL saturation",
+  hsl_luminance: "HSL luminance",
+  lut: "LUT",
+  tone_curve: "Tone curve",
+  color_grading: "Color grading",
+  calibration: "Calibration",
+  sharpening: "Sharpening",
+  noise_reduction: "Noise reduction",
+  vignette: "Post-crop vignetting",
+  grain: "Grain",
+  black_and_white: "Black & white",
+  crop: "Crop",
+  profile: "Profile",
+};
+
+/**
+ * Copies the `fields` groups of `src` over `dst` (mirror of Rust
+ * `ParametricAdjustments::copy_fields`; keep in sync). Returns a new, complete object.
+ */
+export function copyAdjustmentFields(
+  dst: ParametricAdjustments,
+  src: ParametricAdjustments,
+  fields: readonly AdjustmentField[],
+): CompleteAdjustments {
+  const out = structuredClone(completeAdjustments(dst));
+  const s = structuredClone(completeAdjustments(src));
+  for (const f of fields) {
+    switch (f) {
+      case "white_balance":
+        out.whiteBalance = s.whiteBalance;
+        break;
+      case "hsl_hue":
+        out.hsl.hue = s.hsl.hue;
+        break;
+      case "hsl_saturation":
+        out.hsl.saturation = s.hsl.saturation;
+        break;
+      case "hsl_luminance":
+        out.hsl.luminance = s.hsl.luminance;
+        break;
+      case "lut":
+        out.lut = s.lut;
+        break;
+      case "tone_curve":
+        out.toneCurve = s.toneCurve;
+        break;
+      case "color_grading":
+        out.colorGrading = s.colorGrading;
+        break;
+      case "calibration":
+        out.calibration = s.calibration;
+        break;
+      case "sharpening":
+        out.detail.sharpening = s.detail.sharpening;
+        break;
+      case "noise_reduction":
+        out.detail.noiseReduction = s.detail.noiseReduction;
+        break;
+      case "vignette":
+        out.effects.vignette = s.effects.vignette;
+        break;
+      case "grain":
+        out.effects.grain = s.effects.grain;
+        break;
+      case "black_and_white":
+        out.blackAndWhite = s.blackAndWhite;
+        break;
+      case "crop":
+        out.crop = s.crop;
+        break;
+      case "profile":
+        out.profile = s.profile;
+        break;
+      default:
+        out[f] = s[f];
+    }
+  }
+  return out;
+}
+
+/**
+ * Everything except `crop` (mirror of Rust `AdjustmentField::DEFAULT_SYNC`): the default
+ * selection for Sync / Copy Settings and scene matching (crops are per frame).
+ */
+export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter((f) => f !== "crop");
 
 /** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */
 export const EXPORT_FILENAME_TOKENS: { token: string; description: string }[] = [
@@ -89,7 +263,7 @@ export const DEFAULT_MATCH_OPTIONS: MatchOptions = {
   matchWhiteBalance: true,
   matchTone: false,
   strength: 1,
-  copyFields: ALL_ADJUSTMENT_FIELDS,
+  copyFields: DEFAULT_SYNC_FIELDS,
 };
 
 /** Mirror of Rust `scene::TOLERANCE_EV` / `scene::TOLERANCE_AB` (a match is "within tolerance"). */
@@ -104,11 +278,82 @@ function lerpHsl(a: HslChannels, b: HslChannels, t: number): HslChannels {
   return out;
 }
 
+/** Linear interpolation of every numeric field of a flat record (other fields: nearer side). */
+function lerpFlat<T extends object>(a: T, b: T, t: number): T {
+  const out = { ...a } as Record<string, unknown>;
+  const bb = b as Record<string, unknown>;
+  for (const [k, v] of Object.entries(a)) {
+    const w = bb[k];
+    out[k] = typeof v === "number" && typeof w === "number" ? v + (w - v) * t : t >= 0.5 ? w : v;
+  }
+  return out as T;
+}
+
+function lerpWheel(a: ColorWheel, b: ColorWheel, t: number): ColorWheel {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  let hue: number;
+  if (a.saturation === 0) hue = b.hue;
+  else if (b.saturation === 0) hue = a.hue;
+  else {
+    let d = (b.hue - a.hue) % 360;
+    if (d > 180) d -= 360;
+    else if (d < -180) d += 360;
+    hue = (((a.hue + d * t) % 360) + 360) % 360;
+  }
+  return {
+    hue,
+    saturation: a.saturation + (b.saturation - a.saturation) * t,
+    luminance: a.luminance + (b.luminance - a.luminance) * t,
+  };
+}
+
+function lerpCurve(a: CurvePoint[], b: CurvePoint[], t: number): CurvePoint[] {
+  if (a.length === b.length) {
+    return a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t] as CurvePoint);
+  }
+  return t >= 0.5 ? b : a;
+}
+
+function lerpPointCurves(a: PointCurves, b: PointCurves, t: number): PointCurves {
+  return {
+    master: lerpCurve(a.master, b.master, t),
+    red: lerpCurve(a.red, b.red, t),
+    green: lerpCurve(a.green, b.green, t),
+    blue: lerpCurve(a.blue, b.blue, t),
+  };
+}
+
+function lerpGrading(a: ColorGrading, b: ColorGrading, t: number): ColorGrading {
+  return {
+    shadows: lerpWheel(a.shadows, b.shadows, t),
+    midtones: lerpWheel(a.midtones, b.midtones, t),
+    highlights: lerpWheel(a.highlights, b.highlights, t),
+    global: lerpWheel(a.global, b.global, t),
+    blending: a.blending + (b.blending - a.blending) * t,
+    balance: a.balance + (b.balance - a.balance) * t,
+  };
+}
+
+function lerpCrop(a: CropSettings, b: CropSettings, t: number): CropSettings {
+  return a.enabled && b.enabled ? lerpFlat(a, b, t) : t >= 0.5 ? b : a;
+}
+
+function lerpProfile(a: ProfileSettings, b: ProfileSettings, t: number): ProfileSettings {
+  if (a.look && b.look && a.look.uuid === b.look.uuid && a.cameraProfile === b.cameraProfile) {
+    return { cameraProfile: a.cameraProfile, look: { ...a.look, amount: a.look.amount + (b.look.amount - a.look.amount) * t } };
+  }
+  return t >= 0.5 ? b : a;
+}
+
 /**
  * Mirror of Rust `ParametricAdjustments::lerp` (keep in sync): interpolates a (t = 0) -> b (t = 1).
  * Scene-match strength slider: `lerpAdjustments(preview.base, preview.full, strength)`.
+ * Missing v9 groups are treated as RAW defaults; the result is always complete.
  */
-export function lerpAdjustments(a: ParametricAdjustments, b: ParametricAdjustments, t: number): ParametricAdjustments {
+export function lerpAdjustments(a0: ParametricAdjustments, b0: ParametricAdjustments, t: number): CompleteAdjustments {
+  const a = completeAdjustments(a0);
+  const b = completeAdjustments(b0);
   t = Number.isFinite(t) ? Math.min(1, Math.max(0, t)) : 0;
   const l = (x: number, y: number) => x + (y - x) * t;
   const nearB = t >= 0.5;
@@ -149,5 +394,30 @@ export function lerpAdjustments(a: ParametricAdjustments, b: ParametricAdjustmen
       luminance: lerpHsl(a.hsl.luminance, b.hsl.luminance, t),
     },
     lut,
+    toneCurve: {
+      parametric: lerpFlat(a.toneCurve.parametric, b.toneCurve.parametric, t),
+      point: lerpPointCurves(a.toneCurve.point, b.toneCurve.point, t),
+    },
+    colorGrading: lerpGrading(a.colorGrading, b.colorGrading, t),
+    calibration: {
+      red: lerpFlat(a.calibration.red, b.calibration.red, t),
+      green: lerpFlat(a.calibration.green, b.calibration.green, t),
+      blue: lerpFlat(a.calibration.blue, b.calibration.blue, t),
+      shadowTint: l(a.calibration.shadowTint, b.calibration.shadowTint),
+    },
+    detail: {
+      sharpening: lerpFlat(a.detail.sharpening, b.detail.sharpening, t),
+      noiseReduction: lerpFlat(a.detail.noiseReduction, b.detail.noiseReduction, t),
+    },
+    effects: {
+      vignette: lerpFlat(a.effects.vignette, b.effects.vignette, t),
+      grain: lerpFlat(a.effects.grain, b.effects.grain, t),
+    },
+    blackAndWhite: {
+      enabled: nearB ? b.blackAndWhite.enabled : a.blackAndWhite.enabled,
+      mixer: lerpHsl(a.blackAndWhite.mixer, b.blackAndWhite.mixer, t),
+    },
+    crop: lerpCrop(a.crop, b.crop, t),
+    profile: lerpProfile(a.profile, b.profile, t),
   };
 }

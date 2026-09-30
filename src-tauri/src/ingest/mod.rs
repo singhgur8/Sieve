@@ -443,7 +443,7 @@ mod tests {
         }
         let config = IngestConfig { catalog_path: dir.path().join("cat.sqlite"), cache_dir: dir.path().join("cache") };
         let mut conn = db::open(&config.catalog_path).unwrap();
-        repo::import_folder(&mut conn, &shoot, &ImportOptions { recursive: false }).unwrap();
+        repo::import_folder(&mut conn, &shoot, &ImportOptions::raw_only(false)).unwrap();
         (dir, config)
     }
 
@@ -572,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = IngestConfig { catalog_path: dir.path().join("cat.sqlite"), cache_dir: dir.path().join("cache") };
         let mut conn = db::open(&config.catalog_path).unwrap();
-        repo::import_folder(&mut conn, folder, &ImportOptions { recursive: false }).unwrap();
+        repo::import_folder(&mut conn, folder, &ImportOptions::raw_only(false)).unwrap();
         conn.execute("DELETE FROM images WHERE id NOT IN (SELECT id FROM images ORDER BY file_name LIMIT 40)", [])
             .unwrap();
 

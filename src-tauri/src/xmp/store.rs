@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::{ColorLabel, FolderId, ImageId, ParametricAdjustments, PickFlag};
+use crate::ipc::types::{ColorLabel, DevelopWarning, FolderId, ImageId, ParametricAdjustments, PickFlag};
 
 /// XMP-relevant catalog state of one image.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +135,14 @@ pub fn develop_settings(conn: &Connection, id: ImageId) -> AppResult<Option<Para
         return Ok(None);
     }
     Ok(Some(crate::db::repo::get_adjustments(conn, id)?))
+}
+
+/// Stores the sidecar's unsupported-feature warnings (`RawImageEntry.developWarnings`);
+/// empty clears them. Not XMP-mapped (no dirty trigger).
+pub fn set_develop_warnings(conn: &Connection, id: ImageId, warnings: &[DevelopWarning]) -> AppResult<()> {
+    let json = if warnings.is_empty() { None } else { Some(serde_json::to_string(warnings)?) };
+    conn.execute("UPDATE images SET develop_warnings = ?2 WHERE id = ?1", params![id, json])?;
+    Ok(())
 }
 
 pub fn mark_failed(conn: &Connection, id: ImageId, reason: &str) -> AppResult<()> {

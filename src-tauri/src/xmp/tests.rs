@@ -609,7 +609,7 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
 
     let catalog = dir.path().join("cat.sqlite");
     let mut conn = db::open(&catalog).unwrap();
-    let summary = repo::import_folder(&mut conn, &shoot, &ImportOptions { recursive: false }).unwrap();
+    let summary = repo::import_folder(&mut conn, &shoot, &ImportOptions::raw_only(false)).unwrap();
     assert_eq!(summary.added, 4);
     let sync = XmpSync::new(XmpSyncConfig { catalog_path: catalog.clone() });
     assert_eq!(sync.refresh_folder(summary.folder_id).unwrap(), 1, "existing sidecar read on import");
@@ -870,7 +870,7 @@ fn develop_exiftool_check() {
     fs::copy(&raw, &copy).unwrap();
     let catalog = out_dir.join("cat.sqlite");
     let mut conn = db::open(&catalog).unwrap();
-    repo::import_folder(&mut conn, &out_dir, &ImportOptions { recursive: false }).unwrap();
+    repo::import_folder(&mut conn, &out_dir, &ImportOptions::raw_only(false)).unwrap();
     let id: ImageId = conn.query_row("SELECT id FROM images", [], |r| r.get(0)).unwrap();
     develop::history::commit(&mut conn, id, &edited(), "Edit").unwrap();
     let sync = XmpSync::new(XmpSyncConfig { catalog_path: catalog });
@@ -895,4 +895,35 @@ fn develop_exiftool_check() {
     assert_eq!(j[0]["ProcessVersion"], 11.0);
     assert_eq!(j[0]["HasSettings"], true);
     assert_eq!(j[0]["LutId"], "film-a1b2c3d4");
+}
+
+/// Read-only parity check over real Lightroom sidecars:
+/// `SIEVE_SAMPLE_XMP_DIR=/path/to/dir cargo test --lib real_lightroom_sidecars_decode -- --ignored --nocapture`.
+/// Never writes anything.
+#[test]
+#[ignore = "needs SIEVE_SAMPLE_XMP_DIR"]
+fn real_lightroom_sidecars_decode() {
+    use crate::ipc::types::{DevelopWarningCode, PointCurves};
+    let dir = PathBuf::from(std::env::var("SIEVE_SAMPLE_XMP_DIR").expect("SIEVE_SAMPLE_XMP_DIR"));
+    let (mut total, mut developed, mut curves, mut cropped, mut masks) = (0, 0, 0, 0, 0);
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("xmp") {
+            continue;
+        }
+        total += 1;
+        let v = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v.develop_error, None, "{}", path.display());
+        if let Some(adj) = v.develop {
+            adj.validate().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            developed += 1;
+            curves += usize::from(!PointCurves::is_identity(&adj.tone_curve.point.master));
+            cropped += usize::from(adj.crop.enabled);
+        }
+        masks += usize::from(v.warnings.iter().any(|w| w.code == DevelopWarningCode::MasksUnsupported));
+    }
+    println!(
+        "sidecars {total}, with develop {developed}, custom master curve {curves}, cropped {cropped}, masks {masks}"
+    );
+    assert!(total > 0);
 }

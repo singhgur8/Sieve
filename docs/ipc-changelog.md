@@ -425,3 +425,80 @@ Who updates what
 - vision-ml-dev: nothing required; review `apply_pins` in `rescore_all`.
 - rust-engine-dev: nothing required; review `XmpSync::write_dirty`.
 - frontend-dev: build the UX items on these commands (see architecture.md "UX additions (v8)").
+
+## v9 — 2026-09-29 (Phase 7b: Lightroom develop parity, profiles/looks, non-RAW sources)
+Types
+- BREAKING (TS name only) `RawFormat` -> `ImageFormat` (+ `jpeg | heic | tiff | png`); Rust keeps `type RawFormat =
+  ImageFormat`, TS `index.ts` exports `type RawFormat = ImageFormat`. Helpers: `is_raw`, `from_extension`,
+  `pairs_with_raw`, `ImageFormat::RAW`; TS `RAW_FORMATS`, `isRawFormat`.
+- `ParametricAdjustments` (additive; `#[serde(default)]`, so TS fields are optional and old JSON deserializes):
+  `toneCurve: ToneCurve {parametric: ParametricCurve, point: PointCurves}`, `colorGrading: ColorGrading`
+  (`ColorWheel` x4, `blending`, `balance`), `calibration: CameraCalibration` (`PrimaryCalibration` x3,
+  `shadowTint`), `detail: DetailAdjustments {sharpening: Sharpening, noiseReduction: NoiseReduction}`,
+  `effects: EffectsAdjustments {vignette: PostCropVignette (+ VignetteStyle), grain: Grain}`,
+  `blackAndWhite: BlackAndWhite`, `crop: CropSettings`, `profile: ProfileSettings {cameraProfile, look:
+  LookSettings {name, uuid, amount}}`. Ranges in the Rust docs / `validate()`. Defaults = Lightroom's
+  (`defaults_for(format)`, `is_neutral_for(format)`); generated TS constants `DEFAULT_ADJUSTMENTS`,
+  `DEFAULT_ADJUSTMENTS_NON_RAW`. `copy_fields`, `lerp` (+ TS `lerpAdjustments`, `copyAdjustmentFields`) cover the
+  new groups.
+- `AdjustmentField` += `tone_curve, color_grading, calibration, sharpening, noise_reduction, vignette, grain,
+  black_and_white, crop, profile`; `AdjustmentField::DEFAULT_SYNC` (all but crop) / TS `DEFAULT_SYNC_FIELDS`,
+  `ADJUSTMENT_FIELD_LABELS`. `MatchOptions::default().copyFields` = `DEFAULT_SYNC` (was ALL).
+- `DevelopWarningCode` (`profile_unavailable, look_unavailable, masks_unsupported, retouch_unsupported,
+  lens_corrections_unsupported, transform_unsupported, legacy_process_version, source_color_assumed`),
+  `DevelopWarning {code, detail}`.
+- `RawImageEntry` += `companionPath: string | null`, `developWarnings: DevelopWarning[]`.
+- `DevelopInfo` += `warnings: DevelopWarning[]` (entry warnings + profile/look availability + source colour);
+  `asShot` is `{6500, 0}` for non-RAW sources.
+- `ImportOptions` += `includeNonRaw` (default false), `pairJpegWithRaw` (default true) (both optional on the wire).
+  `ImportSummary` += `companions`.
+- `CameraProfileInfo`, `LookProfileInfo`, `ProfileCatalog`. TS: `CurvePoint`, `IDENTITY_CURVE`,
+  `MAX_CURVE_POINTS`, `defaultAdjustments(format)`, `completeAdjustments(adj, format)`, `CompleteAdjustments`.
+
+Commands
+- New `list_profiles(id) -> ProfileCatalog` (installed DCPs for the image's camera + installed looks).
+- `reset_adjustments` resets to the image's format default (RAW vs non-RAW), incl. profile.
+- `get_develop_info` merges the image's stored `developWarnings` into `warnings`.
+- `import_folder` honours the new options (pairing implemented in `repo::import_folder`).
+- `get_adjustments` for an unedited non-RAW image returns `DEFAULT_ADJUSTMENTS_NON_RAW`.
+
+XMP
+- `crs:` mapping extended (table: `docs/architecture.md` "crs mapping", source of truth `xmp/crs.rs`
+  `PARITY_SCALARS`, `PARITY_BOOLS`, `CRS_CURVES`, `CAMERA_PROFILE`). Scalars are written and read now; point curves
+  are read now (written once `packet` supports Seq replace); profile/look read+write pending (`decode_profile`,
+  `encode_profile` stubs). Unsupported features stored per image at every read (`crs::unsupported_warnings`).
+- Non-RAW sidecar path: `<file name>.xmp` (e.g. `DSCF1234.JPG.xmp`), `xmp::sidecar_path`.
+
+Schema (migration `0009_parity_sources.sql`, user_version 9)
+- `images.format` CHECK accepts `jpeg, heic, tiff, png` (in-place `writable_schema` edit; no table rebuild).
+- `images.companion_path TEXT`, `images.develop_warnings TEXT` (JSON; NULL = none). Neither is XMP-mapped.
+
+Config
+- `SIEVE_CAMERA_PROFILES`, `SIEVE_LOOK_PROFILES` (`:`-separated dirs; default system + user Adobe CameraRaw dirs).
+
+Who updates what
+- architect (done): types + validation + tests, generated constants, `list_profiles` + `ProfileLibrary` managed
+  state, migration + test, `repo::{import_folder (pairing), image_format, get_adjustments / save_adjustments (format
+  defaults), ENTRY_SELECT cols 48-49}`, `raw::{format_from_extension, header_matches, default_*}` for new formats,
+  `xmp::{sidecar_path (non-RAW), store::set_develop_warnings}` + read-path wiring, `crs` scalar parity
+  encode/decode + curve helpers + `unsupported_warnings` + tests, `packet::DocSource` (`CrsSource` impl, `look()`
+  returns None), `DevelopInfo.warnings` plumbing, TS helpers, mock backend (`list_profiles`, complete adjustments,
+  new entry fields), minimal `src/lib/adjust.ts` delegation (`FIELD_LABEL`, `copyFields` -> `src/ipc`).
+- rust-engine-dev: every `todo!()` in `raw/raster.rs` (non-RAW ingest/decode/embedded XMP), `profiles/`
+  (`ProfileLibrary::{catalog, dcp, look}`, `Dcp::{parse, peek_names, illuminant_weight}`, `LookProfile::{parse_file,
+  from_sidecar}`, `table::decode`), `develop/parity.rs` (all stages + `crop_geometry`), `xmp/crs.rs`
+  (`decode_profile`, `encode_profile`); `packet`: nested-struct reader (`DocSource::look`, Look parameters),
+  `rdf:Seq` create/replace + `Desired` seq edits (wire `encode_curves`), `<crs:Look>` struct write; develop/export
+  integration: dispatch non-RAW paths to `raw::raster` (by extension), `display_referred` flag, profile + look
+  stages, crop-aware sizes/regions, `DevelopCache::info` warnings (profile/look availability, source colour), reset
+  of history "Original" for non-RAW (uses `repo::get_adjustments`, already format-aware), embedded-XMP fallback in
+  the read path. Acceptance: roadmap Phase 7b (ΔE2000 / visual parity on the user's frames, crs round trip).
+- frontend-dev: panels Tone Curve (parametric sliders + split handles, point-curve editor with channel selector
+  master/R/G/B, `MAX_CURVE_POINTS`), Color Grading (3 wheels + global, luminance sliders, blending, balance),
+  Calibration, Detail (sharpening + noise reduction), Effects (vignette + grain), B&W toggle + mixer, Crop
+  (straighten angle + enable/reset; drag tool can follow), Profile browser (`listProfiles`, groups, look amount when
+  `supportsAmount`); import dialog toggles (`includeNonRaw`, `pairJpegWithRaw`); warning badges from
+  `RawImageEntry.developWarnings` and `DevelopInfo.warnings`; companion indicator ("RAW+JPG"). Use
+  `defaultAdjustments(entry.format)` for "neutral" / before, `completeAdjustments` when reading, and
+  `DEFAULT_SYNC_FIELDS` as the Sync default. Replace `neutralAdjustments()` in `src/lib/adjust.ts` with
+  `defaultAdjustments(format)`.

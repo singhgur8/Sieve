@@ -1079,7 +1079,7 @@ mod tests {
         let catalog = dir.path().join("cat.sqlite");
         {
             let mut conn = db::open(&catalog).unwrap();
-            repo::import_folder(&mut conn, &src, &ImportOptions { recursive: false }).unwrap();
+            repo::import_folder(&mut conn, &src, &ImportOptions::raw_only(false)).unwrap();
         }
         let ex = Exporter::new(
             ExportConfig { catalog_path: catalog, memory_budget_mb: None },

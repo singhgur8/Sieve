@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let have: u32 = conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
     if have == 0 {
         let t = Instant::now();
-        let s = repo::import_folder(&mut conn, &raws.canonicalize()?, &ImportOptions { recursive: false })?;
+        let s = repo::import_folder(&mut conn, &raws.canonicalize()?, &ImportOptions::raw_only(false))?;
         let running = AtomicBool::new(true);
         let st = run_until_idle(&config, &Quiet, &running)?;
         println!("imported {} ({} thumbnails, {} failed) in {:.1}s", s.added, st.done, st.failed, ms(t) / 1000.0);

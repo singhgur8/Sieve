@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Loader2, X } from "lucide-react";
 import {
   ALL_ADJUSTMENT_FIELDS,
+  DEFAULT_SYNC_FIELDS,
   commands,
   convertFileSrc,
   DEFAULT_MATCH_OPTIONS,
@@ -163,7 +164,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
           {check("White balance", "matchWhiteBalance", "match-wb")}
           {check("Tone", "matchTone", "match-tone")}
           <button className="text-sky-400 hover:underline" onClick={() => setFieldsOpen(true)} data-testid="match-copy-fields">
-            Also copy from anchor: {opts.copyFields.length === ALL_ADJUSTMENT_FIELDS.length ? "All settings" : opts.copyFields.length === 0 ? "Nothing" : `${opts.copyFields.length} groups`} ▾
+            Also copy from anchor: {opts.copyFields.length === ALL_ADJUSTMENT_FIELDS.length ? "All settings" : opts.copyFields.length === DEFAULT_SYNC_FIELDS.length && !opts.copyFields.includes("crop") ? "All settings except crop" : opts.copyFields.length === 0 ? "Nothing" : `${opts.copyFields.length} groups`} ▾
           </button>
           {rejectedCount > 0 && (
             <label className="flex items-center gap-1.5">

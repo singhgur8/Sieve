@@ -143,7 +143,11 @@ export const commands = {
 	/**  `adjustments.lut` refers to a LUT not in the library; rendered without it. */
 	lutMissing: boolean,
 } | null, AppError>(__TAURI_INVOKE("render_preview", { id, adjustments, options })),
-	/**  As-shot white balance and develop-source sizes (decodes the RAW if not cached). */
+	/**
+	 *  As-shot white balance, develop-source sizes and render warnings (decodes the source if
+	 *  not cached). `warnings` = the image's stored sidecar warnings + what `DevelopCache::info`
+	 *  reports (profile/look availability, source colour; rust-engine-dev).
+	 */
 	getDevelopInfo: (id: number) => typedError<DevelopInfo, AppError>(__TAURI_INVOKE("get_develop_info", { id })),
 	/**
 	 *  Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
@@ -299,6 +303,15 @@ export const commands = {
 	saturation: number,
 	hsl: HslAdjustments,
 	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
 } | null, region: {
 	x: number,
 	y: number,
@@ -338,6 +351,12 @@ export const commands = {
 	 *  `null`) now, whether or not auto-sync is on (catalog wins, like `write_xmp`).
 	 */
 	writeXmpAllDirty: (folderId: number | null) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("write_xmp_all_dirty", { folderId })),
+	/**
+	 *  Profile browser contents for image `id`: camera profiles (DCPs) installed for its camera
+	 *  and the installed looks (read in place from the user's Adobe installation; empty lists
+	 *  when none are installed). Select one by saving `adjustments.profile`.
+	 */
+	listProfiles: (id: number) => typedError<ProfileCatalog, AppError>(__TAURI_INVOKE("list_profiles", { id })),
 };
 
 /** Events */
@@ -356,6 +375,11 @@ export const events = {
 	xmpWriteFailed: makeEvent<XmpWriteFailed>("xmp-write-failed"),
 };
 
+/* Constants */
+export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+
+export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+
 /* Types */
 /**
  *  Groups of `ParametricAdjustments` selectable in a fields mask (Lightroom's
@@ -371,7 +395,27 @@ export type AdjustmentField =
 /**  `hsl.luminance` (all 8 bands). */
 "hsl_luminance" | 
 /**  `lut` (reference + amount; copying a `null` removes the target's LUT). */
-"lut";
+"lut" | 
+/**  `toneCurve` (parametric + point curves) (v9). */
+"tone_curve" | 
+/**  `colorGrading` (all wheels, blending, balance) (v9). */
+"color_grading" | 
+/**  `calibration` (v9). */
+"calibration" | 
+/**  `detail.sharpening` (v9). */
+"sharpening" | 
+/**  `detail.noiseReduction` (v9). */
+"noise_reduction" | 
+/**  `effects.vignette` (post-crop) (v9). */
+"vignette" | 
+/**  `effects.grain` (v9). */
+"grain" | 
+/**  `blackAndWhite` (treatment + mixer) (v9). */
+"black_and_white" | 
+/**  `crop` (v9). Not in [`AdjustmentField::DEFAULT_SYNC`]. */
+"crop" | 
+/**  `profile` (camera profile + look) (v9). */
+"profile";
 
 /**
  *  Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
@@ -482,6 +526,16 @@ export type ApplySuggestionsResult = {
 /**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
 export type BitDepth = "8" | "16";
 
+/**
+ *  Black & White treatment (`crs:ConvertToGrayscale` + `crs:GrayMixer*`, -100..=100 per
+ *  band). Independent of monochrome looks (Adobe Monochrome, B&W creative profiles), which
+ *  convert through their own tables.
+ */
+export type BlackAndWhite = {
+	enabled: boolean,
+	mixer: HslChannels,
+};
+
 /**  A cluster of near-identical frames shot in quick succession. */
 export type BurstGroup = {
 	id: number,
@@ -493,6 +547,18 @@ export type BurstGroup = {
 	imageIds: number[],
 };
 
+/**
+ *  Calibration panel (`crs:RedHue` ... `crs:ShadowTint`), all -100..=100. Applied to the
+ *  camera -> working-space matrix (primaries), before every other colour operation.
+ */
+export type CameraCalibration = {
+	red: PrimaryCalibration,
+	green: PrimaryCalibration,
+	blue: PrimaryCalibration,
+	/**  Green (-) / magenta (+) tint of the shadows. */
+	shadowTint: number,
+};
+
 export type CameraInfo = {
 	make: CameraMake,
 	model: string | null,
@@ -500,6 +566,17 @@ export type CameraInfo = {
 };
 
 export type CameraMake = "sony" | "fujifilm" | "canon" | "other";
+
+/**  A camera profile (DCP) installed for an image's camera. */
+export type CameraProfileInfo = {
+	/**  DCP `ProfileName` = `crs:CameraProfile` value, e.g. "Adobe Standard", "Camera ST". */
+	name: string,
+	/**
+	 *  Profile browser group: "Adobe Raw" (Adobe Standard), "Camera Matching" (`Camera/<model>/`),
+	 *  else "Other".
+	 */
+	group: string,
+};
 
 /**
  *  EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
@@ -556,8 +633,50 @@ export type CollisionPolicy =
 /**  Leave the existing file; the image counts as `skipped`. */
 "skip";
 
+/**
+ *  Color Grading panel (Lightroom 10+; legacy Split Toning maps onto it: shadow/highlight
+ *  hue+saturation *are* `crs:SplitToning*`, balance is `crs:SplitToningBalance`).
+ *  `blending` 0..=100 (default 50; a legacy split-toning sidecar without
+ *  `crs:ColorGradeBlending` reads as 100), `balance` -100..=100.
+ */
+export type ColorGrading = {
+	shadows: ColorWheel,
+	midtones: ColorWheel,
+	highlights: ColorWheel,
+	global: ColorWheel,
+	blending: number,
+	balance: number,
+};
+
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
 export type ColorLabel = "red" | "yellow" | "green" | "blue" | "purple";
+
+/**
+ *  One Color Grading wheel. `hue` 0..=360 degrees, `saturation` 0..=100,
+ *  `luminance` -100..=100.
+ */
+export type ColorWheel = {
+	hue: number,
+	saturation: number,
+	luminance: number,
+};
+
+/**
+ *  Crop + straighten, in Lightroom's `crs:` semantics so sidecars round-trip:
+ *  `top/left/bottom/right` 0..=1 are fractions of the *un-oriented* image (before EXIF
+ *  orientation, as ACR stores them) with `left < right`, `top < bottom`; `angle` -45..=45
+ *  degrees (`crs:CropAngle`). `enabled` = `crs:HasCrop`; disabled renders the full frame.
+ *  When enabled, renders (`RenderedPreview` size, `RenderOptions.region`, histogram,
+ *  scene stats) and exports cover the cropped, straightened frame.
+ */
+export type CropSettings = {
+	enabled: boolean,
+	top: number,
+	left: number,
+	bottom: number,
+	right: number,
+	angle: number,
+};
 
 /**
  *  The user's culling values of one image, for a frontend culling undo stack:
@@ -620,6 +739,11 @@ export type CullThresholds = {
 	weights: ScoreWeights,
 };
 
+export type DetailAdjustments = {
+	sharpening: Sharpening,
+	noiseReduction: NoiseReduction,
+};
+
 /**  Facts about an image's develop source, for initializing the editor. */
 export type DevelopInfo = {
 	imageId: number,
@@ -627,20 +751,74 @@ export type DevelopInfo = {
 	 *  The camera's as-shot white balance expressed as temperature/tint (from LibRaw's
 	 *  camera multipliers and colour matrix); `null` if the file has none. Seeds the
 	 *  Temp/Tint sliders when switching from `as_shot` to `custom`.
+	 *  Non-RAW sources (v9): always `{6500, 0}` (the decoded pixels are treated as white
+	 *  balanced for D65; a custom temperature/tint is applied relative to that).
 	 */
 	asShot: WhiteBalanceValues | null,
 	/**  Size of the cached develop source (half-size demosaic), orientation applied. */
 	sourceWidth: number,
 	sourceHeight: number,
-	/**  Full sensor output size, orientation applied (Phase 6 export size). */
+	/**  Full sensor output size, orientation applied (Phase 6 export size). Uncropped. */
 	fullWidth: number,
 	fullHeight: number,
+	/**
+	 *  Why the render may differ from Lightroom's (v9): `RawImageEntry.developWarnings`
+	 *  (sidecar features not rendered) + the stored `profile` resolved against the installed
+	 *  profiles (`profile_unavailable`, `look_unavailable`) + source facts
+	 *  (`source_color_assumed`). Recomputed per call.
+	 */
+	warnings: DevelopWarning[],
 };
+
+export type DevelopWarning = {
+	code: DevelopWarningCode,
+	/**  Short specifics for display (look/profile name, count), if any. */
+	detail: string | null,
+};
+
+/**  Why a render may differ from Lightroom's (Phase 7b). */
+export type DevelopWarningCode = 
+/**
+ *  The camera profile (DCP) `detail` is not installed for this camera: Sieve's
+ *  LibRaw-matrix base colour stands in. Installing Adobe DNG Converter (free) fixes it.
+ */
+"profile_unavailable" | 
+/**
+ *  The look `detail` is neither installed nor embedded in the sidecar: rendered
+ *  without it.
+ */
+"look_unavailable" | 
+/**
+ *  `crs:MaskGroupBasedCorrections` (local adjustments / AI masks, Phase 7c):
+ *  preserved in the sidecar, not rendered yet. `detail` = number of mask groups.
+ */
+"masks_unsupported" | 
+/**  `crs:RetouchAreas` (spot heal/clone): preserved, not rendered. */
+"retouch_unsupported" | 
+/**
+ *  Lens profile / chromatic aberration / defringe / manual distortion or lens
+ *  vignetting: preserved, not rendered.
+ */
+"lens_corrections_unsupported" | 
+/**  Upright / manual perspective transform: preserved, not rendered. */
+"transform_unsupported" | 
+/**  Pre-2012 process version: develop settings not imported. */
+"legacy_process_version" | 
+/**
+ *  Non-RAW source without a recognised ICC profile: decoded as sRGB.
+ *  `detail` = profile description, if any.
+ */
+"source_color_assumed";
 
 /**  Adjustments + history after an undo/redo/jump. */
 export type EditState = {
 	adjustments: ParametricAdjustments,
 	history: AdjustmentHistory,
+};
+
+export type EffectsAdjustments = {
+	vignette: PostCropVignette,
+	grain: Grain,
 };
 
 export type ErrorKind = "not_found" | "invalid_argument" | "io" | "database" | "internal";
@@ -889,6 +1067,17 @@ export type FolderEntry = {
 };
 
 /**
+ *  Film grain (Effects panel), all 0..=100: `amount` (0), `size` (25), `roughness` (50,
+ *  `crs:GrainFrequency`). Deterministic per image (seeded by the image id), scaled with the
+ *  output size so previews and exports match.
+ */
+export type Grain = {
+	amount: number,
+	size: number,
+	roughness: number,
+};
+
+/**
  *  256-bin histograms of the rendered output (8-bit sRGB-encoded values, what the user
  *  sees). `luma` uses Rec.709 weights on the encoded values. Each vector has 256 entries;
  *  every channel sums to `width * height` of the render.
@@ -928,6 +1117,27 @@ export type HslChannels = {
 	purple: number,
 	magenta: number,
 };
+
+/**
+ *  Supported file formats: RAW containers in pipeline priority order, then non-RAW
+ *  ("raster", display-referred) sources (Phase 7b). Renamed from `RawFormat` in IPC v9
+ *  (same wire values for the RAW variants).
+ */
+export type ImageFormat = 
+/**  Sony ARW (TIFF-based). */
+"arw" | 
+/**  Fujifilm RAF (X-Trans or Bayer). */
+"raf" | 
+/**  Canon CR3 (ISO-BMFF based). */
+"cr3" | 
+/**  JPEG (`.jpg`, `.jpeg`, `.jpe`), incl. camera JPEGs next to RAWs. */
+"jpeg" | 
+/**  HEIF/HEIC (`.heic`, `.heif`, `.hif`: Canon/Fuji/iPhone HEIF). */
+"heic" | 
+/**  TIFF (`.tif`, `.tiff`), 8/16-bit. */
+"tiff" | 
+/**  PNG, 8/16-bit. */
+"png";
 
 export type ImagePage = {
 	items: RawImageEntry[],
@@ -1020,6 +1230,19 @@ export type ImageStats = {
 
 export type ImportOptions = {
 	recursive: boolean,
+	/**
+	 *  Also import non-RAW sources (JPEG, HEIC, TIFF, PNG) (v9). Default `false` (RAW only,
+	 *  the pre-v9 behaviour); the import dialog should offer it.
+	 */
+	includeNonRaw?: boolean,
+	/**
+	 *  With `includeNonRaw`: a JPEG/HEIC whose stem matches a RAW in the same directory
+	 *  (case-insensitive, e.g. `DSCF1234.RAF` + `DSCF1234.JPG`) is not imported as its own
+	 *  image but recorded as the RAW's `companionPath` (Lightroom's default "treat JPEG next to
+	 *  raw as separate photo" = off). `false` imports both as separate images. Default `true`.
+	 *  TIFF/PNG never pair.
+	 */
+	pairJpegWithRaw?: boolean,
 };
 
 /**
@@ -1055,13 +1278,69 @@ export type ImportSummary = {
 	added: number,
 	/**  Supported files already in the catalog. */
 	skipped: number,
-	/**  Files with a RAW extension whose header did not match the format. */
+	/**
+	 *  Files with a supported extension (RAW, or non-RAW when included) whose header did not
+	 *  match the format.
+	 */
 	invalid: number,
 	/**
 	 *  Existing XMP sidecars whose rating/pick/label were read into the catalog
 	 *  (new images, and unchanged images whose sidecar changed on disk).
 	 */
 	sidecarsRead: number,
+	/**  JPEG/HEIC siblings recorded as a RAW's `companionPath` instead of being added (v9). */
+	companions: number,
+};
+
+/**
+ *  A look / creative profile installed on this Mac (Lightroom's Profile browser entries
+ *  other than bare DCPs).
+ */
+export type LookProfileInfo = {
+	/**  `crs:UUID` (= `LookSettings.uuid`). */
+	uuid: string,
+	/**  `crs:Name`, e.g. "Adobe Color", "Artistic 01". */
+	name: string,
+	/**
+	 *  `crs:Group` (e.g. "Profiles" for Adobe Raw, "Artistic", "B&W", "Modern", "Vintage"),
+	 *  else the containing directory name.
+	 */
+	group: string,
+	/**  `crs:SupportsAmount`: the Amount slider (0..=200%) applies. */
+	supportsAmount: boolean,
+	/**  Converts to monochrome (`crs:ConvertToGrayscale` in the look). */
+	monochrome: boolean,
+	/**
+	 *  `crs:CameraProfile` the look is built on (selecting the look sets
+	 *  `ProfileSettings.cameraProfile` to it); `null` = keeps the current camera profile.
+	 */
+	cameraProfile: string | null,
+	/**
+	 *  Usable for this image (`crs:CameraModelRestriction` empty or matching; RAW-only looks
+	 *  are unavailable for non-RAW sources).
+	 */
+	available: boolean,
+};
+
+/**
+ *  A Look / creative profile (`<crs:Look>`): Adobe Raw looks (Adobe Color, Adobe Monochrome,
+ *  ...), creative profiles (Artistic, B&W, Modern, Vintage) and third-party looks. Resolved
+ *  at render time by `uuid` from the installed look profiles (`profiles::ProfileLibrary`,
+ *  `/Library/Application Support/Adobe/CameraRaw/Settings/**\/*.xmp` with
+ *  `crs:PresetType="Look"`), else from the image's sidecar (`crs:Look/crs:Parameters` +
+ *  `crs:Table_<md5>`); if neither is available the look is skipped and
+ *  `DevelopWarningCode::LookUnavailable` is reported.
+ */
+export type LookSettings = {
+	/**  `crs:Look/crs:Name`, e.g. "Adobe Color" (display only). */
+	name: string,
+	/**  `crs:Look/crs:UUID` (32 upper-case hex digits): the library key. */
+	uuid: string,
+	/**
+	 *  `crs:Look/crs:Amount`, 0..=2 (1 = 100%); only adjustable when the look supports it
+	 *  (`LookProfileInfo.supportsAmount`), else 1.
+	 */
+	amount: number,
 };
 
 /**  Relative luminance percentiles (linear, 0..=1) of a rendered image. */
@@ -1145,6 +1424,7 @@ export type MatchOptions = {
 	strength: number,
 	/**
 	 *  Groups copied from the anchor into `base` (the target keeps its own values for the rest).
+	 *  Default (v9): `AdjustmentField::DEFAULT_SYNC` (everything but `crop`).
 	 *  The groups a `match*` flag corrects are always taken from the anchor.
 	 */
 	copyFields: AdjustmentField[],
@@ -1237,6 +1517,20 @@ export type NeutralEstimate = {
 	coverage: number,
 };
 
+/**
+ *  Noise reduction (Detail panel), all 0..=100. Lightroom RAW defaults: luminance 0,
+ *  luminanceDetail 50, luminanceContrast 0, color 25, colorDetail 50, colorSmoothness 50;
+ *  non-RAW default color 0.
+ */
+export type NoiseReduction = {
+	luminance: number,
+	luminanceDetail: number,
+	luminanceContrast: number,
+	color: number,
+	colorDetail: number,
+	colorSmoothness: number,
+};
+
 /**  Point in normalized preview coordinates (see [`NormRect`]). */
 export type NormPoint = {
 	x: number,
@@ -1270,6 +1564,11 @@ export type OutputSharpening = {
 /**
  *  Parametric develop settings. Field names and ranges mirror Adobe Camera Raw
  *  Process 2012+ (`crs:` XMP namespace) so XMP export is a 1:1 mapping.
+ *  Phase 7c (masking) will add `masks: Vec<MaskGroup>` (`#[serde(default)]`, group `masks`),
+ *  each with a *local* parameter set mirroring Lightroom's `crs:Local*` (exposure, contrast,
+ *  highlights, shadows, whites, blacks, temperature/tint deltas, texture, clarity, dehaze,
+ *  saturation, hue, sharpness, luminance noise, moire, defringe, toning colour, curve
+ *  refine saturation); those reuse this struct's ranges and names, not a second model.
  *  Stored JSON missing newer fields loads as neutral (see `db::repo::get_adjustments`).
  */
 export type ParametricAdjustments = {
@@ -1290,6 +1589,29 @@ export type ParametricAdjustments = {
 	saturation: number,
 	hsl: HslAdjustments,
 	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+};
+
+/**
+ *  Parametric ("region") tone curve: `crs:Parametric*`. Region amounts -100..=100; splits
+ *  0..=100 with `shadowSplit < midtoneSplit < highlightSplit` (Lightroom defaults 25/50/75).
+ */
+export type ParametricCurve = {
+	shadows: number,
+	darks: number,
+	lights: number,
+	highlights: number,
+	shadowSplit: number,
+	midtoneSplit: number,
+	highlightSplit: number,
 };
 
 export type PickFlag = "pick" | "reject" | "unflagged";
@@ -1303,6 +1625,34 @@ export type PlannedFile = {
 	exists: boolean,
 };
 
+/**
+ *  Point curves: `crs:ToneCurvePV2012` (+ `Red` / `Green` / `Blue`). Each curve has
+ *  2..=[`PointCurves::MAX_POINTS`] points with strictly increasing input; endpoints may move
+ *  (e.g. `[0, 14]` lifts the blacks). Identity = `[[0, 0], [255, 255]]`. Interpolation is
+ *  Lightroom's (monotone cubic through the points), evaluated by the engine.
+ */
+export type PointCurves = {
+	/**  Applied to R, G and B alike. */
+	master: ([number, number])[],
+	red: ([number, number])[],
+	green: ([number, number])[],
+	blue: ([number, number])[],
+};
+
+/**
+ *  Post-crop vignette (Effects panel), relative to the cropped frame. `amount` -100..=100
+ *  (negative darkens), `midpoint` 0..=100 (50), `roundness` -100..=100 (0), `feather`
+ *  0..=100 (50), `highlights` 0..=100 (0; highlight/colour priority only).
+ */
+export type PostCropVignette = {
+	amount: number,
+	midpoint: number,
+	roundness: number,
+	feather: number,
+	highlights: number,
+	style: VignetteStyle,
+};
+
 /**  A saved develop preset: applies `adjustments` restricted to `fields`. */
 export type Preset = {
 	id: number,
@@ -1313,6 +1663,46 @@ export type Preset = {
 	fields: AdjustmentField[],
 	createdAtMs: number,
 	updatedAtMs: number,
+};
+
+/**  Hue / saturation shift of one camera primary, each -100..=100. */
+export type PrimaryCalibration = {
+	hue: number,
+	saturation: number,
+};
+
+/**  Profile browser contents for one image (`list_profiles`). */
+export type ProfileCatalog = {
+	imageId: number,
+	/**
+	 *  Adobe unique camera model the DCPs were matched on (e.g. "Sony ILCE-7M4"); `null` for
+	 *  non-RAW sources or unknown cameras.
+	 */
+	cameraModel: string | null,
+	/**  DCPs for this camera (empty for non-RAW sources or when none are installed). */
+	cameraProfiles: CameraProfileInfo[],
+	looks: LookProfileInfo[],
+	/**  Directories scanned (for the "no Adobe profiles found" hint). */
+	searchDirs: string[],
+};
+
+/**
+ *  Profile (Lightroom's Profile browser): base camera profile (DCP) + optional look.
+ *  Default = Lightroom's RAW default "Adobe Color" (= DCP "Adobe Standard" + look Adobe
+ *  Color); non-RAW default = no camera profile, no look.
+ *  Rendering (see `profiles` module docs): the DCP named `cameraProfile` for the image's
+ *  camera is located in the installed Adobe CameraProfiles (read at runtime, never bundled);
+ *  when missing, Sieve's LibRaw-matrix base stands in (`DevelopWarningCode::ProfileUnavailable`).
+ *  Copy/paste group `profile`.
+ */
+export type ProfileSettings = {
+	/**
+	 *  `crs:CameraProfile`: DCP `ProfileName`, e.g. "Adobe Standard", "Camera ST",
+	 *  "Camera Standard". `null` = no camera profile (non-RAW "Embedded"; for RAW the
+	 *  LibRaw-matrix base). 1..=128 chars.
+	 */
+	cameraProfile: string | null,
+	look: LookSettings | null,
 };
 
 /**  Culling-engine scores. All scores are normalized to 0..=1, higher is better. */
@@ -1340,22 +1730,13 @@ export type QualityScore = {
 	suggestedPick: PickFlag,
 };
 
-/**  Supported RAW containers, in pipeline priority order. */
-export type RawFormat = 
-/**  Sony ARW (TIFF-based). */
-"arw" | 
-/**  Fujifilm RAF (X-Trans or Bayer). */
-"raf" | 
-/**  Canon CR3 (ISO-BMFF based). */
-"cr3";
-
 /**  One RAW file in the catalog, with everything the grid and loupe need. */
 export type RawImageEntry = {
 	id: number,
 	folderId: number,
 	path: string,
 	fileName: string,
-	format: RawFormat,
+	format: ImageFormat,
 	camera: CameraInfo,
 	capture: CaptureMeta,
 	width: number | null,
@@ -1381,6 +1762,19 @@ export type RawImageEntry = {
 	sceneId: number | null,
 	/**  This image is a graded anchor of its scene. */
 	isSceneAnchor: boolean,
+	/**
+	 *  RAW only: absolute path of the same-stem camera JPEG/HEIC paired with this RAW at
+	 *  import (`ImportOptions.pairJpegWithRaw`); that file is not a catalog image of its own.
+	 *  Never modified, never exported (Phase 7b).
+	 */
+	companionPath: string | null,
+	/**
+	 *  Sidecar develop settings Sieve preserves but does not render (masks, retouch, lens
+	 *  corrections, transforms, legacy process version), found at the last XMP read. Empty
+	 *  when none / never read. Editor-time warnings (Adobe Look, source colour) are in
+	 *  `DevelopInfo.warnings` (Phase 7b).
+	 */
+	developWarnings: DevelopWarning[],
 };
 
 /**  How to render a preview. */
@@ -1540,6 +1934,18 @@ export type SharpenAmount = "low" | "standard" | "high";
 /**  Lightroom output-sharpening target. */
 export type SharpenMedia = "screen" | "matte" | "glossy";
 
+/**
+ *  Capture sharpening (Detail panel). `amount` 0..=150, `radius` 0.5..=3.0 px (at full
+ *  resolution; the engine scales it for reduced-size previews), `detail` 0..=100,
+ *  `masking` 0..=100. Lightroom RAW defaults 40 / 1.0 / 25 / 0; non-RAW default amount 0.
+ */
+export type Sharpening = {
+	amount: number,
+	radius: number,
+	detail: number,
+	masking: number,
+};
+
 /**  Shoot context; biases subject prioritization and tag thresholds. */
 export type ShootType = "wedding" | "portrait" | "sports" | "event" | "landscape" | "general";
 
@@ -1605,6 +2011,15 @@ export type TiffCompression = "none" | "lzw" |
 "zip";
 
 /**
+ *  Tone Curve panel. Order in the pipeline: parametric curve, then the point curves
+ *  (master, then per channel), both on display-referred values after the base tone.
+ */
+export type ToneCurve = {
+	parametric: ParametricCurve,
+	point: PointCurves,
+};
+
+/**
  *  Small per-catalog UI preferences. Every field is optional so the struct can grow;
  *  `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
  */
@@ -1612,6 +2027,9 @@ export type UiPrefs = {
 	/**  Folder last chosen in the export dialog (absolute path). */
 	lastExportFolder?: string | null,
 };
+
+/**  Post-crop vignette style (`crs:PostCropVignetteStyle` 1 / 2 / 3). */
+export type VignetteStyle = "highlight_priority" | "color_priority" | "paint_overlay";
 
 /**  White balance. `AsShot` uses the camera's recorded multipliers. */
 export type WhiteBalance = { mode: "as_shot" } | 
@@ -1660,7 +2078,10 @@ export type XmpSyncReport = {
 	changed: number[],
 };
 
-/**  Per-image XMP sidecar state (`<basename>.xmp` next to the RAW). */
+/**
+ *  Per-image XMP sidecar state (`<basename>.xmp` next to a RAW; `<file name>.xmp`, e.g.
+ *  `IMG_1.JPG.xmp`, next to a non-RAW source: see `xmp::sidecar_path`).
+ */
 export type XmpSyncState = {
 	/**
 	 *  Rating/pick/label/tags or develop settings (crs:) changed in the catalog since the

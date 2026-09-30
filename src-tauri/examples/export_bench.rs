@@ -281,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Catalog: import + ingest (EXIF, orientation, sizes).
     let config = IngestConfig { catalog_path: work.join("catalog.sqlite"), cache_dir: work.join("cache") };
     let mut conn = db::open(&config.catalog_path)?;
-    let summary = repo::import_folder(&mut conn, &src, &ImportOptions { recursive: false })?;
+    let summary = repo::import_folder(&mut conn, &src, &ImportOptions::raw_only(false))?;
     let t = Instant::now();
     let running = AtomicBool::new(true);
     run_until_idle(&config, &Quiet, &running)?;

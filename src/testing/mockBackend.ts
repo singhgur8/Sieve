@@ -4,7 +4,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
-import { lerpAdjustments } from "../ipc";
+import { completeAdjustments, lerpAdjustments } from "../ipc";
 import type {
   BurstGroup,
   CatalogState,
@@ -152,6 +152,8 @@ export function installMockBackend(count: number) {
       isBurstKeeper: inBurst && i % 25 === 1,
       sceneId: null,
       isSceneAnchor: false,
+      companionPath: null,
+      developWarnings: [],
       tags,
       quality: {
         overall,
@@ -284,7 +286,9 @@ export function installMockBackend(count: number) {
     { id: "film-warm", name: "Film Warm", kind: "lut_3d", size: 33, path: "/mock/luts/film-warm.cube" },
     { id: "teal-orange", name: "Teal Orange", kind: "lut_3d", size: 33, path: "/mock/luts/teal-orange.cube" },
   ];
-  const getAdj = (id: number) => adjs.get(id) ?? neutralAdjustments();
+  // IPC v9: the backend always returns complete adjustments (every parity group present).
+  const neutral = () => completeAdjustments(neutralAdjustments());
+  const getAdj = (id: number): ParametricAdjustments => adjs.get(id) ?? neutral();
   const histOf = (id: number): Hist => {
     let h = hists.get(id);
     if (!h) hists.set(id, (h = { entries: [], cursor: -1, lastAt: 0 }));
@@ -300,8 +304,9 @@ export function installMockBackend(count: number) {
       canRedo: h.cursor >= 0 && h.cursor < h.entries.length - 1,
     };
   };
-  const isNeutral = (a: ParametricAdjustments) => JSON.stringify(a) === JSON.stringify(neutralAdjustments());
-  function commit(id: number, next: ParametricAdjustments, label: string) {
+  const isNeutral = (a: ParametricAdjustments) => JSON.stringify(completeAdjustments(a)) === JSON.stringify(neutral());
+  function commit(id: number, next0: ParametricAdjustments, label: string) {
+    const next = completeAdjustments(next0);
     const cur = getAdj(id);
     const h = histOf(id);
     if (JSON.stringify(cur) === JSON.stringify(next)) return;
@@ -679,7 +684,21 @@ export function installMockBackend(count: number) {
           return jump(args.id as number, h.entries.findIndex((e) => e.id === args.entryId));
         }
         case "get_develop_info":
-          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000 };
+          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000, warnings: [] };
+        case "list_profiles":
+          return {
+            imageId: args.id,
+            cameraModel: "Sony ILCE-7M4",
+            cameraProfiles: [
+              { name: "Adobe Standard", group: "Adobe Raw" },
+              { name: "Camera ST", group: "Camera Matching" },
+            ],
+            looks: [
+              { uuid: "B952C231111CD8E0ECCF14B86BAA7077", name: "Adobe Color", group: "Profiles", supportsAmount: false, monochrome: false, cameraProfile: "Adobe Standard", available: true },
+              { uuid: "0CFE8F8AB5F63B2A73CE0B0077D20817", name: "Adobe Monochrome", group: "Profiles", supportsAmount: false, monochrome: true, cameraProfile: "Adobe Standard", available: true },
+            ],
+            searchDirs: ["/Library/Application Support/Adobe/CameraRaw/CameraProfiles"],
+          };
         case "prepare_develop":
           return null;
         case "render_preview":
@@ -691,7 +710,7 @@ export function installMockBackend(count: number) {
           return batch(args.targetIds as number[], "Sync Settings", (a) => copyFields(a, src, args.fields as AdjustmentField[]));
         }
         case "reset_adjustments":
-          return batch(ids, "Reset", () => neutralAdjustments());
+          return batch(ids, "Reset", () => neutral());
         case "apply_preset": {
           const p = presets.find((x) => x.id === args.presetId);
           if (!p) throw { kind: "not_found", message: "preset" };

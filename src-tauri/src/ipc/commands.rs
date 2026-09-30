@@ -16,6 +16,7 @@ use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::{self, Analysis};
+use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
 use crate::xmp::XmpSync;
 
@@ -312,7 +313,9 @@ pub async fn render_preview(
     .await
 }
 
-/// As-shot white balance and develop-source sizes (decodes the RAW if not cached).
+/// As-shot white balance, develop-source sizes and render warnings (decodes the source if
+/// not cached). `warnings` = the image's stored sidecar warnings + what `DevelopCache::info`
+/// reports (profile/look availability, source colour; rust-engine-dev).
 #[tauri::command]
 #[specta::specta]
 pub async fn get_develop_info(
@@ -320,9 +323,14 @@ pub async fn get_develop_info(
     develop: State<'_, DevelopCache>,
     id: ImageId,
 ) -> AppResult<DevelopInfo> {
-    let src = source_images(&catalog, vec![id]).await?.remove(0);
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let src = SourceImage { id: entry.id, path: PathBuf::from(&entry.path), orientation: entry.orientation };
     let cache = develop.inner().clone();
-    blocking(move || cache.info(&src)).await
+    let mut info = blocking(move || cache.info(&src)).await?;
+    let mut warnings = entry.develop_warnings;
+    warnings.append(&mut info.warnings);
+    info.warnings = warnings;
+    Ok(info)
 }
 
 /// Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
@@ -443,8 +451,30 @@ pub async fn reset_adjustments(
 ) -> AppResult<()> {
     catalog
         .run(move |c| {
-            let neutral = ParametricAdjustments::default();
-            develop::history::apply_fields(c, &ids, &neutral, AdjustmentField::ALL, develop::history::LABEL_RESET)
+            // Neutral depends on the source (non-RAW: no profile, no default sharpening).
+            // Resolve every id first so an unknown id writes nothing.
+            let mut raw_ids = Vec::new();
+            let mut other_ids = Vec::new();
+            for &id in &ids {
+                if repo::image_format(c, id)?.is_raw() {
+                    raw_ids.push(id);
+                } else {
+                    other_ids.push(id);
+                }
+            }
+            for (group, format) in [(raw_ids, ImageFormat::Arw), (other_ids, ImageFormat::Jpeg)] {
+                if !group.is_empty() {
+                    let neutral = ParametricAdjustments::defaults_for(format);
+                    develop::history::apply_fields(
+                        c,
+                        &group,
+                        &neutral,
+                        AdjustmentField::ALL,
+                        develop::history::LABEL_RESET,
+                    )?;
+                }
+            }
+            Ok(())
         })
         .await?;
     xmp.notify(&app);
@@ -1122,4 +1152,33 @@ mod tests {
         validate_reveal_path(&file).unwrap();
         validate_reveal_path(dir.path()).unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Profiles (Phase 7b)
+// ---------------------------------------------------------------------------
+
+/// Profile browser contents for image `id`: camera profiles (DCPs) installed for its camera
+/// and the installed looks (read in place from the user's Adobe installation; empty lists
+/// when none are installed). Select one by saving `adjustments.profile`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_profiles(
+    catalog: State<'_, Catalog>,
+    profiles: State<'_, ProfileLibrary>,
+    id: ImageId,
+) -> AppResult<ProfileCatalog> {
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let camera = CameraKey {
+        format: entry.format,
+        // Adobe's spelling of the makes Sieve identifies ("Sony ILCE-7M4", "Fujifilm X-M5").
+        make: match entry.camera.make {
+            CameraMake::Sony => Some("Sony".to_owned()),
+            CameraMake::Fujifilm => Some("Fujifilm".to_owned()),
+            CameraMake::Canon => Some("Canon".to_owned()),
+            CameraMake::Other => None,
+        },
+        model: entry.camera.model.clone(),
+    };
+    Ok(profiles.catalog(entry.id, &camera))
 }
