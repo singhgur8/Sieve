@@ -239,3 +239,75 @@ Who updates what
   (`ALL_ADJUSTMENT_FIELDS`), presets (`listPresets`/`savePreset`/`applyPreset`/`deletePreset`), LUT picker
   (`listLuts`/`importLut` via the dialog plugin, amount slider). Add mock cases for the new commands in
   `src/testing/mockBackend.ts` (render `url` can point at a Playwright-routed JPEG). `saveAdjustments` gained `label`.
+
+## v6 — 2026-09-29 (Phase 6: export)
+Additive only; no existing type or command changed.
+
+Types
+- Ids: `ExportPresetId` (user presets > 0, built-ins < 0), `ExportJobId`.
+- Enums (snake_case strings): `ExportFormatKind` (`jpeg | tiff | png | webp | heic`), `BitDepth` (`"8" | "16"`),
+  `ChromaSubsampling` (`"444" | "422" | "420"`), `TiffCompression` (`none | lzw | zip`), `ExportColorSpace`
+  (`srgb | display_p3 | adobe_rgb`), `SharpenMedia` (`screen | matte | glossy`), `SharpenAmount`
+  (`low | standard | high`), `CollisionPolicy` (`unique_suffix | overwrite | skip`), `MetadataInclude`
+  (`all | copyright_only | copyright_and_contact | none`), `ExportJobState`
+  (`queued | running | completed | cancelled | interrupted`).
+- Tagged unions (`kind`): `ExportFormat` (`jpeg {quality, chromaSubsampling}`, `tiff {bitDepth, compression}`,
+  `png {bitDepth}`, `webp {quality, lossless}`, `heic {quality}`), `ResizeMode` (`none`, `long_edge {px}`,
+  `short_edge {px}`, `megapixels {mp}`, `width_height {width, height}`), `ExportDestination` (`choose`,
+  `folder {path}`, `source_folder`).
+- Structs: `ResizeOptions {mode, dontEnlarge, resolutionPpi}`, `OutputSharpening {media, amount}`,
+  `FileNaming {template, startNumber, collision}`, `MetadataOptions {include, removeLocation, includeKeywords,
+  copyright, creator}`, `ExportSettings {format, colorSpace, resize, sharpening, naming, destination, subfolder,
+  metadata}` (+ `validate()`), `ExportPreset {id, name, builtIn, settings, createdAtMs, updatedAtMs}`
+  (+ `builtins()`), `ExportFormatInfo {kind, available, reason, bitDepths, supportsMetadata}`,
+  `ExportCapabilities {formats, maxParallel, memoryBudgetMb}`, `PlannedFile {imageId, path, exists}`,
+  `ExportPlan {outputDir, files, existing}`, `ExportFailure {imageId, fileName, reason}`,
+  `ExportJob {id, state, presetName, format, total, done, succeeded, failed, skipped, outputDir, failures,
+  createdAtMs, finishedAtMs}`.
+- File-name templates: literal text + `{filename}`, `{seq}` / `{seq:N}`, `{date}` / `{date:FMT}` (YYYY YY MM DD hh mm
+  ss, `- _ .` space), `{rating}`, `{camera}`, `{folder}`, `{id}`; parsed/validated by `parse_filename_template`
+  (Rust, not on the wire). TS mirrors: `EXPORT_FILENAME_TOKENS`, `EXPORT_EXTENSIONS` in `src/ipc/index.ts`.
+- Built-in presets (read-only, destination `choose`): -1 "Client JPEG full-res sRGB q90" (JPEG q90 4:4:4, full
+  res, 300 ppi, no sharpening, metadata all), -2 "Web 2048 sRGB" (JPEG q80 4:2:0, long edge 2048, 72 ppi, screen
+  standard, copyright only, location removed), -3 "Print TIFF 16-bit Adobe RGB" (TIFF 16 LZW, full res, 300 ppi,
+  glossy standard, metadata all).
+
+Commands (new)
+- `get_export_capabilities() -> ExportCapabilities`.
+- `list_export_presets() -> ExportPreset[]` (built-ins first); `save_export_preset(id | null, name, settings) ->
+  ExportPreset` (built-in id -> `invalid_argument`); `delete_export_preset(id)`.
+- `plan_export(ids, settings) -> ExportPlan` (dry run: final paths + existing files).
+- `export_images(ids, settings, presetName | null) -> ExportJob` (queued; returns immediately; adjustments
+  snapshotted; `choose` destination / empty ids -> `invalid_argument`; unknown id -> `not_found`; duplicate ids
+  dropped).
+- `cancel_export(jobId)`; `get_export_jobs() -> ExportJob[]` (active first, then 50 most recent).
+
+Events (new)
+- `exportProgress {jobId, done, total, failed, skipped, currentFile}` (throttled).
+- `exportFinished {jobId, succeeded, skipped, failed: ExportFailure[], cancelled, outputDir, elapsedMs}` (once per job).
+
+Schema (migration `0006_export.sql`, user_version 6)
+- `export_presets` (user presets; name unique NOCASE; `settings_json`).
+- `export_jobs` (state CHECK, counters, resolved `output_dir`, `settings_json`, timestamps) + `idx_export_jobs_created`.
+- `export_items` (`(job_id, seq)` PK, image, status `pending|done|failed|skipped`, `output_path`, `error`;
+  cascades from jobs and images) + `idx_export_items_image`.
+
+Config
+- `SIEVE_EXPORT_MEMORY_MB` (default 25% of physical RAM clamped to 2..=8 GiB).
+
+Who updates what
+- architect (done): types + validation + template parser + built-ins + tests, commands (thin bodies), events,
+  registration, managed `Exporter` (+ `recover_interrupted` at startup), migration + test, memory policy fns
+  (`export::memory_budget_bytes`, `estimate_image_bytes`, `MAX_PARALLEL`) + test, TS helpers.
+- rust-engine-dev: fill every `todo!()` in `src-tauri/src/export/`: `Exporter::{capabilities, enqueue, cancel,
+  jobs}` (+ real `recover_interrupted`), `plan`, `presets::{list, save, delete}`, `develop::{decode_full,
+  output_size, render_full}`, `naming::expand`, `encode::{icc_profile, probe_formats, write_file}`,
+  `metadata::collect`; refactor `develop::pipeline` so preview and export share the stages up to the linear
+  working image (see `export/develop.rs` docs). Acceptance (roadmap Phase 6): 50-file batch per format from
+  `test-data/`, dimensions / JPEG quality / ICC / metadata verified with `exiftool`, memory flat during batch.
+- frontend-dev: export dialog (preset list via `listExportPresets`, preset editor with every `ExportSettings`
+  field, formats greyed out when `getExportCapabilities().formats[i].available` is false, token help from
+  `EXPORT_FILENAME_TOKENS`, destination picker via the dialog plugin replacing `choose` with `folder`),
+  `planExport` warning for existing files, `exportImages(selectedIds, settings, preset.name)`, a jobs panel
+  (`getExportJobs`, `exportProgress` / `exportFinished`, `cancelExport`). Add mock cases for the new commands in
+  `src/testing/mockBackend.ts` (the build does not need them; UI tests will).
