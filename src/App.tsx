@@ -25,18 +25,30 @@ export default function App() {
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [versions, setVersions] = useState<Record<number, number>>({});
   const loadedRef = useRef(0);
+  // Thumbnail states delivered by events; they win over older list snapshots still marked pending.
+  const eventThumbs = useRef(new Map<number, RawImageEntry["thumbnail"]>());
+
+  const merge = useCallback((e: RawImageEntry): RawImageEntry => {
+    const t = eventThumbs.current.get(e.id);
+    return t && e.thumbnail.status === "pending" ? { ...e, thumbnail: t } : e;
+  }, []);
 
   const patch = useCallback((id: number, fn: (e: RawImageEntry) => RawImageEntry) => {
     setItems((prev) => prev.map((e) => (e.id === id ? fn(e) : e)));
   }, []);
 
-  const loadPage = useCallback(async (offset: number) => {
-    const page = await unwrap(commands.listImages({ ...DEFAULT_QUERY, offset, limit: PAGE_SIZE }));
-    setTotal(page.total);
-    setItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]));
-    loadedRef.current = offset + page.items.length;
-  }, []);
+  const loadPage = useCallback(
+    async (offset: number, limit = PAGE_SIZE) => {
+      const page = await unwrap(commands.listImages({ ...DEFAULT_QUERY, offset, limit }));
+      const fresh = page.items.map(merge);
+      setTotal(page.total);
+      setItems((prev) => (offset === 0 ? fresh : [...prev, ...fresh]));
+      loadedRef.current = offset + page.items.length;
+    },
+    [merge],
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -65,20 +77,31 @@ export default function App() {
         setProgress(ev.payload);
         if (ev.payload.done >= ev.payload.total) {
           void unwrap(commands.getCatalogState()).then(setCatalog).catch(() => {});
+          // Re-fetch what is loaded so no row stays pending after a stale snapshot.
+          void loadPage(0, Math.max(loadedRef.current, PAGE_SIZE)).catch(() => {});
         }
       }),
       events.thumbnailReady.listen((ev) => {
         const p = ev.payload;
+        eventThumbs.current.set(p.imageId, {
+          status: "ready",
+          path: p.path,
+          previewPath: p.previewPath,
+          width: p.width,
+          height: p.height,
+        });
+        setVersions((v) => ({ ...v, [p.imageId]: (v[p.imageId] ?? 0) + 1 }));
         patch(p.imageId, (e) => ({
           ...e,
           thumbnail: { status: "ready", path: p.path, previewPath: p.previewPath, width: p.width, height: p.height },
         }));
         // EXIF is written in the same pass; fetch just this entry.
         unwrap(commands.getImage(p.imageId))
-          .then((fresh) => patch(p.imageId, () => fresh))
+          .then((fresh) => patch(p.imageId, () => merge(fresh)))
           .catch(() => {});
       }),
       events.thumbnailFailed.listen((ev) => {
+        eventThumbs.current.set(ev.payload.imageId, { status: "failed", reason: ev.payload.reason });
         patch(ev.payload.imageId, (e) => ({
           ...e,
           thumbnail: { status: "failed", reason: ev.payload.reason },
@@ -88,7 +111,7 @@ export default function App() {
     return () => {
       unlisten.forEach((u) => void u.then((f) => f()));
     };
-  }, [patch]);
+  }, [patch, merge, loadPage]);
 
   async function importFolder() {
     const path = await open({ directory: true, title: "Import RAW folder" });
@@ -107,6 +130,7 @@ export default function App() {
 
   const retry = useCallback(
     async (id: number) => {
+      eventThumbs.current.delete(id);
       patch(id, (e) => ({ ...e, thumbnail: { status: "pending" } }));
       try {
         await unwrap(commands.regenerateThumbnails([id]));
@@ -142,7 +166,7 @@ export default function App() {
 
       <ul className="flex-1 divide-y divide-neutral-900 overflow-auto">
         {items.map((img) => (
-          <Row key={img.id} img={img} onRetry={retry} />
+          <Row key={img.id} img={img} version={versions[img.id] ?? 0} onRetry={retry} />
         ))}
         {items.length < total && (
           <li className="px-4 py-3">
@@ -177,7 +201,15 @@ function ProgressBar({ progress, active }: { progress: ImportProgress; active: b
   );
 }
 
-const Row = memo(function Row({ img, onRetry }: { img: RawImageEntry; onRetry: (id: number) => void }) {
+const Row = memo(function Row({
+  img,
+  version,
+  onRetry,
+}: {
+  img: RawImageEntry;
+  version: number;
+  onRetry: (id: number) => void;
+}) {
   const t = img.thumbnail;
   const c = img.capture;
   return (
@@ -185,7 +217,7 @@ const Row = memo(function Row({ img, onRetry }: { img: RawImageEntry; onRetry: (
       <div className="flex size-20 shrink-0 items-center justify-center overflow-hidden rounded bg-neutral-900">
         {t.status === "ready" ? (
           <img
-            src={convertFileSrc(t.path)}
+            src={`${convertFileSrc(t.path)}?v=${version}`}
             loading="lazy"
             decoding="async"
             alt={img.fileName}
