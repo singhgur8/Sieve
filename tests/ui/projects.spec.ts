@@ -11,6 +11,13 @@ async function openProject(page: Page, id: number) {
   await expect(page.getByTestId("grid-toolbar")).toBeVisible();
 }
 
+/** The cell's thumbnail <img> has decoded (a blank dark cell would have no image or naturalWidth 0). */
+async function expectThumb(page: Page, id: number) {
+  const img = page.getByTestId(`cell-${id}`).locator("img");
+  await expect(img).toBeVisible();
+  await expect.poll(() => img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
+}
+
 test.describe("projects home page", () => {
   test("lists cards with counts and step; sort and search work", async ({ page }) => {
     await openHome(page);
@@ -51,6 +58,8 @@ test.describe("projects home page", () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.getByTestId("project-open-1").click();
     await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+    await expectThumb(page, 1);
+    await expectThumb(page, 12);
     await shot(page, `${P}inside-1280`);
   });
 
@@ -95,6 +104,7 @@ test.describe("projects home page", () => {
     await expect(page.getByTestId("project-name")).toHaveText("ceremony");
     await expect(page.getByTestId("grid-toolbar")).toContainText("101 photos");
     await expect(page.getByTestId("cell-1")).toBeVisible();
+    await expectThumb(page, 1);
     await expect(page.getByTestId("cell-102")).toHaveCount(0);
     const q1 = (await calls(page, "list_image_ids")).at(-1)!.args.query as { projectId: number };
     expect(q1.projectId).toBe(1);
@@ -115,6 +125,7 @@ test.describe("projects home page", () => {
     await expect(page.getByTestId("project-name")).toHaveText("reception");
     await expect(page.getByTestId("grid-toolbar")).toContainText("100 photos");
     await expect(page.getByTestId("cell-102")).toBeVisible();
+    await expectThumb(page, 102);
     await expect(page.getByTestId("cell-1")).toHaveCount(0);
     expect(((await calls(page, "list_image_ids")).at(-1)!.args.query as { projectId: number }).projectId).toBe(2);
     expect((await calls(page, "get_filter_counts")).at(-1)!.args).toMatchObject({ projectId: 2 });
