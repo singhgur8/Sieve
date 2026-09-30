@@ -87,11 +87,12 @@ pub fn memory_budget_bytes(physical_ram_bytes: u64, override_mb: Option<u64>) ->
 }
 
 /// Peak memory estimate for exporting one image: LibRaw decode (~16 B/px of the source:
-/// raw buffer + 4x16-bit image + RGB16 copy) plus the output-size working set (~24 B/px:
-/// f32 RGB in/out of the pipeline and the quantized output) plus 64 MiB for encoder and LUT
-/// buffers. 24 MP full-res ~= 1.0 GB, 61 MP full-res ~= 2.4 GB, any source -> 2048 px ~= 0.5 GB.
+/// raw buffer + 4x16-bit image + RGB16 copy) plus the output-size working set (~64 B/px:
+/// f32 working RGB, noise-reduction planes and guided-filter temporaries, u16 input and
+/// output) plus 64 MiB for encoder and LUT buffers. 24 MP full-res ~= 2.0 GB, any source ->
+/// 2048 px ~= 0.7 GB.
 pub fn estimate_image_bytes(source_pixels: u64, output_pixels: u64) -> u64 {
-    source_pixels * 16 + output_pixels * 24 + 64 * MIB
+    source_pixels * 16 + output_pixels * 64 + 64 * MIB
 }
 
 /// Physical RAM (`hw.memsize`); 16 GiB if unknown.
@@ -705,11 +706,19 @@ fn export_one(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
     }
-    let src = develop::decode_full(raw)?;
+    let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
     check()?;
     let orientation = item.entry.orientation;
-    let size = develop::planned_size(&src, orientation, &settings.resize);
-    let prepared = develop::prepare_output(&src, orientation, size)?;
+    let crop = &item.adjustments.crop;
+    let size = develop::planned_size(&src, orientation, crop, &settings.resize);
+    let scale = develop::export_scale(&src, orientation, crop, size);
+    let profile = crate::develop::camera::resolve(
+        &meta,
+        &item.adjustments.profile,
+        &crate::profiles::ProfileLibrary::shared(),
+        Some(&crate::xmp::sidecar_path(raw)),
+    );
+    let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
     let pixels = match prepared {
@@ -724,7 +733,8 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings);
+    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64 };
+    let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;
     let image = develop::finish(encoded, size, settings);
@@ -884,9 +894,9 @@ mod tests {
         assert_eq!(memory_budget_bytes(16 * GIB, Some(3000)), 3000 * MIB);
         let mp24 = 6000 * 4000;
         let full = estimate_image_bytes(mp24, mp24);
-        assert!(full > 900 * MIB && full < 1100 * MIB, "{full}");
-        // Four 24 MP full-res exports fit a 16 GB Mac's default budget.
-        assert!(4 * full <= memory_budget_bytes(16 * GIB, None) + 256 * MIB);
+        assert!(full > 1800 * MIB && full < 2200 * MIB, "{full}");
+        // Two 24 MP full-res exports (with noise reduction working sets) fit a 16 GB Mac's default budget.
+        assert!(2 * full <= memory_budget_bytes(16 * GIB, None) + 256 * MIB);
     }
 
     use crate::ipc::types::{

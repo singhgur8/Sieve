@@ -352,14 +352,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, adj) in &edits {
         let Some(id) = ids.get(*i) else { continue };
         let e = repo::get_image(&conn, *id)?;
-        let img = source::decode_half_size(Path::new(&e.path))?;
-        let prep = source::prepare(&img, e.orientation.unwrap_or(1), None, 2048);
+        let (img, meta) = source::decode_half_size_meta(Path::new(&e.path))?;
+        let profile = sieve_lib::develop::camera::resolve(
+            &meta,
+            &adj.profile,
+            &sieve_lib::profiles::ProfileLibrary::shared(),
+            None,
+        );
+        let prep = source::prepare(
+            &img,
+            e.orientation.unwrap_or(1),
+            &sieve_lib::ipc::types::CropSettings::default(),
+            None,
+            2048,
+        );
         let input = pipeline::RenderInput {
             width: prep.width,
             height: prep.height,
             pixels: &prep.pixels,
             color: &img.color,
             frame_long_edge: prep.frame_long_edge,
+            view: prep.view,
+            profile: &profile,
+            seed: 1,
+            quality: pipeline::Quality::Preview,
         };
         let lut_obj = match &adj.lut {
             Some(l) => luts.load(&l.id)?,

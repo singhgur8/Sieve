@@ -198,8 +198,20 @@ fn main() {
         }
 
         // Stage split on the same prepared input (direct calls).
-        let img = source::decode_half_size(path).unwrap();
-        let prep = source::prepare(&img, orientation.unwrap_or(1), None, 2048);
+        let (img, meta) = source::decode_half_size_meta(path).unwrap();
+        let profile = sieve_lib::develop::camera::resolve(
+            &meta,
+            &sieve_lib::ipc::types::ProfileSettings::default(),
+            &sieve_lib::profiles::ProfileLibrary::shared(),
+            None,
+        );
+        let prep = source::prepare(
+            &img,
+            orientation.unwrap_or(1),
+            &sieve_lib::ipc::types::CropSettings::default(),
+            None,
+            2048,
+        );
         for (_, adj) in &vars {
             let lut = adj.lut.as_ref().and_then(|l| luts.load(&l.id).unwrap());
             let input = pipeline::RenderInput {
@@ -208,6 +220,10 @@ fn main() {
                 pixels: &prep.pixels,
                 color: &img.color,
                 frame_long_edge: prep.frame_long_edge,
+                view: prep.view,
+                profile: &profile,
+                seed: 1,
+                quality: pipeline::Quality::Preview,
             };
             let t = Instant::now();
             let out = pipeline::render(&input, adj, lut.as_deref());

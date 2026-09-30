@@ -451,13 +451,18 @@ fn real_jpegs_round_trip_and_neutral_render() {
         // Editor source + neutral render at 1024 px.
         let li = crate::develop::source::decode_half_size(p).unwrap();
         assert!(li.display_referred && li.width.max(li.height) <= 4096);
-        let prep = crate::develop::source::prepare(&li, 1, None, 1024);
+        let prep = crate::develop::source::prepare(&li, 1, &crate::ipc::types::CropSettings::default(), None, 1024);
+        let profile = crate::develop::camera::Profile { display_referred: true, ..Default::default() };
         let input = crate::develop::pipeline::RenderInput {
             width: prep.width,
             height: prep.height,
             pixels: &prep.pixels,
             color: &li.color,
             frame_long_edge: prep.frame_long_edge,
+            view: prep.view,
+            profile: &profile,
+            seed: 1,
+            quality: crate::develop::pipeline::Quality::Preview,
         };
         let neutral = ParametricAdjustmentsExt::non_raw();
         let out = crate::develop::pipeline::render(&input, &neutral, None);
@@ -467,11 +472,10 @@ fn real_jpegs_round_trip_and_neutral_render() {
             out.rgb.iter().zip(&reference).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).collect();
         let mean = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
         let within2 = diffs.iter().filter(|d| **d <= 2).count() as f64 / diffs.len() as f64;
-        eprintln!(
-            "  neutral render vs original: mean |d| {mean:.2}, max {}, <=2 levels {:.1}%",
-            diffs.iter().max().unwrap(),
-            within2 * 100.0
-        );
+        let max = *diffs.iter().max().unwrap();
+        eprintln!("  neutral render vs original: mean |d| {mean:.2}, max {max}, <=2 levels {:.1}%", within2 * 100.0);
+        // Display-referred sources: neutral settings reproduce the file (Phase 7b).
+        assert!(mean <= 1.0 && max <= 2, "{}: mean {mean:.2} max {max}", p.display());
     }
 }
 

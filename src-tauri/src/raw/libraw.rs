@@ -49,7 +49,6 @@ extern "C" {
 
 /// Mirror of `sieve_lr_color_t` in `native/libraw_shim.c`.
 #[repr(C)]
-#[derive(Default)]
 struct ShimColor {
     cam_mul: [f32; 4],
     pre_mul: [f32; 4],
@@ -62,6 +61,22 @@ struct ShimColor {
     flip: c_int,
     colors: c_int,
     filters: c_uint,
+    make: [c_char; 64],
+    model: [c_char; 64],
+    fuji_expo_shift: f32,
+    dng_baseline_exposure: f32,
+}
+
+impl Default for ShimColor {
+    fn default() -> Self {
+        // SAFETY: plain-old-data C struct (floats, integers, char arrays); all-zero is valid.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+fn c_name(b: &[c_char; 64]) -> String {
+    let bytes: Vec<u8> = b.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).trim().to_owned()
 }
 
 /// Colour metadata of a RAW as LibRaw sees it (read right after `open_file`).
@@ -83,6 +98,12 @@ pub struct ColorData {
     pub colors: i32,
     /// CFA pattern code (9 = X-Trans).
     pub filters: u32,
+    /// LibRaw's normalized make / model ("Sony" / "ILCE-7M4"; empty if unknown).
+    pub make: String,
+    pub model: String,
+    /// Fujifilm `RawExposureBias` (EV; 0 if none) and a DNG's `BaselineExposure`.
+    pub fuji_expo_shift: f32,
+    pub dng_baseline_exposure: f32,
 }
 
 /// Linear 16-bit camera RGB (no white balance, black-subtracted, white level = 65535),
@@ -207,6 +228,10 @@ fn color_data(c: &ShimColor) -> ColorData {
         flip: c.flip,
         colors: c.colors,
         filters: c.filters,
+        make: c_name(&c.make),
+        model: c_name(&c.model),
+        fuji_expo_shift: if c.fuji_expo_shift.is_finite() { c.fuji_expo_shift } else { 0.0 },
+        dng_baseline_exposure: if c.dng_baseline_exposure.is_finite() { c.dng_baseline_exposure } else { 0.0 },
     }
 }
 

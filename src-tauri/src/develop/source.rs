@@ -12,7 +12,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::NormRect;
+use crate::ipc::types::{CropSettings, NormRect};
 use crate::raw::libraw;
 use crate::raw::raster::{self, SourceColorSpace};
 
@@ -104,16 +104,54 @@ pub fn color_info(c: &libraw::ColorData) -> ColorInfo {
     ColorInfo { as_shot_mul: normalized_mul(c.cam_mul), daylight_mul, rgb_cam: c.rgb_cam, xyz_to_cam }
 }
 
+/// What the colour pipeline needs to know about a decoded source besides its pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceMeta {
+    pub format: crate::ipc::types::ImageFormat,
+    /// Camera make / model (LibRaw's normalized names for RAWs).
+    pub make: Option<String>,
+    pub model: Option<String>,
+    /// Already rendered (JPEG/HEIC/TIFF/PNG): no baseline exposure, no base tone curve, no
+    /// camera profile.
+    pub display_referred: bool,
+    /// Per-file raw baseline exposure when the file tells it (Fujifilm `RawExposureBias`,
+    /// DNG `BaselineExposure`); `None` = the camera default.
+    pub baseline_exposure: Option<f32>,
+}
+
+impl SourceMeta {
+    /// Metadata of a non-RAW (display-referred) source.
+    pub fn display_referred(format: crate::ipc::types::ImageFormat) -> Self {
+        SourceMeta { format, make: None, model: None, display_referred: true, baseline_exposure: None }
+    }
+
+    fn raw(path: &Path, c: &libraw::ColorData) -> Self {
+        let format = crate::raw::format_from_extension(path).unwrap_or(crate::ipc::types::ImageFormat::Arw);
+        let name = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+        // Camera Raw: Fujifilm baseline = -RawExposureBias - 0.65 (DNG Converter 17.5: DR100
+        // bias -0.7 -> 0.07, DR200 -1.7 -> 1.07).
+        // LibRaw reports -999 when a file has no DNG BaselineExposure.
+        let baseline_exposure = if c.dng_baseline_exposure.abs() < 10.0 && c.dng_baseline_exposure != 0.0 {
+            Some(c.dng_baseline_exposure)
+        } else if format == crate::ipc::types::ImageFormat::Raf && c.fuji_expo_shift != 0.0 {
+            Some(-c.fuji_expo_shift - 0.65)
+        } else {
+            None
+        };
+        SourceMeta { format, make: name(&c.make), model: name(&c.model), display_referred: false, baseline_exposure }
+    }
+}
+
 /// Long edge of the editor's cached decode of a non-RAW source (the RAW equivalent is
 /// LibRaw's half-size decode).
 pub const RASTER_EDITOR_EDGE: u32 = 4096;
 
 /// Non-RAW sources (by extension) are decoded by `raw::raster`; `None` = a RAW path.
-fn decode_raster(path: &Path, max_edge: Option<u32>) -> Option<AppResult<LinearImage>> {
+fn decode_raster(path: &Path, max_edge: Option<u32>) -> Option<AppResult<(LinearImage, SourceMeta)>> {
     let format = crate::raw::format_from_extension(path).filter(|f| !f.is_raw())?;
     Some(
         raster::decode_linear(path, format, max_edge)
-            .map(raster::to_linear_image)
+            .map(|img| (raster::to_linear_image(img), SourceMeta::display_referred(format)))
             .map_err(|e| AppError::internal(format!("{}: {e}", path.display()))),
     )
 }
@@ -121,50 +159,67 @@ fn decode_raster(path: &Path, max_edge: Option<u32>) -> Option<AppResult<LinearI
 /// Blocking half-size decode (~0.3-0.8 s for 24-33 MP on Apple Silicon). Non-RAW sources:
 /// linear decode downscaled to [`RASTER_EDITOR_EDGE`].
 pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
+    decode_half_size_meta(path).map(|(img, _)| img)
+}
+
+/// [`decode_half_size`] plus the source's camera metadata.
+pub fn decode_half_size_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)> {
     if let Some(r) = decode_raster(path, Some(RASTER_EDITOR_EDGE)) {
         return r;
     }
     let d = libraw::decode_linear(path, true).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
+    let meta = SourceMeta::raw(path, &d.color);
     let (full_width, full_height) = if d.color.width > 0 && d.color.height > 0 {
         (d.color.width, d.color.height)
     } else {
         (d.width * 2, d.height * 2)
     };
-    Ok(LinearImage {
-        width: d.width,
-        height: d.height,
-        pixels: d.pixels,
-        color,
-        full_width,
-        full_height,
-        display_referred: false,
-        source_color: None,
-    })
+    Ok((
+        LinearImage {
+            width: d.width,
+            height: d.height,
+            pixels: d.pixels,
+            color,
+            full_width,
+            full_height,
+            display_referred: false,
+            source_color: None,
+        },
+        meta,
+    ))
 }
 
 /// Blocking full-resolution decode for export: the same LibRaw settings as
 /// [`decode_half_size`] except `half_size = 0` and `user_qual = 3` (AHD for Bayer, 3-pass
 /// Markesteijn for X-Trans). LibRaw's buffers are released before returning;
-/// `full_width/full_height` equal `width/height`.
+/// `full_width/full_height` equal `width/height`. Non-RAW sources: full-size linear decode.
 pub fn decode_full(path: &Path) -> AppResult<LinearImage> {
+    decode_full_meta(path).map(|(img, _)| img)
+}
+
+/// [`decode_full`] plus the source's camera metadata.
+pub fn decode_full_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)> {
     if let Some(r) = decode_raster(path, None) {
         return r;
     }
     let d = libraw::decode_linear(path, false).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
-    Ok(LinearImage {
-        width: d.width,
-        height: d.height,
-        pixels: d.pixels,
-        color,
-        full_width: d.width,
-        full_height: d.height,
-        display_referred: false,
-        source_color: None,
-    })
+    let meta = SourceMeta::raw(path, &d.color);
+    Ok((
+        LinearImage {
+            width: d.width,
+            height: d.height,
+            pixels: d.pixels,
+            color,
+            full_width: d.width,
+            full_height: d.height,
+            display_referred: false,
+            source_color: None,
+        },
+        meta,
+    ))
 }
-
 /// Camera RGB cropped/resampled to the render size with orientation applied.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -172,8 +227,10 @@ pub struct Prepared {
     pub height: u32,
     /// Interleaved camera RGB (unscaled, not white balanced), oriented.
     pub pixels: Vec<u16>,
-    /// Long edge of the whole (uncropped) frame in this image's pixel units.
+    /// Long edge of the whole (cropped) frame in this image's pixel units.
     pub frame_long_edge: f32,
+    /// Frame placement and scale (px per full-resolution frame px).
+    pub view: super::pipeline::View,
 }
 
 impl Prepared {
@@ -211,36 +268,161 @@ pub fn unorient_rect(r: NormRect, orientation: u8) -> NormRect {
 }
 
 /// Output size (oriented) for a render of `region` at most `max_edge` long, never
-/// upscaling beyond the source pixels the region covers.
+/// upscaling beyond the source pixels the region covers (no crop).
 pub fn output_size(src_w: u32, src_h: u32, orientation: u8, region: Option<NormRect>, max_edge: u32) -> (u32, u32) {
     let (ow, oh) = oriented_size(src_w, src_h, orientation);
-    let r = region.unwrap_or(NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
-    let (rw, rh) = (r.width.clamp(0.0, 1.0) * ow as f32, r.height.clamp(0.0, 1.0) * oh as f32);
+    fit_region((ow, oh), region, max_edge)
+}
+
+/// Size of `region` of a `frame` (oriented px) fitted into `max_edge`, never upscaled.
+pub fn fit_region(frame: (u32, u32), region: Option<NormRect>, max_edge: u32) -> (u32, u32) {
+    let r = region.unwrap_or(FULL);
+    let (rw, rh) = (r.width.clamp(0.0, 1.0) * frame.0 as f32, r.height.clamp(0.0, 1.0) * frame.1 as f32);
     let long = rw.max(rh).max(1.0);
     let scale = (max_edge as f32 / long).min(1.0);
     (((rw * scale).round() as u32).max(1), ((rh * scale).round() as u32).max(1))
 }
 
-/// Crops `region` (oriented coordinates), resamples to fit `max_edge`, applies orientation.
-pub fn prepare(src: &LinearImage, orientation: u8, region: Option<NormRect>, max_edge: u32) -> Prepared {
+const FULL: NormRect = NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+
+/// Oriented size of the cropped frame of `src` (source pixels).
+pub fn frame_size(src_w: u32, src_h: u32, orientation: u8, crop: &CropSettings) -> (u32, u32) {
+    let g = super::parity::crop_geometry(crop, src_w, src_h, orientation);
+    (g.width, g.height)
+}
+
+/// Crops `region` (oriented coordinates of the cropped frame), resamples to fit `max_edge`,
+/// applies crop/straighten and orientation.
+pub fn prepare(
+    src: &LinearImage,
+    orientation: u8,
+    crop: &CropSettings,
+    region: Option<NormRect>,
+    max_edge: u32,
+) -> Prepared {
     let orientation = if (1..=8).contains(&orientation) { orientation } else { 1 };
-    let full = NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
-    let r_or = region.unwrap_or(full);
-    let (out_w, out_h) = output_size(src.width, src.height, orientation, region, max_edge);
-    let r = unorient_rect(r_or, orientation);
-    let (uw, uh) = if orientation >= 5 { (out_h, out_w) } else { (out_w, out_h) };
-    let crop = [
-        (r.x * src.width as f32) as f64,
-        (r.y * src.height as f32) as f64,
-        ((r.width * src.width as f32) as f64).max(1.0),
-        ((r.height * src.height as f32) as f64).max(1.0),
-    ];
-    let resized = resample(&src.pixels, src.width as usize, src.height as usize, crop, uw as usize, uh as usize);
-    let pixels = if orientation == 1 { resized } else { orient(&resized, uw as usize, uh as usize, orientation) };
-    // Frame long edge in output pixels: output px per source px times the source long edge.
-    let px_scale = uw as f32 / (r.width * src.width as f32).max(1.0);
-    let frame_long_edge = src.width.max(src.height) as f32 * px_scale;
-    Prepared { width: out_w, height: out_h, pixels, frame_long_edge }
+    let frame = frame_size(src.width, src.height, orientation, crop);
+    let (out_w, out_h) = fit_region(frame, region, max_edge);
+    prepare_sized(src, orientation, crop, region, out_w, out_h)
+}
+
+/// As [`prepare`] with an explicit output size (exports).
+pub fn prepare_sized(
+    src: &LinearImage,
+    orientation: u8,
+    crop: &CropSettings,
+    region: Option<NormRect>,
+    out_w: u32,
+    out_h: u32,
+) -> Prepared {
+    let orientation = if (1..=8).contains(&orientation) { orientation } else { 1 };
+    let g = super::parity::crop_geometry(crop, src.width, src.height, orientation);
+    let r_or = region.unwrap_or(FULL);
+    let (sw, sh) = (src.width as usize, src.height as usize);
+    let rotated = crop.enabled && crop.angle.abs() > 1e-4;
+    let pixels = if !rotated {
+        // Axis-aligned: the frame is an un-oriented source rectangle; exact separable path.
+        let (l, t) = g.map(0.0, 0.0);
+        let (r, b) = g.map(1.0, 1.0);
+        let fr = NormRect {
+            x: l.min(r) as f32,
+            y: t.min(b) as f32,
+            width: (r - l).abs() as f32,
+            height: (b - t).abs() as f32,
+        };
+        let ru = unorient_rect(r_or, orientation);
+        let rect = [
+            f64::from(fr.x + ru.x * fr.width) * sw as f64,
+            f64::from(fr.y + ru.y * fr.height) * sh as f64,
+            (f64::from(ru.width * fr.width) * sw as f64).max(1.0),
+            (f64::from(ru.height * fr.height) * sh as f64).max(1.0),
+        ];
+        let (uw, uh) = if orientation >= 5 { (out_h, out_w) } else { (out_w, out_h) };
+        let resized = resample(&src.pixels, sw, sh, rect, uw as usize, uh as usize);
+        if orientation == 1 {
+            resized
+        } else {
+            orient(&resized, uw as usize, uh as usize, orientation)
+        }
+    } else {
+        // Output (u, v) -> frame -> source (normalized).
+        let a = g.to_source;
+        let rr = [r_or.x as f64, r_or.y as f64, r_or.width as f64, r_or.height as f64];
+        let m = [
+            a[0] * rr[2],
+            a[1] * rr[3],
+            a[0] * rr[0] + a[1] * rr[1] + a[2],
+            a[3] * rr[2],
+            a[4] * rr[3],
+            a[3] * rr[0] + a[4] * rr[1] + a[5],
+        ];
+        resample_affine(&src.pixels, sw, sh, m, out_w as usize, out_h as usize)
+    };
+    // Frame placement in output px and scale (output px per full-resolution frame px).
+    let frame_w = out_w as f32 / r_or.width.max(1e-6);
+    let frame_h = out_h as f32 / r_or.height.max(1e-6);
+    let half = src.width as f32 / src.full_width.max(1) as f32;
+    let scale = frame_w / g.width.max(1) as f32 * half;
+    let view =
+        super::pipeline::View { frame_x: -r_or.x * frame_w, frame_y: -r_or.y * frame_h, frame_w, frame_h, scale };
+    Prepared { width: out_w, height: out_h, pixels, frame_long_edge: frame_w.max(frame_h), view }
+}
+
+/// Resamples the parallelogram `m` (normalized output (u, v) -> normalized source) of an
+/// interleaved RGB16 image to `dw x dh`: a Lanczos pre-resample of the bounding box to the
+/// output's pixel pitch, then Catmull-Rom interpolation along the rotated grid.
+pub fn resample_affine(src: &[u16], sw: usize, sh: usize, m: [f64; 6], dw: usize, dh: usize) -> Vec<u16> {
+    let map = |u: f64, v: f64| (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+    let corners = [map(0.0, 0.0), map(1.0, 0.0), map(0.0, 1.0), map(1.0, 1.0)];
+    let x0 = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min).max(0.0) * sw as f64;
+    let x1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).min(1.0) * sw as f64;
+    let y0 = corners.iter().map(|c| c.1).fold(f64::MAX, f64::min).max(0.0) * sh as f64;
+    let y1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).min(1.0) * sh as f64;
+    // Output px per source px along the output x axis.
+    let du = ((m[0] * sw as f64).powi(2) + (m[3] * sh as f64).powi(2)).sqrt() / dw as f64;
+    let s = (1.0 / du.max(1e-9)).min(1.0);
+    let (bw, bh) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
+    let (iw, ih) = (((bw * s).ceil() as usize).max(2), ((bh * s).ceil() as usize).max(2));
+    let inter = resample(src, sw, sh, [x0, y0, bw, bh], iw, ih);
+    let (kx, ky) = (iw as f64 / bw, ih as f64 / bh);
+    let mut out = vec![0u16; dw * dh * 3];
+    out.par_chunks_mut(dw * 3).enumerate().for_each(|(y, row)| {
+        let v = (y as f64 + 0.5) / dh as f64;
+        for x in 0..dw {
+            let u = (x as f64 + 0.5) / dw as f64;
+            let (nx, ny) = map(u, v);
+            let px = (nx * sw as f64 - x0) * kx - 0.5;
+            let py = (ny * sh as f64 - y0) * ky - 0.5;
+            let p = catmull_rom(&inter, iw, ih, px as f32, py as f32);
+            for c in 0..3 {
+                row[x * 3 + c] = p[c].round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+    });
+    out
+}
+
+fn catmull_rom(img: &[u16], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
+    let wt = |t: f32| -> [f32; 4] {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2]
+    };
+    let (xi, yi) = (x.floor() as isize, y.floor() as isize);
+    let (wx, wy) = (wt(x - xi as f32), wt(y - yi as f32));
+    let mut acc = [0.0f32; 3];
+    for (j, wyj) in wy.iter().enumerate() {
+        let yy = (yi + j as isize - 1).clamp(0, h as isize - 1) as usize;
+        for (i, wxi) in wx.iter().enumerate() {
+            let xx = (xi + i as isize - 1).clamp(0, w as isize - 1) as usize;
+            let k = wyj * wxi;
+            let p = &img[(yy * w + xx) * 3..(yy * w + xx) * 3 + 3];
+            acc[0] += k * f32::from(p[0]);
+            acc[1] += k * f32::from(p[1]);
+            acc[2] += k * f32::from(p[2]);
+        }
+    }
+    acc
 }
 
 /// Separable filter taps for one axis: output i covers source `[start, start + weights.len())`.
@@ -398,13 +580,13 @@ mod tests {
     #[test]
     fn identity_resample_and_flat_downscale() {
         let img = image(7, 5, |x, y| [x as u16 * 100, y as u16 * 100, 7]);
-        let p = prepare(&img, 1, None, 64);
+        let p = prepare(&img, 1, &CropSettings::default(), None, 64);
         assert_eq!((p.width, p.height), (7, 5), "never upscaled");
         assert_eq!(p.pixels, img.pixels, "1:1 is exact");
         assert_eq!(p.frame_long_edge, 7.0);
 
         let flat = image(400, 300, |_, _| [1000, 2000, 3000]);
-        let p = prepare(&flat, 1, None, 100);
+        let p = prepare(&flat, 1, &CropSettings::default(), None, 100);
         assert_eq!((p.width, p.height), (100, 75));
         assert!(p.pixels.chunks(3).all(|c| c == [1000, 2000, 3000]));
     }
@@ -414,17 +596,17 @@ mod tests {
         // 4x2 image, pixel value encodes (x, y).
         let img = image(4, 2, |x, y| [x as u16, y as u16, 0]);
         // Orientation 6 (rotate 90 CW for display): output 2x4, top-left shows source (0, 1).
-        let p = prepare(&img, 6, None, 64);
+        let p = prepare(&img, 6, &CropSettings::default(), None, 64);
         assert_eq!((p.width, p.height), (2, 4));
         assert_eq!(&p.pixels[0..2], &[0, 1]);
         // Orientation 8 (rotate 90 CCW): top-left shows source (3, 0).
-        let p = prepare(&img, 8, None, 64);
+        let p = prepare(&img, 8, &CropSettings::default(), None, 64);
         assert_eq!(&p.pixels[0..2], &[3, 0]);
         // Region in oriented coordinates: the bottom half of an orientation-8 frame is
         // the left half of the stored image.
         let r = NormRect { x: 0.0, y: 0.5, width: 1.0, height: 0.5 };
         assert_eq!(unorient_rect(r, 8), NormRect { x: 0.0, y: 0.0, width: 0.5, height: 1.0 });
-        let p = prepare(&img, 8, Some(r), 64);
+        let p = prepare(&img, 8, &CropSettings::default(), Some(r), 64);
         assert_eq!((p.width, p.height), (2, 2));
         // Oriented (0,0) of the crop = stored (1, 0).
         assert_eq!(&p.pixels[0..2], &[1, 0]);
