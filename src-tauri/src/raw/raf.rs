@@ -65,6 +65,20 @@ pub fn parse(src: &(impl ByteSource + ?Sized)) -> Result<Container, String> {
     Ok(Container { meta, jpegs: if jpeg.len > 0 { vec![jpeg] } else { Vec::new() } })
 }
 
+/// EXIF directories for export, from the embedded JPEG's APP1 (Fuji keeps the camera EXIF
+/// there).
+pub fn exif_dirs(src: &(impl ByteSource + ?Sized)) -> Result<tiff::ExifDirs, String> {
+    let mut h = [0u8; HEADER_LEN];
+    src.read_at(0, &mut h).map_err(|e| format!("RAF header: {e}"))?;
+    if !h.starts_with(b"FUJIFILMCCD-RAW") {
+        return Err("not a RAF (bad magic)".into());
+    }
+    let (offset, len) = (be32(&h, JPEG_OFFSET) as u64, be32(&h, JPEG_LENGTH) as u64);
+    let head = src.read_vec(offset, len.min(70 * 1024) as usize).map_err(|e| format!("RAF JPEG: {e}"))?;
+    let exif = jpeg::exif_tiff(&head).ok_or("RAF: embedded JPEG has no EXIF")?;
+    tiff::Tiff::new(exif)?.exif_dirs()
+}
+
 /// RAF directory: u32 count, then `(tag u16, size u16, data[size])` records.
 fn read_directory(dir: &[u8], meta: &mut MetaBuilder) {
     let count = be32(dir, 0).min(512);

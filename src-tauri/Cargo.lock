@@ -292,6 +292,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1777,6 +1779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,6 +1898,17 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "libwebp-sys"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b3a87b44e34d17161e4f17d92a463d596cb13825dcd1758ed18fd3a721e189c"
+dependencies = [
+ "cc",
+ "glob",
+ "pkg-config",
 ]
 
 [[package]]
@@ -3256,8 +3279,11 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "fast_image_resize",
+ "flate2",
  "libc",
+ "libwebp-sys",
  "ort",
+ "png 0.18.1",
  "quick-xml",
  "rayon",
  "rusqlite",
@@ -3272,6 +3298,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "walkdir",
+ "weezl",
 ]
 
 [[package]]
@@ -4588,6 +4615,12 @@ dependencies = [
  "windows",
  "windows-core",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "winapi"

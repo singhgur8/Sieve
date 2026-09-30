@@ -113,6 +113,142 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     })
 }
 
+pub const NS_PHOTOSHOP: &str = "http://ns.adobe.com/photoshop/1.0/";
+pub const NS_IPTC_CORE: &str = "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/";
+pub const NS_EXIF: &str = "http://ns.adobe.com/exif/1.0/";
+
+/// Descriptive metadata of a sidecar that exports may copy (never `crs:` settings).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportValues {
+    /// `dc:creator` (ordered).
+    pub creator: Vec<String>,
+    /// `dc:rights` (x-default / first alternative).
+    pub rights: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// `photoshop:Headline`.
+    pub headline: Option<String>,
+    pub rating: Option<i32>,
+    pub label: Option<String>,
+    pub subjects: Vec<String>,
+    pub hierarchical_subjects: Vec<String>,
+    /// `Iptc4xmpCore:CreatorContactInfo` fields `(local name, value)`, e.g. `("CiEmailWork", ..)`.
+    pub contact: Vec<(String, String)>,
+    /// Location fields `(namespace uri, local name, value)`: `photoshop:City/State/Country`,
+    /// `Iptc4xmpCore:Location/CountryCode`, `exif:GPS*`.
+    pub location: Vec<(&'static str, String, String)>,
+}
+
+/// Reads the fields an export may copy from a sidecar packet.
+pub fn export_values(src: &str) -> Result<ExportValues> {
+    let body = src.strip_prefix(BOM).unwrap_or(src);
+    let doc = Doc::parse(body)?;
+    let scalar = |ns: &str, local: &str| -> Option<String> {
+        doc.scalars(ns, local).into_iter().next().map(|s| s.value.trim().to_owned()).filter(|v| !v.is_empty())
+    };
+    let list = |ns: &str, local: &str| -> Vec<String> {
+        doc.list(ns, local)
+            .filter(|p| p.container.is_some())
+            .map(|p| p.items.iter().map(|i| i.value.trim().to_owned()).filter(|v| !v.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    // Lang-alt / seq values, or a plain scalar written by a lenient tool.
+    let first = |ns: &str, local: &str| list(ns, local).into_iter().next().or_else(|| scalar(ns, local));
+    let mut creator = list(NS_DC, "creator");
+    if creator.is_empty() {
+        creator.extend(scalar(NS_DC, "creator"));
+    }
+    let mut contact = Vec::new();
+    for a in &doc.attr_props {
+        if a.uri == NS_IPTC_CORE && a.local.starts_with("Ci") && !a.attr.value.trim().is_empty() {
+            contact.push((a.local.clone(), a.attr.value.trim().to_owned()));
+        }
+    }
+    if let Some(p) = doc.elem_props.iter().find(|p| p.uri == NS_IPTC_CORE && p.local == "CreatorContactInfo") {
+        for a in &p.elem.attrs {
+            let (_, local) = split_qname(&a.qname);
+            if local.starts_with("Ci") && !a.value.trim().is_empty() {
+                contact.push((local.to_owned(), a.value.trim().to_owned()));
+            }
+        }
+        if !p.elem.empty {
+            contact.extend(child_texts(&body[p.elem.open_end..p.elem.close_start]));
+        }
+    }
+    let mut location = Vec::new();
+    for (ns, local) in [
+        (NS_PHOTOSHOP, "City"),
+        (NS_PHOTOSHOP, "State"),
+        (NS_PHOTOSHOP, "Country"),
+        (NS_IPTC_CORE, "Location"),
+        (NS_IPTC_CORE, "CountryCode"),
+    ] {
+        if let Some(v) = scalar(ns, local) {
+            location.push((ns, local.to_owned(), v));
+        }
+    }
+    let mut gps: Vec<(&'static str, String, String)> = doc
+        .attr_props
+        .iter()
+        .filter(|a| a.uri == NS_EXIF && a.local.starts_with("GPS"))
+        .map(|a| (NS_EXIF, a.local.clone(), a.attr.value.trim().to_owned()))
+        .chain(
+            doc.elem_props
+                .iter()
+                .filter(|p| p.uri == NS_EXIF && p.local.starts_with("GPS") && p.container.is_none())
+                .map(|p| {
+                    (NS_EXIF, p.local.clone(), p.items.first().map_or(String::new(), |i| i.value.trim().to_owned()))
+                }),
+        )
+        .filter(|(_, _, v)| !v.is_empty())
+        .collect();
+    location.append(&mut gps);
+    Ok(ExportValues {
+        creator,
+        rights: first(NS_DC, "rights"),
+        title: first(NS_DC, "title"),
+        description: first(NS_DC, "description"),
+        headline: scalar(NS_PHOTOSHOP, "Headline"),
+        rating: scalar(NS_XMP, "Rating")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.round() as i32),
+        label: scalar(NS_XMP, "Label"),
+        subjects: list(NS_DC, "subject"),
+        hierarchical_subjects: list(NS_LR, "hierarchicalSubject"),
+        contact,
+        location,
+    })
+}
+
+/// `(local name, text)` of the leaf elements in an XML fragment (struct fields).
+fn child_texts(fragment: &str) -> Vec<(String, String)> {
+    let mut reader = Reader::from_str(fragment);
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let q = e.name().into_inner().to_owned();
+                current = Some(split_qname(&q).1.to_owned());
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(name) = &current {
+                    let raw = t[..].to_owned();
+                    let v = text_value(&raw);
+                    if name.starts_with("Ci") && !v.is_empty() {
+                        out.push((name.clone(), v));
+                    }
+                }
+            }
+            Ok(Event::End(_)) => current = None,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Applies `want` to `existing` (or to a new minimal packet), touching only the fields
 /// Sieve owns.
 pub fn merge(existing: Option<&str>, want: &Desired) -> Result<String> {

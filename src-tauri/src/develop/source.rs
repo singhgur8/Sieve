@@ -108,6 +108,23 @@ pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
     Ok(LinearImage { width: d.width, height: d.height, pixels: d.pixels, color, full_width, full_height })
 }
 
+/// Blocking full-resolution decode for export: the same LibRaw settings as
+/// [`decode_half_size`] except `half_size = 0` and `user_qual = 3` (AHD for Bayer, 3-pass
+/// Markesteijn for X-Trans). LibRaw's buffers are released before returning;
+/// `full_width/full_height` equal `width/height`.
+pub fn decode_full(path: &Path) -> AppResult<LinearImage> {
+    let d = libraw::decode_linear(path, false).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
+    let color = color_info(&d.color);
+    Ok(LinearImage {
+        width: d.width,
+        height: d.height,
+        pixels: d.pixels,
+        color,
+        full_width: d.width,
+        full_height: d.height,
+    })
+}
+
 /// Camera RGB cropped/resampled to the render size with orientation applied.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -194,26 +211,41 @@ struct Taps {
     stride: usize,
 }
 
-/// Triangle (tent) filter sized to the scale factor (area-like when shrinking, bilinear at
-/// 1:1). `offset`/`extent` select the source span in pixels.
+/// Lanczos-3 kernel.
+fn lanczos3(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1e-9 {
+        1.0
+    } else if x >= 3.0 {
+        0.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        3.0 * px.sin() * (px / 3.0).sin() / (px * px)
+    }
+}
+
+/// Lanczos-3 filter sized to the scale factor (3 lobes of the output pixel spacing when
+/// shrinking; exact identity at 1:1 with integer offsets). `offset`/`extent` select the
+/// source span in pixels. Shared by the preview (`prepare`) and the export resample, so
+/// both see identically resampled camera RGB. Edge taps are renormalized.
 fn taps(src_len: usize, offset: f64, extent: f64, out_len: usize) -> Taps {
     let scale = extent / out_len as f64;
     let support = scale.max(1.0);
-    let stride = (2.0 * support).ceil() as usize + 2;
+    let radius = 3.0 * support;
+    let stride = (2.0 * radius).ceil() as usize + 2;
     let mut start = Vec::with_capacity(out_len);
     let mut len = Vec::with_capacity(out_len);
     let mut weights = vec![0.0f32; out_len * stride];
     for i in 0..out_len {
         let center = offset + (i as f64 + 0.5) * scale - 0.5;
-        let lo = ((center - support).floor() as i64 + 1).max(0) as usize;
-        let hi = (((center + support).ceil() as i64).min(src_len as i64 - 1)).max(0) as usize;
+        let lo = ((center - radius).floor() as i64 + 1).max(0) as usize;
+        let hi = (((center + radius).ceil() as i64 - 1).min(src_len as i64 - 1)).max(0) as usize;
         let lo = lo.min(hi);
         let n = (hi - lo + 1).min(stride);
         let w = &mut weights[i * stride..i * stride + n];
         let mut sum = 0.0f64;
         for (k, wk) in w.iter_mut().enumerate() {
-            let d = ((lo + k) as f64 - center).abs() / support;
-            let v = (1.0 - d).max(0.0);
+            let v = lanczos3(((lo + k) as f64 - center) / support);
             *wk = v as f32;
             sum += v;
         }

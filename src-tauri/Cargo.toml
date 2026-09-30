@@ -36,6 +36,14 @@ rayon = "1.10"
 fast_image_resize = "6"
 # XMP sidecars (rust-engine-dev): tokenizer for span-preserving packet edits.
 quick-xml = "0.42"
+# Export (rust-engine-dev): PNG writer (iCCP/eXIf/iTXt via raw chunks), TIFF strip
+# compression (LZW / Deflate, own IFD writer for EXIF/GPS/ICC/XMP tags), WebP (vendored
+# libwebp, built by cc), localtime/sysctl.
+png = "0.18"
+weezl = "0.1"
+flate2 = "1"
+libwebp-sys = "0.14"
+libc = "0.2"
 # Culling engine (vision-ml-dev): ONNX Runtime 1.28 (prebuilt, statically linked by ort-sys)
 # with the CoreML execution provider; CPU EP is the fallback.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-27", "coreml"] }
