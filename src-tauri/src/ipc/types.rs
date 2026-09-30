@@ -479,6 +479,60 @@ pub struct RawImageEntry {
     pub tags: Vec<CullTagEntry>,
     pub quality: Option<QualityScore>,
     pub has_edits: bool,
+    /// Sidecar sync state of the XMP-mapped values (rating, pick, label, tags).
+    pub xmp: XmpSyncState,
+}
+
+// ---------------------------------------------------------------------------
+// XMP sidecars (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Per-image XMP sidecar state (`<basename>.xmp` next to the RAW).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpSyncState {
+    /// Rating/pick/label/tags changed in the catalog since the sidecar was last written.
+    pub dirty: bool,
+    /// Unix ms when catalog and sidecar last agreed (write or read); `None` = never synced.
+    pub synced_at_ms: Option<i64>,
+    /// Reason of the last failed write/read; `None` after a success.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpFailure {
+    pub image_id: ImageId,
+    pub reason: String,
+}
+
+/// Result of `write_xmp` / `read_xmp`. Per-image file errors do not fail the batch;
+/// they are listed in `failed` (and stored in `XmpSyncState.error`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpSyncReport {
+    /// Sidecars written (`write_xmp`) or read (`read_xmp`).
+    pub succeeded: u32,
+    /// `read_xmp`: images without a sidecar. `write_xmp`: always 0.
+    pub skipped: u32,
+    pub failed: Vec<XmpFailure>,
+    /// Images whose catalog rating/pick/label changed as a result (reads only);
+    /// refetch them with `get_images`.
+    pub changed: Vec<ImageId>,
+}
+
+/// Catalog-wide XMP sync snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpStatus {
+    /// Images with unwritten changes.
+    pub dirty: u32,
+    /// Images whose last write/read failed.
+    pub failed: u32,
+    /// The auto-sync writer is currently working.
+    pub running: bool,
+    /// Same as `CatalogState.xmpAutoSync`.
+    pub auto_sync: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -666,26 +720,44 @@ string_enum! {
 }
 
 string_enum! {
+    /// Natural order of each key; `ImageQuery.sortDescending` reverses it.
     pub enum ImageSort {
+        /// Oldest first; images without a capture time last. Ties by file name.
         CaptureTime => "capture_time",
+        /// A..Z.
         FileName => "file_name",
         /// Best `QualityScore.overall` first; unscored images last.
         Quality => "quality",
+        /// Most stars first; ties in capture order.
+        Rating => "rating",
     }
 }
 
-/// Filter + page request for the grid. Suppressed tags never match.
+/// Filter + page request for the grid. All filters are ANDed; empty lists / `null`
+/// mean "no constraint". Suppressed tags never match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageQuery {
+    /// Combined with `tagMatch`.
     pub include_tags: Vec<CullTag>,
+    /// Images carrying any of these are excluded.
     pub exclude_tags: Vec<CullTag>,
     pub tag_match: TagMatch,
-    pub pick: Option<PickFlag>,
+    /// Image's pick flag is one of these (e.g. `["pick", "unflagged"]` hides rejects).
+    pub picks: Vec<PickFlag>,
+    /// Inclusive star range, 0..=5.
     pub min_rating: Option<u8>,
+    pub max_rating: Option<u8>,
+    /// Image's colour label is one of these.
+    pub color_labels: Vec<ColorLabel>,
     pub burst_group_id: Option<BurstGroupId>,
+    /// Hide burst members that are not their group's keeper (groups without a keeper
+    /// show all members); images outside bursts are unaffected.
+    pub collapse_bursts: bool,
     pub folder_id: Option<FolderId>,
     pub sort: ImageSort,
+    /// Reverse the natural order of `sort` (images missing the key stay last).
+    pub sort_descending: bool,
     pub offset: u32,
     /// Capped at [`ImageQuery::MAX_LIMIT`].
     pub limit: u32,
@@ -701,11 +773,15 @@ impl Default for ImageQuery {
             include_tags: Vec::new(),
             exclude_tags: Vec::new(),
             tag_match: TagMatch::Any,
-            pick: None,
+            picks: Vec::new(),
             min_rating: None,
+            max_rating: None,
+            color_labels: Vec::new(),
             burst_group_id: None,
+            collapse_bursts: false,
             folder_id: None,
             sort: ImageSort::CaptureTime,
+            sort_descending: false,
             offset: 0,
             limit: 200,
         }
@@ -736,6 +812,9 @@ pub struct ImportSummary {
     pub skipped: u32,
     /// Files with a RAW extension whose header did not match the format.
     pub invalid: u32,
+    /// Existing XMP sidecars whose rating/pick/label were read into the catalog
+    /// (new images, and unchanged images whose sidecar changed on disk).
+    pub sidecars_read: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -751,6 +830,23 @@ pub struct FolderEntry {
 pub struct TagCount {
     pub tag: CullTag,
     pub count: u32,
+}
+
+/// Facet counts for the filter bar over one folder (or the whole catalog).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCounts {
+    pub total: u32,
+    /// Non-suppressed tags; tags with no images are omitted.
+    pub tags: Vec<TagCount>,
+    pub picked: u32,
+    pub rejected: u32,
+    pub unflagged: u32,
+    /// `ratings[n]` = images with exactly `n` stars; always 6 entries.
+    pub ratings: Vec<u32>,
+    pub burst_groups: u32,
+    /// Burst members hidden by `ImageQuery.collapseBursts`.
+    pub burst_non_keepers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -769,6 +865,9 @@ pub struct CatalogState {
     pub cache_dir: String,
     /// Analysis starts automatically after import / on launch (`set_auto_analyze`).
     pub auto_analyze: bool,
+    /// Sidecars are written automatically after rating/pick/label/tag changes
+    /// (`set_xmp_auto_sync`). Default off.
+    pub xmp_auto_sync: bool,
 }
 
 /// Snapshot of thumbnail/metadata extraction, so the UI can restore its progress

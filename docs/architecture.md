@@ -10,16 +10,18 @@ src-tauri/
   migrations/0001_init.sql     catalog schema v1 (append-only)
   migrations/0002_ingest.sql   v2: thumbnails.preview_path, idx_thumbnails_status
   migrations/0003_analysis.sql v3: image_analysis, quality_scores.suggested_*, auto_analyze
+  migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
   src/
     main.rs                    -> lumenraw_lib::run()
-    lib.rs                     plugins, managed Catalog + Ingest + Analysis, cache/models-dir resolution, asset scope,
+    lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync, cache/models-dir resolution, asset scope,
                                specta_builder() (single registration point for commands + events),
                                debug-build export of src/ipc/bindings.ts
     ipc/
       types.rs                 all contract types (source of truth for TS)
       commands.rs              #[tauri::command] handlers + Catalog state (runs DB work on blocking pool)
       events.rs                ImportProgress, ThumbnailReady, ThumbnailFailed,
-                               AnalysisProgress, AnalysisReady, AnalysisFailed, AnalysisFinished
+                               AnalysisProgress, AnalysisReady, AnalysisFailed, AnalysisFinished,
+                               XmpSynced, XmpWriteFailed
       error.rs                 AppError { kind, message }
     db/
       mod.rs                   open (WAL, foreign_keys), user_version migrations
@@ -35,6 +37,7 @@ src-tauri/
     ingest/mod.rs              background pipeline (Ingest state, start/regenerate, import_status)
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
+    xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
 src/
   ipc/bindings.ts              GENERATED from Rust. Do not edit.
   ipc/index.ts                 re-exports bindings + unwrap() + DEFAULT_QUERY
@@ -50,6 +53,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
 | rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
+| `src-tauri/src/xmp/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
 | everything, read-only | qa-engineer |
 
@@ -85,14 +89,23 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `get_faces` / `getFaces` | `id: number` | `FaceInfo[]` |
 | `list_burst_groups` / `listBurstGroups` | `folderId: number \| null` | `BurstGroup[]` |
 | `apply_suggestions` / `applySuggestions` | `ids: number[]` | `number` (images updated) |
+| `get_images` / `getImages` | `ids: number[]` | `RawImageEntry[]` (given order) |
+| `list_image_ids` / `listImageIds` | `query: ImageQuery` | `number[]` (all matches, sorted; offset/limit ignored) |
+| `get_filter_counts` / `getFilterCounts` | `folderId: number \| null` | `FilterCounts` |
+| `write_xmp` / `writeXmp` | `ids: number[]` | `XmpSyncReport` (catalog wins) |
+| `read_xmp` / `readXmp` | `ids: number[]` | `XmpSyncReport` (sidecar wins) |
+| `set_xmp_auto_sync` / `setXmpAutoSync` | `enabled: boolean` | `null` (enabling flushes dirty images) |
+| `get_xmp_status` / `getXmpStatus` | – | `XmpStatus` |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
+`import_folder` reads existing sidecars (`sidecarsRead`); culling writes notify the XMP auto-sync writer.
 
 Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `thumbnailReady {imageId,path,previewPath,width,height}`, `thumbnailFailed {imageId,reason}` (Phase 2),
 `analysisProgress {done,total,failed}`, `analysisReady {imageId}`, `analysisFailed {imageId,reason}`,
-`analysisFinished {analyzed,failed,cancelled,burstGroups}` (Phase 3).
+`analysisFinished {analyzed,failed,cancelled,burstGroups}` (Phase 3),
+`xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -154,6 +167,33 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - Models: `<models_dir>/det_10g.onnx`, `2d106det.onnx` (`scripts/fetch-models.sh`); `LUMENRAW_MODELS`
   overrides the dir (default `src-tauri/models` in debug, `<resource_dir>/models` in release).
 
+## XMP sidecars (Phase 4)
+
+- Sidecar: `<basename>.xmp` next to the RAW (Lightroom convention; `DSC0001.ARW` -> `DSC0001.xmp`). Two RAWs
+  with the same basename in one folder would share a sidecar (not supported; last writer wins).
+- Mapping, catalog -> sidecar:
+  | Catalog | XMP |
+  |---|---|
+  | `pick = reject` | `xmp:Rating = -1` (stars not representable) |
+  | `rating` 0..=5 (not rejected) | `xmp:Rating` |
+  | `pick = pick` | `xmp:Label = "Pick"` (wins over a colour label) |
+  | `colorLabel` (not picked) | `xmp:Label = "Red"/"Yellow"/"Green"/"Blue"/"Purple"` |
+  | neither | `xmp:Label` removed only if it held "Pick" or one of those names |
+  | visible tags | `lr:hierarchicalSubject` `LumenRAW\|<tag>` + `dc:subject` `<tag>` |
+  Writes replace only `LumenRAW|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
+  every other field/namespace. Atomic (temp file + rename).
+- Sidecar -> catalog (read/import): `-1` -> reject; `0..=5` -> rating, `pick` iff Label "Pick" else unflagged;
+  label names -> `colorLabel`. `LumenRAW|*` keywords are not read back (analysis owns tags).
+- Dirty tracking is in the schema: triggers set `images.xmp_dirty = 1` + `meta_updated_at` when rating / pick /
+  color_label or visible tags change, whoever writes them (commands, `apply_suggestions`, analysis auto tags).
+  A successful write/read sets `xmp_dirty = 0`, `xmp_synced_at`, `xmp_mtime_ms` (sidecar mtime), clears `xmp_error`.
+- Conflict policy: `write_xmp` = catalog wins; `read_xmp` and import = sidecar wins; auto-sync = newer wins: a dirty
+  image whose sidecar mtime still equals `xmp_mtime_ms` is written; if the sidecar changed on disk too, the newer of
+  sidecar mtime vs `meta_updated_at` wins. Import refreshes non-dirty images whose sidecar mtime changed.
+- Auto-sync (`catalog_meta.xmp_auto_sync`, default off): `XmpSync::notify` re-arms a 1 s debounce; the worker (own
+  SQLite connection, never the command mutex) syncs all dirty images, emits `xmpSynced` per pass and
+  `xmpWriteFailed` per failure. Notified after culling writes, on enabling, on launch and on `analysisFinished`.
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `LUMENRAW_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -161,9 +201,9 @@ migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |
 |---|---|
-| `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `cull_thresholds.<shoot_type>` (JSON) |
+| `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON) |
 | `folders` | imported roots |
-| `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group |
+| `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |

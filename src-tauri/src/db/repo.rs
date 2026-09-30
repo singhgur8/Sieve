@@ -73,6 +73,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
         tag_counts,
         cache_dir: cache_dir.to_owned(),
         auto_analyze: auto_analyze(conn)?,
+        xmp_auto_sync: xmp_auto_sync(conn)?,
     })
 }
 
@@ -84,6 +85,26 @@ pub fn auto_analyze(conn: &Connection) -> AppResult<bool> {
 
 pub fn set_auto_analyze(conn: &Connection, enabled: bool) -> AppResult<()> {
     set_meta(conn, "auto_analyze", if enabled { "1" } else { "0" })
+}
+
+/// `catalog_meta.xmp_auto_sync`; default off.
+pub fn xmp_auto_sync(conn: &Connection) -> AppResult<bool> {
+    let v: Option<String> =
+        conn.query_row("SELECT value FROM catalog_meta WHERE key = 'xmp_auto_sync'", [], |r| r.get(0)).optional()?;
+    Ok(v.as_deref() == Some("1"))
+}
+
+pub fn set_xmp_auto_sync(conn: &Connection, enabled: bool) -> AppResult<()> {
+    set_meta(conn, "xmp_auto_sync", if enabled { "1" } else { "0" })
+}
+
+pub fn xmp_status(conn: &Connection, running: bool) -> AppResult<XmpStatus> {
+    let (dirty, failed) = conn.query_row(
+        "SELECT COALESCE(SUM(xmp_dirty = 1), 0), COALESCE(SUM(xmp_error IS NOT NULL), 0) FROM images",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(XmpStatus { dirty, failed, running, auto_sync: xmp_auto_sync(conn)? })
 }
 
 pub fn shoot_type(conn: &Connection) -> AppResult<ShootType> {
@@ -224,7 +245,8 @@ const ENTRY_SELECT: &str = "
            EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id),
            t.preview_path,
            q.suggested_rating, q.suggested_pick,
-           EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id)
+           EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id),
+           i.xmp_dirty, i.xmp_synced_at, i.xmp_error
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -307,6 +329,7 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         tags: Vec::new(),
         quality,
         has_edits: r.get(38)?,
+        xmp: XmpSyncState { dirty: r.get(43)?, synced_at_ms: r.get(44)?, error: r.get(45)? },
     })
 }
 
@@ -354,17 +377,38 @@ pub fn get_image(conn: &Connection, id: ImageId) -> AppResult<RawImageEntry> {
     Ok(entry)
 }
 
-pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
+/// Entries for `ids` in the given order. Atomic: an unknown id fails with `not_found`.
+pub fn get_images(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<RawImageEntry>> {
+    let mut by_id: HashMap<ImageId, RawImageEntry> = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(500) {
+        let ph = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("{ENTRY_SELECT} WHERE i.id IN ({ph})"))?;
+        for e in stmt.query_map(params_from_iter(chunk.iter()), entry_from_row)? {
+            let e = e?;
+            by_id.insert(e.id, e);
+        }
+    }
+    let mut out = ids
+        .iter()
+        .map(|id| by_id.get(id).cloned().ok_or_else(|| AppError::not_found(format!("image {id}"))))
+        .collect::<AppResult<Vec<_>>>()?;
+    attach_tags(conn, &mut out)?;
+    Ok(out)
+}
+
+/// Binds `items` as text values and returns the matching `?,?,..` placeholder list.
+fn text_list<T: Copy>(items: &[T], args: &mut Vec<Value>, as_str: fn(T) -> &'static str) -> String {
+    args.extend(items.iter().map(|&t| Value::Text(as_str(t).to_owned())));
+    vec!["?"; items.len()].join(",")
+}
+
+/// `WHERE` clause (with leading space, or empty) and its bound values for `q`'s filters.
+fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
     let mut clauses: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
 
-    let tag_list = |tags: &[CullTag], args: &mut Vec<Value>| {
-        args.extend(tags.iter().map(|t| Value::Text(t.as_str().to_owned())));
-        vec!["?"; tags.len()].join(",")
-    };
-
     if !q.include_tags.is_empty() {
-        let ph = tag_list(&q.include_tags, &mut args);
+        let ph = text_list(&q.include_tags, &mut args, CullTag::as_str);
         clauses.push(match q.tag_match {
             TagMatch::Any => format!(
                 "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
@@ -380,23 +424,40 @@ pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
         });
     }
     if !q.exclude_tags.is_empty() {
-        let ph = tag_list(&q.exclude_tags, &mut args);
+        let ph = text_list(&q.exclude_tags, &mut args, CullTag::as_str);
         clauses.push(format!(
             "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
                          AND it.suppressed = 0 AND it.tag IN ({ph}))"
         ));
     }
-    if let Some(pick) = q.pick {
-        clauses.push("i.pick = ?".into());
-        args.push(Value::Text(pick.as_str().into()));
+    if !q.picks.is_empty() {
+        let ph = text_list(&q.picks, &mut args, PickFlag::as_str);
+        clauses.push(format!("i.pick IN ({ph})"));
     }
-    if let Some(min) = q.min_rating {
-        clauses.push("i.rating >= ?".into());
-        args.push(Value::Integer(min.into()));
+    for (bound, op) in [(q.min_rating, ">="), (q.max_rating, "<=")] {
+        if let Some(v) = bound {
+            if v > 5 {
+                return Err(AppError::invalid(format!("rating bound {v} is outside 0..=5")));
+            }
+            clauses.push(format!("i.rating {op} ?"));
+            args.push(Value::Integer(v.into()));
+        }
+    }
+    if !q.color_labels.is_empty() {
+        let ph = text_list(&q.color_labels, &mut args, ColorLabel::as_str);
+        clauses.push(format!("i.color_label IN ({ph})"));
     }
     if let Some(burst) = q.burst_group_id {
         clauses.push("i.burst_group_id = ?".into());
         args.push(Value::Integer(burst));
+    }
+    if q.collapse_bursts {
+        clauses.push(
+            "(i.burst_group_id IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id
+                 AND b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id))"
+                .into(),
+        );
     }
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
@@ -404,24 +465,95 @@ pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
     }
 
     let where_sql = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
+    Ok((where_sql, args))
+}
 
+/// `ORDER BY` terms for `q` (always ends with a unique key for stable paging).
+fn query_order(q: &ImageQuery) -> &'static str {
+    match (q.sort, q.sort_descending) {
+        (ImageSort::CaptureTime, false) => "i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+        (ImageSort::CaptureTime, true) => {
+            "i.captured_at_ms IS NULL, i.captured_at_ms DESC, i.file_name DESC, i.id DESC"
+        }
+        (ImageSort::FileName, false) => "i.file_name, i.id",
+        (ImageSort::FileName, true) => "i.file_name DESC, i.id DESC",
+        (ImageSort::Quality, false) => "q.overall IS NULL, q.overall DESC, i.id",
+        (ImageSort::Quality, true) => "q.overall IS NULL, q.overall, i.id DESC",
+        (ImageSort::Rating, false) => "i.rating DESC, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+        (ImageSort::Rating, true) => "i.rating, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+    }
+}
+
+pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
+    let (where_sql, args) = query_filter(q)?;
     let total: u32 =
         conn.query_row(&format!("SELECT COUNT(*) FROM images i{where_sql}"), params_from_iter(args.iter()), |r| {
             r.get(0)
         })?;
 
-    let order = match q.sort {
-        ImageSort::CaptureTime => "i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-        ImageSort::FileName => "i.file_name, i.id",
-        ImageSort::Quality => "q.overall IS NULL, q.overall DESC, i.id",
-    };
     let limit = q.limit.min(ImageQuery::MAX_LIMIT);
-    let sql = format!("{ENTRY_SELECT}{where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}", q.offset);
+    let sql = format!("{ENTRY_SELECT}{where_sql} ORDER BY {} LIMIT {limit} OFFSET {}", query_order(q), q.offset);
     let mut items =
         conn.prepare(&sql)?.query_map(params_from_iter(args.iter()), entry_from_row)?.collect::<Result<Vec<_>, _>>()?;
     attach_tags(conn, &mut items)?;
 
     Ok(ImagePage { items, total })
+}
+
+/// Every id matching `q` in sort order; `offset`/`limit` are ignored.
+pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageId>> {
+    let (where_sql, args) = query_filter(q)?;
+    let sql = format!(
+        "SELECT i.id FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id{where_sql} ORDER BY {}",
+        query_order(q)
+    );
+    let ids = conn.prepare(&sql)?.query_map(params_from_iter(args.iter()), |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// Facet counts over `folder` (or the whole catalog).
+pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<FilterCounts> {
+    let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
+    {
+        let mut stmt = conn.prepare(
+            "SELECT pick, rating, COUNT(*) FROM images WHERE ?1 IS NULL OR folder_id = ?1 GROUP BY pick, rating",
+        )?;
+        let rows =
+            stmt.query_map([folder], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?, r.get::<_, u32>(2)?)))?;
+        for row in rows {
+            let (pick, rating, n) = row?;
+            c.total += n;
+            if let Some(slot) = c.ratings.get_mut(usize::from(rating)) {
+                *slot += n;
+            }
+            match PickFlag::parse(&pick) {
+                Some(PickFlag::Pick) => c.picked += n,
+                Some(PickFlag::Reject) => c.rejected += n,
+                _ => c.unflagged += n,
+            }
+        }
+    }
+    c.tags = conn
+        .prepare(
+            "SELECT it.tag, COUNT(*) FROM image_tags it JOIN images i ON i.id = it.image_id
+             WHERE it.suppressed = 0 AND (?1 IS NULL OR i.folder_id = ?1)
+             GROUP BY it.tag ORDER BY it.tag",
+        )?
+        .query_map([folder], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?
+        .filter_map(|r| match r {
+            Ok((tag, count)) => CullTag::parse(&tag).map(|tag| Ok(TagCount { tag, count })),
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    (c.burst_groups, c.burst_non_keepers) = conn.query_row(
+        "SELECT COUNT(DISTINCT i.burst_group_id),
+                COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
+         FROM images i JOIN burst_groups b ON b.id = i.burst_group_id
+         WHERE ?1 IS NULL OR i.folder_id = ?1",
+        [folder],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(c)
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +1029,7 @@ mod tests {
         let e = get_image(&conn, ids[0]).unwrap();
         assert_eq!((e.rating, e.pick, e.color_label), (4, PickFlag::Reject, Some(ColorLabel::Red)));
 
-        let q = ImageQuery { min_rating: Some(4), pick: Some(PickFlag::Reject), ..Default::default() };
+        let q = ImageQuery { min_rating: Some(4), picks: vec![PickFlag::Reject], ..Default::default() };
         assert_eq!(list_images(&conn, &q).unwrap().total, 1);
 
         assert_eq!(set_rating(&mut conn, &ids, 6).unwrap_err().kind, ErrorKind::InvalidArgument);
@@ -1107,5 +1239,147 @@ mod tests {
         assert_eq!((a.rating, a.pick), (1, PickFlag::Reject));
         assert_eq!((b.rating, b.pick), (4, PickFlag::Pick));
         assert_eq!((c.rating, c.pick), (1, PickFlag::Pick));
+    }
+
+    /// Three images in folder 1 (burst 7 = {1, 2}, keeper 2) and one in folder 2.
+    fn phase4_fixture() -> Connection {
+        let conn = open_in_memory();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0), (2, '/g', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                 imported_at, captured_at_ms, rating, pick, color_label)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0, 1000, 2, 'unflagged', 'red'),
+                    (2, 1, '/f/b.arw', 'b.arw', 'arw', 'sony', 1, 0, 0, 1500, 5, 'pick', NULL),
+                    (3, 1, '/f/c.arw', 'c.arw', 'arw', 'sony', 1, 0, 0, 9000, 0, 'reject', 'blue'),
+                    (4, 2, '/g/d.arw', 'd.arw', 'arw', 'sony', 1, 0, 0, NULL, 2, 'unflagged', NULL);
+             INSERT INTO burst_groups (id, started_at_ms, ended_at_ms, keeper_image_id) VALUES (7, 1000, 1500, 2);
+             UPDATE images SET burst_group_id = 7 WHERE id IN (1, 2);
+             INSERT INTO image_tags (image_id, tag, source, confidence, suppressed) VALUES
+                 (1, 'duplicate_burst', 'auto', 1.0, 0), (3, 'blink', 'auto', 0.9, 0), (3, 'motion_blur', 'auto', 0.5, 1);
+             UPDATE images SET xmp_dirty = 0, meta_updated_at = NULL;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn ids_for(conn: &Connection, q: ImageQuery) -> Vec<ImageId> {
+        let ids = list_image_ids(conn, &q).unwrap();
+        let page: Vec<_> = list_images(conn, &q).unwrap().items.iter().map(|e| e.id).collect();
+        assert_eq!(ids, page, "list_image_ids and list_images agree on order");
+        ids
+    }
+
+    #[test]
+    fn phase4_filters_and_sorts() {
+        let conn = phase4_fixture();
+        let q = ImageQuery::default;
+        assert_eq!(ids_for(&conn, q()), [1, 2, 3, 4], "capture time, missing last");
+        assert_eq!(ids_for(&conn, ImageQuery { sort_descending: true, ..q() }), [3, 2, 1, 4]);
+        assert_eq!(ids_for(&conn, ImageQuery { sort: ImageSort::Rating, ..q() }), [2, 1, 4, 3]);
+        assert_eq!(ids_for(&conn, ImageQuery { sort: ImageSort::Rating, sort_descending: true, ..q() }), [3, 1, 4, 2]);
+        assert_eq!(
+            ids_for(&conn, ImageQuery { sort: ImageSort::FileName, sort_descending: true, ..q() }),
+            [4, 3, 2, 1]
+        );
+        assert_eq!(ids_for(&conn, ImageQuery { picks: vec![PickFlag::Pick, PickFlag::Unflagged], ..q() }), [1, 2, 4]);
+        assert_eq!(ids_for(&conn, ImageQuery { min_rating: Some(1), max_rating: Some(2), ..q() }), [1, 4]);
+        assert_eq!(ids_for(&conn, ImageQuery { max_rating: Some(0), ..q() }), [3]);
+        assert_eq!(ids_for(&conn, ImageQuery { color_labels: vec![ColorLabel::Red, ColorLabel::Blue], ..q() }), [1, 3]);
+        assert_eq!(ids_for(&conn, ImageQuery { collapse_bursts: true, ..q() }), [2, 3, 4]);
+        assert_eq!(ids_for(&conn, ImageQuery { folder_id: Some(1), collapse_bursts: true, ..q() }), [2, 3]);
+        assert_eq!(ids_for(&conn, ImageQuery { include_tags: vec![CullTag::MotionBlur], ..q() }), Vec::<i64>::new());
+        assert_eq!(
+            list_images(&conn, &ImageQuery { min_rating: Some(6), ..q() }).unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        // limit/offset do not apply to ids.
+        assert_eq!(list_image_ids(&conn, &ImageQuery { offset: 3, limit: 1, ..q() }).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn phase4_get_images_and_counts() {
+        let conn = phase4_fixture();
+        let got: Vec<_> = get_images(&conn, &[3, 1]).unwrap();
+        assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), [3, 1]);
+        assert_eq!(got[0].tags.len(), 2);
+        assert_eq!(got[0], get_image(&conn, 3).unwrap());
+        assert!(get_images(&conn, &[]).unwrap().is_empty());
+        assert_eq!(get_images(&conn, &[1, 99]).unwrap_err().kind, ErrorKind::NotFound);
+
+        let all = filter_counts(&conn, None).unwrap();
+        assert_eq!(
+            all,
+            FilterCounts {
+                total: 4,
+                tags: vec![
+                    TagCount { tag: CullTag::Blink, count: 1 },
+                    TagCount { tag: CullTag::DuplicateBurst, count: 1 }
+                ],
+                picked: 1,
+                rejected: 1,
+                unflagged: 2,
+                ratings: vec![1, 0, 2, 0, 0, 1],
+                burst_groups: 1,
+                burst_non_keepers: 1,
+            }
+        );
+        let g = filter_counts(&conn, Some(2)).unwrap();
+        assert_eq!((g.total, g.tags.len(), g.burst_groups, g.ratings[2]), (1, 0, 0, 1));
+    }
+
+    #[test]
+    fn phase4_xmp_dirty_triggers_and_status() {
+        let mut conn = phase4_fixture();
+        let dirty = |conn: &Connection| -> Vec<ImageId> {
+            conn.prepare("SELECT id FROM images WHERE xmp_dirty = 1 ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(dirty(&conn).is_empty());
+        assert_eq!(get_image(&conn, 1).unwrap().xmp, XmpSyncState::default());
+
+        // No-op writes and non-visible tag changes do not dirty.
+        set_rating(&mut conn, &[2], 5).unwrap();
+        conn.execute("UPDATE image_tags SET confidence = 0.3 WHERE image_id = 3 AND tag = 'blink'", []).unwrap();
+        conn.execute("UPDATE image_tags SET source = 'user' WHERE image_id = 1", []).unwrap();
+        conn.execute("DELETE FROM image_tags WHERE image_id = 3 AND tag = 'motion_blur'", []).unwrap();
+        conn.execute("INSERT INTO image_tags (image_id, tag, source, suppressed) VALUES (4, 'blink', 'auto', 1)", [])
+            .unwrap();
+        assert!(dirty(&conn).is_empty());
+
+        set_rating(&mut conn, &[1], 3).unwrap();
+        set_pick(&mut conn, &[2], PickFlag::Reject).unwrap();
+        set_color_label(&mut conn, &[3], None).unwrap();
+        assert_eq!(dirty(&conn), [1, 2, 3]);
+        let e = get_image(&conn, 1).unwrap();
+        assert!(e.xmp.dirty && e.xmp.synced_at_ms.is_none());
+        let updated: i64 = conn.query_row("SELECT meta_updated_at FROM images WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert!((now_ms() - updated).abs() < 5_000, "meta_updated_at is unix ms");
+
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+        set_user_tag(&mut conn, &[4], CullTag::Blink, true).unwrap(); // un-suppress via user tag
+        set_user_tag(&mut conn, &[3], CullTag::Blink, false).unwrap(); // suppress auto
+        conn.execute("INSERT INTO image_tags (image_id, tag, source) VALUES (2, 'underexposed', 'auto')", []).unwrap();
+        assert_eq!(dirty(&conn), [2, 3, 4]);
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+        conn.execute("DELETE FROM image_tags WHERE image_id = 2", []).unwrap();
+        assert_eq!(dirty(&conn), [2]);
+
+        // The sync bookkeeping update itself does not re-dirty.
+        conn.execute("UPDATE images SET xmp_dirty = 0, xmp_synced_at = 5, xmp_error = 'x' WHERE id = 2", []).unwrap();
+        assert!(dirty(&conn).is_empty());
+        assert_eq!(
+            get_image(&conn, 2).unwrap().xmp,
+            XmpSyncState { dirty: false, synced_at_ms: Some(5), error: Some("x".into()) }
+        );
+
+        assert!(!catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
+        set_xmp_auto_sync(&conn, true).unwrap();
+        assert!(catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
+        set_rating(&mut conn, &[4], 1).unwrap();
+        assert_eq!(xmp_status(&conn, true).unwrap(), XmpStatus { dirty: 1, failed: 1, running: true, auto_sync: true });
     }
 }

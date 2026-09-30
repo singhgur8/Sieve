@@ -12,7 +12,7 @@ export const commands = {
 	setBurstWindow: (ms: number) => typedError<null, AppError>(__TAURI_INVOKE("set_burst_window", { ms })),
 	/**
 	 *  Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
-	 *  then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
+	 *  reads existing XMP sidecars (rating/pick/label) of new or externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 	 *  returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 	 *  (and `analysis*`) events.
 	 */
@@ -84,6 +84,31 @@ export const commands = {
 	 *  (unanalyzed images skipped). Returns the number of images updated.
 	 */
 	applySuggestions: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("apply_suggestions", { ids })),
+	/**
+	 *  Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
+	 *  edits). Atomic: an unknown id fails with `not_found`.
+	 */
+	getImages: (ids: number[]) => typedError<RawImageEntry[], AppError>(__TAURI_INVOKE("get_images", { ids })),
+	/**
+	 *  Every id matching `query` in its sort order, ignoring `offset`/`limit`
+	 *  (select-all, loupe navigation, batch actions over a filter).
+	 */
+	listImageIds: (query: ImageQuery) => typedError<number[], AppError>(__TAURI_INVOKE("list_image_ids", { query })),
+	/**  Filter-bar facet counts for `folderId` (`null` = whole catalog). */
+	getFilterCounts: (folderId: number | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId })),
+	/**
+	 *  Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
+	 *  preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
+	 */
+	writeXmp: (ids: number[]) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("write_xmp", { ids })),
+	/**
+	 *  Reads rating/pick/label from existing sidecars of `ids` into the catalog (sidecar wins).
+	 *  Images without a sidecar are `skipped`; refetch `report.changed`.
+	 */
+	readXmp: (ids: number[]) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("read_xmp", { ids })),
+	/**  Turns automatic (debounced) sidecar writing on/off. Enabling flushes every dirty image. */
+	setXmpAutoSync: (enabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_xmp_auto_sync", { enabled })),
+	getXmpStatus: () => typedError<XmpStatus, AppError>(__TAURI_INVOKE("get_xmp_status")),
 };
 
 /** Events */
@@ -95,6 +120,8 @@ export const events = {
 	importProgress: makeEvent<ImportProgress>("import-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
+	xmpSynced: makeEvent<XmpSynced>("xmp-synced"),
+	xmpWriteFailed: makeEvent<XmpWriteFailed>("xmp-write-failed"),
 };
 
 /* Types */
@@ -236,6 +263,11 @@ export type CatalogState = {
 	cacheDir: string,
 	/**  Analysis starts automatically after import / on launch (`set_auto_analyze`). */
 	autoAnalyze: boolean,
+	/**
+	 *  Sidecars are written automatically after rating/pick/label/tag changes
+	 *  (`set_xmp_auto_sync`). Default off.
+	 */
+	xmpAutoSync: boolean,
 };
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
@@ -331,6 +363,21 @@ export type FaceInfo = {
 	considered: boolean,
 };
 
+/**  Facet counts for the filter bar over one folder (or the whole catalog). */
+export type FilterCounts = {
+	total: number,
+	/**  Non-suppressed tags; tags with no images are omitted. */
+	tags: TagCount[],
+	picked: number,
+	rejected: number,
+	unflagged: number,
+	/**  `ratings[n]` = images with exactly `n` stars; always 6 entries. */
+	ratings: number[],
+	burstGroups: number,
+	/**  Burst members hidden by `ImageQuery.collapseBursts`. */
+	burstNonKeepers: number,
+};
+
 export type FolderEntry = {
 	id: number,
 	path: string,
@@ -361,24 +408,48 @@ export type ImagePage = {
 	total: number,
 };
 
-/**  Filter + page request for the grid. Suppressed tags never match. */
+/**
+ *  Filter + page request for the grid. All filters are ANDed; empty lists / `null`
+ *  mean "no constraint". Suppressed tags never match.
+ */
 export type ImageQuery = {
+	/**  Combined with `tagMatch`. */
 	includeTags: CullTag[],
+	/**  Images carrying any of these are excluded. */
 	excludeTags: CullTag[],
 	tagMatch: TagMatch,
-	pick: PickFlag | null,
+	/**  Image's pick flag is one of these (e.g. `["pick", "unflagged"]` hides rejects). */
+	picks: PickFlag[],
+	/**  Inclusive star range, 0..=5. */
 	minRating: number | null,
+	maxRating: number | null,
+	/**  Image's colour label is one of these. */
+	colorLabels: ColorLabel[],
 	burstGroupId: number | null,
+	/**
+	 *  Hide burst members that are not their group's keeper (groups without a keeper
+	 *  show all members); images outside bursts are unaffected.
+	 */
+	collapseBursts: boolean,
 	folderId: number | null,
 	sort: ImageSort,
+	/**  Reverse the natural order of `sort` (images missing the key stay last). */
+	sortDescending: boolean,
 	offset: number,
 	/**  Capped at [`ImageQuery::MAX_LIMIT`]. */
 	limit: number,
 };
 
-export type ImageSort = "capture_time" | "file_name" | 
+/**  Natural order of each key; `ImageQuery.sortDescending` reverses it. */
+export type ImageSort = 
+/**  Oldest first; images without a capture time last. Ties by file name. */
+"capture_time" | 
+/**  A..Z. */
+"file_name" | 
 /**  Best `QualityScore.overall` first; unscored images last. */
-"quality";
+"quality" | 
+/**  Most stars first; ties in capture order. */
+"rating";
 
 export type ImportOptions = {
 	recursive: boolean,
@@ -419,6 +490,11 @@ export type ImportSummary = {
 	skipped: number,
 	/**  Files with a RAW extension whose header did not match the format. */
 	invalid: number,
+	/**
+	 *  Existing XMP sidecars whose rating/pick/label were read into the catalog
+	 *  (new images, and unchanged images whose sidecar changed on disk).
+	 */
+	sidecarsRead: number,
 };
 
 /**  A 3D LUT (`.cube`) applied after the parametric stage. */
@@ -532,6 +608,8 @@ export type RawImageEntry = {
 	tags: CullTagEntry[],
 	quality: QualityScore | null,
 	hasEdits: boolean,
+	/**  Sidecar sync state of the XMP-mapped values (rating, pick, label, tags). */
+	xmp: XmpSyncState,
 };
 
 /**
@@ -616,6 +694,69 @@ width: number; height: number } |
 export type WhiteBalance = { mode: "as_shot" } | 
 /**  `temperatureK` 2000..=50000, `tint` -150..=150 (Lightroom scale). */
 { mode: "custom"; temperatureK: number; tint: number };
+
+export type XmpFailure = {
+	imageId: number,
+	reason: string,
+};
+
+/**  Catalog-wide XMP sync snapshot. */
+export type XmpStatus = {
+	/**  Images with unwritten changes. */
+	dirty: number,
+	/**  Images whose last write/read failed. */
+	failed: number,
+	/**  The auto-sync writer is currently working. */
+	running: boolean,
+	/**  Same as `CatalogState.xmpAutoSync`. */
+	autoSync: boolean,
+};
+
+/**
+ *  Result of `write_xmp` / `read_xmp`. Per-image file errors do not fail the batch;
+ *  they are listed in `failed` (and stored in `XmpSyncState.error`).
+ */
+export type XmpSyncReport = {
+	/**  Sidecars written (`write_xmp`) or read (`read_xmp`). */
+	succeeded: number,
+	/**  `read_xmp`: images without a sidecar. `write_xmp`: always 0. */
+	skipped: number,
+	failed: XmpFailure[],
+	/**
+	 *  Images whose catalog rating/pick/label changed as a result (reads only);
+	 *  refetch them with `get_images`.
+	 */
+	changed: number[],
+};
+
+/**  Per-image XMP sidecar state (`<basename>.xmp` next to the RAW). */
+export type XmpSyncState = {
+	/**  Rating/pick/label/tags changed in the catalog since the sidecar was last written. */
+	dirty: boolean,
+	/**  Unix ms when catalog and sidecar last agreed (write or read); `None` = never synced. */
+	syncedAtMs: number | null,
+	/**  Reason of the last failed write/read; `None` after a success. */
+	error: string | null,
+};
+
+/**
+ *  The auto-sync writer finished a pass. `written`: sidecars now match the catalog.
+ *  `read`: sidecars that were newer than the catalog's change (edited externally) and
+ *  were read into the catalog instead; refetch those entries (`get_images`).
+ */
+export type XmpSynced = {
+	written: number[],
+	read: number[],
+};
+
+/**
+ *  Auto-sync could not write (or read) an image's sidecar. Also stored in
+ *  `XmpSyncState.error`; the image stays `dirty` and is retried on the next pass.
+ */
+export type XmpWriteFailed = {
+	imageId: number,
+	reason: string,
+};
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

@@ -84,3 +84,22 @@ pub struct AnalysisFinished {
     /// Burst groups in the catalog after regrouping.
     pub burst_groups: u32,
 }
+
+/// The auto-sync writer finished a pass. `written`: sidecars now match the catalog.
+/// `read`: sidecars that were newer than the catalog's change (edited externally) and
+/// were read into the catalog instead; refetch those entries (`get_images`).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpSynced {
+    pub written: Vec<ImageId>,
+    pub read: Vec<ImageId>,
+}
+
+/// Auto-sync could not write (or read) an image's sidecar. Also stored in
+/// `XmpSyncState.error`; the image stays `dirty` and is retried on the next pass.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct XmpWriteFailed {
+    pub image_id: ImageId,
+    pub reason: String,
+}
