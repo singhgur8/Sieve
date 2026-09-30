@@ -205,7 +205,13 @@ fn main() {
             &sieve_lib::profiles::ProfileLibrary::shared(),
             None,
         );
-        let prep = source::prepare(&img, orientation.unwrap_or(1), &sieve_lib::ipc::types::CropSettings::default(), None, 2048);
+        let prep = source::prepare(
+            &img,
+            orientation.unwrap_or(1),
+            &sieve_lib::ipc::types::CropSettings::default(),
+            None,
+            2048,
+        );
         for (_, adj) in &vars {
             let lut = adj.lut.as_ref().and_then(|l| luts.load(&l.id).unwrap());
             let input = pipeline::RenderInput {

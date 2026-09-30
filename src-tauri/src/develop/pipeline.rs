@@ -476,6 +476,11 @@ impl RgbLook<'_> {
     }
 }
 
+/// HSL strengths at +-100 fitted to Camera Raw renders of colour patches (`tools/acr-oracle`).
+const HSL_HUE_DEG: f32 = 37.5;
+const HSL_SAT_GAIN: f32 = 1.15;
+const HSL_LUM_EV: f32 = 5.0;
+
 /// HSL / vibrance / saturation, evaluated in Oklab (smooth everywhere, so the per-render
 /// LUT interpolates it well): hue = Oklab hue angle with Lightroom's eight bands placed at
 /// the Oklab hues of the sRGB colours they are named after, chroma scaled for saturation,
@@ -531,9 +536,9 @@ impl ColorOps {
             let (i, j, t) = lab.bands(hue);
             let pick = |vals: &[f32; 8]| vals[i] + (vals[j] - vals[i]) * t;
             let (dh, ds, dl) = (pick(&hsl[0]), pick(&hsl[1]), pick(&hsl[2]));
-            theta = dh * 30.0f32.to_radians() * near_neutral;
-            chroma *= (1.0 + ds * near_neutral).max(0.0);
-            lum_ev = dl * 1.2 * (sat * 1.5).min(1.0);
+            theta = dh * HSL_HUE_DEG.to_radians() * near_neutral;
+            chroma *= (1.0 + ds * HSL_SAT_GAIN * near_neutral).max(0.0);
+            lum_ev = dl * HSL_LUM_EV * (sat * 1.5).min(1.0);
         }
         let (sn, cs) = theta.sin_cos();
         let (a2, b2) = ((a * cs - b * sn) * chroma, (a * sn + b * cs) * chroma);
@@ -847,7 +852,7 @@ fn develop(
     let m = setup.m;
     let mut rgb = vec![0.0f32; w * h * 3];
     rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
-        for (o, p) in out.chunks_exact_mut(3).zip(inp.chunks_exact(3)) {
+        for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
             let c = [
                 (f32::from(p[0]) * mul[0]).min(1.0),
                 (f32::from(p[1]) * mul[1]).min(1.0),
@@ -886,7 +891,13 @@ fn develop(
     let need_tex = local.texture != 0.0;
     let need_haze = local.dehaze > 0.0;
     let (base, clar, tex, haze) = if need_base || need_clar || need_tex || need_haze {
-        let f0 = if w.min(h) >= 1024 { 4 } else if w.min(h) >= 256 { 2 } else { 1 };
+        let f0 = if w.min(h) >= 1024 {
+            4
+        } else if w.min(h) >= 256 {
+            2
+        } else {
+            1
+        };
         let (lum, dark) = base_grids(&rgb, w, h, f0, need_haze);
         if need_base {
             // Image key (mean log2 luminance) for the image-adaptive Highlights slider.
@@ -934,10 +945,8 @@ fn develop(
             BigTable::Look(_) => None,
         })
     });
-    let luts: CurveLuts = parity::curve_luts(
-        &adj.tone_curve,
-        look.map(|l| (&l.parameters.tone_curve.point, look_amount.min(1.0))),
-    );
+    let luts: CurveLuts =
+        parity::curve_luts(&adj.tone_curve, look.map(|l| (&l.parameters.tone_curve.point, look_amount.min(1.0))));
     let tone_curve = profile.dcp.as_ref().and_then(|d| d.tone_curve.clone());
     let display = profile.display_referred;
     let base_fn = tone::profile_curve(tone_curve.as_deref());
@@ -1104,13 +1113,15 @@ pub fn render(input: &RenderInput, adjustments: &ParametricAdjustments, lut: Opt
         .zip(dev.rgb.par_chunks(w * 3 * BAND))
         .map(|(out, src)| {
             let mut hist = [[0u32; 256]; 4];
-            for (o, s) in out.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
+            for (o, s) in out.as_chunks_mut::<3>().0.iter_mut().zip(src.as_chunks::<3>().0) {
                 let q = [s[0], s[1], s[2]].map(|c| (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
                 o.copy_from_slice(&q);
                 hist[0][q[0] as usize] += 1;
                 hist[1][q[1] as usize] += 1;
                 hist[2][q[2] as usize] += 1;
-                let l = (LUMA_709[0] * f32::from(q[0]) + LUMA_709[1] * f32::from(q[1]) + LUMA_709[2] * f32::from(q[2])
+                let l = (LUMA_709[0] * f32::from(q[0])
+                    + LUMA_709[1] * f32::from(q[1])
+                    + LUMA_709[2] * f32::from(q[2])
                     + 0.5) as usize;
                 hist[3][l.min(255)] += 1;
             }

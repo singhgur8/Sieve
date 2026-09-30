@@ -52,7 +52,8 @@ fn orient(img: &Img, o: u8) -> Img {
                 7 => (w - 1 - y, h - 1 - x),
                 _ => (w - 1 - y, x),
             };
-            px[(y * dw + x) * 3..(y * dw + x) * 3 + 3].copy_from_slice(&img.px[(sy * w + sx) * 3..(sy * w + sx) * 3 + 3]);
+            px[(y * dw + x) * 3..(y * dw + x) * 3 + 3]
+                .copy_from_slice(&img.px[(sy * w + sx) * 3..(sy * w + sx) * 3 + 3]);
         }
     }
     Img { w: dw, h: dh, px }
@@ -169,7 +170,8 @@ fn de2000(l1: [f64; 3], l2: [f64; 3]) -> f64 {
     } else {
         (h1p + h2p - 360.0) / 2.0
     };
-    let t = 1.0 - 0.17 * (hm - 30.0).to_radians().cos() + 0.24 * (2.0 * hm).to_radians().cos()
+    let t = 1.0 - 0.17 * (hm - 30.0).to_radians().cos()
+        + 0.24 * (2.0 * hm).to_radians().cos()
         + 0.32 * (3.0 * hm + 6.0).to_radians().cos()
         - 0.20 * (4.0 * hm - 63.0).to_radians().cos();
     let dtheta = 30.0 * (-((hm - 275.0) / 25.0).powi(2)).exp();
@@ -229,10 +231,9 @@ fn auto_pick(folder: &Path, count: usize) -> Vec<PathBuf> {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(xmp::sidecar_path(p)) else { continue };
-            let skip = ["MaskGroupBasedCorrections", "RetouchAreas", "PaintBasedCorrections"]
-                .iter()
-                .any(|k| text.contains(k))
-                || text.contains("crs:PerspectiveUpright=\"1\"");
+            let skip =
+                ["MaskGroupBasedCorrections", "RetouchAreas", "PaintBasedCorrections"].iter().any(|k| text.contains(k))
+                    || text.contains("crs:PerspectiveUpright=\"1\"");
             if !skip && text.contains("crs:Exposure2012") {
                 out.push(p.clone());
                 n += 1;
@@ -300,6 +301,17 @@ fn main() {
                     "lnr" => adj.detail.noise_reduction.luminance = v,
                     "cnr" => adj.detail.noise_reduction.color = v,
                     "sharp" => adj.detail.sharpening.amount = v,
+                    "curve0" => {
+                        let splits = adj.tone_curve.parametric;
+                        adj.tone_curve.parametric = sieve_lib::ipc::types::ParametricCurve {
+                            shadows: 0.0,
+                            darks: 0.0,
+                            lights: 0.0,
+                            highlights: 0.0,
+                            ..splits
+                        };
+                        adj.tone_curve.point.master = sieve_lib::ipc::types::PointCurves::identity_curve();
+                    }
                     _ => panic!("unknown override {k}"),
                 }
             }
@@ -350,7 +362,8 @@ fn main() {
             _ => None,
         };
         let refimg = reference.as_ref().and_then(|dir| {
-            let r = load_jpeg(&dir.join(format!("{stem}.ref.jpg"))).or_else(|| load_jpeg(&dir.join(format!("{stem}.jpg"))))?;
+            let r = load_jpeg(&dir.join(format!("{stem}.ref.jpg")))
+                .or_else(|| load_jpeg(&dir.join(format!("{stem}.jpg"))))?;
             // Un-rotated reference (DNG preview): apply the orientation when the aspect says so.
             let same = (r.w >= r.h) == (sieve.w >= sieve.h);
             Some(if same { r } else { orient(&r, o) })
@@ -410,7 +423,10 @@ fn main() {
         let mean = summary.iter().map(|s| s.1).sum::<f64>() / n;
         let p95 = summary.iter().map(|s| s.2).sum::<f64>() / n;
         let blocks = summary.iter().map(|s| s.3).sum::<f64>() / n;
-        println!("\n== {} images: dE2000 mean of means {mean:.2}, mean p95 {p95:.2}, block mean {blocks:.2} ==", summary.len());
+        println!(
+            "\n== {} images: dE2000 mean of means {mean:.2}, mean p95 {p95:.2}, block mean {blocks:.2} ==",
+            summary.len()
+        );
         for fmt in ["Arw", "Cr3", "Raf"] {
             let v: Vec<_> = summary.iter().filter(|s| s.4 == fmt).collect();
             if !v.is_empty() {

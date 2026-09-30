@@ -330,10 +330,10 @@ fn rotate_chroma(c: [f32; 3], theta: f32) -> [f32; 3] {
 
 /// Camera-calibration primaries adjustment as a 3x3 matrix to fold into camera -> working
 /// (hue rotates each primary, saturation scales its chroma; identity for all zeros).
-/// Working space: linear ProPhoto. Each primary's column is split into its grey component
-/// (its luminance) and chroma; hue rotates the chroma towards the next primary (+) or the
-/// previous (-) by up to 30 degrees, saturation scales it by up to +-60%; rows are then
-/// renormalized so white stays white.
+/// Working space: linear ProPhoto. Each primary's chroma (relative to the grey (1,1,1)/3)
+/// is rotated around the grey axis (hue, towards the next primary for +) and scaled
+/// (saturation); rows are renormalized so white stays white. Gains fitted to Camera Raw
+/// renders of colour patches (`tools/acr-oracle`, effect-size ratio ~1.0 per slider).
 pub fn calibration_matrix(cal: &CameraCalibration) -> [[f32; 3]; 3] {
     let prim = [cal.red, cal.green, cal.blue];
     if prim.iter().all(|p| p.hue == 0.0 && p.saturation == 0.0) {
@@ -343,16 +343,13 @@ pub fn calibration_matrix(cal: &CameraCalibration) -> [[f32; 3]; 3] {
     for (i, p) in prim.iter().enumerate() {
         let mut e = [0.0f32; 3];
         e[i] = 1.0;
-        let y = PROPHOTO_Y[i];
+        let y = 1.0 / 3.0;
         let chroma = [e[0] - y, e[1] - y, e[2] - y];
-        // Positive hue turns red towards yellow (towards green), green towards cyan,
-        // blue towards magenta: a positive rotation in R -> G -> B order.
         let theta = (p.hue / 100.0).clamp(-1.0, 1.0) * 30f32.to_radians() * CAL_HUE_GAIN;
         let c = rotate_chroma(chroma, theta);
         let s = 1.0 + (p.saturation / 100.0).clamp(-1.0, 1.0) * CAL_SAT_GAIN;
         cols[i] = [y + c[0] * s, y + c[1] * s, y + c[2] * s];
     }
-    // Matrix with the adjusted primaries as columns, rows renormalized to keep white.
     let mut m = [[0.0f32; 3]; 3];
     for r in 0..3 {
         for c in 0..3 {
@@ -367,8 +364,8 @@ pub fn calibration_matrix(cal: &CameraCalibration) -> [[f32; 3]; 3] {
 }
 
 /// Calibration hue / saturation strength (fitted, see `tools/acr-oracle`).
-pub const CAL_HUE_GAIN: f32 = 1.0;
-pub const CAL_SAT_GAIN: f32 = 0.6;
+pub const CAL_HUE_GAIN: f32 = 1.12;
+pub const CAL_SAT_GAIN: f32 = 1.25;
 
 /// Shadow tint (green -/magenta +) weighted towards the shadows. `rgb` linear working.
 pub fn shadow_tint(rgb: [f32; 3], tint: f32) -> [f32; 3] {
@@ -418,8 +415,9 @@ pub struct Grade {
 
 impl Grade {
     pub fn new(g: &ColorGrading) -> Self {
-        let wheel = |w: &ColorWheel| (hue_direction(w.hue), (w.saturation / 100.0).clamp(0.0, 1.0) * GRADE_GAIN);
-        let wheels = [wheel(&g.shadows), wheel(&g.midtones), wheel(&g.highlights), wheel(&g.global)];
+        let wheel = |w: &ColorWheel, gain: f32| (hue_direction(w.hue), (w.saturation / 100.0).clamp(0.0, 1.0) * gain);
+        let (sh, mid) = (GRADE_GAIN * 1.85, GRADE_GAIN * 0.47);
+        let wheels = [wheel(&g.shadows, sh), wheel(&g.midtones, mid), wheel(&g.highlights, sh), wheel(&g.global, mid)];
         let lum = [g.shadows.luminance, g.midtones.luminance, g.highlights.luminance, g.global.luminance]
             .map(|v| (v / 100.0).clamp(-1.0, 1.0));
         let any = wheels.iter().any(|w| w.1 > 0.0) || lum.iter().any(|v| *v != 0.0);
@@ -454,20 +452,19 @@ impl Grade {
         let weights = [w[0], w[1], w[2], 1.0];
         let mut off = [0.0f32; 3];
         let mut dl = 0.0;
-        for k in 0..4 {
-            let (dir, s) = self.wheels[k];
-            let a = s * weights[k];
+        for ((&(dir, s), &wk), &lum) in self.wheels.iter().zip(&weights).zip(&self.lum) {
+            let a = s * wk;
             off[0] += dir[0] * a;
             off[1] += dir[1] * a;
             off[2] += dir[2] * a;
-            dl += self.lum[k] * weights[k];
+            dl += lum * wk;
         }
         // Tints scale with the pixel's brightness away from black and white.
         let room = (l * (1.0 - l) * 4.0).clamp(0.0, 1.0).sqrt();
         let mut out = [rgb[0] + off[0] * room, rgb[1] + off[1] * room, rgb[2] + off[2] * room];
         // Keep luminance, then apply the luminance sliders.
         let l2 = out[0] * 0.2627 + out[1] * 0.6780 + out[2] * 0.0593;
-        let target = (l + dl * 0.25 * (1.0 - (2.0 * l - 1.0).powi(2)).max(0.0)).clamp(0.0, 1.0);
+        let target = (l + dl * 0.125 * (1.0 - (2.0 * l - 1.0).powi(2)).max(0.0)).clamp(0.0, 1.0);
         let shift = target - l2;
         out = out.map(|c| c + shift);
         out
@@ -526,7 +523,8 @@ impl Oklab {
         let from_lms = invert3(&to_lms).expect("invertible");
         let from_lab = invert3(&M2).expect("invertible");
         let f = |m: [[f64; 3]; 3]| m.map(|r| r.map(|v| v as f32));
-        let mut ok = Oklab { to_lms: f(to_lms), from_lms: f(from_lms), to_lab: f(M2), from_lab: f(from_lab), centers: [0.0; 8] };
+        let mut ok =
+            Oklab { to_lms: f(to_lms), from_lms: f(from_lms), to_lab: f(M2), from_lab: f(from_lab), centers: [0.0; 8] };
         let srgb_lin_to_pp = invert3(&pp_to_srgb).expect("invertible");
         for (k, h) in [0.0f32, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0].iter().enumerate() {
             let e = crate::profiles::dcp::hsv_to_rgb(h / 60.0, 1.0, 1.0);
@@ -850,7 +848,9 @@ pub fn noise_sigma(p: &[f32], w: usize, h: usize) -> f32 {
         .flat_map_iter(|&y| {
             let (u, m, d) = (&p[(y - 1) * w..y * w], &p[y * w..(y + 1) * w], &p[(y + 1) * w..(y + 2) * w]);
             (1..w - 1).step_by(2).map(move |x| {
-                let lap = m[x - 1] + m[x + 1] + u[x] + d[x] - 4.0 * m[x] - 0.5 * (u[x - 1] + u[x + 1] + d[x - 1] + d[x + 1] - 4.0 * m[x]);
+                let lap = m[x - 1] + m[x + 1] + u[x] + d[x]
+                    - 4.0 * m[x]
+                    - 0.5 * (u[x - 1] + u[x + 1] + d[x - 1] + d[x + 1] - 4.0 * m[x]);
                 lap.abs()
             })
         })
@@ -891,16 +891,15 @@ pub fn denoise_opts(img: &mut Working, nr: &NoiseReduction, scale: f32, luminanc
     let mut yq = vec![0.0f32; n];
     let mut c1 = vec![0.0f32; n];
     let mut c2 = vec![0.0f32; n];
-    img.rgb
-        .par_chunks(3)
-        .zip(yq.par_iter_mut().zip(c1.par_iter_mut().zip(c2.par_iter_mut())))
-        .for_each(|(p, (y, (a, b)))| {
+    img.rgb.par_chunks(3).zip(yq.par_iter_mut().zip(c1.par_iter_mut().zip(c2.par_iter_mut()))).for_each(
+        |(p, (y, (a, b)))| {
             let q = [p[0].max(0.0).sqrt(), p[1].max(0.0).sqrt(), p[2].max(0.0).sqrt()];
             let l = 0.3 * q[0] + 0.6 * q[1] + 0.1 * q[2];
             *y = l;
             *a = q[0] - l;
             *b = q[2] - l;
-        });
+        },
+    );
     let scale = scale.clamp(0.05, 4.0);
     if lum_amt > 0.0 {
         let sigma = noise_sigma(&yq, w, h);
@@ -967,8 +966,7 @@ pub fn sharpen(img: &mut Working, sharpening: &Sharpening, scale: f32) {
     if gain < 1e-3 {
         return;
     }
-    let lum: Vec<f32> =
-        img.rgb.par_chunks(3).map(|p| 0.2627 * p[0] + 0.6780 * p[1] + 0.0593 * p[2]).collect();
+    let lum: Vec<f32> = img.rgb.par_chunks(3).map(|p| 0.2627 * p[0] + 0.6780 * p[1] + 0.0593 * p[2]).collect();
     let blurred = blur(&lum, w, h, sigma);
     let detail = (sharpening.detail / 100.0).clamp(0.0, 1.0);
     let halo = 0.015 + 0.25 * detail * detail;
@@ -1375,10 +1373,7 @@ mod tests {
     fn calibration_identity_and_directions() {
         let id = calibration_matrix(&CameraCalibration::default());
         assert_eq!(id, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let cal = CameraCalibration {
-            red: PrimaryCalibration { hue: 0.0, saturation: 50.0 },
-            ..Default::default()
-        };
+        let cal = CameraCalibration { red: PrimaryCalibration { hue: 0.0, saturation: 50.0 }, ..Default::default() };
         let m = calibration_matrix(&cal);
         // White stays white.
         for r in m {
@@ -1420,27 +1415,21 @@ mod tests {
     fn color_grading_shifts_hue_in_expected_direction() {
         let mid = [0.5f32, 0.5, 0.5];
         assert_eq!(color_grade(mid, &ColorGrading::default()), mid);
-        let warm = ColorGrading {
-            global: ColorWheel { hue: 30.0, saturation: 50.0, luminance: 0.0 },
-            ..Default::default()
-        };
+        let warm =
+            ColorGrading { global: ColorWheel { hue: 30.0, saturation: 50.0, luminance: 0.0 }, ..Default::default() };
         let out = color_grade(mid, &warm);
         assert!(out[0] > out[1] && out[1] > out[2], "orange tint: {out:?}");
         let l = |c: [f32; 3]| c[0] * 0.2627 + c[1] * 0.6780 + c[2] * 0.0593;
         assert!((l(out) - l(mid)).abs() < 1e-4, "luminance kept");
         // Shadows wheel affects dark tones more than bright ones.
-        let sh = ColorGrading {
-            shadows: ColorWheel { hue: 220.0, saturation: 60.0, luminance: 0.0 },
-            ..Default::default()
-        };
+        let sh =
+            ColorGrading { shadows: ColorWheel { hue: 220.0, saturation: 60.0, luminance: 0.0 }, ..Default::default() };
         let dark = color_grade([0.2, 0.2, 0.2], &sh);
         let bright = color_grade([0.85, 0.85, 0.85], &sh);
         assert!(dark[2] - dark[0] > bright[2] - bright[0], "{dark:?} {bright:?}");
         // Luminance slider.
-        let lum = ColorGrading {
-            midtones: ColorWheel { hue: 0.0, saturation: 0.0, luminance: 50.0 },
-            ..Default::default()
-        };
+        let lum =
+            ColorGrading { midtones: ColorWheel { hue: 0.0, saturation: 0.0, luminance: 50.0 }, ..Default::default() };
         assert!(l(color_grade(mid, &lum)) > 0.52);
     }
 
@@ -1475,8 +1464,10 @@ mod tests {
         let (w, h) = (128, 64);
         let mut px = noisy_step(w, h, 0.02);
         let var = |p: &[f32], x0: usize, x1: usize| {
-            let vals: Vec<f32> =
-                (8..h - 8).flat_map(|y| (x0..x1).map(move |x| (y, x))).map(|(y, x)| p[(y * w + x) * 3 + 1].sqrt()).collect();
+            let vals: Vec<f32> = (8..h - 8)
+                .flat_map(|y| (x0..x1).map(move |x| (y, x)))
+                .map(|(y, x)| p[(y * w + x) * 3 + 1].sqrt())
+                .collect();
             let m = vals.iter().sum::<f32>() / vals.len() as f32;
             vals.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / vals.len() as f32
         };
@@ -1527,7 +1518,10 @@ mod tests {
         assert!(at(0, 0) < 0.5, "{}", at(0, 0));
         assert!((at(30, 20) - 0.6).abs() < 0.01);
         let mut px2 = vec![0.6f32; w * h * 3];
-        vignette(&mut Working { width: w, height: h, rgb: &mut px2 }, &PostCropVignette { amount: 60.0, ..Default::default() });
+        vignette(
+            &mut Working { width: w, height: h, rgb: &mut px2 },
+            &PostCropVignette { amount: 60.0, ..Default::default() },
+        );
         assert!(px2[0] > 0.65);
     }
 
@@ -1577,9 +1571,18 @@ mod tests {
         // The corners land on the given source points.
         let (x0, y0) = g2.map(0.0, 0.0);
         let (x1, y1) = g2.map(1.0, 1.0);
-        assert!((x0 - 0.1).abs() < 1e-3 && (y0 - 0.2).abs() < 1e-3 && (x1 - 0.6).abs() < 1e-3 && (y1 - 0.7).abs() < 1e-3);
+        assert!(
+            (x0 - 0.1).abs() < 1e-3 && (y0 - 0.2).abs() < 1e-3 && (x1 - 0.6).abs() < 1e-3 && (y1 - 0.7).abs() < 1e-3
+        );
         // Camera Raw reference: AZA06911 (7008 x 4672, -5.74 degrees) renders 6120 x 4080.
-        let lr = CropSettings { enabled: true, left: 0.036395, top: 0.131022, right: 0.963605, bottom: 0.868978, angle: -5.74 };
+        let lr = CropSettings {
+            enabled: true,
+            left: 0.036395,
+            top: 0.131022,
+            right: 0.963605,
+            bottom: 0.868978,
+            angle: -5.74,
+        };
         let g3 = crop_geometry(&lr, 7008, 4672, 1);
         assert!((g3.width as i32 - 6120).abs() <= 2 && (g3.height as i32 - 4080).abs() <= 2, "{g3:?}");
         let (cx, cy) = g2.map(0.5, 0.5);

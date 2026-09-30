@@ -338,7 +338,7 @@ impl ProfileLibrary {
                     None => true,
                     Some(r) => {
                         let r = r.to_ascii_lowercase();
-                        cands.iter().any(|c| *c == r)
+                        cands.contains(&r)
                     }
                 };
                 let source_ok = camera.format.is_raw() || i.supports_output_referred;
@@ -492,7 +492,10 @@ mod tests {
         let cat = lib.catalog(7, &sony);
         assert_eq!(cat.image_id, 7);
         assert_eq!(cat.camera_model.as_deref(), Some("Sony ILCE-7M4"));
-        assert_eq!(cat.camera_profiles, vec![CameraProfileInfo { name: "Adobe Standard".into(), group: "Adobe Raw".into() }]);
+        assert_eq!(
+            cat.camera_profiles,
+            vec![CameraProfileInfo { name: "Adobe Standard".into(), group: "Adobe Raw".into() }]
+        );
         assert_eq!(cat.looks.len(), 1);
         assert_eq!(cat.looks[0].group, "Mine", "directory name when crs:Group is absent");
         assert!(cat.looks[0].available && cat.looks[0].supports_amount);
@@ -512,9 +515,11 @@ mod tests {
     fn installed_library_finds_sample_cameras() {
         let lib = ProfileLibrary::new(ProfileConfig::from_env());
         let t = std::time::Instant::now();
-        for (make, model, fmt) in
-            [("SONY", "ILCE-7M4", ImageFormat::Arw), ("Canon", "Canon EOS M6 Mark II", ImageFormat::Cr3), ("FUJIFILM", "X-M5", ImageFormat::Raf)]
-        {
+        for (make, model, fmt) in [
+            ("SONY", "ILCE-7M4", ImageFormat::Arw),
+            ("Canon", "Canon EOS M6 Mark II", ImageFormat::Cr3),
+            ("FUJIFILM", "X-M5", ImageFormat::Raf),
+        ] {
             let k = CameraKey { format: fmt, make: Some(make.into()), model: Some(model.into()) };
             let cat = lib.catalog(1, &k);
             assert!(cat.camera_profiles.iter().any(|p| p.name == "Adobe Standard"), "{model}: {cat:?}");

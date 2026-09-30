@@ -75,11 +75,13 @@ pub fn resolve(meta: &SourceMeta, settings: &ProfileSettings, lib: &ProfileLibra
             let found = lib.look(&l.uuid).or_else(|| {
                 let text = std::fs::read_to_string(sidecar?).ok()?;
                 let embedded = LookProfile::from_sidecar(&text).ok()??;
-                (embedded.uuid == l.uuid.to_ascii_uppercase() && !embedded.tables.is_empty()).then(|| Arc::new(embedded))
+                (embedded.uuid == l.uuid.to_ascii_uppercase() && !embedded.tables.is_empty())
+                    .then(|| Arc::new(embedded))
             });
             let usable = found.filter(|lp| !meta.display_referred || lp.supports_output_referred);
             if usable.is_none() {
-                warnings.push(DevelopWarning { code: DevelopWarningCode::LookUnavailable, detail: Some(l.name.clone()) });
+                warnings
+                    .push(DevelopWarning { code: DevelopWarningCode::LookUnavailable, detail: Some(l.name.clone()) });
             }
             (usable, l.amount.clamp(0.0, 2.0))
         }

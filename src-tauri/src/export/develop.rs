@@ -26,8 +26,8 @@ use crate::develop::pipeline::{self, Quality, RenderInput, View};
 use crate::develop::source::{self, ColorInfo, LinearImage};
 use crate::ipc::error::AppResult;
 use crate::ipc::types::{
-    BitDepth, CropSettings, ExportSettings, OutputSharpening, ParametricAdjustments, ResizeMode, ResizeOptions, SharpenAmount,
-    SharpenMedia,
+    BitDepth, CropSettings, ExportSettings, OutputSharpening, ParametricAdjustments, ResizeMode, ResizeOptions,
+    SharpenAmount, SharpenMedia,
 };
 use crate::lut::Lut;
 
@@ -421,10 +421,11 @@ mod tests {
         adj.detail.noise_reduction.color = 0.0;
         let tiff =
             ExportFormat::Tiff { bit_depth: BitDepth::Sixteen, compression: crate::ipc::types::TiffCompression::None };
-        let get = |cs| match render_full(&src, None, &adj, None, &settings(cs, tiff.clone()), &prof(), 1).unwrap().pixels {
-            ExportPixels::Rgb16(v) => v,
-            _ => panic!(),
-        };
+        let get =
+            |cs| match render_full(&src, None, &adj, None, &settings(cs, tiff.clone()), &prof(), 1).unwrap().pixels {
+                ExportPixels::Rgb16(v) => v,
+                _ => panic!(),
+            };
         let (s, p3, adobe) =
             (get(ExportColorSpace::Srgb), get(ExportColorSpace::DisplayP3), get(ExportColorSpace::AdobeRgb));
         // Grey pixel (top half) equal in sRGB and P3 (same transfer), neutral in Adobe RGB

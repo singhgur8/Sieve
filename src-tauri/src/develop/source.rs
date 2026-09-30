@@ -348,7 +348,14 @@ pub fn prepare_sized(
         // Output (u, v) -> frame -> source (normalized).
         let a = g.to_source;
         let rr = [r_or.x as f64, r_or.y as f64, r_or.width as f64, r_or.height as f64];
-        let m = [a[0] * rr[2], a[1] * rr[3], a[0] * rr[0] + a[1] * rr[1] + a[2], a[3] * rr[2], a[4] * rr[3], a[3] * rr[0] + a[4] * rr[1] + a[5]];
+        let m = [
+            a[0] * rr[2],
+            a[1] * rr[3],
+            a[0] * rr[0] + a[1] * rr[1] + a[2],
+            a[3] * rr[2],
+            a[4] * rr[3],
+            a[3] * rr[0] + a[4] * rr[1] + a[5],
+        ];
         resample_affine(&src.pixels, sw, sh, m, out_w as usize, out_h as usize)
     };
     // Frame placement in output px and scale (output px per full-resolution frame px).
@@ -356,13 +363,8 @@ pub fn prepare_sized(
     let frame_h = out_h as f32 / r_or.height.max(1e-6);
     let half = src.width as f32 / src.full_width.max(1) as f32;
     let scale = frame_w / g.width.max(1) as f32 * half;
-    let view = super::pipeline::View {
-        frame_x: -r_or.x * frame_w,
-        frame_y: -r_or.y * frame_h,
-        frame_w,
-        frame_h,
-        scale,
-    };
+    let view =
+        super::pipeline::View { frame_x: -r_or.x * frame_w, frame_y: -r_or.y * frame_h, frame_w, frame_h, scale };
     Prepared { width: out_w, height: out_h, pixels, frame_long_edge: frame_w.max(frame_h), view }
 }
 
@@ -404,12 +406,7 @@ fn catmull_rom(img: &[u16], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
     let wt = |t: f32| -> [f32; 4] {
         let t2 = t * t;
         let t3 = t2 * t;
-        [
-            -0.5 * t3 + t2 - 0.5 * t,
-            1.5 * t3 - 2.5 * t2 + 1.0,
-            -1.5 * t3 + 2.0 * t2 + 0.5 * t,
-            0.5 * t3 - 0.5 * t2,
-        ]
+        [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2]
     };
     let (xi, yi) = (x.floor() as isize, y.floor() as isize);
     let (wx, wy) = (wt(x - xi as f32), wt(y - yi as f32));

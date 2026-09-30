@@ -359,7 +359,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &sieve_lib::profiles::ProfileLibrary::shared(),
             None,
         );
-        let prep = source::prepare(&img, e.orientation.unwrap_or(1), &sieve_lib::ipc::types::CropSettings::default(), None, 2048);
+        let prep = source::prepare(
+            &img,
+            e.orientation.unwrap_or(1),
+            &sieve_lib::ipc::types::CropSettings::default(),
+            None,
+            2048,
+        );
         let input = pipeline::RenderInput {
             width: prep.width,
             height: prep.height,

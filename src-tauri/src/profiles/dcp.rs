@@ -239,7 +239,7 @@ fn hsv_table(
         return Err(format!("tag {data_tag:#x}: dimensions {h}x{s}x{v} do not match {} values", e.count));
     }
     let vals = r.nums(e)?;
-    let data = vals.chunks_exact(3).map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
+    let data = vals.as_chunks::<3>().0.iter().map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
     let srgb_gamma = match find(entries, enc_tag) {
         Some(x) => r.num(x, 0)? as u32 == 1,
         None => false,
@@ -271,7 +271,7 @@ impl Dcp {
                 if v.len() < 4 || v.len() % 2 != 0 {
                     return Err("ProfileToneCurve: odd or too few values".into());
                 }
-                Some(v.chunks_exact(2).map(|p| [p[0] as f32, p[1] as f32]).collect())
+                Some(v.as_chunks::<2>().0.iter().map(|p| [p[0] as f32, p[1] as f32]).collect())
             }
             None => None,
         };
@@ -353,11 +353,7 @@ impl Dcp {
                     .iter()
                     .zip(&b.data)
                     .map(|(p, q)| {
-                        [
-                            p[0] * g + q[0] * (1.0 - g),
-                            p[1] * g + q[1] * (1.0 - g),
-                            p[2] * g + q[2] * (1.0 - g),
-                        ]
+                        [p[0] * g + q[0] * (1.0 - g), p[1] * g + q[1] * (1.0 - g), p[2] * g + q[2] * (1.0 - g)]
                     })
                     .collect();
                 Some(HsvTable { data, ..a.clone() })
@@ -478,16 +474,16 @@ fn lerp_matrix(m1: &[[f32; 3]; 3], m2: Option<&[[f32; 3]; 3]>, g: f32) -> [[f64;
 pub fn illuminant_temperature(code: u16) -> f64 {
     match code {
         1 | 4 | 9 | 18 | 20 => 5500.0, // daylight, flash, fine weather, B, D55
-        2 | 15 => 3450.0,               // fluorescent, white fluorescent
-        3 | 17 => 2850.0,               // tungsten, standard A
-        10 | 19 => 6500.0,              // cloudy, C
-        11 | 22 => 7500.0,              // shade, D75
-        12 => 6430.0,                   // daylight fluorescent
-        13 => 5000.0,                   // day white fluorescent
-        14 => 4150.0,                   // cool white fluorescent
-        21 => 6504.0,                   // D65
-        23 => 5003.0,                   // D50
-        24 => 3200.0,                   // ISO studio tungsten
+        2 | 15 => 3450.0,              // fluorescent, white fluorescent
+        3 | 17 => 2850.0,              // tungsten, standard A
+        10 | 19 => 6500.0,             // cloudy, C
+        11 | 22 => 7500.0,             // shade, D75
+        12 => 6430.0,                  // daylight fluorescent
+        13 => 5000.0,                  // day white fluorescent
+        14 => 4150.0,                  // cool white fluorescent
+        21 => 6504.0,                  // D65
+        23 => 5003.0,                  // D50
+        24 => 3200.0,                  // ISO studio tungsten
         _ => 0.0,
     }
 }

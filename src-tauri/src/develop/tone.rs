@@ -85,7 +85,8 @@ impl ToneModel {
         let step = |t: &[[f32; d::DELTA_N]], a: f32| {
             slider_row(t, a).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: false })
         };
-        let hl = slider_row(&d::HIGHLIGHTS, s.highlights).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: true });
+        let hl =
+            slider_row(&d::HIGHLIGHTS, s.highlights).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: true });
         let local = [step(&d::SHADOWS, s.shadows), hl].into_iter().flatten().collect();
         let mut global: Vec<Step> = step(&d::WHITES, s.whites).into_iter().collect();
         if s.exposure != 0.0 {
@@ -208,7 +209,14 @@ mod tests {
         let c = ToneSliders { contrast: 50.0, ..base };
         assert!(at(c, -6.0) < -6.2 && at(c, -1.0) > -0.95);
         // Monotone in the input for a strong user-like set.
-        let u = ToneSliders { exposure: -0.5, contrast: -60.0, highlights: -66.0, shadows: 51.0, whites: -24.0, blacks: 63.0 };
+        let u = ToneSliders {
+            exposure: -0.5,
+            contrast: -60.0,
+            highlights: -66.0,
+            shadows: 51.0,
+            whites: -24.0,
+            blacks: 63.0,
+        };
         let m = ToneModel::new(u);
         let mut last = f32::NEG_INFINITY;
         for i in 0..200 {
