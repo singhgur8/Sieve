@@ -24,6 +24,7 @@
 //!   queue); concurrent decodes of the same image are coalesced.
 
 pub mod history;
+pub mod masks;
 pub mod parity;
 pub mod pipeline;
 pub mod presets;
