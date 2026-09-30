@@ -51,6 +51,7 @@
 //!   written back so tags reach the sidecar too.
 
 pub mod crs;
+pub mod masks;
 pub mod packet;
 mod store;
 

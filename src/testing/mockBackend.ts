@@ -6,6 +6,11 @@ import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
 import { completeAdjustments, lerpAdjustments } from "../ipc";
 import type {
+  AiMaskRequest,
+  AiMaskStatus,
+  MaskCapabilities,
+  MaskGroup,
+  MaskOverlayOptions,
   DevelopWarning,
   LookProfileInfo,
   BurstGroup,
@@ -39,6 +44,42 @@ import type {
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
 const LABELS = [null, null, null, "red", "yellow", "green", "blue", "purple"] as const;
+
+const MOCK_MASK_CAPABILITIES: MaskCapabilities = {
+  ai: [
+    { kind: "subject", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "sky", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "background", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "people", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "object", available: false, model: null, reason: "mock: no object model" },
+    { kind: "landscape", available: false, model: null, reason: "mock: no landscape model" },
+  ],
+  personParts: ["face_skin", "body_skin", "eyebrows", "eye_sclera", "iris_pupil", "lips", "teeth", "hair", "clothes"],
+  landscape: [],
+};
+
+/** Deterministic 32-hex "digest" for mock AI mattes. */
+function mockDigest(s: string): string {
+  let h = 2166136261;
+  let out = "";
+  for (let round = 0; round < 4; round++) {
+    for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+    h = Math.imul(h ^ round, 16777619) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return out.toUpperCase();
+}
+
+/** Mock AI status: components with a digest are ready, others need an update. */
+function mockAiStatus(groups: MaskGroup[]): AiMaskStatus[] {
+  return groups.flatMap((g) =>
+    g.components.flatMap((c) =>
+      c.shape.kind === "ai"
+        ? [{ groupId: g.id, componentId: c.id, state: c.shape.digest ? ("ready" as const) : ("needs_update" as const), info: null }]
+        : [],
+    ),
+  );
+}
 
 export interface MockCall {
   cmd: string;
@@ -716,6 +757,50 @@ export function installMockBackend(count: number) {
           };
         case "prepare_develop":
           return null;
+        // Masks (IPC v10): minimal fakes so the masking UI can be built and tested.
+        case "list_masks": {
+          const groups = completeAdjustments(getAdj(args.id as number)).masks;
+          return { imageId: args.id, groups, ai: mockAiStatus(groups) };
+        }
+        case "save_masks":
+          commit(args.id as number, { ...completeAdjustments(getAdj(args.id as number)), masks: args.masks as MaskGroup[] }, args.label as string);
+          return historyDto(args.id as number);
+        case "compute_ai_mask": {
+          const r = args.request as AiMaskRequest;
+          return {
+            digest: mockDigest(`${args.id}:${JSON.stringify(r.target)}:${JSON.stringify(r.referencePoint)}`),
+            target: r.target,
+            referencePoint: r.referencePoint,
+            origin: "sieve",
+            modelVersion: "mock-segmenter@1",
+            width: 1920,
+            height: 1280,
+            bounds: { x: 0, y: 0, width: 1, height: 1 },
+            coverage: 0.3,
+          };
+        }
+        case "detect_people":
+          return [
+            { referencePoint: { x: 0.35, y: 0.3 }, bbox: { x: 0.2, y: 0.1, width: 0.3, height: 0.85 }, face: { x: 0.3, y: 0.15, width: 0.1, height: 0.14 } },
+            { referencePoint: { x: 0.65, y: 0.35 }, bbox: { x: 0.5, y: 0.15, width: 0.3, height: 0.8 }, face: { x: 0.6, y: 0.2, width: 0.1, height: 0.14 } },
+          ];
+        case "render_mask_overlay": {
+          const o = args.options as MaskOverlayOptions;
+          const key = `${args.id}:mask`;
+          const seq = (seqs.get(key) ?? 0) + 1;
+          seqs.set(key, seq);
+          return {
+            imageId: args.id,
+            seq,
+            url: `/mock/render/${args.id}/mask?v=${seq}`,
+            width: o.maxEdge,
+            height: Math.round((o.maxEdge * 2) / 3),
+            coverage: 0.25,
+            renderMs: 5,
+          };
+        }
+        case "get_mask_capabilities":
+          return MOCK_MASK_CAPABILITIES;
         case "render_preview":
           return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);
         case "paste_settings":

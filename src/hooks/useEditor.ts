@@ -82,7 +82,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
   const [info, setInfo] = useState<DevelopInfo | null>(null);
-  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null });
+  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null, mask: null });
   const [histogram, setHistogram] = useState<Histogram | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -94,7 +94,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const lastProfile = useRef("");
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
-  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false });
+  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false });
   const inflight = useRef(new Set<string>());
   const nullStreak = useRef(new Map<string, number>());
   const draft = useRef(false);
@@ -195,7 +195,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (id == null) return;
     let stale = false;
     setLoading(true);
-    setViews({ main: null, before: null, detail: null });
+    setViews({ main: null, before: null, detail: null, mask: null });
     setHistogram(null);
     setInfo(null);
     setHistory(null);
