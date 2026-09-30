@@ -1,5 +1,5 @@
 // Export job tracking: seeds from get_export_jobs, then follows exportProgress / exportFinished.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { commands, events, unwrap, type ExportFinished, type ExportJob } from "../ipc";
 
 export interface JobView {
@@ -14,6 +14,8 @@ export interface JobView {
   running: boolean;
   cancelling: boolean;
   finished: ExportFinished | null;
+  /** Finished job collapsed into the 28 px pill (8 s after completion, unless something failed). */
+  collapsed: boolean;
 }
 
 const blank = (id: number): JobView => ({
@@ -28,6 +30,7 @@ const blank = (id: number): JobView => ({
   running: true,
   cancelling: false,
   finished: null,
+  collapsed: false,
 });
 
 const fromJob = (j: ExportJob): Partial<JobView> => ({
@@ -39,8 +42,11 @@ const fromJob = (j: ExportJob): Partial<JobView> => ({
   outputDir: j.outputDir,
 });
 
+const COLLAPSE_MS = 8000;
+
 export function useExportJobs(onError: (e: unknown) => void) {
   const [jobs, setJobs] = useState<JobView[]>([]);
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
 
   const upsert = useCallback((id: number, patch: (j: JobView) => Partial<JobView>) => {
     setJobs((all) => {
@@ -80,9 +86,20 @@ export function useExportJobs(onError: (e: unknown) => void) {
           failed: f.failed.length,
           skipped: f.skipped,
         }));
+        if (f.failed.length === 0) {
+          const t = setTimeout(() => {
+            timers.current.delete(t);
+            upsert(f.jobId, () => ({ collapsed: true }));
+          }, COLLAPSE_MS);
+          timers.current.add(t);
+        }
       }),
     ];
-    return () => unlisten.forEach((u) => void u.then((fn) => fn()));
+    const pending = timers.current;
+    return () => {
+      unlisten.forEach((u) => void u.then((fn) => fn()));
+      pending.forEach((t) => clearTimeout(t));
+    };
   }, [upsert]);
 
   const track = useCallback((j: ExportJob) => upsert(j.id, (c) => (c.finished ? {} : fromJob(j))), [upsert]);

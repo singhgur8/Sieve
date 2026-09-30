@@ -8,7 +8,7 @@ async function boot() {
   const mock = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("mock") : null;
   if (mock !== null) {
     const { installMockBackend } = await import("./testing/mockBackend");
-    installMockBackend(Number(mock) || 5000);
+    installMockBackend(mock === "0" ? 0 : Number(mock) || 5000);
   }
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>

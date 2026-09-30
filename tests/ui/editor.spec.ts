@@ -212,7 +212,8 @@ test.describe("develop", () => {
     await expect(page.getByTestId("history-list")).toContainText("Preset: Warm Look");
 
     await page.getByTestId("preset-list").locator("li").first().hover();
-    await page.locator('[data-testid^="preset-delete-"]').first().click();
+    await page.locator('[data-testid^="preset-delete-"]:not([data-testid*="confirm"]):not([data-testid*="cancel"])').first().click();
+    await page.locator('[data-testid^="preset-delete-confirm-"]').click();
     await expect(page.getByTestId("preset-list")).toHaveCount(1);
     await expect(page.getByText("No presets yet")).toBeVisible();
   });

@@ -157,7 +157,7 @@ export function Viewer(p: Props) {
       {p.showBefore && <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="before-badge">Before</span>}
       {p.loading && !shown && (
         <div className="absolute inset-0 flex items-center justify-center">
-          <Loader2 className="size-6 animate-spin text-neutral-600" />
+          <Loader2 className="size-6 animate-spin text-neutral-400" />
         </div>
       )}
     </div>

@@ -1,14 +1,14 @@
-// Phase 4 culling UI: virtualized grid, filter bar, loupe / compare, Lightroom-style keyboard.
+// Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Undo2, X } from "lucide-react";
 import { commands, unwrap, type ColorLabel, type Scene, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
 import { BASE_QUERY, useLibrary, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useKeyboard } from "./hooks/useKeyboard";
+import { useCullUndo } from "./hooks/useCullUndo";
 import { TopBar } from "./components/TopBar";
-import { FilterBar } from "./components/FilterBar";
+import { FilterBar, FilterExtras, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
 import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
@@ -20,8 +20,16 @@ import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
 import { MatchPanel } from "./components/scenes/MatchPanel";
+import { Toasts, useToasts } from "./components/Toasts";
+import { CheatSheet } from "./components/CheatSheet";
+import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
+import { matchKey } from "./lib/keymap";
+import { modalCount } from "./lib/modal";
+import { getClipboard } from "./lib/clipboard";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
+
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
 export default function App() {
   const [query, setQuery] = useState<Query>(BASE_QUERY);
@@ -30,15 +38,20 @@ export default function App() {
   const [size, setSize] = useState(200);
   const [autoAdvance, setAutoAdvance] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [filtersOpen, setFiltersOpen] = useState(true);
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
+  const [applyOpen, setApplyOpen] = useState<{ ids: number[]; scope: string } | null>(null);
+  const [cheatOpen, setCheatOpen] = useState(false);
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
-  const [matchUndo, setMatchUndo] = useState<number[] | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
-  const colsRef = useRef(1);
+  const colsRef = useRef({ cols: 1, page: 1 });
   const loupe = useRef<LoupeHandle>(null);
   const develop = useRef<DevelopHandle>(null);
   const reloadRef = useRef<() => void>(() => {});
+
+  const toasts = useToasts();
+  const { push } = toasts;
+  const setNotice = useCallback((m: string) => void push(m), [push]);
 
   const onLibraryChanged = useCallback(() => reloadRef.current(), []);
   const status = useBackendStatus(onLibraryChanged);
@@ -49,6 +62,7 @@ export default function App() {
   const exportJobs = useExportJobs(reportError);
   const sel = useSelection(ids);
   const scenes = useScenes(query.folderId, query.sceneId ?? null, lib, reportError, setNotice);
+  const counts = useFilterCounts(query.folderId, lib.epoch);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
@@ -156,7 +170,7 @@ export default function App() {
     } catch (e) {
       reportError(e);
     }
-  }, [ids, mode, sel, lib, query.folderId, reportError]);
+  }, [ids, mode, sel, lib, query.folderId, reportError, setNotice]);
 
   const openDevelop = useCallback(() => {
     const target = sel.active ?? ids[0];
@@ -179,7 +193,17 @@ export default function App() {
     [openLoupe, openDevelop, enterCompare],
   );
 
-  // ---- culling actions (batch over targets) ----
+  // ---- culling actions (batch over targets), all undoable ----
+  const onRestored = useCallback(
+    (changed: number[]) => {
+      void lib.refresh(changed.filter((id) => lib.getEntry(id)).slice(0, 2000)).catch(reportError);
+      if (membershipSensitive) void lib.reload();
+      status.refreshXmp();
+    },
+    [lib, reportError, membershipSensitive, status],
+  );
+  const cull = useCullUndo({ getEntry: lib.getEntry, onRestored, toast: setNotice, onError: reportError });
+
   const advanceIf = useCallback(
     (t: number[], force: boolean) => {
       if ((force || autoAdvance) && t.length === 1) {
@@ -191,10 +215,23 @@ export default function App() {
   );
 
   const mutate = useCallback(
-    async (t: number[], optimistic: (e: RawImageEntry) => RawImageEntry, call: () => Promise<unknown>) => {
+    async (label: string, t: number[], optimistic: (e: RawImageEntry) => RawImageEntry, call: () => Promise<unknown>) => {
+      let before = null;
+      try {
+        before = await cull.capture(t);
+      } catch (e) {
+        reportError(e);
+      }
+      const changes = before?.some((s) => {
+        const e = lib.getEntry(s.imageId);
+        if (!e) return true;
+        const n = optimistic(e);
+        return n.pick !== s.pick || n.rating !== s.rating || n.colorLabel !== s.colorLabel;
+      });
       lib.patch(t, optimistic);
       try {
         await call();
+        if (before && changes) cull.record(label, before);
       } catch (e) {
         reportError(e);
       }
@@ -205,14 +242,15 @@ export default function App() {
       }
       if (membershipSensitive) void lib.reload();
     },
-    [lib, reportError, membershipSensitive],
+    [lib, cull, reportError, membershipSensitive],
   );
 
   const doPick = useCallback(
     (pick: PickFlag, advance: boolean) => {
       const t = targets();
       if (t.length === 0) return;
-      void mutate(t, (e) => ({ ...e, pick }), () => unwrap(commands.setPick(t, pick)));
+      const label = `${{ pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick]} ${plural(t.length, "photo")}`;
+      void mutate(label, t, (e) => ({ ...e, pick }), () => unwrap(commands.setPick(t, pick)));
       advanceIf(t, advance);
     },
     [targets, mutate, advanceIf],
@@ -222,7 +260,7 @@ export default function App() {
     (rating: number) => {
       const t = targets();
       if (t.length === 0) return;
-      void mutate(t, (e) => ({ ...e, rating }), () => unwrap(commands.setRating(t, rating)));
+      void mutate(`Rate ${plural(t.length, "photo")} ${rating}★`, t, (e) => ({ ...e, rating }), () => unwrap(commands.setRating(t, rating)));
       advanceIf(t, false);
     },
     [targets, mutate, advanceIf],
@@ -234,12 +272,33 @@ export default function App() {
       if (t.length === 0) return;
       const allHave = t.every((id) => lib.getEntry(id)?.colorLabel === label);
       const next = allHave ? null : label;
-      void mutate(t, (e) => ({ ...e, colorLabel: next }), () => unwrap(commands.setColorLabel(t, next)));
+      void mutate(`Label ${plural(t.length, "photo")} ${next ?? "none"}`, t, (e) => ({ ...e, colorLabel: next }), () => unwrap(commands.setColorLabel(t, next)));
       advanceIf(t, false);
     },
     [targets, mutate, advanceIf, lib],
   );
 
+  /** Make `id` the keeper of its burst (optionally Pick it too: Compare's K). */
+  const setKeeper = useCallback(
+    async (id: number | null, alsoPick: boolean) => {
+      if (id == null) return;
+      const entry = lib.getEntry(id);
+      if (!entry || entry.burstGroupId == null) return setNotice("This photo is not part of a burst");
+      try {
+        const g = await unwrap(commands.setBurstKeeper(entry.burstGroupId, id));
+        if (alsoPick) {
+          void mutate(`Pick ${entry.fileName}`, [id], (e) => ({ ...e, pick: "pick" }), () => unwrap(commands.setPick([id], "pick")));
+        }
+        await lib.refresh(g.imageIds.filter((x) => lib.getEntry(x)));
+        setNotice(`${entry.fileName} is now the burst keeper`);
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    [lib, mutate, reportError, setNotice],
+  );
+
+  // ---- XMP ----
   const writeXmp = useCallback(async () => {
     const t = targets();
     if (t.length === 0) return;
@@ -251,7 +310,18 @@ export default function App() {
     } catch (e) {
       reportError(e);
     }
-  }, [targets, lib, status, reportError]);
+  }, [targets, lib, status, reportError, setNotice]);
+
+  const saveAllDirty = useCallback(async () => {
+    try {
+      const r = await unwrap(commands.writeXmpAllDirty(null));
+      setNotice(`Saved XMP for ${plural(r.succeeded, "photo")}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      status.refreshXmp();
+      await lib.refreshAll();
+    } catch (e) {
+      reportError(e);
+    }
+  }, [lib, status, reportError, setNotice]);
 
   const readXmp = useCallback(async () => {
     const t = targets();
@@ -265,140 +335,12 @@ export default function App() {
     } catch (e) {
       reportError(e);
     }
-  }, [targets, lib, status, reportError, membershipSensitive]);
+  }, [targets, lib, status, reportError, membershipSensitive, setNotice]);
 
   const openExport = useCallback(() => {
     if (ids.length === 0) return;
     setExportOpen(targets());
   }, [ids.length, targets]);
-
-  // ---- keyboard ----
-  useKeyboard((e) => {
-    const k = e.key;
-    const lower = k.toLowerCase();
-    if (exportOpen || matchOpen != null) return;
-    if ((e.metaKey || e.ctrlKey) && e.shiftKey && lower === "e") {
-      e.preventDefault();
-      openExport();
-      return;
-    }
-    if ((e.metaKey || e.ctrlKey) && mode === "develop") {
-      if (lower === "z") {
-        e.preventDefault();
-        if (e.shiftKey) develop.current?.redo();
-        else develop.current?.undo();
-        return;
-      }
-      if (e.shiftKey && lower === "c") {
-        e.preventDefault();
-        develop.current?.copy();
-        return;
-      }
-      if (e.shiftKey && lower === "v") {
-        e.preventDefault();
-        develop.current?.paste();
-        return;
-      }
-    }
-    if (e.metaKey || e.ctrlKey) {
-      if (lower === "a") {
-        e.preventDefault();
-        sel.selectAll();
-      } else if (lower === "s") {
-        e.preventDefault();
-        void writeXmp();
-      }
-      return;
-    }
-    if (e.altKey) return;
-    if (e.shiftKey && lower === "a") {
-      e.preventDefault();
-      void scenes.toggleAnchor(active ?? null);
-      return;
-    }
-    const used = () => e.preventDefault();
-    if (mode === "develop") {
-      if (k === "\\") { used(); develop.current?.toggleBefore(); return; }
-      if (lower === "d") { used(); return; }
-      if (lower === "z") { used(); develop.current?.toggleZoom(); return; }
-      if (k === " " || k === "Enter" || k === "Tab" || lower === "c" || lower === "f" || lower === "e") {
-        if (lower === "e") { used(); changeMode("grid"); }
-        return;
-      }
-    }
-    if (lower === "p") { used(); doPick("pick", e.shiftKey); return; }
-    if (lower === "x") { used(); doPick("reject", e.shiftKey); return; }
-    if (lower === "u") { used(); doPick("unflagged", false); return; }
-    if (/^[0-5]$/.test(k)) { used(); doRating(Number(k)); return; }
-    if (LABEL_KEYS[k]) { used(); doLabel(LABEL_KEYS[k]); return; }
-    switch (k) {
-      case "ArrowLeft":
-      case "ArrowRight": {
-        used();
-        const dir = k === "ArrowRight" ? 1 : -1;
-        if (mode === "compare") stepCompare(dir);
-        else step(dir, e.shiftKey && mode === "grid");
-        return;
-      }
-      case "ArrowUp":
-      case "ArrowDown":
-        if (mode === "grid") {
-          used();
-          step(k === "ArrowDown" ? colsRef.current : -colsRef.current, e.shiftKey);
-        }
-        return;
-      case " ":
-        used();
-        if (mode === "grid") openLoupe();
-        else changeMode("grid");
-        return;
-      case "Enter":
-        used();
-        if (mode === "grid") openLoupe();
-        return;
-      case "Escape":
-        if (mode !== "grid") changeMode("grid");
-        else sel.clear();
-        return;
-      case "Tab":
-        if (mode === "compare" && cmp) {
-          used();
-          const focus = cmp.focus === "a" ? "b" : "a";
-          setCmp({ ...cmp, focus });
-          sel.set([cmp[focus]], cmp[focus]);
-        }
-        return;
-    }
-    switch (lower) {
-      case "e":
-        used();
-        if (mode === "grid") openLoupe();
-        else changeMode("grid");
-        return;
-      case "g":
-        used();
-        changeMode("grid");
-        return;
-      case "d":
-        used();
-        openDevelop();
-        return;
-      case "c":
-        used();
-        if (mode === "compare") openLoupe(cmp ? cmp[cmp.focus] : undefined);
-        else void enterCompare();
-        return;
-      case "z":
-        used();
-        if (mode === "grid") openLoupe();
-        setTimeout(() => loupe.current?.toggleZoom(), mode === "grid" ? 120 : 0);
-        return;
-      case "f":
-        used();
-        if (mode !== "grid") loupe.current?.cycleFace(e.shiftKey ? -1 : 1);
-        return;
-    }
-  });
 
   // ---- top-bar actions ----
   const run = useCallback(
@@ -413,20 +355,23 @@ export default function App() {
     [setError, reportError],
   );
 
-  const importFolder = () =>
-    void run(async () => {
-      const path = await open({ directory: true, title: "Import RAW folder" });
-      if (typeof path !== "string") return;
-      setBusy(true);
-      try {
-        const s = await unwrap(commands.importFolder(path, { recursive: true }));
-        setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read)`);
-        await status.refreshCatalog();
-        await lib.reload();
-      } finally {
-        setBusy(false);
-      }
-    });
+  const importFolder = useCallback(
+    () =>
+      void run(async () => {
+        const path = await open({ directory: true, title: "Import RAW folder" });
+        if (typeof path !== "string") return;
+        setBusy(true);
+        try {
+          const s = await unwrap(commands.importFolder(path, { recursive: true }));
+          setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read)`);
+          await status.refreshCatalog();
+          await lib.reload();
+        } finally {
+          setBusy(false);
+        }
+      }),
+    [run, status, lib, setNotice],
+  );
 
   const analyze = (kind: "pending" | "all") =>
     void run(async () => {
@@ -434,17 +379,186 @@ export default function App() {
       await unwrap(commands.analyzeImages({ kind }));
     });
 
-  const applyAll = () =>
+  const askApplySuggestions = () => {
+    const explicit = sel.selected.size > 0;
+    const t = explicit ? [...sel.selected] : ids;
+    if (t.length === 0) return;
+    setApplyOpen({ ids: t, scope: explicit ? "The selected photos" : "All photos in the current view" });
+  };
+
+  const applySuggestions = (t: number[], onlyUnset: boolean) =>
     void run(async () => {
-      const t = sel.selected.size > 0 ? [...sel.selected] : ids;
-      const { applied } = await unwrap(commands.applySuggestions(t, false));
-      setNotice(`Applied suggestions to ${applied} of ${t.length} photos`);
+      const before = await unwrap(commands.getCullSnapshot(t));
+      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset));
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
+      status.refreshXmp();
+      if (applied === 0) {
+        setNotice(`Nothing to apply (${skipped} skipped)`);
+        return;
+      }
+      const entry = cull.record(`Apply suggestions to ${plural(applied, "photo")}`, before);
+      push(`Applied suggestions to ${applied} of ${t.length} photos${skipped ? ` (${skipped} skipped)` : ""}`, {
+        action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) },
+      });
     });
+
+  const revealInFinder = (path: string) => void run(() => unwrap(commands.revealInFinder(path)));
+
+  const pasteToSelection = useCallback(async () => {
+    const c = getClipboard();
+    if (!c) return setNotice("Nothing copied yet (Cmd+Shift+C in Develop)");
+    const t = targets();
+    if (t.length === 0) return;
+    try {
+      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      setNotice(`Pasted ${plural(c.fields.length, "setting group")} to ${plural(t.length, "photo")}`);
+      await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
+    } catch (e) {
+      reportError(e);
+    }
+  }, [targets, lib, reportError, setNotice]);
+
+  const selectBurst = useCallback(async () => {
+    const id = active;
+    const entry = id != null ? lib.getEntry(id) : undefined;
+    if (id == null || entry?.burstGroupId == null) return setNotice("The active photo is not part of a burst");
+    try {
+      const groups = await unwrap(commands.listBurstGroups(query.folderId));
+      const g = groups.find((x) => x.id === entry.burstGroupId);
+      const members = g ? g.imageIds.filter((x) => ids.includes(x)) : [];
+      if (members.length === 0) return setNotice("Burst members are hidden by the current filters");
+      sel.set(members, id);
+      setNotice(`Selected ${plural(members.length, "photo")} of the burst`);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [active, lib, query.folderId, ids, sel, reportError, setNotice]);
+
+  // ---- keyboard: one handler driven by the shared keymap ----
+  useKeyboard((e) => {
+    if (modalCount() > 0) return; // dialogs and menus own the keyboard
+    const def = matchKey(e, mode);
+    if (!def) return;
+    e.preventDefault();
+    const k = e.key;
+    switch (def.id) {
+      case "pick":
+        return doPick("pick", e.shiftKey);
+      case "reject":
+        return doPick("reject", e.shiftKey);
+      case "unflag":
+        return doPick("unflagged", false);
+      case "rate":
+        return doRating(Number(k));
+      case "label":
+        return doLabel(LABEL_KEYS[k]);
+      case "keeper":
+        return void setKeeper(cmp ? cmp[cmp.focus] : null, true);
+      case "keeperSet":
+        return void setKeeper(active ?? null, false);
+      case "undoCull":
+        return void cull.undo();
+      case "redoCull":
+        return void cull.redo();
+      case "anchor":
+        return void scenes.toggleAnchor(active ?? null);
+      case "selectBurst":
+        return void selectBurst();
+      case "navH": {
+        const dir = k === "ArrowRight" ? 1 : -1;
+        if (mode === "compare") stepCompare(dir);
+        else step(dir, e.shiftKey && mode === "grid");
+        return;
+      }
+      case "navV":
+        return step(k === "ArrowDown" ? colsRef.current.cols : -colsRef.current.cols, e.shiftKey);
+      case "gridJump": {
+        const page = colsRef.current.page;
+        const delta = { Home: -Infinity, End: Infinity, PageUp: -page, PageDown: page }[k] ?? 0;
+        return step(Math.max(-1e9, Math.min(1e9, delta)), e.shiftKey);
+      }
+      case "toggleLoupe":
+        if (mode === "grid") openLoupe();
+        else changeMode("grid");
+        return;
+      case "devToLoupe":
+        return openLoupe();
+      case "toGrid":
+        return changeMode("grid");
+      case "escape":
+        if (mode !== "grid") changeMode("grid");
+        else sel.clear();
+        return;
+      case "develop":
+        return openDevelop();
+      case "compare":
+        if (mode === "compare") openLoupe(cmp ? cmp[cmp.focus] : undefined);
+        else void enterCompare();
+        return;
+      case "tab":
+        if (cmp) {
+          const focus = cmp.focus === "a" ? "b" : "a";
+          setCmp({ ...cmp, focus });
+          sel.set([cmp[focus]], cmp[focus]);
+        }
+        return;
+      case "selectAll":
+        return sel.selectAll();
+      case "selectNone":
+        return sel.clear();
+      case "filterBar":
+        if (mode === "grid") setFiltersOpen((v) => !v);
+        else {
+          changeMode("grid");
+          setFiltersOpen(true);
+        }
+        return;
+      case "zoomLoupe":
+        if (mode === "grid") openLoupe();
+        setTimeout(() => loupe.current?.toggleZoom(), mode === "grid" ? 120 : 0);
+        return;
+      case "zoomDevelop":
+        return develop.current?.toggleZoom();
+      case "face":
+        return loupe.current?.cycleFace(e.shiftKey ? -1 : 1);
+      case "info":
+        return loupe.current?.cycleInfo();
+      case "before":
+        return develop.current?.toggleBefore();
+      case "split":
+        return develop.current?.toggleSplit();
+      case "undoAdj":
+        return develop.current?.undo();
+      case "redoAdj":
+        return develop.current?.redo();
+      case "copy":
+        return develop.current?.copy();
+      case "paste":
+        if (mode === "develop") develop.current?.paste();
+        else void pasteToSelection();
+        return;
+      case "sync":
+        return develop.current?.sync();
+      case "reset":
+        return develop.current?.reset();
+      case "saveXmp":
+        return void writeXmp();
+      case "export":
+        return openExport();
+      case "import":
+        return importFolder();
+      case "cheatSheet":
+        return setCheatOpen(true);
+    }
+  });
 
   const importActive = status.progress !== null && status.progress.done < status.progress.total;
   const catalog = status.catalog;
+  const running = exportJobs.jobs.filter((j) => j.running);
+  const exportPct = running.length ? Math.round((running.reduce((a, j) => a + j.done, 0) / Math.max(1, running.reduce((a, j) => a + j.total, 0))) * 100) : null;
+  const filtered = isFiltered(query);
+  const clearFilters = () => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }));
 
   return (
     <main className="flex h-screen flex-col">
@@ -453,8 +567,11 @@ export default function App() {
         analysis={status.analysis}
         xmp={status.xmp}
         busy={busy}
+        mode={mode}
+        onMode={changeMode}
         hasSelection={targets().length > 0}
         hasImages={ids.length > 0}
+        detecting={scenes.detecting}
         onImport={importFolder}
         onShootType={(t: ShootType) =>
           void run(async () => {
@@ -469,6 +586,7 @@ export default function App() {
             status.setCatalog((c) => (c ? { ...c, autoAnalyze: v } : c));
           })
         }
+        onDetectScenes={() => void scenes.detect()}
         onAutoXmp={(v) =>
           void run(async () => {
             await unwrap(commands.setXmpAutoSync(v));
@@ -476,13 +594,15 @@ export default function App() {
             status.refreshXmp();
           })
         }
-        onApplySuggestions={applyAll}
+        onApplySuggestions={askApplySuggestions}
         onWriteXmp={() => void writeXmp()}
+        onSaveAllDirty={() => void saveAllDirty()}
         onReadXmp={() => void readXmp()}
         onExport={openExport}
-        exportsRunning={exportJobs.jobs.filter((j) => j.running).length}
+        onCheatSheet={() => setCheatOpen(true)}
+        exportPct={exportPct}
       />
-      <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} />
+      <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
       {exportOpen && (
         <ExportDialog
           selectionIds={exportOpen}
@@ -492,40 +612,55 @@ export default function App() {
           onStarted={exportJobs.track}
         />
       )}
+      {applyOpen && (
+        <ApplySuggestionsDialog
+          ids={applyOpen.ids}
+          scopeLabel={applyOpen.scope}
+          onCancel={() => setApplyOpen(null)}
+          onConfirm={(onlyUnset) => {
+            const t = applyOpen.ids;
+            setApplyOpen(null);
+            applySuggestions(t, onlyUnset);
+          }}
+        />
+      )}
+      {cheatOpen && <CheatSheet onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
-      {notice && (
-        <p className="flex items-center justify-between bg-neutral-900 px-4 py-1 text-xs text-neutral-300" data-testid="notice">
-          {notice}
-          <button onClick={() => setNotice(null)} aria-label="Dismiss">
-            <X className="size-3.5" />
-          </button>
-        </p>
-      )}
-      {status.error && (
-        <p className="flex items-center justify-between bg-red-950 px-4 py-1.5 text-sm text-red-300" data-testid="error">
-          {status.error}
-          <button onClick={() => setError(null)} aria-label="Dismiss">
-            <X className="size-3.5" />
-          </button>
-        </p>
-      )}
 
-      <FilterBar query={query} setQuery={setQuery} catalog={catalog} epoch={lib.epoch} shown={ids.length} />
-      <GridToolbar
-        mode={mode}
-        query={query}
-        setQuery={setQuery}
-        size={size}
-        onSize={setSize}
-        selectedCount={sel.selected.size}
-        total={ids.length}
-        autoAdvance={autoAdvance}
-        onAutoAdvance={setAutoAdvance}
-        onMode={changeMode}
-      />
+      {mode === "grid" ? (
+        <>
+          {filtersOpen ? (
+            <FilterBar query={query} setQuery={setQuery} counts={counts} shown={ids.length} />
+          ) : (
+            <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} />
+          )}
+          <GridToolbar
+            query={query}
+            setQuery={setQuery}
+            size={size}
+            onSize={setSize}
+            selectedCount={sel.selected.size}
+            total={ids.length}
+            autoAdvance={autoAdvance}
+            onAutoAdvance={setAutoAdvance}
+            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={catalog} /> : null}
+          />
+        </>
+      ) : (
+        <FilterSummary
+          query={query}
+          shown={ids.length}
+          total={counts?.total ?? null}
+          sceneNumber={scenes.number}
+          onEdit={() => {
+            changeMode("grid");
+            setFiltersOpen(true);
+          }}
+        />
+      )}
 
       <SceneStrip
         api={scenes}
@@ -535,30 +670,6 @@ export default function App() {
         activeId={active ?? null}
         onMatch={(s) => setMatchOpen(s.id)}
       />
-      {matchUndo && (
-        <p className="flex items-center gap-3 bg-emerald-950 px-4 py-1 text-xs text-emerald-200" data-testid="match-undo-bar">
-          Matched {matchUndo.length} photo{matchUndo.length === 1 ? "" : "s"} (history: Match Scene)
-          <button
-            className="flex items-center gap-1 rounded bg-emerald-900 px-2 py-0.5 hover:bg-emerald-800"
-            data-testid="match-undo"
-            onClick={() =>
-              void run(async () => {
-                const done = matchUndo;
-                setMatchUndo(null);
-                for (const id of done) await unwrap(commands.undoAdjustments(id));
-                await lib.refresh(done.filter((id) => lib.getEntry(id)));
-                setDevEpoch((n) => n + 1);
-                setNotice(`Undid Match Scene on ${done.length} photo${done.length === 1 ? "" : "s"}`);
-              })
-            }
-          >
-            <Undo2 className="size-3" /> Undo
-          </button>
-          <button className="ml-auto" onClick={() => setMatchUndo(null)} aria-label="Dismiss">
-            <X className="size-3.5" />
-          </button>
-        </p>
-      )}
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <PhotoGrid
@@ -566,9 +677,13 @@ export default function App() {
           targetSize={size}
           selected={sel.selected}
           active={sel.active}
-          onColsChange={(c) => (colsRef.current = c)}
+          onColsChange={(cols, page) => (colsRef.current = { cols, page })}
           onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
           onCellDoubleClick={openLoupe}
+          catalogEmpty={catalog != null && catalog.imageCount === 0}
+          filtered={filtered}
+          onImport={importFolder}
+          onClearFilters={clearFilters}
         />
         {mode === "develop" && (
           <DevelopView key={devEpoch} ref={develop} lib={lib} sel={sel} onError={reportError} onNotice={setNotice} onBack={() => changeMode("grid")} />
@@ -598,13 +713,26 @@ export default function App() {
           onClose={() => setMatchOpen(null)}
           onApplied={(changed, attempted) => {
             setMatchOpen(null);
-            setNotice(`Applied Match Scene to ${changed.length} of ${attempted.length} photo${attempted.length === 1 ? "" : "s"}`);
-            setMatchUndo(changed.length ? changed : null);
             void lib.refresh(attempted.filter((id) => lib.getEntry(id))).catch(reportError);
             setDevEpoch((n) => n + 1);
+            if (changed.length === 0) return setNotice(`Applied Match Scene to 0 of ${plural(attempted.length, "photo")}`);
+            push(`Applied Match Scene to ${changed.length} of ${plural(attempted.length, "photo")} (history: Match Scene)`, {
+              action: {
+                label: "Undo",
+                testid: "match-undo",
+                onClick: () =>
+                  void run(async () => {
+                    for (const id of changed) await unwrap(commands.undoAdjustments(id));
+                    await lib.refresh(changed.filter((id) => lib.getEntry(id)));
+                    setDevEpoch((n) => n + 1);
+                    setNotice(`Undid Match Scene on ${plural(changed.length, "photo")}`);
+                  }),
+              },
+            });
           }}
         />
       )}
+      <Toasts api={toasts} error={status.error} onDismissError={() => setError(null)} />
     </main>
   );
 }

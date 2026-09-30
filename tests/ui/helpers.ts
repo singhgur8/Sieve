@@ -54,6 +54,23 @@ export async function openApp(page: Page, count = 5000) {
   await expect(page.getByTestId("cell-1").locator("img")).toBeVisible();
 }
 
+/** Analyze menu -> Detect scenes. */
+export async function detectScenes(page: Page) {
+  await page.getByTestId("analyze-menu").click();
+  await page.getByTestId("scenes-detect").click();
+}
+
+/** Opens the Scene menu when needed and returns the item; call `closeMenus` after assertions on it. */
+export async function sceneItem(page: Page, testid: string) {
+  if (!(await page.getByTestId(testid).isVisible())) await page.getByTestId("scene-menu").click();
+  return page.getByTestId(testid);
+}
+
+export async function closeMenus(page: Page) {
+  if ((await page.getByRole("menu").count()) > 0) await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+}
+
 export async function calls(page: Page, cmd: string) {
   return page.evaluate((c) => window.__ipcLog.filter((x) => x.cmd === c), cmd) as Promise<{ cmd: string; args: Record<string, any> }[]>;
 }

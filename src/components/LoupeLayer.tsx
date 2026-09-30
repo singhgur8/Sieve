@@ -18,6 +18,7 @@ export interface LoupeHandle {
   toggleZoom: () => void;
   cycleFace: (dir: 1 | -1) => void;
   resetView: () => void;
+  cycleInfo: () => void;
 }
 
 interface Props {
@@ -33,6 +34,7 @@ interface Props {
 export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen }, ref) {
   const [view, setView] = useState<View>(FIT);
   const [faces, setFaces] = useState<FaceInfo[]>([]);
+  const [info, setInfo] = useState<InfoLevel>("full");
   const faceIdx = useRef(-1);
   const metrics = useRef<Metrics | null>(null);
   const viewRef = useRef(view);
@@ -80,6 +82,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         setView({ scale: Math.min(scale, 16), cx: b.x + b.width / 2, cy: b.y + b.height / 2 });
       },
       resetView: () => setView(FIT),
+      cycleInfo: () => setInfo((i) => (i === "full" ? "name" : i === "name" ? "off" : "full")),
     }),
     [faces],
   );
@@ -101,7 +104,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-image-id={id}
                 >
                   <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} />
-                  <InfoOverlay entry={lib.getEntry(id)} />
+                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} />
                 </div>
               );
             })}
@@ -109,7 +112,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
             <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} testId="zoom-a" />
-            <InfoOverlay entry={lib.getEntry(activeId)} />
+            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} />
           </div>
         ) : null}
         <div
@@ -125,8 +128,27 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
   );
 });
 
-function InfoOverlay({ entry }: { entry: RawImageEntry | undefined }) {
-  if (!entry) return null;
+type InfoLevel = "full" | "name" | "off";
+
+const PICK_LABEL = { pick: "Pick", reject: "Reject", unflagged: "Unflagged" } as const;
+
+/** "Suggested: Reject · 2★" when the automatic suggestion differs from what is set. */
+function suggestion(entry: RawImageEntry): string | null {
+  const q = entry.quality;
+  if (!q) return null;
+  if (q.suggestedPick === entry.pick && q.suggestedRating === entry.rating) return null;
+  return `Suggested: ${PICK_LABEL[q.suggestedPick]} · ${q.suggestedRating}★`;
+}
+
+function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean }) {
+  if (!entry || level === "off") return null;
+  if (level === "name")
+    return (
+      <div className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-2 py-1 text-xs font-medium text-neutral-100" data-testid="info-overlay" data-level="name">
+        {entry.fileName}
+      </div>
+    );
+  const suggested = suggestion(entry);
   const c = entry.capture;
   const exif = [
     c.iso != null ? `ISO ${c.iso}` : null,
@@ -136,7 +158,7 @@ function InfoOverlay({ entry }: { entry: RawImageEntry | undefined }) {
   ].filter(Boolean);
   const tags = entry.tags.filter((t) => !t.suppressed);
   return (
-    <div className="pointer-events-none absolute left-2 top-2 flex max-w-[90%] flex-col gap-1 rounded bg-black/60 px-2 py-1 text-xs" data-testid="info-overlay">
+    <div className="pointer-events-none absolute left-2 top-2 flex max-w-[90%] flex-col gap-1 rounded bg-black/60 px-2 py-1 text-xs" data-testid="info-overlay" data-level="full">
       <div className="flex items-center gap-2">
         <span className="font-medium text-neutral-100">{entry.fileName}</span>
         {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" />}
@@ -144,7 +166,17 @@ function InfoOverlay({ entry }: { entry: RawImageEntry | undefined }) {
         {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
         <Stars n={entry.rating} />
         <XmpBadge entry={entry} />
+        {showKeeper && entry.isBurstKeeper && (
+          <span className="rounded bg-green-900 px-1.5 text-green-200" data-testid="keeper-badge">
+            Keeper
+          </span>
+        )}
       </div>
+      {suggested && (
+        <div className="text-sky-300" data-testid="suggested-line">
+          {suggested}
+        </div>
+      )}
       <div className="text-neutral-400">
         {exif.join(" · ")}
         {entry.quality ? ` · Q ${Math.round(entry.quality.overall * 100)}` : ""}

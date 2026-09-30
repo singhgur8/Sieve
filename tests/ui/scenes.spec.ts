@@ -1,10 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
-import { calls, clearCalls, openApp, shot } from "./helpers";
+import { calls, clearCalls, closeMenus, detectScenes, openApp, sceneItem, shot } from "./helpers";
 
 // Mock rule (src/testing/mockBackend.ts): detect_scenes chunks each folder into scenes of 40.
 // 200 photos -> scenes 1..6 = ids 1-40, 41-80, 81-100, 101-140, 141-180, 181-200.
 async function detect(page: Page) {
-  await page.getByTestId("scenes-detect").click();
+  await detectScenes(page);
   await expect(page.getByTestId("scene-chip-6")).toBeVisible();
 }
 
@@ -17,8 +17,8 @@ test.describe("scenes", () => {
   test("detect scenes shows progress, lists chips, badges cells and filters the grid", async ({ page }) => {
     await page.addInitScript(() => (window.__mockSceneDelay = 300));
     await openApp(page, 200);
-    await expect(page.getByTestId("scene-chips")).toContainText("No scenes yet");
-    await page.getByTestId("scenes-detect").click();
+    await expect(page.getByTestId("scene-strip")).toHaveCount(0); // hidden until scenes exist
+    await detectScenes(page);
     await expect(page.getByTestId("scene-progress")).toBeVisible();
     await expect(page.getByTestId("scene-chip-6")).toBeVisible();
     await expect(page.getByTestId("scene-progress")).toHaveCount(0);
@@ -51,7 +51,8 @@ test.describe("scenes", () => {
 
   test("anchors: Shift+A toggles, at most two, oldest replaced with a notice", async ({ page }) => {
     await setup(page);
-    await expect(page.getByTestId("scene-anchor")).toBeDisabled();
+    await expect(await sceneItem(page, "scene-anchor")).toBeDisabled();
+    await closeMenus(page);
     await page.getByTestId("cell-3").click();
     await clearCalls(page);
     await page.keyboard.press("Shift+A");
@@ -60,7 +61,7 @@ test.describe("scenes", () => {
     await expect(page.getByTestId("scene-anchors-1")).toContainText("1");
 
     await page.getByTestId("cell-5").click();
-    await page.getByTestId("scene-anchor").click();
+    await (await sceneItem(page, "scene-anchor")).click();
     expect((await calls(page, "set_scene_anchors")).at(-1)!.args).toEqual({ id: 1, anchorIds: [3, 5] });
     await expect(page.getByTestId("scene-anchors-1")).toContainText("2");
 
@@ -80,11 +81,12 @@ test.describe("scenes", () => {
     // A photo outside any scene cannot be an anchor.
     await page.getByTestId("scene-chip-2").click();
     await page.getByTestId("cell-50").click();
-    await page.getByTestId("scene-remove").click();
+    await (await sceneItem(page, "scene-remove")).click();
     await page.getByTestId("scene-chip-all").click();
     await page.getByTestId("cell-50").click();
     await expect(page.getByTestId("scene-badge-50")).toHaveCount(0);
-    await expect(page.getByTestId("scene-anchor")).toBeDisabled();
+    await expect(await sceneItem(page, "scene-anchor")).toBeDisabled();
+    await closeMenus(page);
     await page.keyboard.press("Shift+A");
     await expect(page.getByTestId("notice")).toContainText("before marking it as an anchor");
   });
@@ -100,6 +102,12 @@ test.describe("scenes", () => {
     await page.getByTestId("scene-match").click();
     await expect(page.getByTestId("match-panel")).toBeVisible();
     await expect(page.getByTestId("match-summary")).toContainText("1 anchor");
+    // Rejected photos are excluded by default (ids 8, 22, 36 in scene 1); the toggle brings them back.
+    await expect(page.getByTestId("match-summary")).toContainText("36 targets");
+    await expect(page.getByTestId("match-include-rejected")).toBeVisible();
+    await expect(page.getByTestId("match-anchor-1")).toContainText("DSC00001.ARW");
+    await expect(page.getByTestId("match-copy-fields")).toContainText("Also copy from anchor: All settings");
+    await page.getByTestId("match-include-rejected").check();
     await expect(page.getByTestId("match-summary")).toContainText("39 targets");
     await expect(page.getByTestId("match-exposure")).toBeChecked();
     await expect(page.getByTestId("match-wb")).toBeChecked();
@@ -153,6 +161,7 @@ test.describe("scenes", () => {
     await page.keyboard.press("Shift+A");
     await expect(page.getByTestId("scene-badge-1")).toHaveAttribute("data-anchor", "true");
     await page.getByTestId("scene-match").click();
+    await page.getByTestId("match-include-rejected").check();
     await page.getByTestId("match-run").click();
     await expect(page.getByTestId("match-card-2")).toBeVisible();
     await expect(page.getByTestId("match-selected-count")).toHaveText("39 of 39 selected");
@@ -185,7 +194,7 @@ test.describe("scenes", () => {
     expect(t3.whiteBalance.mode).toBe("custom");
     expect(t3.whiteBalance.temperatureK).toBeGreaterThan(0);
     await expect(page.getByTestId("notice")).toContainText("Applied Match Scene to 33 of 33 photos");
-    await expect(page.getByTestId("match-undo-bar")).toBeVisible();
+    await expect(page.getByTestId("match-undo")).toBeVisible();
     await expect(page.getByTestId("cell-3")).toBeVisible();
 
     // History entry per image via the existing history; Undo reverts them.
@@ -194,17 +203,18 @@ test.describe("scenes", () => {
     await shot(page, "4x-scenes-05-applied");
     await clearCalls(page);
     await page.getByTestId("match-undo").click();
-    await expect(page.getByTestId("match-undo-bar")).toHaveCount(0);
+    await expect(page.getByTestId("match-undo")).toHaveCount(0);
     expect((await calls(page, "undo_adjustments")).length).toBe(33);
   });
 
   test("split, merge, new scene, remove and delete", async ({ page }) => {
     await setup(page);
     // Split at 10: scene 1 keeps 1-9, new scene 7 gets 10-40.
-    await expect(page.getByTestId("scene-split")).toBeDisabled();
+    await expect(await sceneItem(page, "scene-split")).toBeDisabled();
+    await closeMenus(page);
     await page.getByTestId("cell-10").click();
     await clearCalls(page);
-    await page.getByTestId("scene-split").click();
+    await (await sceneItem(page, "scene-split")).click();
     await expect(page.getByTestId("scene-chip-7")).toBeVisible();
     expect((await calls(page, "split_scene"))[0].args).toEqual({ id: 1, firstImageId: 10 });
     await expect(page.getByTestId("scene-chip-1")).toContainText("9");
@@ -213,14 +223,17 @@ test.describe("scenes", () => {
     await expect(page.getByTestId("scene-badge-10")).toHaveText("S7");
     // The first frame of a scene cannot be a split point.
     await page.getByTestId("cell-1").click();
-    await expect(page.getByTestId("scene-split")).toBeDisabled();
+    await expect(await sceneItem(page, "scene-split")).toBeDisabled();
+    await closeMenus(page);
 
     // Merge the scenes of photo 1 (scene 1) and photo 10 (scene 7).
-    await expect(page.getByTestId("scene-merge")).toBeDisabled();
+    await expect(await sceneItem(page, "scene-merge")).toBeDisabled();
+    await closeMenus(page);
     await page.getByTestId("cell-10").click({ modifiers: ["Meta"] });
-    await expect(page.getByTestId("scene-merge")).toBeEnabled();
+    await expect(await sceneItem(page, "scene-merge")).toBeEnabled();
+    await closeMenus(page);
     await clearCalls(page);
-    await page.getByTestId("scene-merge").click();
+    await (await sceneItem(page, "scene-merge")).click();
     await expect(page.getByTestId("scene-chip-7")).toHaveCount(0);
     expect((await calls(page, "merge_scenes"))[0].args).toEqual({ ids: [1, 7] });
     await expect(page.getByTestId("scene-chip-1")).toContainText("40");
@@ -230,7 +243,7 @@ test.describe("scenes", () => {
     await page.getByTestId("cell-11").click();
     await page.getByTestId("cell-13").click({ modifiers: ["Shift"] });
     await clearCalls(page);
-    await page.getByTestId("scene-new").click();
+    await (await sceneItem(page, "scene-new")).click();
     await expect(page.getByTestId("scene-chip-8")).toBeVisible();
     expect((await calls(page, "create_scene"))[0].args).toEqual({ imageIds: [11, 12, 13] });
     await expect(page.getByTestId("scene-chip-8")).toContainText("3");
@@ -240,7 +253,7 @@ test.describe("scenes", () => {
     // Remove one photo from the scene.
     await page.getByTestId("cell-12").click();
     await clearCalls(page);
-    await page.getByTestId("scene-remove").click();
+    await (await sceneItem(page, "scene-remove")).click();
     await expect(page.getByTestId("scene-badge-12")).toHaveCount(0);
     expect((await calls(page, "set_scene_members"))[0].args).toEqual({ id: 8, imageIds: [11, 13] });
 
@@ -248,7 +261,7 @@ test.describe("scenes", () => {
     await page.getByTestId("scene-chip-8").click();
     await expect(page.getByTestId("selection-count")).toContainText("2 photos");
     await clearCalls(page);
-    await page.getByTestId("scene-delete").click();
+    await (await sceneItem(page, "scene-delete")).click();
     await expect(page.getByTestId("scene-chip-8")).toHaveCount(0);
     expect((await calls(page, "delete_scene"))[0].args).toEqual({ id: 8 });
     await expect(page.getByTestId("selection-count")).toContainText("200 photos");

@@ -3,18 +3,22 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Loader2, X } from "lucide-react";
 import {
+  ALL_ADJUSTMENT_FIELDS,
   commands,
+  convertFileSrc,
   DEFAULT_MATCH_OPTIONS,
   lerpAdjustments,
   unwrap,
   type AdjustmentField,
   type MatchOptions,
   type MatchPreview,
+  type RawImageEntry,
   type ParametricAdjustments,
   type Scene,
   type SceneProgress,
 } from "../../ipc";
 import { FieldsDialog } from "../develop/FieldsDialog";
+import { Dialog } from "../Dialog";
 import { formatError } from "../../lib/format";
 
 interface Props {
@@ -30,21 +34,21 @@ interface Props {
 const RENDER_EDGE = 360;
 
 export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, onClose, onApplied }: Props) {
-  const [names, setNames] = useState<Map<number, string>>(new Map());
-  const fileName = useCallback((id: number) => names.get(id) ?? libName(id), [names, libName]);
+  const [rows, setRows] = useState<Map<number, RawImageEntry>>(new Map());
+  const fileName = useCallback((id: number) => rows.get(id)?.fileName ?? libName(id), [rows, libName]);
   useEffect(() => {
     let live = true;
     (async () => {
-      const m = new Map<number, string>();
+      const m = new Map<number, RawImageEntry>();
       for (let i = 0; i < scene.imageIds.length; i += 200) {
         try {
-          const rows = await unwrap(commands.getImages(scene.imageIds.slice(i, i + 200)));
-          rows.forEach((r) => m.set(r.id, r.fileName));
+          const list = await unwrap(commands.getImages(scene.imageIds.slice(i, i + 200)));
+          list.forEach((r) => m.set(r.id, r));
         } catch {
           return;
         }
       }
-      if (live) setNames(m);
+      if (live) setRows(m);
     })();
     return () => {
       live = false;
@@ -61,7 +65,10 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
   const [stale, setStale] = useState(false);
   const strength = opts.strength;
 
-  const targetIds = useMemo(() => scene.imageIds.filter((i) => !scene.anchorIds.includes(i)), [scene]);
+  const [includeRejected, setIncludeRejected] = useState(false);
+  const nonAnchors = useMemo(() => scene.imageIds.filter((i) => !scene.anchorIds.includes(i)), [scene]);
+  const rejectedCount = useMemo(() => nonAnchors.filter((i) => rows.get(i)?.pick === "reject").length, [nonAnchors, rows]);
+  const targetIds = useMemo(() => (includeRejected ? nonAnchors : nonAnchors.filter((i) => rows.get(i)?.pick !== "reject")), [nonAnchors, rows, includeRejected]);
 
   const change = (patch: Partial<MatchOptions>, needsSolve = true) => {
     setOpts((o) => ({ ...o, ...patch }));
@@ -119,11 +126,30 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
   );
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70" data-testid="match-panel" onKeyDown={(e) => e.key === "Escape" && !fieldsOpen && onClose()}>
-      <div className="flex h-[88vh] w-[min(1200px,94vw)] flex-col rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl">
+    <Dialog
+      label={`Match Scene ${sceneNumber}`}
+      testid="match-panel"
+      overlayClass="z-40 bg-black/70"
+      className="flex h-[88vh] w-[min(1200px,94vw)] flex-col rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl"
+      onCancel={onClose}
+    >
+      <>
         <div className="flex items-center gap-3 border-b border-neutral-800 px-4 py-2.5">
           <h2 className="text-sm font-semibold">Match Scene {sceneNumber}</h2>
-          <span className="text-xs text-neutral-500" data-testid="match-summary">
+          <div className="flex items-center gap-2" data-testid="match-anchors">
+            {scene.anchorIds.map((id) => {
+              const t = rows.get(id)?.thumbnail;
+              return (
+                <div key={id} className="flex items-center gap-1.5" data-testid={`match-anchor-${id}`}>
+                  <span className="block size-16 shrink-0 overflow-hidden rounded bg-neutral-800">
+                    {t?.status === "ready" && <img src={convertFileSrc(t.path)} alt="" className="size-full object-cover" draggable={false} />}
+                  </span>
+                  <span className="max-w-28 truncate text-xs text-neutral-300">{fileName(id)}</span>
+                </div>
+              );
+            })}
+          </div>
+          <span className="text-xs text-neutral-400" data-testid="match-summary">
             {scene.anchorIds.length} anchor{scene.anchorIds.length === 1 ? "" : "s"} ({scene.anchorIds.map(fileName).join(", ")}) · {targetIds.length} target
             {targetIds.length === 1 ? "" : "s"}
           </span>
@@ -137,8 +163,22 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
           {check("White balance", "matchWhiteBalance", "match-wb")}
           {check("Tone", "matchTone", "match-tone")}
           <button className="text-sky-400 hover:underline" onClick={() => setFieldsOpen(true)} data-testid="match-copy-fields">
-            Copy from anchor: {opts.copyFields.length} groups
+            Also copy from anchor: {opts.copyFields.length === ALL_ADJUSTMENT_FIELDS.length ? "All settings" : opts.copyFields.length === 0 ? "Nothing" : `${opts.copyFields.length} groups`} ▾
           </button>
+          {rejectedCount > 0 && (
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={includeRejected}
+                data-testid="match-include-rejected"
+                onChange={(e) => {
+                  setIncludeRejected(e.target.checked);
+                  if (previews) setStale(true);
+                }}
+              />
+              Include rejected ({rejectedCount})
+            </label>
+          )}
           <label className="flex items-center gap-2">
             Strength
             <input
@@ -176,8 +216,8 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
         )}
 
         <div className="min-h-0 flex-1 overflow-y-auto p-3" data-testid="match-results">
-          {!previews && !solving && <p className="p-6 text-center text-sm text-neutral-500">Choose what to match, then press Preview match. Nothing is saved until you apply.</p>}
-          {solving && !previews && <Loader2 className="mx-auto mt-10 size-6 animate-spin text-neutral-500" />}
+          {!previews && !solving && <p className="p-6 text-center text-sm text-neutral-400">Choose what to match, then press Preview match. Nothing is saved until you apply.</p>}
+          {solving && !previews && <Loader2 className="mx-auto mt-10 size-6 animate-spin text-neutral-400" />}
           {previews && (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", opacity: stale ? 0.5 : 1 }}>
               {previews.map((p) => (
@@ -214,7 +254,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
             {applying ? "Applying..." : `Apply to ${selected.length} photo${selected.length === 1 ? "" : "s"}`}
           </button>
         </div>
-      </div>
+      </>
       {fieldsOpen && (
         <FieldsDialog
           title="Copy from anchor"
@@ -227,7 +267,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
           }}
         />
       )}
-    </div>
+    </Dialog>
   );
 }
 
@@ -312,7 +352,7 @@ const MatchCard = memo(function MatchCard({
       <div className="mb-1.5 flex items-center gap-2">
         <input type="checkbox" checked={included} onChange={() => onToggle(p.targetId)} data-testid={`match-include-${p.targetId}`} aria-label={`Apply to ${name}`} />
         <span className="truncate font-medium text-neutral-200">{name}</span>
-        {p.anchorIds.length > 1 && <span className="text-[10px] text-neutral-500">blend {Math.round(p.anchorWeight * 100)}%</span>}
+        {p.anchorIds.length > 1 && <span className="text-[10px] text-neutral-400">blend {Math.round(p.anchorWeight * 100)}%</span>}
         {p.converged ? (
           <span className="ml-auto flex items-center gap-0.5 text-emerald-400" title="Within tolerance of the anchor at full strength">
             <CheckCircle2 className="size-3.5" /> converged

@@ -31,7 +31,7 @@ function Section({ id, title, onReset, children, defaultOpen = true }: { id: str
           {title}
         </button>
         {onReset && (
-          <button className="text-neutral-500 hover:text-neutral-200" title={`Reset ${title}`} onClick={onReset} data-testid={`reset-${id}`}>
+          <button className="text-neutral-400 hover:text-neutral-200" title={`Reset ${title}`} onClick={onReset} data-testid={`reset-${id}`}>
             <RotateCcw className="size-3.5" />
           </button>
         )}
@@ -150,7 +150,7 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
           ))}
         </div>
         <button
-          className="mb-1 text-[11px] text-neutral-500 hover:text-neutral-200"
+          className="mb-1 text-[11px] text-neutral-400 hover:text-neutral-200"
           onClick={() => resetFields([HSL_FIELD[hslTab]], `Reset ${hslTab}`)}
           data-testid="hsl-reset-tab"
         >

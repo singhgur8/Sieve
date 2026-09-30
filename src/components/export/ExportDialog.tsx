@@ -12,10 +12,12 @@ import {
   type ExportPlan,
   type ExportPreset,
   type ExportSettings,
+  type UiPrefs,
   type RawImageEntry,
   type ResizeMode,
 } from "../../ipc";
 import { formatError } from "../../lib/format";
+import { Dialog } from "../Dialog";
 import { defaultFormat, defaultResize, DEFAULT_SETTINGS, normalizeSettings, previewTemplate, validateSubfolder } from "../../lib/exportSettings";
 
 interface Props {
@@ -39,10 +41,25 @@ const RESIZE_LABEL: Record<ResizeMode["kind"], string> = {
 const field = "rounded bg-neutral-800 px-2 py-1 text-sm text-neutral-100 outline-none focus:ring-1 focus:ring-amber-400";
 const btn = "rounded-md bg-neutral-800 px-2.5 py-1 text-sm hover:bg-neutral-700 disabled:opacity-40";
 
+/** data-testid of the first invalid numeric field (for the "Check the size fields" jump). */
+function badNumberField(d: ExportSettings): string {
+  const m = d.resize.mode;
+  if (m.kind === "long_edge" || m.kind === "short_edge") {
+    if (!(m.px >= 1)) return "export-resize-px";
+  } else if (m.kind === "megapixels") {
+    if (!(m.mp >= 0.1 && m.mp <= 200)) return "export-resize-mp";
+  } else if (m.kind === "width_height") {
+    if (!(m.width >= 1)) return "export-resize-width";
+    if (!(m.height >= 1)) return "export-resize-height";
+  }
+  if (!(d.resize.resolutionPpi >= 1 && d.resize.resolutionPpi <= 4800)) return "export-ppi";
+  return "export-start-number";
+}
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="border-b border-neutral-800 py-3">
-      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">{title}</h3>
+      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">{title}</h3>
       <div className="space-y-2">{children}</div>
     </section>
   );
@@ -77,7 +94,9 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [draft, setDraft] = useState<ExportSettings>(DEFAULT_SETTINGS);
-  const [scope, setScope] = useState<"selection" | "filtered">("selection");
+  const [scope, setScope] = useState<"selection" | "filtered">(selectionIds.length <= 1 && filteredIds.length > selectionIds.length ? "filtered" : "selection");
+  const [prefs, setPrefs] = useState<UiPrefs>({});
+  const editorRef = useRef<HTMLDivElement>(null);
   const [saveName, setSaveName] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [plan, setPlan] = useState<ExportPlan | null>(null);
@@ -93,12 +112,20 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
   useEffect(() => {
     void (async () => {
       try {
-        const [list, c] = await Promise.all([unwrap(commands.listExportPresets()), unwrap(commands.getExportCapabilities())]);
+        const [list, c, pf] = await Promise.all([
+          unwrap(commands.listExportPresets()),
+          unwrap(commands.getExportCapabilities()),
+          unwrap(commands.getUiPrefs()).catch((): UiPrefs => ({})),
+        ]);
         setCaps(c);
         setPresets(list);
+        setPrefs(pf);
         if (list[0]) {
           setSelectedId(list[0].id);
-          setDraft(structuredClone(list[0].settings));
+          const st = structuredClone(list[0].settings);
+          // Pre-fill the folder used last time when the preset asks to choose one at export time.
+          if (st.destination.kind === "choose" && pf.lastExportFolder) st.destination = { kind: "folder", path: pf.lastExportFolder };
+          setDraft(st);
         }
       } catch (e) {
         fail(e);
@@ -145,7 +172,19 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
       (m.kind === "long_edge" || m.kind === "short_edge" ? m.px >= 1 : m.kind === "megapixels" ? m.mp >= 0.1 && m.mp <= 200 : m.width >= 1 && m.height >= 1);
     return okRes && r.resolutionPpi >= 1 && r.resolutionPpi <= 4800 && draft.naming.startNumber >= 0 && draft.naming.startNumber <= 999999999;
   })();
-  const canExport = ids.length > 0 && destOk && !tpl.error && !subErr && numsOk && !busy;
+  const problem: { text: string; focus: string } | null =
+    ids.length === 0
+      ? { text: "Nothing to export", focus: "" }
+      : !destOk
+        ? { text: "Choose a destination folder", focus: "export-choose-folder" }
+        : tpl.error
+          ? { text: "Fix the file name template", focus: "export-template" }
+          : subErr
+            ? { text: "Invalid subfolder", focus: "export-subfolder" }
+            : !numsOk
+              ? { text: "Check the size fields", focus: badNumberField(draft) }
+              : null;
+  const canExport = problem == null && !busy;
 
   // Debounced dry run: warn about existing files.
   const planKey = JSON.stringify([ids, normalizeSettings(draft)]);
@@ -160,17 +199,6 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planKey]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const chooseFolder = async () => {
     try {
@@ -228,11 +256,25 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
     }
   };
 
+  /** Clicking the (visually disabled) Export button explains itself: scroll to and focus the offending field. */
+  const goExport = () => {
+    if (problem) {
+      const el = problem.focus ? editorRef.current?.querySelector<HTMLElement>(`[data-testid="${problem.focus}"]`) : null;
+      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      el?.focus();
+      return;
+    }
+    if (!busy) void doExport();
+  };
+
   const doExport = async () => {
     setBusy(true);
     setError(null);
     try {
       const job = await unwrap(commands.exportImages(ids, normalizeSettings(draft), preset?.name ?? null));
+      if (draft.destination.kind === "folder" && draft.destination.path) {
+        void unwrap(commands.setUiPrefs({ ...prefs, lastExportFolder: draft.destination.path })).catch(() => {});
+      }
       onStarted(job);
       onClose();
     } catch (e) {
@@ -261,8 +303,17 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
   const fmtInfo = info(fmt.kind);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" data-testid="export-dialog" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="flex max-h-full w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-900 shadow-2xl" role="dialog" aria-label="Export">
+    <Dialog
+      label="Export"
+      testid="export-dialog"
+      overlayClass="z-50 bg-black/60 p-6"
+      className="flex max-h-full w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-900 shadow-2xl"
+      onCancel={onClose}
+      onConfirm={goExport}
+      requireMod
+      backdropClose
+    >
+      <>
         <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-2.5">
           <h2 className="font-semibold">Export</h2>
           <button onClick={onClose} aria-label="Close" data-testid="export-close" className="text-neutral-400 hover:text-neutral-100">
@@ -273,7 +324,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
         <div className="flex min-h-0 flex-1">
           {/* presets */}
           <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 p-3" data-testid="export-presets">
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">Presets</h3>
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">Presets</h3>
             <ul className="min-h-0 flex-1 space-y-0.5 overflow-auto">
               {presets.map((p) => (
                 <li key={p.id}>
@@ -284,7 +335,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                     className={`w-full truncate rounded px-2 py-1 text-left text-sm ${p.id === selectedId ? "bg-amber-400/20 text-amber-200" : "hover:bg-neutral-800"}`}
                   >
                     {p.name}
-                    {p.builtIn && <span className="ml-1 text-[10px] text-neutral-500">built-in</span>}
+                    {p.builtIn && <span className="ml-1 text-[10px] text-neutral-400">built-in</span>}
                     {p.id === selectedId && dirty && <span className="ml-1 text-amber-400" title="Modified">*</span>}
                   </button>
                 </li>
@@ -321,7 +372,42 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
           </aside>
 
           {/* editor */}
-          <div className="min-w-0 flex-1 overflow-auto px-4 pb-3" data-testid="export-editor">
+          <div ref={editorRef} className="min-w-0 flex-1 overflow-auto px-4 pb-3" data-testid="export-editor">
+            <Section title="Destination">
+              <Row label="Export to">
+                <select
+                  data-testid="export-dest-kind"
+                  value={draft.destination.kind === "source_folder" ? "source_folder" : "folder"}
+                  onChange={(e) => patch({ destination: e.target.value === "source_folder" ? { kind: "source_folder" } : draft.destination.kind === "folder" ? draft.destination : { kind: "choose" } })}
+                  className={field}
+                >
+                  <option value="folder">Specific folder</option>
+                  <option value="source_folder">Same folder as original</option>
+                </select>
+              </Row>
+              {draft.destination.kind !== "source_folder" && (
+                <Row label="Folder">
+                  <button type="button" onClick={() => void chooseFolder()} data-testid="export-choose-folder" className={btn}>
+                    Choose…
+                  </button>
+                  <span className="max-w-md break-all font-mono text-xs text-neutral-300" data-testid="export-dest-path">
+                    {draft.destination.kind === "folder" ? draft.destination.path : <span className="text-amber-400">No folder chosen</span>}
+                  </span>
+                </Row>
+              )}
+              <Row label="Subfolder">
+                <input
+                  type="text"
+                  data-testid="export-subfolder"
+                  value={draft.subfolder ?? ""}
+                  onChange={(e) => patch({ subfolder: e.target.value })}
+                  placeholder="optional, e.g. Smith Wedding/Web"
+                  className={`${field} w-72`}
+                />
+                {subErr && <span className="text-xs text-red-400">{subErr}</span>}
+              </Row>
+            </Section>
+
             <Section title="File format">
               <Row label="Format">
                 <select data-testid="export-format" value={fmt.kind} onChange={(e) => setKind(e.target.value as ExportFormatKind)} className={field}>
@@ -337,7 +423,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                   })}
                 </select>
                 {fmtInfo && !fmtInfo.available && <span className="text-xs text-red-400">{fmtInfo.reason ?? "Encoder not available"}</span>}
-                {fmtInfo && !fmtInfo.supportsMetadata && <span className="text-xs text-neutral-500">No metadata embedding</span>}
+                {fmtInfo && !fmtInfo.supportsMetadata && <span className="text-xs text-neutral-400">No metadata embedding</span>}
               </Row>
               {hasQuality && "quality" in fmt && (
                 <Row label="Quality">
@@ -395,7 +481,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                   <option value="display_p3">Display P3</option>
                   <option value="adobe_rgb">Adobe RGB (1998)</option>
                 </select>
-                <span className="text-xs text-neutral-500">ICC profile embedded</span>
+                <span className="text-xs text-neutral-400">ICC profile embedded</span>
               </Row>
             </Section>
 
@@ -420,23 +506,23 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                     return (
                       <>
                         <NumInput id="export-resize-px" value={m.px} min={1} onChange={(px) => set({ ...m, px })} />
-                        <span className="text-xs text-neutral-500">px</span>
+                        <span className="text-xs text-neutral-400">px</span>
                       </>
                     );
                   if (m.kind === "megapixels")
                     return (
                       <>
                         <NumInput id="export-resize-mp" value={m.mp} min={0.1} max={200} step={0.1} onChange={(mp) => set({ ...m, mp })} />
-                        <span className="text-xs text-neutral-500">MP</span>
+                        <span className="text-xs text-neutral-400">MP</span>
                       </>
                     );
                   if (m.kind === "width_height")
                     return (
                       <>
                         <NumInput id="export-resize-width" value={m.width} min={1} onChange={(width) => set({ ...m, width })} />
-                        <span className="text-xs text-neutral-500">x</span>
+                        <span className="text-xs text-neutral-400">x</span>
                         <NumInput id="export-resize-height" value={m.height} min={1} onChange={(height) => set({ ...m, height })} />
-                        <span className="text-xs text-neutral-500">px</span>
+                        <span className="text-xs text-neutral-400">px</span>
                       </>
                     );
                   return null;
@@ -447,7 +533,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
               </Row>
               <Row label="Resolution">
                 <NumInput id="export-ppi" value={draft.resize.resolutionPpi} min={1} max={4800} onChange={(resolutionPpi) => patch({ resize: { ...draft.resize, resolutionPpi } })} />
-                <span className="text-xs text-neutral-500">pixels per inch</span>
+                <span className="text-xs text-neutral-400">pixels per inch</span>
               </Row>
             </Section>
 
@@ -522,40 +608,6 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
               </Row>
             </Section>
 
-            <Section title="Destination">
-              <Row label="Export to">
-                <select
-                  data-testid="export-dest-kind"
-                  value={draft.destination.kind === "source_folder" ? "source_folder" : "folder"}
-                  onChange={(e) => patch({ destination: e.target.value === "source_folder" ? { kind: "source_folder" } : draft.destination.kind === "folder" ? draft.destination : { kind: "choose" } })}
-                  className={field}
-                >
-                  <option value="folder">Specific folder</option>
-                  <option value="source_folder">Same folder as original</option>
-                </select>
-              </Row>
-              {draft.destination.kind !== "source_folder" && (
-                <Row label="Folder">
-                  <button type="button" onClick={() => void chooseFolder()} data-testid="export-choose-folder" className={btn}>
-                    Choose…
-                  </button>
-                  <span className="max-w-md break-all font-mono text-xs text-neutral-300" data-testid="export-dest-path">
-                    {draft.destination.kind === "folder" ? draft.destination.path : <span className="text-amber-400">No folder chosen</span>}
-                  </span>
-                </Row>
-              )}
-              <Row label="Subfolder">
-                <input
-                  type="text"
-                  data-testid="export-subfolder"
-                  value={draft.subfolder ?? ""}
-                  onChange={(e) => patch({ subfolder: e.target.value })}
-                  placeholder="optional, e.g. Smith Wedding/Web"
-                  className={`${field} w-72`}
-                />
-                {subErr && <span className="text-xs text-red-400">{subErr}</span>}
-              </Row>
-            </Section>
 
             <Section title="Metadata">
               <Row label="Include">
@@ -570,7 +622,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                 <>
                   <Row label="Remove location">
                     <input type="checkbox" data-testid="export-remove-location" checked={meta.removeLocation} onChange={(e) => patch({ metadata: { ...meta, removeLocation: e.target.checked } })} />
-                    <span className="text-xs text-neutral-500">Strip GPS and location fields</span>
+                    <span className="text-xs text-neutral-400">Strip GPS and location fields</span>
                   </Row>
                   <Row label="Keywords">
                     <input type="checkbox" data-testid="export-keywords" checked={meta.includeKeywords} onChange={(e) => patch({ metadata: { ...meta, includeKeywords: e.target.checked } })} />
@@ -617,6 +669,11 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
               {draft.naming.collision === "overwrite" ? " and will be overwritten" : draft.naming.collision === "skip" ? " and will be skipped" : " (a suffix will be added)"}
             </span>
           )}
+          {problem && (
+            <span className="text-xs font-medium text-amber-300" data-testid="export-reason">
+              {problem.text}
+            </span>
+          )}
           {error && (
             <span className="text-xs text-red-400" data-testid="export-error">
               {error}
@@ -627,17 +684,18 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
               Cancel
             </button>
             <button
-              onClick={() => void doExport()}
-              disabled={!canExport}
+              onClick={goExport}
+              aria-disabled={!canExport}
               data-testid="export-go"
-              title={!destOk ? "Choose a destination folder" : undefined}
-              className="rounded-md bg-amber-500 px-4 py-1 text-sm font-medium text-neutral-950 hover:bg-amber-400 disabled:opacity-40"
+              data-disabled={!canExport}
+              title={problem ? `${problem.text} (click to jump to it)` : "Export (Cmd+Enter)"}
+              className={`rounded-md bg-amber-500 px-4 py-1 text-sm font-medium text-neutral-950 hover:bg-amber-400 ${canExport ? "" : "opacity-40"}`}
             >
               Export {ids.length}
             </button>
           </div>
         </footer>
-      </div>
-    </div>
+      </>
+    </Dialog>
   );
 }

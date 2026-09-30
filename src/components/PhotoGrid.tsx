@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Library } from "../hooks/useLibrary";
+import { FolderOpen } from "lucide-react";
 import { Cell } from "./Cell";
+import { hint } from "../lib/keymap";
 
 const GAP = 6;
 const PAD = 8;
@@ -11,12 +13,17 @@ interface Props {
   targetSize: number;
   selected: Set<number>;
   active: number | null;
-  onColsChange: (cols: number) => void;
+  onColsChange: (cols: number, page: number) => void;
   onCellClick: (id: number, e: React.MouseEvent) => void;
   onCellDoubleClick: (id: number) => void;
+  /** True when the catalog holds no photos at all (first run). */
+  catalogEmpty: boolean;
+  filtered: boolean;
+  onImport: () => void;
+  onClearFilters: () => void;
 }
 
-export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick }: Props) {
+export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const { ids } = lib;
@@ -37,8 +44,9 @@ export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onC
   const rowCount = Math.ceil(ids.length / cols);
 
   useEffect(() => {
-    onColsChange(cols);
-  }, [cols, onColsChange]);
+    const h = parentRef.current?.clientHeight ?? 0;
+    onColsChange(cols, cols * Math.max(1, Math.floor(h / rowHeight)));
+  }, [cols, rowHeight, onColsChange]);
 
   const virtualizer = useVirtualizer({
     count: rowCount,
@@ -69,9 +77,27 @@ export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onC
   }, [activeIndex, cols, virtualizer]);
 
   if (lib.loaded && ids.length === 0) {
+    if (catalogEmpty && !filtered) {
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center" data-testid="grid-empty-catalog">
+          <FolderOpen className="size-10 text-neutral-400" />
+          <h2 className="text-lg font-semibold text-neutral-100">Import a shoot folder to start</h2>
+          <p className="max-w-md text-sm text-neutral-400">Sieve reads your RAW files in place, culls them automatically and writes ratings to XMP sidecars next to the originals.</p>
+          <button onClick={onImport} data-testid="empty-import" className="flex items-center gap-2 rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600">
+            <FolderOpen className="size-4" /> Import folder{hint("import")}
+          </button>
+          <p className="text-xs text-neutral-400">Supported: Sony ARW, Fujifilm RAF, Canon CR3</p>
+        </div>
+      );
+    }
     return (
-      <div className="flex flex-1 items-center justify-center text-sm text-neutral-500" data-testid="grid-empty">
+      <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-neutral-400" data-testid="grid-empty">
         No images match the current filters.
+        {filtered && (
+          <button onClick={onClearFilters} data-testid="empty-clear-filters" className="rounded bg-neutral-800 px-3 py-1.5 text-neutral-100 hover:bg-neutral-700">
+            Clear filters
+          </button>
+        )}
       </div>
     );
   }

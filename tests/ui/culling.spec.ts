@@ -331,11 +331,13 @@ test.describe("compare", () => {
 
 test("top bar: XMP auto-sync toggle and save metadata call the backend", async ({ page }) => {
   await openApp(page, 200);
+  await page.getByTestId("more-menu").click();
   await page.getByTestId("xmp-auto").check();
+  await page.keyboard.press("Escape");
   await expect.poll(async () => (await calls(page, "set_xmp_auto_sync")).length).toBe(1);
   expect((await calls(page, "set_xmp_auto_sync"))[0].args).toEqual({ enabled: true });
   await page.getByTestId("cell-8").click();
-  await page.getByRole("button", { name: "Save metadata" }).click();
+  await page.getByTestId("save-metadata").click();
   await expect.poll(async () => (await calls(page, "write_xmp")).length).toBe(1);
   await expect(page.getByTestId("notice")).toContainText("Saved metadata");
   await shot(page, "10-top-bar");

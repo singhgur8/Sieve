@@ -1,8 +1,10 @@
-import { ArrowDownAZ, ArrowUpAZ, Columns2, Grid3x3, Maximize, SkipForward, SlidersHorizontal } from "lucide-react";
+import type { ReactNode } from "react";
+import { ArrowDownAZ, ArrowUpAZ, SkipForward } from "lucide-react";
 import type { ImageSort } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
+import type { Mode } from "../lib/keymap";
 
-export type Mode = "grid" | "loupe" | "compare" | "develop";
+export type { Mode };
 
 const SORTS: { key: ImageSort; label: string }[] = [
   { key: "capture_time", label: "Capture time" },
@@ -12,7 +14,6 @@ const SORTS: { key: ImageSort; label: string }[] = [
 ];
 
 interface Props {
-  mode: Mode;
   query: Query;
   setQuery: (fn: (q: Query) => Query) => void;
   size: number;
@@ -21,31 +22,24 @@ interface Props {
   total: number;
   autoAdvance: boolean;
   onAutoAdvance: (v: boolean) => void;
-  onMode: (m: Mode) => void;
+  /** Rating / label / burst / folder filters, shown to the left. */
+  filters?: ReactNode;
 }
 
 const seg = (on: boolean) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
 
+/** Library-only row: extra filters plus thumbnail size, sort and auto-advance. */
 export function GridToolbar(p: Props) {
   return (
-    <div className="flex flex-wrap items-center gap-3 border-b border-neutral-800 px-4 py-1.5 text-xs text-neutral-400" data-testid="grid-toolbar">
-      <div className="flex gap-1">
-        <button className={seg(p.mode === "grid")} onClick={() => p.onMode("grid")} title="Grid (G)" data-testid="mode-grid">
-          <Grid3x3 className="size-3.5" /> Grid
-        </button>
-        <button className={seg(p.mode === "loupe")} onClick={() => p.onMode("loupe")} title="Loupe (Space / E / Enter)" data-testid="mode-loupe">
-          <Maximize className="size-3.5" /> Loupe
-        </button>
-        <button className={seg(p.mode === "compare")} onClick={() => p.onMode("compare")} title="Compare (C)" data-testid="mode-compare">
-          <Columns2 className="size-3.5" /> Compare
-        </button>
-        <button className={seg(p.mode === "develop")} onClick={() => p.onMode("develop")} title="Develop (D)" data-testid="mode-develop">
-          <SlidersHorizontal className="size-3.5" /> Develop
-        </button>
-      </div>
-      <label className="flex items-center gap-2">
+    <div
+      className="flex h-8 shrink-0 items-center gap-x-3 overflow-x-auto overflow-y-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs text-neutral-300"
+      data-testid="grid-toolbar"
+    >
+      {p.filters}
+      <span className="mx-1 h-4 w-px shrink-0 bg-neutral-700" />
+      <label className="flex items-center gap-1.5">
         Size
-        <input type="range" min={90} max={420} step={10} value={p.size} onChange={(e) => p.onSize(Number(e.target.value))} data-testid="thumb-size" />
+        <input type="range" className="w-20" min={90} max={420} step={10} value={p.size} onChange={(e) => p.onSize(Number(e.target.value))} data-testid="thumb-size" />
       </label>
       <label className="flex items-center gap-1.5">
         Sort
@@ -65,17 +59,17 @@ export function GridToolbar(p: Props) {
       <button
         className={seg(p.query.sortDescending)}
         data-testid="sort-dir"
+        aria-label={p.query.sortDescending ? "Descending" : "Ascending"}
         onClick={() => p.setQuery((q) => ({ ...q, sortDescending: !q.sortDescending }))}
-        title="Reverse sort order"
+        title={p.query.sortDescending ? "Descending (click for ascending)" : "Ascending (click for descending)"}
       >
         {p.query.sortDescending ? <ArrowUpAZ className="size-3.5" /> : <ArrowDownAZ className="size-3.5" />}
-        {p.query.sortDescending ? "Descending" : "Ascending"}
       </button>
       <label className="flex items-center gap-1.5" title="Advance to the next photo after flagging/rating (Shift+P / Shift+X always advance)">
         <input type="checkbox" checked={p.autoAdvance} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />
         <SkipForward className="size-3.5" /> Auto-advance
       </label>
-      <span className="ml-auto" data-testid="selection-count">
+      <span className="ml-auto pl-2" data-testid="selection-count">
         {p.selectedCount} selected · {p.total} photos
       </span>
     </div>

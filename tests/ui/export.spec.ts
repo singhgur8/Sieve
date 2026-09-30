@@ -208,7 +208,7 @@ test.describe("export", () => {
     const job = page.getByTestId("export-job-1");
     await expect(job).toBeVisible();
     await expect(page.getByTestId("export-progress-text")).toHaveText("0/4");
-    await expect(page.getByTestId("export-button")).toContainText("1 running");
+    await expect(page.getByTestId("export-ring")).toBeVisible();
 
     await step(page, 1);
     await expect(page.getByTestId("export-progress-text")).toHaveText("1/4");
@@ -225,7 +225,7 @@ test.describe("export", () => {
     await expect(page.getByTestId("export-summary-text")).toContainText("3 exported, 1 failed");
     await expect(page.getByTestId("export-failure-7")).toContainText("DSC00007.ARW: Decode error (mock)");
     await expect(page.getByTestId("export-output-dir")).toHaveText("/mock/export/Smith Wedding");
-    await expect(page.getByTestId("export-button")).not.toContainText("running");
+    await expect(page.getByTestId("export-ring")).toHaveCount(0);
     await shot(page, "3x-export-05-finished");
 
     await page.getByTestId("export-job-dismiss").click();
