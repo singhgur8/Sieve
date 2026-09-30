@@ -380,8 +380,8 @@ fn radial(r: &RadialMask, grid: &Grid) -> Vec<f32> {
     })
 }
 
-/// Separable box blur (two passes) of `plane` with radius `r` px.
-fn box_blur(plane: &mut [f32], w: usize, h: usize, r: usize) {
+/// One separable box-mean pass (rows, then columns) in place.
+fn box_pass(plane: &mut [f32], w: usize, h: usize, r: usize) {
     if r == 0 || w == 0 || h == 0 {
         return;
     }
@@ -407,13 +407,11 @@ fn box_blur(plane: &mut [f32], w: usize, h: usize, r: usize) {
             }
         });
     };
-    for _ in 0..2 {
-        pass_rows(plane, w);
-        let mut t = transpose(plane, w, h);
-        pass_rows(&mut t, h);
-        let back = transpose(&t, h, w);
-        plane.copy_from_slice(&back);
-    }
+    pass_rows(plane, w);
+    let mut t = transpose(plane, w, h);
+    pass_rows(&mut t, h);
+    let back = transpose(&t, h, w);
+    plane.copy_from_slice(&back);
 }
 
 fn transpose(src: &[f32], w: usize, h: usize) -> Vec<f32> {
@@ -426,22 +424,27 @@ fn transpose(src: &[f32], w: usize, h: usize) -> Vec<f32> {
     out
 }
 
-/// Trapezoid over L*/100 (`featherLow -> low` up, `high -> featherHigh` down; linear ramps,
-/// hard edges when a feather is empty).
+/// Width (in L*/100) of the anti-aliasing ramp a hard range edge (empty feather) gets, placed
+/// outside the range so in-range pixels keep full weight.
+const HARD_EDGE: f32 = 0.01;
+
+/// Trapezoid over L*/100 (`featherLow -> low` up, `high -> featherHigh` down), ramps shaped
+/// by a smoothstep (no kink where the falloff meets the plateau); an empty feather gets a
+/// [`HARD_EDGE`] wide ramp instead of a step (no aliasing / noise speckle on the edge).
 #[inline]
 pub fn luminance_weight(l: f32, r: &LuminanceRange) -> f32 {
+    let smooth = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
     if l >= r.low && l <= r.high {
         1.0
     } else if l < r.low {
-        if r.low - r.feather_low <= 1e-6 {
-            0.0
-        } else {
-            ((l - r.feather_low) / (r.low - r.feather_low)).clamp(0.0, 1.0)
-        }
-    } else if r.feather_high - r.high <= 1e-6 {
-        0.0
+        let lo = r.feather_low.min(r.low - HARD_EDGE);
+        smooth((l - lo) / (r.low - lo))
     } else {
-        ((r.feather_high - l) / (r.feather_high - r.high)).clamp(0.0, 1.0)
+        let hi = r.feather_high.max(r.high + HARD_EDGE);
+        smooth((hi - l) / (hi - r.high))
     }
 }
 
@@ -455,9 +458,48 @@ fn luminance(r: &LuminanceRange, grid: &Grid, guide: &RangeGuide) -> Option<Vec<
             *v = luminance_weight(guide.lab[y * w + x][0] / 100.0, r).clamp(0.0, 1.0);
         }
     });
-    let radius = (f64::from(r.smoothness) / 100.0 * 0.005 * grid.sw * grid.scale).round() as usize;
-    box_blur(&mut out, grid.w, grid.h, radius);
+    if r.smoothness > 0.0 {
+        let radius = ((f64::from(r.smoothness) / 100.0 * 0.005 * grid.sw * grid.scale).round() as usize).max(1);
+        let lum: Vec<f32> = guide.lab.iter().map(|p| p[0] / 100.0).collect();
+        out = guided_filter(&lum, &out, grid.w, grid.h, radius, RANGE_EPS);
+    }
     Some(out)
+}
+
+/// Guided-filter regularisation for range-mask smoothing (on L*/100): edges of more than a
+/// few L* stay crisp, flat noisy areas are averaged.
+const RANGE_EPS: f32 = 1e-3;
+
+/// Edge-aware smoothing of `p` guided by `guide` (He et al. guided filter, box windows of
+/// radius `r`): follows the image's edges instead of turning selections into rectangles as a
+/// plain box blur does. Output clamped to 0..=1.
+pub(crate) fn guided_filter(guide: &[f32], p: &[f32], w: usize, h: usize, r: usize, eps: f32) -> Vec<f32> {
+    if w == 0 || h == 0 || r == 0 {
+        return p.to_vec();
+    }
+    let prod = |a: &[f32], b: &[f32]| -> Vec<f32> { a.par_iter().zip(b).map(|(x, y)| x * y).collect() };
+    let mean_i = box_mean(guide, w, h, r);
+    let mean_p = box_mean(p, w, h, r);
+    let corr_ip = box_mean(&prod(guide, p), w, h, r);
+    let corr_ii = box_mean(&prod(guide, guide), w, h, r);
+    let (a, b): (Vec<f32>, Vec<f32>) = (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            let var = (corr_ii[i] - mean_i[i] * mean_i[i]).max(0.0);
+            let cov = corr_ip[i] - mean_i[i] * mean_p[i];
+            let a = cov / (var + eps);
+            (a, mean_p[i] - a * mean_i[i])
+        })
+        .unzip();
+    let (ma, mb) = (box_mean(&a, w, h, r), box_mean(&b, w, h, r));
+    guide.par_iter().zip(ma.par_iter().zip(&mb)).map(|(i, (a, b))| (a * i + b).clamp(0.0, 1.0)).collect()
+}
+
+/// One separable box-mean pass (window `2r + 1`, clamped at the edges) of `plane`.
+fn box_mean(plane: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut out = plane.to_vec();
+    box_pass(&mut out, w, h, r);
+    out
 }
 
 fn color(c: &ColorRange, grid: &Grid, guide: &RangeGuide) -> Option<Vec<f32>> {
