@@ -626,7 +626,7 @@ test.describe("P2 items", () => {
     await page.keyboard.press("p");
     await page.keyboard.press("4");
     await expect(page.getByTestId("film-flag-9")).toHaveAttribute("data-pick", "pick");
-    await expect(page.getByTestId("film-rating-9")).toHaveText("4★");
+    await expect(page.getByTestId("film-rating-9")).toHaveAttribute("data-rating", "4");
   });
 
   test("Cmd+Alt+V pastes from the previous photo (not crop / masks); Cmd+Shift+N saves a preset", async ({ page }) => {

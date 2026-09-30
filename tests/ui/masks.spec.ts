@@ -414,8 +414,11 @@ test.describe("masks", () => {
     await createSubject(page);
     const gid = (await lastAdj(page)).masks[0].id as string;
     await page.getByTestId(`mask-group-name-${gid}`).click();
-    expect((await calls(page, "render_mask_overlay")).length).toBe(0);
+    // Creating the mask flashed the overlay; it fades out on its own (nothing pinned).
     await expect(page.getByTestId("mask-overlay")).toHaveCount(0);
+    await clearCalls(page);
+    await page.waitForTimeout(300);
+    expect((await calls(page, "render_mask_overlay")).length).toBe(0);
     await page.keyboard.press("o");
     await expect(page.getByTestId("mask-overlay")).toBeVisible();
     const oc = await calls(page, "render_mask_overlay");

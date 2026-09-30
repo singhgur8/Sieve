@@ -54,6 +54,9 @@ export interface Busy {
   label: string;
 }
 
+/** How long the overlay stays up after the last mask edit (then it fades out unless "Show overlay" is on). */
+export const OVERLAY_HOLD_MS = 600;
+
 let capsPromise: Promise<MaskCapabilities> | null = null;
 const capsListeners = new Set<() => void>();
 /** Drops the cached capabilities (models were installed) and makes every mounted panel refetch. */
@@ -74,7 +77,10 @@ export interface MasksApi {
   endTool: () => void;
   brush: BrushSettings;
   patchBrush: (p: Partial<BrushSettings>) => void;
+  /** "Show overlay" (O): pinned on. */
   overlayOn: boolean;
+  /** Pinned on, or an edit happened within the last 600 ms (brush, handle drag, any mask slider): the overlay is shown. */
+  overlayVisible: boolean;
   toggleOverlay: () => void;
   overlayStyle: number;
   cycleOverlayStyle: () => void;
@@ -154,6 +160,15 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
   const [brush, setBrush] = useState<BrushSettings>(DEFAULT_BRUSH);
   const [overlayOn, setOverlayOn] = useState(false);
   const [overlayStyle, setOverlayStyle] = useState(0);
+  // Auto-show: any mask edit shows the overlay and keeps it up until OVERLAY_HOLD_MS after the last one.
+  const [flash, setFlash] = useState(false);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const poke = useCallback(() => {
+    setFlash(true);
+    clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlash(false), OVERLAY_HOLD_MS);
+  }, []);
+  useEffect(() => () => clearTimeout(flashTimer.current), []);
   const [pins, setPins] = useState(true);
   const [hover, setHover] = useState<{ groupId: string; componentId: string | null } | null>(null);
   const [caps, setCaps] = useState<MaskCapabilities | null>(null);
@@ -275,9 +290,24 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
   );
 
   // ---- editing primitives ----
-  const edit = useCallback((fn: (m: MaskGroup[]) => MaskGroup[], label: string) => edRef.current.edit((a) => ({ ...a, masks: fn(a.masks) }), label), []);
-  const change = useCallback((fn: (m: MaskGroup[]) => MaskGroup[], label: string) => edRef.current.change((a) => ({ ...a, masks: fn(a.masks) }), label), []);
-  const commit = useCallback(() => edRef.current.commit(), []);
+  const edit = useCallback(
+    (fn: (m: MaskGroup[]) => MaskGroup[], label: string) => {
+      poke();
+      edRef.current.edit((a) => ({ ...a, masks: fn(a.masks) }), label);
+    },
+    [poke],
+  );
+  const change = useCallback(
+    (fn: (m: MaskGroup[]) => MaskGroup[], label: string) => {
+      poke();
+      edRef.current.change((a) => ({ ...a, masks: fn(a.masks) }), label);
+    },
+    [poke],
+  );
+  const commit = useCallback(() => {
+    poke();
+    edRef.current.commit();
+  }, [poke]);
 
   const addComponent = useCallback(
     (target: Target | undefined, shape: MaskShape, baseName: string, label: string) => {
@@ -593,6 +623,7 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
     brush,
     patchBrush,
     overlayOn,
+    overlayVisible: overlayOn || flash,
     toggleOverlay: () => setOverlayOn((v) => !v),
     overlayStyle,
     cycleOverlayStyle: () => setOverlayStyle((i) => (i + 1) % OVERLAY_STYLES.length),

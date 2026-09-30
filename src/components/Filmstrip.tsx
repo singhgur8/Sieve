@@ -5,7 +5,7 @@ import { Flag, X } from "lucide-react";
 import { convertFileSrc } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { LABEL_COLOR } from "../lib/format";
-import { SceneBadge } from "./Cell";
+import { SceneBadge, Stars } from "./Cell";
 
 interface Props {
   lib: Library;
@@ -19,9 +19,15 @@ interface Props {
   height: number;
   scenePrefix: string;
   align?: "auto" | "center";
+  /** Click on a star: rate that photo (0 clears). */
+  onRate?: (id: number, rating: number) => void;
+  /** Extra per-cell badge (Compare: Select / Candidate). */
+  badge?: (id: number) => React.ReactNode;
+  /** Cells that get the secondary (candidate) ring. */
+  marked?: Set<number>;
 }
 
-export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, height, scenePrefix, align = "auto" }: Props) {
+export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, height, scenePrefix, align = "auto", onRate, badge, marked }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const { ids, ensure } = lib;
   const v = useVirtualizer({ horizontal: true, count: ids.length, getScrollElement: () => ref.current, estimateSize: () => cellW + 4, overscan: 8 });
@@ -45,15 +51,18 @@ export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, heigh
           const t = e?.thumbnail;
           const active = fid === activeId;
           const isSel = selected?.has(fid) ?? false;
+          const isMarked = marked?.has(fid) ?? false;
           return (
-            <button
+            <div
               key={it.key}
+              role="button"
               tabIndex={-1}
               data-testid={`film-${fid}`}
               data-active={active}
               data-selected={isSel}
+              data-marked={isMarked}
               onClick={(ev) => onPick(fid, ev)}
-              className={`absolute top-2 overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
+              className={`absolute top-2 cursor-pointer overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${isMarked ? "ring-2 ring-amber-400" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
               style={{ left: it.start, width: cellW, height: cellH }}
             >
               {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(fid)}`} alt="" draggable={false} className="size-full object-cover" />}
@@ -65,17 +74,18 @@ export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, heigh
                 </span>
               )}
               {e && e.rating > 0 && (
-                <span className="pointer-events-none absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5 text-[10px] leading-3 text-amber-400" data-testid={`film-rating-${fid}`}>
-                  {e.rating}★
+                <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5" data-testid={`film-rating-${fid}`} data-rating={e.rating}>
+                  <Stars n={e.rating} className="size-2.5" onRate={onRate && ((r) => onRate(fid, r))} testId={`film-stars-${fid}`} />
                 </span>
               )}
+              {badge?.(fid)}
               {e && e.sceneId != null && (
                 <span className="absolute bottom-0.5 left-0.5">
                   <SceneBadge entry={e} testPrefix={scenePrefix} />
                 </span>
               )}
               {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited" data-testid={`film-edited-${fid}`} />}
-            </button>
+            </div>
           );
         })}
       </div>
