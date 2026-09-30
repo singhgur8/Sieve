@@ -207,6 +207,217 @@ pub struct QualityScore {
     pub exposure: ExposureStats,
     /// Identifies the model/algorithm set, so scores can be recomputed on upgrade.
     pub model_version: String,
+    /// Engine's suggested star rating 0..=5. Never written to `RawImageEntry.rating`
+    /// except through `apply_suggestions`.
+    pub suggested_rating: u8,
+    /// Engine's suggested flag (burst non-keepers and hard defects lean `reject`).
+    /// Never written to `RawImageEntry.pick` except through `apply_suggestions`.
+    pub suggested_pick: PickFlag,
+}
+
+/// Axis-aligned rectangle in normalized preview coordinates: 0..=1 of the preview's
+/// width/height, origin top-left, orientation already applied (same frame the UI shows).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NormRect {
+    #[specta(type = Number)]
+    pub x: f32,
+    #[specta(type = Number)]
+    pub y: f32,
+    #[specta(type = Number)]
+    pub width: f32,
+    #[specta(type = Number)]
+    pub height: f32,
+}
+
+/// Point in normalized preview coordinates (see [`NormRect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NormPoint {
+    #[specta(type = Number)]
+    pub x: f32,
+    #[specta(type = Number)]
+    pub y: f32,
+}
+
+/// One detected face, for the loupe's face-crop zoom and per-face diagnostics.
+/// Raw measurements (`ear`, `sharpness`) are threshold-independent; the derived flags
+/// (`eyesOpen`, `blink`, `inFocus`) reflect the thresholds at the last (re)score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceInfo {
+    pub bbox: NormRect,
+    /// Eye centres from the detector keypoints; image-left and image-right.
+    pub left_eye: NormPoint,
+    pub right_eye: NormPoint,
+    /// Detector confidence 0..=1.
+    #[specta(type = Number)]
+    pub detection_score: f32,
+    /// Eye Aspect Ratio of the less-open eye; `None` if landmarks were unusable.
+    #[specta(type = Option<Number>)]
+    pub ear: Option<f32>,
+    /// Eye openness 0..=1 derived from `ear`; `None` if `ear` is `None`.
+    #[specta(type = Option<Number>)]
+    pub eyes_open: Option<f32>,
+    /// Normalized sharpness 0..=1 of the eye region (face crop if eyes unusable).
+    #[specta(type = Number)]
+    pub sharpness: f32,
+    /// Eyes closed per `CullThresholds.blinkEar`.
+    pub blink: bool,
+    /// `sharpness >= CullThresholds.faceSharpnessMin`.
+    pub in_focus: bool,
+    /// The face that drives `QualityScore.faceSharpness` (largest / most central).
+    pub primary: bool,
+    /// Face is large enough to be judged (`CullThresholds.minFaceSize`); smaller faces
+    /// are reported but ignored for tags and scores.
+    pub considered: bool,
+}
+
+/// Relative weights of the score components in `QualityScore.overall`.
+/// Non-negative; normalized by their sum (all-zero is invalid).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoreWeights {
+    #[specta(type = Number)]
+    pub eyes_open: f32,
+    #[specta(type = Number)]
+    pub face_sharpness: f32,
+    #[specta(type = Number)]
+    pub global_sharpness: f32,
+    #[specta(type = Number)]
+    pub exposure: f32,
+    #[specta(type = Number)]
+    pub composition: f32,
+}
+
+/// Tag/score thresholds for one `ShootType`. Defaults come from
+/// `ml::thresholds::default_thresholds`; user overrides are stored per shoot type.
+/// Sharpness values use the same normalized 0..=1 scale as `QualityScore`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CullThresholds {
+    /// EAR below this means the eye is closed (`blink`). 0..=1; open eyes are ~0.24.
+    #[specta(type = Number)]
+    pub blink_ear: f32,
+    /// Group shots: `blink` if *any* considered face blinks (else only the primary face).
+    pub require_all_eyes_open: bool,
+    /// Faces whose box height is below this share of the preview height are ignored. 0..=1.
+    #[specta(type = Number)]
+    pub min_face_size: f32,
+    /// Primary-face sharpness below this means `missed_focus`. 0..=1.
+    #[specta(type = Number)]
+    pub face_sharpness_min: f32,
+    /// Global sharpness below this (no usable face) means `missed_focus`/`motion_blur`. 0..=1.
+    #[specta(type = Number)]
+    pub global_sharpness_min: f32,
+    /// Mean luma below this means `underexposed`. 0..=1.
+    #[specta(type = Number)]
+    pub underexposed_mean_luma: f32,
+    /// Share of shadow-clipped pixels above this means `underexposed`. 0..=1.
+    #[specta(type = Number)]
+    pub underexposed_clip_pct: f32,
+    /// Share of highlight-clipped pixels above this means `overexposed`. 0..=1.
+    #[specta(type = Number)]
+    pub overexposed_clip_pct: f32,
+    /// Max Hamming distance (0..=64) between 64-bit perceptual hashes of frames in one burst.
+    pub burst_hash_distance: u32,
+    /// `overall` at or above this suggests `pick`. 0..=1.
+    #[specta(type = Number)]
+    pub pick_min_overall: f32,
+    /// `overall` below this suggests `reject`. 0..=1, `<= pickMinOverall`.
+    #[specta(type = Number)]
+    pub reject_max_overall: f32,
+    pub weights: ScoreWeights,
+}
+
+impl CullThresholds {
+    /// Returns a description of the first invalid value, if any.
+    pub fn validate(&self) -> Result<(), String> {
+        fn unit(name: &str, v: f32) -> Result<(), String> {
+            if v.is_finite() && (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} = {v} is outside 0..=1"))
+            }
+        }
+        for (name, v) in [
+            ("blinkEar", self.blink_ear),
+            ("minFaceSize", self.min_face_size),
+            ("faceSharpnessMin", self.face_sharpness_min),
+            ("globalSharpnessMin", self.global_sharpness_min),
+            ("underexposedMeanLuma", self.underexposed_mean_luma),
+            ("underexposedClipPct", self.underexposed_clip_pct),
+            ("overexposedClipPct", self.overexposed_clip_pct),
+            ("pickMinOverall", self.pick_min_overall),
+            ("rejectMaxOverall", self.reject_max_overall),
+        ] {
+            unit(name, v)?;
+        }
+        if self.burst_hash_distance > 64 {
+            return Err(format!("burstHashDistance = {} is outside 0..=64", self.burst_hash_distance));
+        }
+        if self.reject_max_overall > self.pick_min_overall {
+            return Err("rejectMaxOverall must be <= pickMinOverall".into());
+        }
+        let w = self.weights;
+        let ws = [w.eyes_open, w.face_sharpness, w.global_sharpness, w.exposure, w.composition];
+        if ws.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err("weights must be finite and >= 0".into());
+        }
+        if ws.iter().sum::<f32>() <= 0.0 {
+            return Err("weights must not all be zero".into());
+        }
+        Ok(())
+    }
+}
+
+/// What `analyze_images` should (re)process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum AnalysisScope {
+    /// Every image with a ready preview that is unanalyzed or out of date (new import,
+    /// re-extracted preview, older `modelVersion`). What auto-analysis runs.
+    Pending,
+    /// Re-measure these images even if up to date. Unknown ids fail with `not_found`.
+    Images { ids: Vec<ImageId> },
+    /// Re-measure every image in this folder.
+    Folder { folder_id: FolderId },
+    /// Re-measure the whole catalog.
+    All,
+    /// No ML: recompute tags, scores, suggestions and burst groups from stored
+    /// measurements (after a shoot type / threshold / burst window change).
+    Rescore,
+}
+
+/// Catalog-wide analysis snapshot, so the UI can restore progress after a reload.
+/// `total = analyzed + failed + pending + waiting`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisStatus {
+    pub total: u32,
+    /// Up to date with the current model version and preview.
+    pub analyzed: u32,
+    /// Failed with the current model version (not retried until forced or re-extracted).
+    pub failed: u32,
+    /// Have a ready preview and need (re)analysis.
+    pub pending: u32,
+    /// No usable preview yet (thumbnail pending or failed).
+    pub waiting: u32,
+    /// The background worker is currently working.
+    pub running: bool,
+}
+
+/// A cluster of near-identical frames shot in quick succession.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BurstGroup {
+    pub id: BurstGroupId,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    /// Best frame of the burst; the others carry `duplicate_burst`.
+    pub keeper_image_id: Option<ImageId>,
+    /// Members in capture order (at least 2).
+    pub image_ids: Vec<ImageId>,
 }
 
 string_enum! {
@@ -263,6 +474,8 @@ pub struct RawImageEntry {
     pub pick: PickFlag,
     pub color_label: Option<ColorLabel>,
     pub burst_group_id: Option<BurstGroupId>,
+    /// This image is its burst group's keeper.
+    pub is_burst_keeper: bool,
     pub tags: Vec<CullTagEntry>,
     pub quality: Option<QualityScore>,
     pub has_edits: bool,
@@ -554,6 +767,8 @@ pub struct CatalogState {
     /// Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
     /// Thumbnails/previews live in `<cacheDir>/thumbs/`.
     pub cache_dir: String,
+    /// Analysis starts automatically after import / on launch (`set_auto_analyze`).
+    pub auto_analyze: bool,
 }
 
 /// Snapshot of thumbnail/metadata extraction, so the UI can restore its progress

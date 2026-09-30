@@ -42,10 +42,45 @@ pub struct ThumbnailFailed {
     pub reason: String,
 }
 
-/// Progress of the culling/analysis worker.
+/// Progress of the per-image stage of the analysis worker. Counts cover the current
+/// run (`total` grows while ingest keeps producing previews). `done` includes failures.
+/// Throttled like `ImportProgress`. `done == total` ends the per-image stage; burst
+/// grouping/rescoring follows and the run ends with `AnalysisFinished`.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisProgress {
     pub done: u32,
     pub total: u32,
+    /// Of `done`, how many failed.
+    pub failed: u32,
+}
+
+/// An image's measurements, `QualityScore`, faces and auto tags were written.
+/// Burst membership / `duplicate_burst` may still change until `AnalysisFinished`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisReady {
+    pub image_id: ImageId,
+}
+
+/// Analysis failed for an image (unreadable preview, model error).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisFailed {
+    pub image_id: ImageId,
+    pub reason: String,
+}
+
+/// The worker went idle: bursts, tags, scores and suggestions are final for this run.
+/// Refetch the visible page and `getCatalogState()` (tag counts).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisFinished {
+    /// Images measured in this run (excluding failures).
+    pub analyzed: u32,
+    pub failed: u32,
+    /// Stopped by `cancel_analysis`; remaining work stays pending.
+    pub cancelled: bool,
+    /// Burst groups in the catalog after regrouping.
+    pub burst_groups: u32,
 }

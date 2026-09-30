@@ -11,12 +11,19 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
-use ipc::events::{AnalysisProgress, ImportProgress, ThumbnailFailed, ThumbnailReady};
+use ipc::events::{
+    AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ImportProgress, ThumbnailFailed, ThumbnailReady,
+};
+use ipc::types::AnalysisScope;
+use ml::{Analysis, AnalysisConfig};
 
 /// Overrides the catalog location (useful for tests and scratch catalogs).
 const CATALOG_ENV: &str = "LUMENRAW_CATALOG";
 /// Overrides the derived-file cache root (thumbnails live in `<cache>/thumbs/`).
 const CACHE_ENV: &str = "LUMENRAW_CACHE";
+/// Overrides the ONNX model directory (default: `src-tauri/models` in debug builds,
+/// `<resource_dir>/models` in release).
+const MODELS_ENV: &str = "LUMENRAW_MODELS";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -39,8 +46,25 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::save_adjustments,
             commands::regenerate_thumbnails,
             commands::get_import_status,
+            commands::analyze_images,
+            commands::cancel_analysis,
+            commands::get_analysis_status,
+            commands::set_auto_analyze,
+            commands::get_cull_thresholds,
+            commands::set_cull_thresholds,
+            commands::get_faces,
+            commands::list_burst_groups,
+            commands::apply_suggestions,
         ])
-        .events(collect_events![ImportProgress, ThumbnailReady, ThumbnailFailed, AnalysisProgress])
+        .events(collect_events![
+            ImportProgress,
+            ThumbnailReady,
+            ThumbnailFailed,
+            AnalysisProgress,
+            AnalysisReady,
+            AnalysisFailed,
+            AnalysisFinished
+        ])
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -69,16 +93,27 @@ pub fn run() {
                 Some(p) => PathBuf::from(p),
                 None => app.path().app_cache_dir()?,
             };
+            let models_dir = match std::env::var_os(MODELS_ENV) {
+                Some(p) => PathBuf::from(p),
+                None if cfg!(debug_assertions) => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/models")),
+                None => app.path().resource_dir()?.join("models"),
+            };
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
             // covers a `LUMENRAW_CACHE` override (and is a no-op widening otherwise).
             app.asset_protocol_scope().allow_directory(config.thumbs_dir(), true)?;
 
-            app.manage(Catalog::open(path)?);
+            let catalog = Catalog::open(path.clone())?;
+            let auto_analyze = catalog.auto_analyze_blocking()?;
+            app.manage(catalog);
             app.manage(Ingest::new(config));
-            // Resume thumbnails left `pending` by a previous session.
+            app.manage(Analysis::new(AnalysisConfig { catalog_path: path, models_dir }));
+            // Resume thumbnails left `pending` (and analysis left undone) by a previous session.
             app.state::<Ingest>().start(app.handle())?;
+            if auto_analyze {
+                app.state::<Analysis>().start(app.handle(), AnalysisScope::Pending)?;
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -72,7 +72,59 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
         folders,
         tag_counts,
         cache_dir: cache_dir.to_owned(),
+        auto_analyze: auto_analyze(conn)?,
     })
+}
+
+pub fn auto_analyze(conn: &Connection) -> AppResult<bool> {
+    let v: Option<String> =
+        conn.query_row("SELECT value FROM catalog_meta WHERE key = 'auto_analyze'", [], |r| r.get(0)).optional()?;
+    Ok(v.as_deref() != Some("0"))
+}
+
+pub fn set_auto_analyze(conn: &Connection, enabled: bool) -> AppResult<()> {
+    set_meta(conn, "auto_analyze", if enabled { "1" } else { "0" })
+}
+
+pub fn shoot_type(conn: &Connection) -> AppResult<ShootType> {
+    Ok(ShootType::parse(&get_meta(conn, "shoot_type")?).unwrap_or(ShootType::General))
+}
+
+fn thresholds_key(shoot_type: ShootType) -> String {
+    format!("cull_thresholds.{}", shoot_type.as_str())
+}
+
+/// Effective thresholds for `shoot_type`: stored overrides overlaid on
+/// `ml::thresholds::default_thresholds`, so fields added later load as defaults.
+pub fn cull_thresholds(conn: &Connection, shoot_type: ShootType) -> AppResult<CullThresholds> {
+    let defaults = crate::ml::thresholds::default_thresholds(shoot_type);
+    let json: Option<String> = conn
+        .query_row("SELECT value FROM catalog_meta WHERE key = ?1", [thresholds_key(shoot_type)], |r| r.get(0))
+        .optional()?;
+    let Some(json) = json else { return Ok(defaults) };
+    let mut merged = serde_json::to_value(&defaults)?;
+    merge_json(&mut merged, serde_json::from_str(&json)?);
+    let t: CullThresholds = serde_json::from_value(merged)?;
+    // Stored values that no longer validate (e.g. after a range change) fall back.
+    Ok(if t.validate().is_ok() { t } else { defaults })
+}
+
+/// Stores `thresholds` for `shoot_type`, or resets to defaults when `None`.
+pub fn set_cull_thresholds(
+    conn: &Connection,
+    shoot_type: ShootType,
+    thresholds: Option<&CullThresholds>,
+) -> AppResult<()> {
+    match thresholds {
+        Some(t) => {
+            t.validate().map_err(AppError::invalid)?;
+            set_meta(conn, &thresholds_key(shoot_type), &serde_json::to_string(t)?)
+        }
+        None => {
+            conn.execute("DELETE FROM catalog_meta WHERE key = ?1", [thresholds_key(shoot_type)])?;
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +222,9 @@ const ENTRY_SELECT: &str = "
            q.face_count, q.clipped_highlights_pct, q.clipped_shadows_pct, q.mean_luma,
            q.model_version,
            EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id),
-           t.preview_path
+           t.preview_path,
+           q.suggested_rating, q.suggested_pick,
+           EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id)
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -215,6 +269,8 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
                 mean_luma: r.get(36)?,
             },
             model_version: r.get(37)?,
+            suggested_rating: r.get(40)?,
+            suggested_pick: enum_col(r, 41, PickFlag::parse)?,
         }),
         None => None,
     };
@@ -247,6 +303,7 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         pick: enum_col(r, 25, PickFlag::parse)?,
         color_label: opt_enum_col(r, 26, ColorLabel::parse)?,
         burst_group_id: r.get(27)?,
+        is_burst_keeper: r.get(42)?,
         tags: Vec::new(),
         quality,
         has_edits: r.get(38)?,
@@ -620,6 +677,82 @@ pub fn reset_thumbnails(conn: &mut Connection, ids: &[ImageId]) -> AppResult<Vec
     Ok(old)
 }
 
+// ---------------------------------------------------------------------------
+// Analysis reads + user-driven writes (Phase 3 contract plumbing). The worker's writes
+// (measurements, scores, auto tags, burst groups) live in `ml/` (vision-ml-dev).
+// ---------------------------------------------------------------------------
+
+fn ensure_image(conn: &Connection, id: ImageId) -> AppResult<()> {
+    let exists: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)", [id], |r| r.get(0))?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::not_found(format!("image {id}")))
+    }
+}
+
+/// Detected faces from the last analysis; empty if unanalyzed or no faces.
+pub fn get_faces(conn: &Connection, id: ImageId) -> AppResult<Vec<FaceInfo>> {
+    ensure_image(conn, id)?;
+    let json: Option<Option<String>> =
+        conn.query_row("SELECT faces_json FROM image_analysis WHERE image_id = ?1", [id], |r| r.get(0)).optional()?;
+    match json.flatten() {
+        Some(json) => Ok(serde_json::from_str(&json)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Burst groups (optionally only those with a member in `folder`), in capture order.
+pub fn list_burst_groups(conn: &Connection, folder: Option<FolderId>) -> AppResult<Vec<BurstGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.started_at_ms, b.ended_at_ms, b.keeper_image_id, i.id
+         FROM burst_groups b JOIN images i ON i.burst_group_id = b.id
+         WHERE ?1 IS NULL OR b.id IN (SELECT burst_group_id FROM images WHERE folder_id = ?1)
+         ORDER BY b.started_at_ms, b.id, i.captured_at_ms, i.file_name, i.id",
+    )?;
+    let rows = stmt.query_map([folder], |r| {
+        Ok((
+            BurstGroup {
+                id: r.get(0)?,
+                started_at_ms: r.get(1)?,
+                ended_at_ms: r.get(2)?,
+                keeper_image_id: r.get(3)?,
+                image_ids: Vec::new(),
+            },
+            r.get::<_, ImageId>(4)?,
+        ))
+    })?;
+    let mut groups: Vec<BurstGroup> = Vec::new();
+    for row in rows {
+        let (group, member) = row?;
+        match groups.last_mut() {
+            Some(last) if last.id == group.id => last.image_ids.push(member),
+            _ => groups.push(BurstGroup { image_ids: vec![member], ..group }),
+        }
+    }
+    Ok(groups)
+}
+
+/// Copies `suggested_rating` / `suggested_pick` into the user's rating/pick for `ids`.
+/// Unanalyzed images are skipped. Atomic; unknown ids fail with `not_found`.
+/// Returns how many images were updated.
+pub fn apply_suggestions(conn: &mut Connection, ids: &[ImageId]) -> AppResult<u32> {
+    let tx = conn.transaction()?;
+    let mut updated = 0;
+    for &id in ids {
+        ensure_image(&tx, id)?;
+        updated += tx.execute(
+            "UPDATE images SET
+                 rating = (SELECT suggested_rating FROM quality_scores WHERE image_id = ?1),
+                 pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM quality_scores WHERE image_id = ?1)",
+            [id],
+        )? as u32;
+    }
+    tx.commit()?;
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,5 +1027,85 @@ mod tests {
         assert!(set_burst_window(&conn, 5).is_err());
         let s = catalog_state(&conn, "", "").unwrap();
         assert_eq!((s.shoot_type, s.burst_window_ms), (ShootType::Wedding, 800));
+    }
+
+    #[test]
+    fn analysis_settings_and_thresholds() {
+        let conn = open_in_memory();
+        assert!(catalog_state(&conn, "", "").unwrap().auto_analyze);
+        set_auto_analyze(&conn, false).unwrap();
+        assert!(!catalog_state(&conn, "", "").unwrap().auto_analyze);
+
+        let defaults = crate::ml::thresholds::default_thresholds(ShootType::Wedding);
+        assert_eq!(cull_thresholds(&conn, ShootType::Wedding).unwrap(), defaults);
+        let custom = CullThresholds { blink_ear: 0.2, ..defaults.clone() };
+        set_cull_thresholds(&conn, ShootType::Wedding, Some(&custom)).unwrap();
+        assert_eq!(cull_thresholds(&conn, ShootType::Wedding).unwrap(), custom);
+        assert_ne!(cull_thresholds(&conn, ShootType::Sports).unwrap(), custom);
+        let bad = CullThresholds { reject_max_overall: 0.9, pick_min_overall: 0.5, ..defaults.clone() };
+        assert_eq!(
+            set_cull_thresholds(&conn, ShootType::Wedding, Some(&bad)).unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        set_cull_thresholds(&conn, ShootType::Wedding, None).unwrap();
+        assert_eq!(cull_thresholds(&conn, ShootType::Wedding).unwrap(), defaults);
+    }
+
+    #[test]
+    fn analysis_reads_and_suggestions() {
+        let mut conn = open_in_memory();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0), (2, '/g', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                 imported_at, captured_at_ms, rating, pick)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0, 1000, 2, 'unflagged'),
+                    (2, 1, '/f/b.arw', 'b.arw', 'arw', 'sony', 1, 0, 0, 1500, 0, 'unflagged'),
+                    (3, 2, '/g/c.arw', 'c.arw', 'arw', 'sony', 1, 0, 0, 9000, 1, 'pick');
+             INSERT INTO burst_groups (id, started_at_ms, ended_at_ms, keeper_image_id) VALUES (7, 1000, 1500, 2);
+             UPDATE images SET burst_group_id = 7 WHERE id IN (1, 2);
+             INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                                         clipped_shadows_pct, mean_luma, model_version, analyzed_at,
+                                         suggested_rating, suggested_pick)
+             VALUES (1, 0.2, 0.3, 0, 0, 0.5, 'm', 0, 1, 'reject'),
+                    (2, 0.9, 0.8, 0, 0, 0.5, 'm', 0, 4, 'pick');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO image_analysis (image_id, status, model_version, analyzed_at, phash, faces_json)
+             VALUES (2, 'done', 'm', 0, ?1, ?2)",
+            params![
+                u64::MAX as i64,
+                r#"[{"bbox":{"x":0.1,"y":0.2,"width":0.3,"height":0.4},"leftEye":{"x":0.2,"y":0.3},
+                    "rightEye":{"x":0.3,"y":0.3},"detectionScore":0.9,"ear":0.25,"eyesOpen":1.0,
+                    "sharpness":0.8,"blink":false,"inFocus":true,"primary":true,"considered":true}]"#
+            ],
+        )
+        .unwrap();
+
+        let b = get_image(&conn, 2).unwrap();
+        assert!(b.is_burst_keeper);
+        let q = b.quality.unwrap();
+        assert_eq!((q.suggested_rating, q.suggested_pick), (4, PickFlag::Pick));
+        assert!(!get_image(&conn, 1).unwrap().is_burst_keeper);
+
+        let faces = get_faces(&conn, 2).unwrap();
+        assert_eq!(faces.len(), 1);
+        assert!(faces[0].primary && faces[0].ear == Some(0.25));
+        assert!(get_faces(&conn, 1).unwrap().is_empty());
+        assert_eq!(get_faces(&conn, 99).unwrap_err().kind, ErrorKind::NotFound);
+
+        let groups = list_burst_groups(&conn, None).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!((groups[0].keeper_image_id, groups[0].image_ids.clone()), (Some(2), vec![1, 2]));
+        assert_eq!(list_burst_groups(&conn, Some(1)).unwrap().len(), 1);
+        assert!(list_burst_groups(&conn, Some(2)).unwrap().is_empty());
+
+        assert_eq!(apply_suggestions(&mut conn, &[1, 99]).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(get_image(&conn, 1).unwrap().rating, 2);
+        assert_eq!(apply_suggestions(&mut conn, &[1, 2, 3]).unwrap(), 2);
+        let (a, b, c) = (get_image(&conn, 1).unwrap(), get_image(&conn, 2).unwrap(), get_image(&conn, 3).unwrap());
+        assert_eq!((a.rating, a.pick), (1, PickFlag::Reject));
+        assert_eq!((b.rating, b.pick), (4, PickFlag::Pick));
+        assert_eq!((c.rating, c.pick), (1, PickFlag::Pick));
     }
 }

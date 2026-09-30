@@ -29,7 +29,7 @@ Conventions
   - Acceptance: importing the full sample folder completes; 788/788 thumbnails `ready`; EXIF populated (capture time non-null for all); throughput ≥ 30 files/s on this Mac; peak RSS does not grow with file count (compare 100 vs 788 files); Fuji/Canon paths covered by unit tests with synthetic containers.
 
 ## Phase 3 — Culling engine
-- [ ] **Contract** (architect): analysis commands (`analyze_images`, `cancel_analysis`), per-shoot-type thresholds, suggested rating/pick fields.
+- [x] **Contract** (architect): analysis commands (`analyze_images`, `cancel_analysis`), per-shoot-type thresholds, suggested rating/pick fields.
 - [ ] **Models** (vision-ml-dev): download SCRFD (face det) + 5/106-pt landmark ONNX into `src-tauri/models/` (gitignored) with a fetch script + checksums; `ort` with CoreML EP, CPU fallback.
 - [ ] **Metrics** (vision-ml-dev): face boxes; EAR blink per face; Laplacian variance on eye/face crop vs full frame; motion vs creative blur heuristic (directional blur + subject sharp elsewhere); exposure clipping + mean luma.
 - [ ] **Bursts** (vision-ml-dev): group by capture-time gap ≤ `burst_window_ms` + perceptual hash distance; pick burst keeper; tag others `duplicate_burst`.
@@ -104,3 +104,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 1 complete (`bae9d2c`): 12 Rust tests, frontend build, dev app launches.
 - 2026-09-29 — Phase 2 Contract: IPC v2 (previewPath, cacheDir, ImportStatus, regenerate_thumbnails, get_import_status, thumbnailFailed), migration 0002, asset protocol scoped to cache. Gate: 13 tests, clippy, fmt, pnpm build green.
 - 2026-09-29 — Phase 2 complete: own FFI to libraw_r + TurboJPEG, direct ARW/RAF/CR3 container parsing, rayon ingest pipeline (8 threads). QA: 34 tests + 2 real-sample ignored tests pass; 396/396 ARW ready, 0 null capture times; 160.9 files/s; footprint 252 MB (100 files) vs 264 MB (396); EXIF/orientation match exiftool; frontend list + progress + retry, stale-race and cache-bust fixes. Sample folder trimmed to 396 by user. GUI rendering not screenshot-verified (terminal lacks Screen Recording permission); app launches on QA catalog with no runtime errors.
+- 2026-09-29 — Phase 3 Contract: IPC v3 (analyze_images/cancel/status, CullThresholds per shoot type, FaceInfo, BurstGroup, suggestions + apply_suggestions, auto-analyze), migration 0003. Gate: 37 tests, clippy, fmt, build green.

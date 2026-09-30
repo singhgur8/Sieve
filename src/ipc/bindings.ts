@@ -6,12 +6,15 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	getCatalogState: () => typedError<CatalogState, AppError>(__TAURI_INVOKE("get_catalog_state")),
+	/**  Also kicks a rescore (tags/scores/suggestions use the new shoot type's thresholds). */
 	setShootType: (shootType: ShootType) => typedError<null, AppError>(__TAURI_INVOKE("set_shoot_type", { shootType })),
+	/**  Also kicks a rescore (burst regrouping). */
 	setBurstWindow: (ms: number) => typedError<null, AppError>(__TAURI_INVOKE("set_burst_window", { ms })),
 	/**
 	 *  Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
-	 *  then kicks the background ingest pipeline and returns. Extraction progress arrives
-	 *  as `importProgress` / `thumbnailReady` / `thumbnailFailed` events.
+	 *  then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
+	 *  returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
+	 *  (and `analysis*`) events.
 	 */
 	importFolder: (path: string, options: ImportOptions) => typedError<ImportSummary, AppError>(__TAURI_INVOKE("import_folder", { path, options })),
 	listImages: (query: ImageQuery) => typedError<ImagePage, AppError>(__TAURI_INVOKE("list_images", { query })),
@@ -26,32 +29,168 @@ export const commands = {
 	saveAdjustments: (id: number, adjustments: ParametricAdjustments) => typedError<null, AppError>(__TAURI_INVOKE("save_adjustments", { id, adjustments })),
 	/**
 	 *  Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
-	 *  `pending` and returns immediately; results arrive as events.
+	 *  `pending` and returns immediately; results arrive as events. With `autoAnalyze`, the
+	 *  new previews are re-analyzed.
 	 */
 	regenerateThumbnails: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("regenerate_thumbnails", { ids })),
 	/**  Catalog-wide pending/ready/failed counts and whether the pipeline is running. */
 	getImportStatus: () => typedError<ImportStatus, AppError>(__TAURI_INVOKE("get_import_status")),
+	/**
+	 *  Queues `scope` for the background analysis worker and returns immediately.
+	 *  Progress: `analysisProgress`, `analysisReady`, `analysisFailed`, `analysisFinished`.
+	 */
+	analyzeImages: (scope: AnalysisScope) => typedError<null, AppError>(__TAURI_INVOKE("analyze_images", { scope })),
+	/**  Stops the worker after the images in flight; remaining work stays pending. */
+	cancelAnalysis: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_analysis")),
+	getAnalysisStatus: () => typedError<AnalysisStatus, AppError>(__TAURI_INVOKE("get_analysis_status")),
+	setAutoAnalyze: (enabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_auto_analyze", { enabled })),
+	/**  Effective thresholds for `shootType` (stored overrides over the defaults). */
+	getCullThresholds: (shootType: ShootType) => typedError<CullThresholds, AppError>(__TAURI_INVOKE("get_cull_thresholds", { shootType })),
+	/**
+	 *  Stores thresholds for `shootType` (`null` resets to defaults). Kicks a rescore when
+	 *  `shootType` is the catalog's current shoot type.
+	 */
+	setCullThresholds: (shootType: ShootType, thresholds: {
+	/**  EAR below this means the eye is closed (`blink`). 0..=1; open eyes are ~0.24. */
+	blinkEar: number,
+	/**  Group shots: `blink` if *any* considered face blinks (else only the primary face). */
+	requireAllEyesOpen: boolean,
+	/**  Faces whose box height is below this share of the preview height are ignored. 0..=1. */
+	minFaceSize: number,
+	/**  Primary-face sharpness below this means `missed_focus`. 0..=1. */
+	faceSharpnessMin: number,
+	/**  Global sharpness below this (no usable face) means `missed_focus`/`motion_blur`. 0..=1. */
+	globalSharpnessMin: number,
+	/**  Mean luma below this means `underexposed`. 0..=1. */
+	underexposedMeanLuma: number,
+	/**  Share of shadow-clipped pixels above this means `underexposed`. 0..=1. */
+	underexposedClipPct: number,
+	/**  Share of highlight-clipped pixels above this means `overexposed`. 0..=1. */
+	overexposedClipPct: number,
+	/**  Max Hamming distance (0..=64) between 64-bit perceptual hashes of frames in one burst. */
+	burstHashDistance: number,
+	/**  `overall` at or above this suggests `pick`. 0..=1. */
+	pickMinOverall: number,
+	/**  `overall` below this suggests `reject`. 0..=1, `<= pickMinOverall`. */
+	rejectMaxOverall: number,
+	weights: ScoreWeights,
+} | null) => typedError<null, AppError>(__TAURI_INVOKE("set_cull_thresholds", { shootType, thresholds })),
+	/**  Faces from the last analysis (empty if unanalyzed); for face-crop zoom. */
+	getFaces: (id: number) => typedError<FaceInfo[], AppError>(__TAURI_INVOKE("get_faces", { id })),
+	/**  Burst groups with members, optionally limited to groups touching `folderId`. */
+	listBurstGroups: (folderId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId })),
+	/**
+	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`
+	 *  (unanalyzed images skipped). Returns the number of images updated.
+	 */
+	applySuggestions: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("apply_suggestions", { ids })),
 };
 
 /** Events */
 export const events = {
+	analysisFailed: makeEvent<AnalysisFailed>("analysis-failed"),
+	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
+	analysisReady: makeEvent<AnalysisReady>("analysis-ready"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
 };
 
 /* Types */
-/**  Progress of the culling/analysis worker. */
+/**  Analysis failed for an image (unreadable preview, model error). */
+export type AnalysisFailed = {
+	imageId: number,
+	reason: string,
+};
+
+/**
+ *  The worker went idle: bursts, tags, scores and suggestions are final for this run.
+ *  Refetch the visible page and `getCatalogState()` (tag counts).
+ */
+export type AnalysisFinished = {
+	/**  Images measured in this run (excluding failures). */
+	analyzed: number,
+	failed: number,
+	/**  Stopped by `cancel_analysis`; remaining work stays pending. */
+	cancelled: boolean,
+	/**  Burst groups in the catalog after regrouping. */
+	burstGroups: number,
+};
+
+/**
+ *  Progress of the per-image stage of the analysis worker. Counts cover the current
+ *  run (`total` grows while ingest keeps producing previews). `done` includes failures.
+ *  Throttled like `ImportProgress`. `done == total` ends the per-image stage; burst
+ *  grouping/rescoring follows and the run ends with `AnalysisFinished`.
+ */
 export type AnalysisProgress = {
 	done: number,
 	total: number,
+	/**  Of `done`, how many failed. */
+	failed: number,
+};
+
+/**
+ *  An image's measurements, `QualityScore`, faces and auto tags were written.
+ *  Burst membership / `duplicate_burst` may still change until `AnalysisFinished`.
+ */
+export type AnalysisReady = {
+	imageId: number,
+};
+
+/**  What `analyze_images` should (re)process. */
+export type AnalysisScope = 
+/**
+ *  Every image with a ready preview that is unanalyzed or out of date (new import,
+ *  re-extracted preview, older `modelVersion`). What auto-analysis runs.
+ */
+{ kind: "pending" } | 
+/**  Re-measure these images even if up to date. Unknown ids fail with `not_found`. */
+{ kind: "images"; ids: number[] } | 
+/**  Re-measure every image in this folder. */
+{ kind: "folder"; folderId: number } | 
+/**  Re-measure the whole catalog. */
+{ kind: "all" } | 
+/**
+ *  No ML: recompute tags, scores, suggestions and burst groups from stored
+ *  measurements (after a shoot type / threshold / burst window change).
+ */
+{ kind: "rescore" };
+
+/**
+ *  Catalog-wide analysis snapshot, so the UI can restore progress after a reload.
+ *  `total = analyzed + failed + pending + waiting`.
+ */
+export type AnalysisStatus = {
+	total: number,
+	/**  Up to date with the current model version and preview. */
+	analyzed: number,
+	/**  Failed with the current model version (not retried until forced or re-extracted). */
+	failed: number,
+	/**  Have a ready preview and need (re)analysis. */
+	pending: number,
+	/**  No usable preview yet (thumbnail pending or failed). */
+	waiting: number,
+	/**  The background worker is currently working. */
+	running: boolean,
 };
 
 /**  Error returned by every command. Serialized as `{ kind, message }`. */
 export type AppError = {
 	kind: ErrorKind,
 	message: string,
+};
+
+/**  A cluster of near-identical frames shot in quick succession. */
+export type BurstGroup = {
+	id: number,
+	startedAtMs: number,
+	endedAtMs: number,
+	/**  Best frame of the burst; the others carry `duplicate_burst`. */
+	keeperImageId: number | null,
+	/**  Members in capture order (at least 2). */
+	imageIds: number[],
 };
 
 export type CameraInfo = {
@@ -95,6 +234,8 @@ export type CatalogState = {
 	 *  Thumbnails/previews live in `<cacheDir>/thumbs/`.
 	 */
 	cacheDir: string,
+	/**  Analysis starts automatically after import / on launch (`set_auto_analyze`). */
+	autoAnalyze: boolean,
 };
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
@@ -117,6 +258,37 @@ export type CullTagEntry = {
 	suppressed: boolean,
 };
 
+/**
+ *  Tag/score thresholds for one `ShootType`. Defaults come from
+ *  `ml::thresholds::default_thresholds`; user overrides are stored per shoot type.
+ *  Sharpness values use the same normalized 0..=1 scale as `QualityScore`.
+ */
+export type CullThresholds = {
+	/**  EAR below this means the eye is closed (`blink`). 0..=1; open eyes are ~0.24. */
+	blinkEar: number,
+	/**  Group shots: `blink` if *any* considered face blinks (else only the primary face). */
+	requireAllEyesOpen: boolean,
+	/**  Faces whose box height is below this share of the preview height are ignored. 0..=1. */
+	minFaceSize: number,
+	/**  Primary-face sharpness below this means `missed_focus`. 0..=1. */
+	faceSharpnessMin: number,
+	/**  Global sharpness below this (no usable face) means `missed_focus`/`motion_blur`. 0..=1. */
+	globalSharpnessMin: number,
+	/**  Mean luma below this means `underexposed`. 0..=1. */
+	underexposedMeanLuma: number,
+	/**  Share of shadow-clipped pixels above this means `underexposed`. 0..=1. */
+	underexposedClipPct: number,
+	/**  Share of highlight-clipped pixels above this means `overexposed`. 0..=1. */
+	overexposedClipPct: number,
+	/**  Max Hamming distance (0..=64) between 64-bit perceptual hashes of frames in one burst. */
+	burstHashDistance: number,
+	/**  `overall` at or above this suggests `pick`. 0..=1. */
+	pickMinOverall: number,
+	/**  `overall` below this suggests `reject`. 0..=1, `<= pickMinOverall`. */
+	rejectMaxOverall: number,
+	weights: ScoreWeights,
+};
+
 export type ErrorKind = "not_found" | "invalid_argument" | "io" | "database" | "internal";
 
 export type ExposureStats = {
@@ -126,6 +298,37 @@ export type ExposureStats = {
 	clippedShadowsPct: number,
 	/**  Mean luminance, 0..=1. */
 	meanLuma: number,
+};
+
+/**
+ *  One detected face, for the loupe's face-crop zoom and per-face diagnostics.
+ *  Raw measurements (`ear`, `sharpness`) are threshold-independent; the derived flags
+ *  (`eyesOpen`, `blink`, `inFocus`) reflect the thresholds at the last (re)score.
+ */
+export type FaceInfo = {
+	bbox: NormRect,
+	/**  Eye centres from the detector keypoints; image-left and image-right. */
+	leftEye: NormPoint,
+	rightEye: NormPoint,
+	/**  Detector confidence 0..=1. */
+	detectionScore: number,
+	/**  Eye Aspect Ratio of the less-open eye; `None` if landmarks were unusable. */
+	ear: number | null,
+	/**  Eye openness 0..=1 derived from `ear`; `None` if `ear` is `None`. */
+	eyesOpen: number | null,
+	/**  Normalized sharpness 0..=1 of the eye region (face crop if eyes unusable). */
+	sharpness: number,
+	/**  Eyes closed per `CullThresholds.blinkEar`. */
+	blink: boolean,
+	/**  `sharpness >= CullThresholds.faceSharpnessMin`. */
+	inFocus: boolean,
+	/**  The face that drives `QualityScore.faceSharpness` (largest / most central). */
+	primary: boolean,
+	/**
+	 *  Face is large enough to be judged (`CullThresholds.minFaceSize`); smaller faces
+	 *  are reported but ignored for tags and scores.
+	 */
+	considered: boolean,
 };
 
 export type FolderEntry = {
@@ -225,6 +428,23 @@ export type LutRef = {
 	amount: number,
 };
 
+/**  Point in normalized preview coordinates (see [`NormRect`]). */
+export type NormPoint = {
+	x: number,
+	y: number,
+};
+
+/**
+ *  Axis-aligned rectangle in normalized preview coordinates: 0..=1 of the preview's
+ *  width/height, origin top-left, orientation already applied (same frame the UI shows).
+ */
+export type NormRect = {
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+};
+
 /**
  *  Parametric develop settings. Field names and ranges mirror Adobe Camera Raw
  *  Process 2012+ (`crs:` XMP namespace) so XMP export is a 1:1 mapping.
@@ -265,6 +485,16 @@ export type QualityScore = {
 	exposure: ExposureStats,
 	/**  Identifies the model/algorithm set, so scores can be recomputed on upgrade. */
 	modelVersion: string,
+	/**
+	 *  Engine's suggested star rating 0..=5. Never written to `RawImageEntry.rating`
+	 *  except through `apply_suggestions`.
+	 */
+	suggestedRating: number,
+	/**
+	 *  Engine's suggested flag (burst non-keepers and hard defects lean `reject`).
+	 *  Never written to `RawImageEntry.pick` except through `apply_suggestions`.
+	 */
+	suggestedPick: PickFlag,
 };
 
 /**  Supported RAW containers, in pipeline priority order. */
@@ -297,9 +527,23 @@ export type RawImageEntry = {
 	pick: PickFlag,
 	colorLabel: ColorLabel | null,
 	burstGroupId: number | null,
+	/**  This image is its burst group's keeper. */
+	isBurstKeeper: boolean,
 	tags: CullTagEntry[],
 	quality: QualityScore | null,
 	hasEdits: boolean,
+};
+
+/**
+ *  Relative weights of the score components in `QualityScore.overall`.
+ *  Non-negative; normalized by their sum (all-zero is invalid).
+ */
+export type ScoreWeights = {
+	eyesOpen: number,
+	faceSharpness: number,
+	globalSharpness: number,
+	exposure: number,
+	composition: number,
 };
 
 /**

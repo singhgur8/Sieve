@@ -12,6 +12,7 @@ use super::error::{AppError, AppResult};
 use super::types::*;
 use crate::db::{self, repo};
 use crate::ingest::{self, Ingest};
+use crate::ml::{self, Analysis};
 
 /// Managed state: the open catalog.
 pub struct Catalog {
@@ -23,6 +24,12 @@ impl Catalog {
     pub fn open(path: PathBuf) -> AppResult<Self> {
         let conn = db::open(&path)?;
         Ok(Self { path, conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// Synchronous read of the `autoAnalyze` setting (startup only).
+    pub fn auto_analyze_blocking(&self) -> AppResult<bool> {
+        let conn = self.conn.lock().map_err(|_| AppError::internal("catalog lock poisoned"))?;
+        repo::auto_analyze(&conn)
     }
 
     /// Runs `f` against the connection on the blocking pool so SQLite and
@@ -50,41 +57,72 @@ pub async fn get_catalog_state(catalog: State<'_, Catalog>, ingest: State<'_, In
     catalog.run(move |c| repo::catalog_state(c, &path, &cache_dir)).await
 }
 
+/// Also kicks a rescore (tags/scores/suggestions use the new shoot type's thresholds).
 #[tauri::command]
 #[specta::specta]
-pub async fn set_shoot_type(catalog: State<'_, Catalog>, shoot_type: ShootType) -> AppResult<()> {
-    catalog.run(move |c| repo::set_shoot_type(c, shoot_type)).await
+pub async fn set_shoot_type(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    shoot_type: ShootType,
+) -> AppResult<()> {
+    catalog.run(move |c| repo::set_shoot_type(c, shoot_type)).await?;
+    analysis.start(&app, AnalysisScope::Rescore)
 }
 
+/// Also kicks a rescore (burst regrouping).
 #[tauri::command]
 #[specta::specta]
-pub async fn set_burst_window(catalog: State<'_, Catalog>, ms: u32) -> AppResult<()> {
-    catalog.run(move |c| repo::set_burst_window(c, ms)).await
+pub async fn set_burst_window(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    ms: u32,
+) -> AppResult<()> {
+    catalog.run(move |c| repo::set_burst_window(c, ms)).await?;
+    analysis.start(&app, AnalysisScope::Rescore)
 }
 
 /// Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
-/// then kicks the background ingest pipeline and returns. Extraction progress arrives
-/// as `importProgress` / `thumbnailReady` / `thumbnailFailed` events.
+/// then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
+/// returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
+/// (and `analysis*`) events.
 #[tauri::command]
 #[specta::specta]
 pub async fn import_folder(
     app: AppHandle,
     catalog: State<'_, Catalog>,
     ingest: State<'_, Ingest>,
+    analysis: State<'_, Analysis>,
     path: String,
     options: ImportOptions,
 ) -> AppResult<ImportSummary> {
-    let summary = catalog.run(move |c| repo::import_folder(c, Path::new(&path), &options)).await?;
+    let (summary, auto) =
+        catalog.run(move |c| Ok((repo::import_folder(c, Path::new(&path), &options)?, repo::auto_analyze(c)?))).await?;
     ingest.start(&app)?;
+    if auto {
+        analysis.start(&app, AnalysisScope::Pending)?;
+    }
     Ok(summary)
 }
 
 /// Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
-/// `pending` and returns immediately; results arrive as events.
+/// `pending` and returns immediately; results arrive as events. With `autoAnalyze`, the
+/// new previews are re-analyzed.
 #[tauri::command]
 #[specta::specta]
-pub async fn regenerate_thumbnails(app: AppHandle, ingest: State<'_, Ingest>, ids: Vec<ImageId>) -> AppResult<()> {
-    ingest.regenerate(&app, ids)
+pub async fn regenerate_thumbnails(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    analysis: State<'_, Analysis>,
+    ids: Vec<ImageId>,
+) -> AppResult<()> {
+    ingest.regenerate(&app, ids)?;
+    if catalog.run(|c| repo::auto_analyze(c)).await? {
+        analysis.start(&app, AnalysisScope::Pending)?;
+    }
+    Ok(())
 }
 
 /// Catalog-wide pending/ready/failed counts and whether the pipeline is running.
@@ -156,4 +194,92 @@ pub async fn save_adjustments(
     adjustments: ParametricAdjustments,
 ) -> AppResult<()> {
     catalog.run(move |c| repo::save_adjustments(c, id, &adjustments)).await
+}
+
+// ---------------------------------------------------------------------------
+// Analysis (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Queues `scope` for the background analysis worker and returns immediately.
+/// Progress: `analysisProgress`, `analysisReady`, `analysisFailed`, `analysisFinished`.
+#[tauri::command]
+#[specta::specta]
+pub async fn analyze_images(app: AppHandle, analysis: State<'_, Analysis>, scope: AnalysisScope) -> AppResult<()> {
+    analysis.start(&app, scope)
+}
+
+/// Stops the worker after the images in flight; remaining work stays pending.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_analysis(analysis: State<'_, Analysis>) -> AppResult<()> {
+    analysis.cancel();
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_analysis_status(
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+) -> AppResult<AnalysisStatus> {
+    let running = analysis.is_running();
+    catalog.run(move |c| ml::analysis_status(c, running)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_auto_analyze(catalog: State<'_, Catalog>, enabled: bool) -> AppResult<()> {
+    catalog.run(move |c| repo::set_auto_analyze(c, enabled)).await
+}
+
+/// Effective thresholds for `shootType` (stored overrides over the defaults).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_cull_thresholds(catalog: State<'_, Catalog>, shoot_type: ShootType) -> AppResult<CullThresholds> {
+    catalog.run(move |c| repo::cull_thresholds(c, shoot_type)).await
+}
+
+/// Stores thresholds for `shootType` (`null` resets to defaults). Kicks a rescore when
+/// `shootType` is the catalog's current shoot type.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_cull_thresholds(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    shoot_type: ShootType,
+    thresholds: Option<CullThresholds>,
+) -> AppResult<()> {
+    let current = catalog
+        .run(move |c| {
+            repo::set_cull_thresholds(c, shoot_type, thresholds.as_ref())?;
+            repo::shoot_type(c)
+        })
+        .await?;
+    if current == shoot_type {
+        analysis.start(&app, AnalysisScope::Rescore)?;
+    }
+    Ok(())
+}
+
+/// Faces from the last analysis (empty if unanalyzed); for face-crop zoom.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_faces(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<Vec<FaceInfo>> {
+    catalog.run(move |c| repo::get_faces(c, id)).await
+}
+
+/// Burst groups with members, optionally limited to groups touching `folderId`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_burst_groups(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<BurstGroup>> {
+    catalog.run(move |c| repo::list_burst_groups(c, folder_id)).await
+}
+
+/// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`
+/// (unanalyzed images skipped). Returns the number of images updated.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_suggestions(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<u32> {
+    catalog.run(move |c| repo::apply_suggestions(c, &ids)).await
 }

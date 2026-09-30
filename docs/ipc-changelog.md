@@ -49,3 +49,60 @@ Who updates what
 - frontend-dev: show thumbnails via `convertFileSrc(thumbnail.path)`; listen to `importProgress`,
   `thumbnailReady`, `thumbnailFailed`; call `getImportStatus()` on mount to restore progress;
   offer retry via `regenerateThumbnails(ids)` for failed images.
+
+## v3 — 2026-09-29 (Phase 3: culling engine)
+Types
+- `QualityScore` gains `suggestedRating: number` (0–5) and `suggestedPick: PickFlag`. Suggestions never
+  touch the user's `rating`/`pick` except via `applySuggestions`.
+- `RawImageEntry.isBurstKeeper: boolean`.
+- `CatalogState.autoAnalyze: boolean`.
+- New `FaceInfo { bbox: NormRect, leftEye, rightEye: NormPoint, detectionScore, ear, eyesOpen, sharpness,
+  blink, inFocus, primary, considered }`; `NormRect {x,y,width,height}` / `NormPoint {x,y}` are 0..1 of the
+  (orientation-corrected) preview, origin top-left.
+- New `CullThresholds` (+ `ScoreWeights`): per-shoot-type blink EAR, min face size, face/global sharpness
+  minimums, under/overexposure limits, burst hash distance, pick/reject cut-offs, score weights.
+  `CullThresholds::validate()`.
+- New `AnalysisScope` (tagged by `kind`): `pending | images{ids} | folder{folderId} | all | rescore`.
+- New `AnalysisStatus { total, analyzed, failed, pending, waiting, running }`.
+- New `BurstGroup { id, startedAtMs, endedAtMs, keeperImageId, imageIds }`.
+
+Commands (new)
+- `analyze_images(scope) -> null`, `cancel_analysis() -> null`, `get_analysis_status() -> AnalysisStatus`.
+- `set_auto_analyze(enabled) -> null`.
+- `get_cull_thresholds(shootType) -> CullThresholds`, `set_cull_thresholds(shootType, thresholds | null) -> null`
+  (`null` resets to defaults; rescore kicked if `shootType` is current).
+- `get_faces(id) -> FaceInfo[]`, `list_burst_groups(folderId | null) -> BurstGroup[]`,
+  `apply_suggestions(ids) -> number` (count updated; unanalyzed skipped; atomic, `not_found` on unknown id).
+
+Commands (changed; TS signatures unchanged)
+- `import_folder` and `regenerate_thumbnails` also kick analysis (`pending`) when `autoAnalyze` is on.
+- `set_shoot_type` and `set_burst_window` also kick a `rescore`.
+
+Events
+- `analysisProgress` gains `failed`.
+- New `analysisReady {imageId}`, `analysisFailed {imageId, reason}`,
+  `analysisFinished {analyzed, failed, cancelled, burstGroups}`.
+
+Schema (migration `0003_analysis.sql`, user_version 3)
+- New table `image_analysis` (status queued/done/failed, model_version, analyzed_at, error, phash, faces_json,
+  metrics_json) + `idx_image_analysis_status`.
+- `quality_scores.suggested_rating`, `quality_scores.suggested_pick`.
+- `catalog_meta`: `auto_analyze` (default `'1'`); overrides under `cull_thresholds.<shoot_type>` (JSON).
+
+Config
+- `LUMENRAW_MODELS=/path` overrides the model dir (default `src-tauri/models` in debug, `<resource_dir>/models`
+  in release — bundling is Phase 8).
+
+Who updates what
+- architect (done): types, events, commands, registration, migration, `Analysis` managed in `lib.rs`
+  (auto-start on launch), repo plumbing for the new read/user-write commands (`auto_analyze`,
+  `set_auto_analyze`, `shoot_type`, `cull_thresholds`, `set_cull_thresholds`, `get_faces`,
+  `list_burst_groups`, `apply_suggestions`) + `ENTRY_SELECT` columns 40–42, with tests.
+- vision-ml-dev: fill the stubs in `src-tauri/src/ml/mod.rs` — `Analysis::start` (queue scope + worker),
+  `analysis_status`, `Analyzer::{load, measure}`, `score`, `group_bursts`, `MODEL_VERSION`; tune
+  `ml/thresholds.rs`. Put the worker's SQL (write `image_analysis`, `quality_scores`, auto tags, burst groups,
+  needs-analysis query) in `ml/` (e.g. `ml/store.rs`), not in `db/repo.rs`, to avoid conflicts.
+  Add `ort` etc. to `Cargo.toml`.
+- frontend-dev: listen to `analysis*` events, show progress/cancel, `isBurstKeeper`, suggestions with an
+  "apply suggestions" action; thresholds editor and auto-analyze toggle are optional in Phase 3 (Phase 4 UI).
+  `DEFAULT_QUERY` unchanged.
