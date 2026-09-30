@@ -235,34 +235,27 @@ impl Index {
                 }
             }
         }
+        // UUID -> file from the shared look scan (`xmp::looks`), then the header of each look.
+        let mut found: Vec<(String, PathBuf)> = crate::xmp::looks::scan(&config.look_dirs).into_iter().collect();
+        found.sort_by(|a, b| a.1.cmp(&b.1));
         let mut looks: Vec<LookEntry> = Vec::new();
-        for dir in &config.look_dirs {
-            let mut files = Vec::new();
-            walk(dir, "xmp", &mut files, 0);
-            for path in files {
-                let Some(start) = head(&path, 4096) else { continue };
-                let s = String::from_utf8_lossy(&start);
-                if !s.contains("PresetType=\"Look\"") && !s.contains("<crs:PresetType>Look<") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                match LookProfile::parse_file_opts(&text, false) {
-                    Ok(Some(mut info)) => {
-                        if info.group.is_empty() {
-                            info.group = path
-                                .parent()
-                                .and_then(|p| p.file_name())
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                        }
-                        // First directory wins (system before user), like Camera Raw.
-                        if !looks.iter().any(|l| l.info.uuid == info.uuid) {
-                            looks.push(LookEntry { info, path });
-                        }
+        for (_, path) in found {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            match LookProfile::parse_file_opts(&text, false) {
+                Ok(Some(mut info)) => {
+                    if info.group.is_empty() {
+                        info.group = path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
                     }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("look profile {}: {e}", path.display()),
+                    if !looks.iter().any(|l| l.info.uuid == info.uuid) {
+                        looks.push(LookEntry { info, path });
+                    }
                 }
+                Ok(None) => {}
+                Err(e) => eprintln!("look profile {}: {e}", path.display()),
             }
         }
         Index { dcps, looks }
@@ -307,6 +300,11 @@ impl ProfileLibrary {
 
     fn index(&self) -> &Index {
         self.inner.index.get_or_init(|| Index::scan(&self.inner.config))
+    }
+
+    /// Scans the installed profiles now (call from a background thread at startup).
+    pub fn warm(&self) {
+        let _ = self.index();
     }
 
     /// Adobe unique camera model matched for `camera` (if any DCP is installed for it).

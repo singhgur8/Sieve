@@ -43,6 +43,8 @@ typedef struct {
   unsigned filters;
   char make[64];
   char model[64];
+  float fuji_expo_shift;
+  float dng_baseline_exposure;
 } sieve_lr_color_t;
 
 /* Colour data after open_file (before processing rewrites pre_mul). */
@@ -64,6 +66,8 @@ void sieve_lr_get_color(libraw_data_t *lr, sieve_lr_color_t *out)
   memcpy(out->model, lr->idata.normalized_model, sizeof out->model);
   out->make[sizeof out->make - 1] = 0;
   out->model[sizeof out->model - 1] = 0;
+  out->fuji_expo_shift = lr->makernotes.fuji.ExpoMidPointShift;
+  out->dng_baseline_exposure = lr->color.dng_levels.baseline_exposure;
 }
 
 /* Copies the processed image (after dcraw_process) as interleaved RGB16 into `out`

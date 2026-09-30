@@ -23,11 +23,15 @@
 //! - Prefetch: one background thread decodes queued sources (newest request replaces the
 //!   queue); concurrent decodes of the same image are coalesced.
 
+pub mod camera;
 pub mod history;
+mod param_data;
 pub mod parity;
 pub mod pipeline;
 pub mod presets;
 pub mod source;
+pub mod tone;
+mod tone_data;
 pub mod wb;
 
 use std::collections::{HashMap, VecDeque};
@@ -40,11 +44,14 @@ use tauri::http;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    DevelopInfo, ImageId, NormRect, ParametricAdjustments, RenderOptions, RenderSlot, RenderedPreview,
+    CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect, ParametricAdjustments,
+    ProfileSettings, RenderOptions, RenderSlot, RenderedPreview,
 };
 use crate::lut::LutLibrary;
+use crate::profiles::ProfileLibrary;
 
-use source::{LinearImage, Prepared};
+use camera::Profile;
+use source::{LinearImage, Prepared, SourceMeta};
 
 /// Custom URI scheme serving rendered previews (registered in `lib.rs`).
 pub const RENDER_SCHEME: &str = "sieve";
@@ -89,18 +96,24 @@ pub struct RenderTicket {
     pub seq: u32,
 }
 
+/// Renders at most this long run as drafts (slider drags): cheaper LUT, no luminance NR.
+pub const DRAFT_EDGE: u32 = 1024;
+
 /// Identity of a prepared input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrepKey {
     orientation: u8,
     max_edge: u32,
     region: Option<[u32; 4]>,
+    /// Crop (enabled flag + rect + angle bits); `None` = whole frame.
+    crop: Option<[u32; 5]>,
 }
 
 impl PrepKey {
-    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>) -> Self {
+    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>, crop: &CropSettings) -> Self {
         let region = region.map(|r| [r.x.to_bits(), r.y.to_bits(), r.width.to_bits(), r.height.to_bits()]);
-        PrepKey { orientation, max_edge, region }
+        let crop = crop.enabled.then(|| [crop.top, crop.left, crop.bottom, crop.right, crop.angle].map(f32::to_bits));
+        PrepKey { orientation, max_edge, region, crop }
     }
 }
 
@@ -108,7 +121,10 @@ impl PrepKey {
 struct Entry {
     path: PathBuf,
     image: LinearImage,
+    meta: SourceMeta,
     prepared: Mutex<Vec<(PrepKey, Arc<Prepared>)>>,
+    /// Last resolved profile (resolution reads the sidecar when a look is not installed).
+    profile: Mutex<Option<(ProfileSettings, Arc<Profile>)>>,
 }
 
 impl Entry {
@@ -118,8 +134,8 @@ impl Entry {
     }
 
     /// Prepared input for the key (computed and cached if needed).
-    fn prepared(&self, orientation: u8, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
-        let key = PrepKey::new(orientation, max_edge, region);
+    fn prepared(&self, orientation: u8, crop: &CropSettings, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
+        let key = PrepKey::new(orientation, max_edge, region, crop);
         {
             let mut list = lock(&self.prepared);
             if let Some(i) = list.iter().position(|(k, _)| *k == key) {
@@ -129,13 +145,59 @@ impl Entry {
                 return p;
             }
         }
-        let p = Arc::new(source::prepare(&self.image, orientation, region, max_edge));
+        let p = Arc::new(source::prepare(&self.image, orientation, crop, region, max_edge));
         let mut list = lock(&self.prepared);
         if list.len() >= PREPARED_PER_IMAGE {
             list.remove(0);
         }
         list.push((key, p.clone()));
         p
+    }
+
+    /// Camera profile + look for `settings` (cached for the last settings).
+    fn profile(&self, settings: &ProfileSettings) -> Arc<Profile> {
+        if let Some((s, p)) = lock(&self.profile).as_ref() {
+            if s == settings {
+                return p.clone();
+            }
+        }
+        let sidecar = crate::xmp::sidecar_path(&self.path);
+        let p = Arc::new(camera::resolve(&self.meta, settings, &ProfileLibrary::shared(), Some(&sidecar)));
+        *lock(&self.profile) = Some((settings.clone(), p.clone()));
+        p
+    }
+
+    /// The format's default profile (for `info`).
+    fn default_profile(&self) -> Arc<Profile> {
+        self.profile(&ParametricAdjustments::defaults_for(self.meta.format).profile)
+    }
+
+    fn input<'a>(
+        &'a self,
+        prepared: &'a Prepared,
+        profile: &'a Profile,
+        seed: ImageId,
+        quality: pipeline::Quality,
+    ) -> pipeline::RenderInput<'a> {
+        pipeline::RenderInput {
+            width: prepared.width,
+            height: prepared.height,
+            pixels: &prepared.pixels,
+            color: &self.image.color,
+            frame_long_edge: prepared.frame_long_edge,
+            view: prepared.view,
+            profile,
+            seed: seed as u64,
+            quality,
+        }
+    }
+}
+
+fn quality_for(max_edge: u32) -> pipeline::Quality {
+    if max_edge <= DRAFT_EDGE {
+        pipeline::Quality::Draft
+    } else {
+        pipeline::Quality::Preview
     }
 }
 
@@ -182,6 +244,9 @@ pub struct DevelopCache {
 
 impl DevelopCache {
     pub fn new(config: DevelopConfig) -> Self {
+        // Scan the installed Adobe profiles in the background so the first render does not
+        // wait for it.
+        let _ = std::thread::Builder::new().name("profile-scan".into()).spawn(|| ProfileLibrary::shared().warm());
         Self {
             config,
             latest: Arc::new(Mutex::new(HashMap::new())),
@@ -238,8 +303,14 @@ impl DevelopCache {
         if let Some(e) = self.cached(src) {
             return Ok(e);
         }
-        let image = source::decode_half_size(&src.path)?;
-        let entry = Arc::new(Entry { path: src.path.clone(), image, prepared: Mutex::new(Vec::new()) });
+        let (image, meta) = source::decode_half_size_meta(&src.path)?;
+        let entry = Arc::new(Entry {
+            path: src.path.clone(),
+            image,
+            meta,
+            prepared: Mutex::new(Vec::new()),
+            profile: Mutex::new(None),
+        });
         {
             let mut lru = lock(&self.inner.lru);
             lru.clock += 1;
@@ -293,7 +364,7 @@ impl DevelopCache {
             return Ok(None);
         }
         let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), options.region, options.max_edge);
+        let prepared = entry.prepared(src.orientation(), &adjustments.crop, options.region, options.max_edge);
         self.evict(src.id);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id)?,
@@ -303,13 +374,8 @@ impl DevelopCache {
         if !self.is_current(ticket) {
             return Ok(None);
         }
-        let input = pipeline::RenderInput {
-            width: prepared.width,
-            height: prepared.height,
-            pixels: &prepared.pixels,
-            color: &entry.image.color,
-            frame_long_edge: prepared.frame_long_edge,
-        };
+        let profile = entry.profile(&adjustments.profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge));
         let img = pipeline::render(&input, adjustments, lut.as_deref());
         if !self.is_current(ticket) {
             return Ok(None);
@@ -357,16 +423,13 @@ impl DevelopCache {
         let o = src.orientation();
         let (source_width, source_height) = source::oriented_size(img.width, img.height, o);
         let (full_width, full_height) = source::oriented_size(img.full_width, img.full_height, o);
-        let as_shot = img.color.as_shot_mul.map(|m| wb::values_for(m, &img.color.xyz_to_cam));
-        Ok(DevelopInfo {
-            image_id: src.id,
-            as_shot,
-            source_width,
-            source_height,
-            full_width,
-            full_height,
-            warnings: Vec::new(),
-        })
+        let profile = entry.default_profile();
+        let as_shot = camera::as_shot_values(&img.color, &profile);
+        let mut warnings = profile.warnings.clone();
+        if let Some(detail) = img.source_color.as_ref().and_then(|c| c.assumed_detail()) {
+            warnings.push(DevelopWarning { code: DevelopWarningCode::SourceColorAssumed, detail: Some(detail) });
+        }
+        Ok(DevelopInfo { image_id: src.id, as_shot, source_width, source_height, full_width, full_height, warnings })
     }
 
     /// Warms the cache for `sources` in the background (e.g. filmstrip neighbours) and
@@ -434,23 +497,17 @@ impl DevelopCache {
         luts: &LutLibrary,
     ) -> AppResult<RenderedPixels> {
         let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), region, max_edge);
+        let prepared = entry.prepared(src.orientation(), &adjustments.crop, region, max_edge);
         self.evict(src.id);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id)?,
             None => None,
         };
         let lut_missing = adjustments.lut.is_some() && lut.is_none();
-        let input = pipeline::RenderInput {
-            width: prepared.width,
-            height: prepared.height,
-            pixels: &prepared.pixels,
-            color: &entry.image.color,
-            frame_long_edge: prepared.frame_long_edge,
-        };
+        let profile = entry.profile(&adjustments.profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge));
         let image = pipeline::render(&input, adjustments, lut.as_deref());
-        let color = &entry.image.color;
-        let as_shot = color.as_shot_mul.map(|m| wb::values_for(m, &color.xyz_to_cam));
+        let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
     }
 }

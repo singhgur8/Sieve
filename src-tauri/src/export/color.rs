@@ -267,10 +267,10 @@ mod tests {
         // Adobe RGB: gamma curv with one entry = 0x0233.
         let a = icc_profile(ExportColorSpace::AdobeRgb);
         assert!(a.windows(14).any(|w| w == b"curv\0\0\0\0\0\0\0\x01\x02\x33"));
-        // P3 red is outside sRGB: its linear Rec.2020 -> P3 matrix maps P3 red to (1, 0, 0).
+        // The XYZ -> P3 matrix maps P3 red (its to_xyz column) to (1, 0, 0).
         let p3 = output_space(ExportColorSpace::DisplayP3);
-        let red_2020 = wb::invert3(&p3.from_rec2020).unwrap();
-        let back = mat_vec(&p3.from_rec2020, [red_2020[0][0], red_2020[1][0], red_2020[2][0]]);
+        let red_xyz = [p3.to_xyz[0][0], p3.to_xyz[1][0], p3.to_xyz[2][0]];
+        let back = mat_vec(&p3.from_xyz, red_xyz);
         assert!((back[0] - 1.0).abs() < 1e-9 && back[1].abs() < 1e-9);
     }
 }

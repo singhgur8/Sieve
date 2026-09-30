@@ -88,7 +88,8 @@ pub fn resolve(meta: &SourceMeta, settings: &ProfileSettings, lib: &ProfileLibra
     let baseline_ev = if meta.display_referred {
         0.0
     } else {
-        crate::profiles::raw_baseline_exposure(meta.make.as_deref(), meta.model.as_deref())
+        meta.baseline_exposure
+            .unwrap_or_else(|| crate::profiles::raw_baseline_exposure(meta.make.as_deref(), meta.model.as_deref()))
             + dcp.as_ref().map_or(0.0, |d| d.baseline_exposure_offset)
     };
     Profile { dcp, look, look_amount, baseline_ev, display_referred: meta.display_referred, warnings }

@@ -12,8 +12,9 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::NormRect;
+use crate::ipc::types::{CropSettings, NormRect};
 use crate::raw::libraw;
+use crate::raw::raster::{self, SourceColorSpace};
 
 use super::wb;
 
@@ -48,6 +49,13 @@ pub struct LinearImage {
     /// Full-size output dimensions before orientation.
     pub full_width: u32,
     pub full_height: u32,
+    /// Display-referred source (non-RAW, Phase 7b): pixels are the file's own linear light,
+    /// so the pipeline must skip `BASELINE_EV` and the base (filmic) curve; neutral
+    /// adjustments then reproduce the file. `false` for RAW decodes.
+    pub display_referred: bool,
+    /// Colour encoding of a raster source (`None` for RAW). `Unknown` =>
+    /// `DevelopWarningCode::SourceColorAssumed` (detail: `SourceColorSpace::assumed_detail`).
+    pub source_color: Option<SourceColorSpace>,
 }
 
 impl LinearImage {
@@ -106,28 +114,59 @@ pub struct SourceMeta {
     /// Already rendered (JPEG/HEIC/TIFF/PNG): no baseline exposure, no base tone curve, no
     /// camera profile.
     pub display_referred: bool,
+    /// Per-file raw baseline exposure when the file tells it (Fujifilm `RawExposureBias`,
+    /// DNG `BaselineExposure`); `None` = the camera default.
+    pub baseline_exposure: Option<f32>,
 }
 
 impl SourceMeta {
     /// Metadata of a non-RAW (display-referred) source.
     pub fn display_referred(format: crate::ipc::types::ImageFormat) -> Self {
-        SourceMeta { format, make: None, model: None, display_referred: true }
+        SourceMeta { format, make: None, model: None, display_referred: true, baseline_exposure: None }
     }
 
     fn raw(path: &Path, c: &libraw::ColorData) -> Self {
         let format = crate::raw::format_from_extension(path).unwrap_or(crate::ipc::types::ImageFormat::Arw);
         let name = |s: &str| (!s.is_empty()).then(|| s.to_owned());
-        SourceMeta { format, make: name(&c.make), model: name(&c.model), display_referred: false }
+        // Camera Raw: Fujifilm baseline = -RawExposureBias - 0.65 (DNG Converter 17.5: DR100
+        // bias -0.7 -> 0.07, DR200 -1.7 -> 1.07).
+        // LibRaw reports -999 when a file has no DNG BaselineExposure.
+        let baseline_exposure = if c.dng_baseline_exposure.abs() < 10.0 && c.dng_baseline_exposure != 0.0 {
+            Some(c.dng_baseline_exposure)
+        } else if format == crate::ipc::types::ImageFormat::Raf && c.fuji_expo_shift != 0.0 {
+            Some(-c.fuji_expo_shift - 0.65)
+        } else {
+            None
+        };
+        SourceMeta { format, make: name(&c.make), model: name(&c.model), display_referred: false, baseline_exposure }
     }
 }
 
-/// Blocking half-size decode (~0.3-0.8 s for 24-33 MP on Apple Silicon).
+/// Long edge of the editor's cached decode of a non-RAW source (the RAW equivalent is
+/// LibRaw's half-size decode).
+pub const RASTER_EDITOR_EDGE: u32 = 4096;
+
+/// Non-RAW sources (by extension) are decoded by `raw::raster`; `None` = a RAW path.
+fn decode_raster(path: &Path, max_edge: Option<u32>) -> Option<AppResult<(LinearImage, SourceMeta)>> {
+    let format = crate::raw::format_from_extension(path).filter(|f| !f.is_raw())?;
+    Some(
+        raster::decode_linear(path, format, max_edge)
+            .map(|img| (raster::to_linear_image(img), SourceMeta::display_referred(format)))
+            .map_err(|e| AppError::internal(format!("{}: {e}", path.display()))),
+    )
+}
+
+/// Blocking half-size decode (~0.3-0.8 s for 24-33 MP on Apple Silicon). Non-RAW sources:
+/// linear decode downscaled to [`RASTER_EDITOR_EDGE`].
 pub fn decode_half_size(path: &Path) -> AppResult<LinearImage> {
     decode_half_size_meta(path).map(|(img, _)| img)
 }
 
 /// [`decode_half_size`] plus the source's camera metadata.
 pub fn decode_half_size_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)> {
+    if let Some(r) = decode_raster(path, Some(RASTER_EDITOR_EDGE)) {
+        return r;
+    }
     let d = libraw::decode_linear(path, true).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
     let meta = SourceMeta::raw(path, &d.color);
@@ -136,19 +175,34 @@ pub fn decode_half_size_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)
     } else {
         (d.width * 2, d.height * 2)
     };
-    Ok((LinearImage { width: d.width, height: d.height, pixels: d.pixels, color, full_width, full_height }, meta))
+    Ok((
+        LinearImage {
+            width: d.width,
+            height: d.height,
+            pixels: d.pixels,
+            color,
+            full_width,
+            full_height,
+            display_referred: false,
+            source_color: None,
+        },
+        meta,
+    ))
 }
 
 /// Blocking full-resolution decode for export: the same LibRaw settings as
 /// [`decode_half_size`] except `half_size = 0` and `user_qual = 3` (AHD for Bayer, 3-pass
 /// Markesteijn for X-Trans). LibRaw's buffers are released before returning;
-/// `full_width/full_height` equal `width/height`.
+/// `full_width/full_height` equal `width/height`. Non-RAW sources: full-size linear decode.
 pub fn decode_full(path: &Path) -> AppResult<LinearImage> {
     decode_full_meta(path).map(|(img, _)| img)
 }
 
 /// [`decode_full`] plus the source's camera metadata.
 pub fn decode_full_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)> {
+    if let Some(r) = decode_raster(path, None) {
+        return r;
+    }
     let d = libraw::decode_linear(path, false).map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
     let color = color_info(&d.color);
     let meta = SourceMeta::raw(path, &d.color);
@@ -160,26 +214,12 @@ pub fn decode_full_meta(path: &Path) -> AppResult<(LinearImage, SourceMeta)> {
             color,
             full_width: d.width,
             full_height: d.height,
+            display_referred: false,
+            source_color: None,
         },
         meta,
     ))
 }
-
-/// Decodes any supported source (RAW via LibRaw, others via `raw::raster`) for the editor
-/// (`half = true`: half-size RAW / <= 4096 px raster) or for export (full size).
-pub fn decode_any(path: &Path, half: bool) -> AppResult<(LinearImage, SourceMeta)> {
-    let format = crate::raw::format_from_extension(path);
-    match format {
-        Some(f) if !f.is_raw() => {
-            let img = crate::raw::raster::decode_linear(path, f, if half { Some(4096) } else { None })
-                .map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
-            Ok((crate::raw::raster::to_linear_image(img), SourceMeta::display_referred(f)))
-        }
-        _ if half => decode_half_size_meta(path),
-        _ => decode_full_meta(path),
-    }
-}
-
 /// Camera RGB cropped/resampled to the render size with orientation applied.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -535,19 +575,21 @@ mod tests {
             },
             full_width: w * 2,
             full_height: h * 2,
+            display_referred: false,
+            source_color: None,
         }
     }
 
     #[test]
     fn identity_resample_and_flat_downscale() {
         let img = image(7, 5, |x, y| [x as u16 * 100, y as u16 * 100, 7]);
-        let p = prepare(&img, 1, None, 64);
+        let p = prepare(&img, 1, &CropSettings::default(), None, 64);
         assert_eq!((p.width, p.height), (7, 5), "never upscaled");
         assert_eq!(p.pixels, img.pixels, "1:1 is exact");
         assert_eq!(p.frame_long_edge, 7.0);
 
         let flat = image(400, 300, |_, _| [1000, 2000, 3000]);
-        let p = prepare(&flat, 1, None, 100);
+        let p = prepare(&flat, 1, &CropSettings::default(), None, 100);
         assert_eq!((p.width, p.height), (100, 75));
         assert!(p.pixels.chunks(3).all(|c| c == [1000, 2000, 3000]));
     }
@@ -557,17 +599,17 @@ mod tests {
         // 4x2 image, pixel value encodes (x, y).
         let img = image(4, 2, |x, y| [x as u16, y as u16, 0]);
         // Orientation 6 (rotate 90 CW for display): output 2x4, top-left shows source (0, 1).
-        let p = prepare(&img, 6, None, 64);
+        let p = prepare(&img, 6, &CropSettings::default(), None, 64);
         assert_eq!((p.width, p.height), (2, 4));
         assert_eq!(&p.pixels[0..2], &[0, 1]);
         // Orientation 8 (rotate 90 CCW): top-left shows source (3, 0).
-        let p = prepare(&img, 8, None, 64);
+        let p = prepare(&img, 8, &CropSettings::default(), None, 64);
         assert_eq!(&p.pixels[0..2], &[3, 0]);
         // Region in oriented coordinates: the bottom half of an orientation-8 frame is
         // the left half of the stored image.
         let r = NormRect { x: 0.0, y: 0.5, width: 1.0, height: 0.5 };
         assert_eq!(unorient_rect(r, 8), NormRect { x: 0.0, y: 0.0, width: 0.5, height: 1.0 });
-        let p = prepare(&img, 8, Some(r), 64);
+        let p = prepare(&img, 8, &CropSettings::default(), Some(r), 64);
         assert_eq!((p.width, p.height), (2, 2));
         // Oriented (0,0) of the crop = stored (1, 0).
         assert_eq!(&p.pixels[0..2], &[1, 0]);

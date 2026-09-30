@@ -19,6 +19,8 @@ fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
         tags: tags.iter().map(|t| t.to_string()).collect(),
         metadata_date: DATE.into(),
         develop: Vec::new(),
+        seqs: Vec::new(),
+        profile: None,
     }
 }
 
@@ -262,9 +264,9 @@ fn sidecar_to_catalog_mapping() {
 fn newer_wins_decisions() {
     assert_eq!(decide(None, Some(5), Some(10)), Action::Write, "no sidecar");
     assert_eq!(decide(Some(5), Some(5), Some(10)), Action::Write, "not modified externally");
-    assert_eq!(decide(Some(20), Some(5), Some(10)), Action::Read, "sidecar newer");
+    assert_eq!(decide(Some(20), Some(5), Some(10)), Action::Read(None), "sidecar newer");
     assert_eq!(decide(Some(7), Some(5), Some(10)), Action::Write, "catalog newer");
-    assert_eq!(decide(Some(7), None, None), Action::Read);
+    assert_eq!(decide(Some(7), None, None), Action::Read(None));
 }
 
 #[test]
@@ -756,7 +758,8 @@ fn develop_settings_written_only_for_edited_images_and_merged() {
     assert!(out0.contains("crs:Exposure2012=\"-0.65\""), "{out0}");
     assert!(out0.contains("crs:WhiteBalance=\"Custom\""));
     assert!(out0.contains("crs:Temperature=\"4350\"") && out0.contains("crs:Tint=\"-7.5\""));
-    assert!(out0.contains("crs:ProcessVersion=\"11.0\""));
+    // A newer process version is never downgraded (Lightroom would re-render with PV 11).
+    assert!(out0.contains("crs:ProcessVersion=\"15.4\""));
     assert!(out0.contains("crs:LuminanceAdjustmentOrange=\"+8.5\""));
     assert!(
         out0.contains("sieve:LutId=\"film-a1b2c3d4\"") && out0.contains("xmlns:sieve=\"http://sieve.app/ns/1.0/\"")

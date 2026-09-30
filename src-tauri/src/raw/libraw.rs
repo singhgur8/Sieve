@@ -63,6 +63,8 @@ struct ShimColor {
     filters: c_uint,
     make: [c_char; 64],
     model: [c_char; 64],
+    fuji_expo_shift: f32,
+    dng_baseline_exposure: f32,
 }
 
 impl Default for ShimColor {
@@ -99,6 +101,9 @@ pub struct ColorData {
     /// LibRaw's normalized make / model ("Sony" / "ILCE-7M4"; empty if unknown).
     pub make: String,
     pub model: String,
+    /// Fujifilm `RawExposureBias` (EV; 0 if none) and a DNG's `BaselineExposure`.
+    pub fuji_expo_shift: f32,
+    pub dng_baseline_exposure: f32,
 }
 
 /// Linear 16-bit camera RGB (no white balance, black-subtracted, white level = 65535),
@@ -225,6 +230,8 @@ fn color_data(c: &ShimColor) -> ColorData {
         filters: c.filters,
         make: c_name(&c.make),
         model: c_name(&c.model),
+        fuji_expo_shift: if c.fuji_expo_shift.is_finite() { c.fuji_expo_shift } else { 0.0 },
+        dng_baseline_exposure: if c.dng_baseline_exposure.is_finite() { c.dng_baseline_exposure } else { 0.0 },
     }
 }
 

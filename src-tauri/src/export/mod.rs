@@ -40,7 +40,7 @@
 pub mod color;
 pub mod develop;
 pub mod encode;
-mod heic;
+pub(crate) mod heic;
 pub mod metadata;
 pub mod naming;
 pub mod presets;
@@ -87,11 +87,12 @@ pub fn memory_budget_bytes(physical_ram_bytes: u64, override_mb: Option<u64>) ->
 }
 
 /// Peak memory estimate for exporting one image: LibRaw decode (~16 B/px of the source:
-/// raw buffer + 4x16-bit image + RGB16 copy) plus the output-size working set (~24 B/px:
-/// f32 RGB in/out of the pipeline and the quantized output) plus 64 MiB for encoder and LUT
-/// buffers. 24 MP full-res ~= 1.0 GB, 61 MP full-res ~= 2.4 GB, any source -> 2048 px ~= 0.5 GB.
+/// raw buffer + 4x16-bit image + RGB16 copy) plus the output-size working set (~64 B/px:
+/// f32 working RGB, noise-reduction planes and guided-filter temporaries, u16 input and
+/// output) plus 64 MiB for encoder and LUT buffers. 24 MP full-res ~= 2.0 GB, any source ->
+/// 2048 px ~= 0.7 GB.
 pub fn estimate_image_bytes(source_pixels: u64, output_pixels: u64) -> u64 {
-    source_pixels * 16 + output_pixels * 24 + 64 * MIB
+    source_pixels * 16 + output_pixels * 64 + 64 * MIB
 }
 
 /// Physical RAM (`hw.memsize`); 16 GiB if unknown.
@@ -705,11 +706,19 @@ fn export_one(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
     }
-    let src = develop::decode_full(raw)?;
+    let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
     check()?;
     let orientation = item.entry.orientation;
-    let size = develop::planned_size(&src, orientation, &settings.resize);
-    let prepared = develop::prepare_output(&src, orientation, size)?;
+    let crop = &item.adjustments.crop;
+    let size = develop::planned_size(&src, orientation, crop, &settings.resize);
+    let scale = develop::export_scale(&src, orientation, crop, size);
+    let profile = crate::develop::camera::resolve(
+        &meta,
+        &item.adjustments.profile,
+        &crate::profiles::ProfileLibrary::shared(),
+        Some(&crate::xmp::sidecar_path(raw)),
+    );
+    let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
     let pixels = match prepared {
@@ -724,7 +733,8 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings);
+    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64 };
+    let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;
     let image = develop::finish(encoded, size, settings);
@@ -884,9 +894,9 @@ mod tests {
         assert_eq!(memory_budget_bytes(16 * GIB, Some(3000)), 3000 * MIB);
         let mp24 = 6000 * 4000;
         let full = estimate_image_bytes(mp24, mp24);
-        assert!(full > 900 * MIB && full < 1100 * MIB, "{full}");
-        // Four 24 MP full-res exports fit a 16 GB Mac's default budget.
-        assert!(4 * full <= memory_budget_bytes(16 * GIB, None) + 256 * MIB);
+        assert!(full > 1800 * MIB && full < 2200 * MIB, "{full}");
+        // Two 24 MP full-res exports (with noise reduction working sets) fit a 16 GB Mac's default budget.
+        assert!(2 * full <= memory_budget_bytes(16 * GIB, None) + 256 * MIB);
     }
 
     use crate::ipc::types::{
@@ -987,6 +997,84 @@ mod tests {
         let mut s = settings(&out);
         s.destination = ExportDestination::Folder { path: "/dev/null/nope".into() };
         assert_eq!(ex.enqueue_with(sink, vec![1], s, None).unwrap_err().kind, ErrorKind::Io);
+    }
+
+    /// v9: exports from non-RAW sources (JPEG with EXIF + orientation, 16-bit PNG) through
+    /// the raster decode; EXIF is copied from the JPEG, orientation applied, originals intact.
+    #[test]
+    fn non_raw_sources_export() {
+        use crate::ingest::{run_until_idle, IngestConfig, IngestSink};
+        use crate::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
+        use crate::raw::raster::tests::fixtures;
+        struct Quiet;
+        impl IngestSink for Quiet {
+            fn ready(&self, _: ThumbnailReady) {}
+            fn failed(&self, e: ThumbnailFailed) {
+                panic!("{}", e.reason)
+            }
+            fn progress(&self, _: ImportProgress) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let jpeg = fixtures::camera_jpeg(640, 480, 6, None);
+        std::fs::write(src.join("IMG_1.JPG"), &jpeg).unwrap();
+        let px: Vec<u16> = (0..200 * 100).flat_map(|i| [(i * 3 % 65536) as u16, 30000, 50000]).collect();
+        std::fs::write(
+            src.join("b.png"),
+            crate::raw::png::test_support::encode(200, 100, Some(&px), None, None, None, None),
+        )
+        .unwrap();
+        let catalog = dir.path().join("cat.sqlite");
+        {
+            let mut conn = db::open(&catalog).unwrap();
+            let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+            assert_eq!(repo::import_folder(&mut conn, &src, &opts).unwrap().added, 2);
+        }
+        let cfg = IngestConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") };
+        run_until_idle(&cfg, &Quiet, &std::sync::atomic::AtomicBool::new(true)).unwrap();
+
+        let ex = Exporter::new(
+            ExportConfig { catalog_path: catalog, memory_budget_mb: Some(1024) },
+            LutLibrary::new(dir.path().join("luts")),
+        );
+        let out = dir.path().join("out");
+        let mut s = settings(&out);
+        s.resize.mode = ResizeMode::None;
+        let sink = Arc::new(Sink::default());
+        ex.enqueue_with(sink.clone(), vec![1, 2], s.clone(), None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        let fin = lock(&sink.finished).clone();
+        assert_eq!(fin[0].succeeded, 2, "{:?}", fin[0].failed);
+
+        let web = out.join("Web");
+        let j = std::fs::read(web.join("IMG_1.jpg")).unwrap();
+        assert_eq!(crate::raw::turbo::dimensions(&j).unwrap(), (480, 640), "orientation 6 applied");
+        let exif = crate::raw::jpeg::exif_tiff(&j).expect("EXIF copied");
+        let meta = crate::raw::tiff::scan_bytes(exif, false).unwrap().meta;
+        assert_eq!(
+            (meta.make.as_deref(), meta.model.as_deref(), meta.orientation),
+            (Some("FUJIFILM"), Some("X-T5"), Some(1))
+        );
+        assert!(meta.date_original.is_some());
+        assert!(web.join("b.jpg").exists());
+        // Originals untouched.
+        assert_eq!(std::fs::read(src.join("IMG_1.JPG")).unwrap(), jpeg);
+
+        // 16-bit TIFF from the 16-bit PNG.
+        s.format = ExportFormat::Tiff {
+            bit_depth: crate::ipc::types::BitDepth::Sixteen,
+            compression: crate::ipc::types::TiffCompression::Zip,
+        };
+        ex.enqueue_with(sink.clone(), vec![2], s, None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        assert_eq!(lock(&sink.finished)[1].succeeded, 1);
+        let t = crate::raw::raster::decode_linear(&web.join("b.tif"), crate::ipc::types::ImageFormat::Tiff, None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(t.map(|i| (i.width, i.height, i.bit_depth)).unwrap(), (200, 100, 16));
+        #[cfg(not(target_os = "macos"))]
+        let _ = t;
     }
 
     #[test]

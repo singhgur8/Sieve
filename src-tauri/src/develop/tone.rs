@@ -47,14 +47,20 @@ struct Step {
     row: Vec<f32>,
     /// Constant EV offset added (exposure).
     offset: f32,
+    /// Domain shift: the table is evaluated at `e + shift` (image-adaptive Highlights).
+    shift: f32,
+    highlights: bool,
 }
 
 impl Step {
     #[inline]
     fn apply(&self, e: f32) -> f32 {
-        e + self.offset + sample(&self.row, d::DELTA_EV0, d::DELTA_STEP, e)
+        e + self.offset + sample(&self.row, d::DELTA_EV0, d::DELTA_STEP, e + self.shift)
     }
 }
+
+/// Mean log2 luminance of the calibration ramp the tables were measured on.
+pub const KEY_CAL: f32 = -6.5;
 
 /// The tone sliders of one render.
 pub struct ToneModel {
@@ -76,13 +82,31 @@ pub struct ToneSliders {
 impl ToneModel {
     /// `exposure` includes the baseline exposure.
     pub fn new(s: ToneSliders) -> Self {
-        let step = |t: &[[f32; d::DELTA_N]], a: f32| slider_row(t, a).map(|row| Step { row, offset: 0.0 });
-        let local = [step(&d::SHADOWS, s.shadows), step(&d::HIGHLIGHTS, s.highlights)].into_iter().flatten().collect();
+        let step = |t: &[[f32; d::DELTA_N]], a: f32| {
+            slider_row(t, a).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: false })
+        };
+        let hl = slider_row(&d::HIGHLIGHTS, s.highlights).map(|row| Step { row, offset: 0.0, shift: 0.0, highlights: true });
+        let local = [step(&d::SHADOWS, s.shadows), hl].into_iter().flatten().collect();
         let mut global: Vec<Step> = step(&d::WHITES, s.whites).into_iter().collect();
-        global.push(Step { row: exposure_row(s.exposure), offset: s.exposure });
+        if s.exposure != 0.0 {
+            global.push(Step { row: exposure_row(s.exposure), offset: s.exposure, shift: 0.0, highlights: false });
+        }
         global.extend(step(&d::CONTRAST, s.contrast));
         global.extend(step(&d::BLACKS, s.blacks));
         ToneModel { local, global }
+    }
+
+    /// Image-adaptive Shadows/Highlights (fitted to Camera Raw renders of ramps of different
+    /// ranges): Highlights act relative to the image's key (`key` = mean log2 luminance of
+    /// the frame, pre-exposure EV), Shadows relative to its white (`white` = log2 of the
+    /// brightest content, 0 = the raw clip).
+    pub fn with_key(mut self, key: f32, white: f32) -> Self {
+        let hl = (KEY_CAL - key).clamp(-8.0, 8.0);
+        let sh = (-white).clamp(0.0, 10.0);
+        for s in self.local.iter_mut() {
+            s.shift = if s.highlights { hl } else { sh };
+        }
+        self
     }
 
     /// Shadows/Highlights have an effect.

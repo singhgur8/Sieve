@@ -347,7 +347,7 @@ pub fn calibration_matrix(cal: &CameraCalibration) -> [[f32; 3]; 3] {
         let chroma = [e[0] - y, e[1] - y, e[2] - y];
         // Positive hue turns red towards yellow (towards green), green towards cyan,
         // blue towards magenta: a positive rotation in R -> G -> B order.
-        let theta = -(p.hue / 100.0).clamp(-1.0, 1.0) * 30f32.to_radians() * CAL_HUE_GAIN;
+        let theta = (p.hue / 100.0).clamp(-1.0, 1.0) * 30f32.to_radians() * CAL_HUE_GAIN;
         let c = rotate_chroma(chroma, theta);
         let s = 1.0 + (p.saturation / 100.0).clamp(-1.0, 1.0) * CAL_SAT_GAIN;
         cols[i] = [y + c[0] * s, y + c[1] * s, y + c[2] * s];
@@ -480,6 +480,118 @@ pub fn color_grade(rgb: [f32; 3], grading: &ColorGrading) -> [f32; 3] {
     Grade::new(grading).apply(rgb)
 }
 
+/// Oklab (Ottosson 2020) over linear ProPhoto, with Lightroom's eight colour bands placed at
+/// the Oklab hues of the sRGB colours they are named after (red, orange, yellow, green,
+/// aqua, blue, purple, magenta = HSV hues 0, 30, 60, 120, 180, 240, 270, 300).
+pub struct Oklab {
+    to_lms: [[f32; 3]; 3],
+    from_lms: [[f32; 3]; 3],
+    to_lab: [[f32; 3]; 3],
+    from_lab: [[f32; 3]; 3],
+    /// Band centres (Oklab hue degrees), increasing; wraps from the last to the first.
+    pub centers: [f32; 8],
+}
+
+#[inline]
+fn m3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [dot(m[0], v), dot(m[1], v), dot(m[2], v)]
+}
+
+impl Oklab {
+    pub fn get() -> &'static Oklab {
+        static O: std::sync::OnceLock<Oklab> = std::sync::OnceLock::new();
+        O.get_or_init(Oklab::new)
+    }
+
+    fn new() -> Oklab {
+        use crate::profiles::dcp::{bradford, invert3, mul_mm, xy_to_xyz, D50_XY};
+        const M1: [[f64; 3]; 3] = [
+            [0.412_221_470_8, 0.536_332_536_3, 0.051_445_992_9],
+            [0.211_903_498_2, 0.680_699_545_1, 0.107_396_956_6],
+            [0.088_302_461_9, 0.281_718_837_6, 0.629_978_700_5],
+        ];
+        const M2: [[f64; 3]; 3] = [
+            [0.210_454_255_3, 0.793_617_785_0, -0.004_072_046_8],
+            [1.977_998_495_1, -2.428_592_205_0, 0.450_593_709_9],
+            [0.025_904_037_1, 0.782_771_766_2, -0.808_675_766_0],
+        ];
+        const XYZ_TO_SRGB: [[f64; 3]; 3] = [
+            [3.240_454_2, -1.537_138_5, -0.498_531_4],
+            [-0.969_266_0, 1.876_010_8, 0.041_556_0],
+            [0.055_643_4, -0.204_025_9, 1.057_225_2],
+        ];
+        let d50_d65 = bradford(xy_to_xyz(D50_XY), xy_to_xyz((0.3127, 0.3290)));
+        let pp_to_srgb = mul_mm(&XYZ_TO_SRGB, &mul_mm(&d50_d65, &crate::develop::camera::PROPHOTO_TO_XYZ));
+        let to_lms = mul_mm(&M1, &pp_to_srgb);
+        let from_lms = invert3(&to_lms).expect("invertible");
+        let from_lab = invert3(&M2).expect("invertible");
+        let f = |m: [[f64; 3]; 3]| m.map(|r| r.map(|v| v as f32));
+        let mut ok = Oklab { to_lms: f(to_lms), from_lms: f(from_lms), to_lab: f(M2), from_lab: f(from_lab), centers: [0.0; 8] };
+        let srgb_lin_to_pp = invert3(&pp_to_srgb).expect("invertible");
+        for (k, h) in [0.0f32, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0].iter().enumerate() {
+            let e = crate::profiles::dcp::hsv_to_rgb(h / 60.0, 1.0, 1.0);
+            let lin = e.map(|c| f64::from(crate::develop::pipeline::srgb_decode(c)));
+            let pp = crate::profiles::dcp::mul_mv(&srgb_lin_to_pp, lin).map(|v| v as f32);
+            let [_, a, b] = ok.from_prophoto(pp);
+            ok.centers[k] = b.atan2(a).to_degrees().rem_euclid(360.0);
+        }
+        // Keep increasing order (red may sit just below 360 in exotic cases).
+        for k in 1..8 {
+            while ok.centers[k] < ok.centers[k - 1] {
+                ok.centers[k] += 360.0;
+            }
+        }
+        ok
+    }
+
+    #[inline]
+    pub fn from_prophoto(&self, v: [f32; 3]) -> [f32; 3] {
+        let lms = m3(&self.to_lms, v).map(f32::cbrt);
+        m3(&self.to_lab, lms)
+    }
+
+    #[inline]
+    pub fn to_prophoto(&self, lab: [f32; 3]) -> [f32; 3] {
+        let lms = m3(&self.from_lab, lab).map(|c| c * c * c);
+        m3(&self.from_lms, lms)
+    }
+
+    /// Adjacent bands (i, j) and the weight of j for an Oklab hue (degrees).
+    #[inline]
+    pub fn bands(&self, hue: f32) -> (usize, usize, f32) {
+        let c = &self.centers;
+        let mut h = hue;
+        while h < c[0] {
+            h += 360.0;
+        }
+        while h >= c[0] + 360.0 {
+            h -= 360.0;
+        }
+        let mut i = 7;
+        for k in 0..7 {
+            if h >= c[k] && h < c[k + 1] {
+                i = k;
+                break;
+            }
+        }
+        let (lo, hi) = if i == 7 { (c[7], c[0] + 360.0) } else { (c[i], c[i + 1]) };
+        let t = ((h - lo) / (hi - lo)).clamp(0.0, 1.0);
+        (i, (i + 1) % 8, t * t * (3.0 - 2.0 * t))
+    }
+
+    /// Weight of band `k` at `hue`.
+    pub fn band_weight(&self, hue: f32, k: usize) -> f32 {
+        let (i, j, t) = self.bands(hue);
+        if i == k {
+            1.0 - t
+        } else if j == k {
+            t
+        } else {
+            0.0
+        }
+    }
+}
+
 /// HSL band centres (degrees of sRGB-encoded HSV hue), Lightroom order.
 pub const BAND_CENTERS: [f32; 9] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0, 360.0];
 
@@ -508,11 +620,12 @@ pub fn gray_mix(rgb: [f32; 3], mixer: &HslChannels) -> f32 {
     if mix.iter().all(|v| *v == 0.0) {
         return y;
     }
-    // Hue/saturation as seen in gamma-encoded ProPhoto.
-    let e = rgb.map(|c| c.max(0.0).sqrt());
-    let (h, s, _) = crate::profiles::dcp::rgb_to_hsv(e[0], e[1], e[2]);
-    let (a, b, t) = band_weights(h * 60.0);
-    let m = (mix[a] + (mix[b] - mix[a]) * t) / 100.0;
+    let lab = Oklab::get();
+    let [_, a, b] = lab.from_prophoto(rgb);
+    let c = (a * a + b * b).sqrt();
+    let s = (c / 0.28).min(1.0);
+    let (i, j, t) = lab.bands(b.atan2(a).to_degrees());
+    let m = (mix[i] + (mix[j] - mix[i]) * t) / 100.0;
     y * (m * 1.5 * s).exp2()
 }
 
@@ -631,25 +744,97 @@ fn small_blur(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
 /// Self-guided / cross-guided filter (He et al.): smooths `p` where the guide `i` is flat,
 /// preserves edges of the guide. `eps` in squared guide units.
 pub fn guided(i: &[f32], p: &[f32], w: usize, h: usize, r: usize, eps: f32) -> Vec<f32> {
-    let n = w * h;
+    let self_guided = std::ptr::eq(i, p);
     let mean_i = box2d(i, w, h, r);
-    let mean_p = if std::ptr::eq(i, p) { mean_i.clone() } else { box2d(p, w, h, r) };
-    let ip: Vec<f32> = i.par_iter().zip(p).map(|(a, b)| a * b).collect();
-    let ii: Vec<f32> = i.par_iter().map(|a| a * a).collect();
-    let mean_ip = box2d(&ip, w, h, r);
-    let mean_ii = box2d(&ii, w, h, r);
-    drop((ip, ii));
-    let mut a = vec![0.0f32; n];
-    let mut b = vec![0.0f32; n];
-    a.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (a, b))| {
-        let var = (mean_ii[k] - mean_i[k] * mean_i[k]).max(0.0);
-        let cov = mean_ip[k] - mean_i[k] * mean_p[k];
-        *a = cov / (var + eps);
-        *b = mean_p[k] - *a * mean_i[k];
+    let mut mean_ii = {
+        let ii: Vec<f32> = i.par_iter().map(|a| a * a).collect();
+        box2d(&ii, w, h, r)
+    };
+    let cross = (!self_guided).then(|| {
+        let ip: Vec<f32> = i.par_iter().zip(p).map(|(a, b)| a * b).collect();
+        (box2d(p, w, h, r), box2d(&ip, w, h, r))
     });
-    let ma = box2d(&a, w, h, r);
+    // a -> mean_ii's buffer, b -> a new plane (or mean_p's).
+    let mut b = match cross {
+        Some((mean_p, mut mean_ip)) => {
+            mean_ii.par_iter_mut().zip(mean_ip.par_iter_mut()).enumerate().for_each(|(k, (a, bb))| {
+                let var = (*a - mean_i[k] * mean_i[k]).max(0.0);
+                let cov = *bb - mean_i[k] * mean_p[k];
+                *a = cov / (var + eps);
+                *bb = mean_p[k] - *a * mean_i[k];
+            });
+            mean_ip
+        }
+        None => {
+            let mut b = vec![0.0f32; w * h];
+            mean_ii.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (a, bb))| {
+                let var = (*a - mean_i[k] * mean_i[k]).max(0.0);
+                *a = var / (var + eps);
+                *bb = mean_i[k] - *a * mean_i[k];
+            });
+            b
+        }
+    };
+    drop(mean_i);
+    let ma = box2d(&mean_ii, w, h, r);
+    drop(mean_ii);
     let mb = box2d(&b, w, h, r);
-    (0..n).into_par_iter().map(|k| ma[k] * i[k] + mb[k]).collect()
+    b.par_iter_mut().enumerate().for_each(|(k, q)| *q = ma[k] * i[k] + mb[k]);
+    b
+}
+
+/// Edge-aware smoothing by the domain transform recursive filter (Gastal & Oliveira 2011):
+/// halo-free, edges of `data` stronger than `sigma_r` are kept, flat areas are smoothed
+/// over ~`sigma_s` pixels. Three iterations, rows and columns in parallel.
+pub fn domain_transform(data: &[f32], w: usize, h: usize, sigma_s: f32, sigma_r: f32) -> Vec<f32> {
+    let n_iter = 3;
+    let ratio = sigma_s / sigma_r.max(1e-6);
+    // Derivatives of the guide (the input) along x and y.
+    let dx: Vec<f32> = (0..w * h)
+        .map(|k| {
+            let x = k % w;
+            if x == 0 {
+                1.0
+            } else {
+                1.0 + ratio * (data[k] - data[k - 1]).abs()
+            }
+        })
+        .collect();
+    let dy: Vec<f32> =
+        (0..w * h).map(|k| if k < w { 1.0 } else { 1.0 + ratio * (data[k] - data[k - w]).abs() }).collect();
+    let mut img = data.to_vec();
+    let pass_rows = |img: &mut [f32], d: &[f32], w: usize, a: f32| {
+        img.par_chunks_mut(w).zip(d.par_chunks(w)).for_each(|(row, dr)| {
+            for x in 1..w {
+                let f = a.powf(dr[x]);
+                row[x] += f * (row[x - 1] - row[x]);
+            }
+            for x in (0..w - 1).rev() {
+                let f = a.powf(dr[x + 1]);
+                row[x] += f * (row[x + 1] - row[x]);
+            }
+        });
+    };
+    let dy_t = transpose(&dy, w, h);
+    for i in 0..n_iter {
+        let sigma_h = sigma_s * 3f32.sqrt() * 2f32.powi(n_iter - 1 - i) / (4f32.powi(n_iter) - 1.0).sqrt();
+        let a = (-(2f32.sqrt()) / sigma_h.max(1e-3)).exp();
+        pass_rows(&mut img, &dx, w, a);
+        let mut t = transpose(&img, w, h);
+        pass_rows(&mut t, &dy_t, h, a);
+        img = transpose(&t, h, w);
+    }
+    img
+}
+
+fn transpose(data: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(h).enumerate().for_each(|(x, col)| {
+        for (y, v) in col.iter_mut().enumerate() {
+            *v = data[y * w + x];
+        }
+    });
+    out
 }
 
 /// Robust noise standard deviation of a plane (Immerkaer's Laplacian estimator on a
@@ -1043,11 +1228,12 @@ pub fn orientation_map(o: u8) -> [f64; 6] {
 /// Crop/straighten geometry in Lightroom's semantics (`CropSettings` docs): `src_w/src_h`
 /// un-oriented source size, `orientation` EXIF 1..=8. Disabled crop = the whole frame.
 ///
-/// `top/left/bottom/right` describe, in un-oriented normalized source coordinates, the
-/// crop rectangle *before* straightening; the output is that rectangle rotated by
-/// `angle` degrees about its centre (Lightroom rotates the image under a fixed frame;
-/// positive angles turn the frame clockwise in the source). Output size = the rectangle's
-/// size in source pixels, oriented.
+/// `(left, top)` and `(right, bottom)` are the crop frame's top-left and bottom-right corners
+/// in un-oriented normalized source coordinates; the frame is rotated by `angle` degrees
+/// (positive = clockwise in the source, y down) about the midpoint of the two corners, so
+/// its size is the corner-to-corner vector rotated back by `-angle` (checked against Camera
+/// Raw renders: a -5.74 degree crop of a 7008 x 4672 frame with corners (0.0364, 0.1310) and
+/// (0.9636, 0.8690) renders 6120 x 4080). Output size in source pixels, oriented.
 pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u8) -> CropGeometry {
     let o = if (1..=8).contains(&orientation) { orientation } else { 1 };
     let (sw, sh) = (f64::from(src_w.max(1)), f64::from(src_h.max(1)));
@@ -1064,11 +1250,14 @@ pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u
     } else {
         (0.0, 0.0, 1.0, 1.0, 0.0)
     };
-    // Un-oriented output frame (pixels): centre and size.
+    // (left, top) and (right, bottom) are the crop frame's top-left and bottom-right corners
+    // in the source; the frame is rotated by `angle`, so its size is the corner-to-corner
+    // vector rotated back (verified against Camera Raw renders of straightened crops).
     let (cx, cy) = ((l + r) / 2.0 * sw, (t + b) / 2.0 * sh);
-    let (fw, fh) = ((r - l) * sw, (b - t) * sh);
+    let (dx, dy) = ((r - l) * sw, (b - t) * sh);
     let th = angle.to_radians();
     let (sn, cs) = th.sin_cos();
+    let (fw, fh) = ((dx * cs + dy * sn).max(1.0), (-dx * sn + dy * cs).max(1.0));
     // Un-oriented frame coords (u, v in 0..1) -> source px:
     // p = c + R(th) * ((u - 0.5) fw, (v - 0.5) fh).
     let uv_to_src = [
@@ -1271,7 +1460,7 @@ mod tests {
         };
         for _y in 0..h {
             for x in 0..w {
-                let v = if x < w / 2 { 0.05 } else { 0.4 };
+                let v: f32 = if x < w / 2 { 0.05 } else { 0.4 };
                 for _ in 0..3 {
                     let q = v.sqrt() + sigma * rnd();
                     out.push(q.max(0.0).powi(2));
@@ -1376,17 +1565,28 @@ mod tests {
         let g = crop_geometry(&c, 6000, 4000, 1);
         assert_eq!((g.width, g.height), (3000, 2000));
         let (x, y) = g.map(0.0, 0.0);
-        assert!((x - 0.1).abs() < 1e-9 && (y - 0.2).abs() < 1e-9);
+        assert!((x - 0.1).abs() < 1e-6 && (y - 0.2).abs() < 1e-6);
         assert!(g.is_axis_aligned());
         // Straightened: centre fixed, corners rotate.
         let c2 = CropSettings { angle: 5.0, ..c };
         let g2 = crop_geometry(&c2, 6000, 4000, 1);
-        assert_eq!((g2.width, g2.height), (3000, 2000));
-        let (cx, cy) = g2.map(0.5, 0.5);
-        assert!((cx - 0.35).abs() < 1e-9 && (cy - 0.45).abs() < 1e-9);
-        assert!(!g2.is_axis_aligned());
+        // Corner vector (3000, 2000) rotated back by 5 degrees.
+        let (sn, cs) = 5f64.to_radians().sin_cos();
+        let expect = ((3000.0 * cs + 2000.0 * sn).round() as u32, (-3000.0 * sn + 2000.0 * cs).round() as u32);
+        assert_eq!((g2.width, g2.height), expect);
+        // The corners land on the given source points.
         let (x0, y0) = g2.map(0.0, 0.0);
-        assert!((x0 - 0.1).abs() > 1e-3 && (y0 - 0.2).abs() > 1e-3);
+        let (x1, y1) = g2.map(1.0, 1.0);
+        assert!((x0 - 0.1).abs() < 1e-3 && (y0 - 0.2).abs() < 1e-3 && (x1 - 0.6).abs() < 1e-3 && (y1 - 0.7).abs() < 1e-3);
+        // Camera Raw reference: AZA06911 (7008 x 4672, -5.74 degrees) renders 6120 x 4080.
+        let lr = CropSettings { enabled: true, left: 0.036395, top: 0.131022, right: 0.963605, bottom: 0.868978, angle: -5.74 };
+        let g3 = crop_geometry(&lr, 7008, 4672, 1);
+        assert!((g3.width as i32 - 6120).abs() <= 2 && (g3.height as i32 - 4080).abs() <= 2, "{g3:?}");
+        let (cx, cy) = g2.map(0.5, 0.5);
+        assert!((cx - 0.35).abs() < 1e-6 && (cy - 0.45).abs() < 1e-6);
+        assert!(!g2.is_axis_aligned());
+        let (x0, _) = g2.map(1.0, 0.0);
+        assert!((x0 - 0.6).abs() > 1e-3, "top-right corner moved by the rotation");
         // Disabled or inverted: whole frame.
         let off = CropSettings { enabled: false, ..c2 };
         assert_eq!(crop_geometry(&off, 100, 50, 1).width, 100);

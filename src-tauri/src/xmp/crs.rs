@@ -5,13 +5,17 @@
 //! Write (catalog -> sidecar), only for images that have an `adjustments` row (never add
 //! or remove `crs:` for images not edited in Sieve):
 //! - Set every property in [`CRS_FIELDS`] / [`CRS_HSL_BANDS`], plus `crs:ProcessVersion
-//!   = "11.0"` and `crs:HasSettings = "True"`. Numbers are written signed with the shortest
+//!   = "11.0"` (never downgrading a newer one already in the sidecar, e.g. Lightroom's
+//!   "15.4": `packet::merge` skips the edit) and `crs:HasSettings = "True"`. Numbers are written signed with the shortest
 //!   decimal that round-trips the f32 (`+15`, `-7.5`, `+0.7`; zero as `0`), so
 //!   catalog -> XMP -> catalog is lossless for every valid value.
 //! - `whiteBalance = as_shot` -> `crs:WhiteBalance = "As Shot"` and remove `crs:Temperature`
 //!   / `crs:Tint`; `custom` -> `"Custom"` + both values.
 //! - `lut` -> `sieve:LutId`, `sieve:LutAmount`; `null` -> remove both.
-//! - Every other `crs:` property (tone curves, sharpening, crop, lens, masks, ...) and every
+//! - v9: the parity scalars ([`PARITY_SCALARS`], [`PARITY_BOOLS`]), point curves
+//!   ([`encode_curves`], `rdf:Seq`s replaced only when their items change) and the profile
+//!   ([`encode_profile`] + [`look_change`], `<crs:Look>` struct) are written too.
+//! - Every other `crs:` property (lens, masks, retouch, `crs:Table_*`, ...) and every
 //!   other namespace stays byte-for-byte (span-preserving merge, as in Phase 4).
 //!
 //! Read (sidecar -> catalog; `read_xmp`, import, newer-wins auto-sync):
@@ -32,8 +36,9 @@
 
 use crate::develop::wb;
 use crate::ipc::types::{
-    is_valid_lut_id, CropSettings, CurvePoint, DevelopWarning, DevelopWarningCode, HslChannels, LookSettings, LutRef,
-    ParametricAdjustments, ParametricCurve, PointCurves, ProfileSettings, VignetteStyle, WhiteBalance,
+    is_valid_lut_id, CropSettings, CurvePoint, DevelopWarning, DevelopWarningCode, HslChannels, ImageFormat,
+    LookSettings, LutRef, ParametricAdjustments, ParametricCurve, PointCurves, ProfileSettings, VignetteStyle,
+    WhiteBalance,
 };
 
 pub const CRS_NS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
@@ -589,8 +594,8 @@ pub fn encode_parity(adj: &ParametricAdjustments) -> Vec<PropertyEdit> {
     out
 }
 
-/// Curve edits (four `rdf:Seq`s) + `crs:ToneCurveName2012`. Not yet part of [`encode`]:
-/// rust-engine-dev wires them into `packet::Desired` once `packet` can create/replace a Seq.
+/// Curve edits (four `rdf:Seq`s) + `crs:ToneCurveName2012`. Not part of [`encode`]: the
+/// sidecar writer (`xmp::desired`) puts them into `packet::Desired::seqs` / `develop`.
 pub fn encode_curves(adj: &ParametricAdjustments) -> (Vec<SeqEdit>, PropertyEdit) {
     let p = &adj.tone_curve.point;
     let seqs = CRS_CURVES
@@ -662,30 +667,150 @@ pub fn decode_parity(src: &dyn CrsSource, adj: &mut ParametricAdjustments) -> Re
         }
     }
 
-    // `profile` is decoded by [`decode_profile`] once the write side exists (both are
-    // rust-engine-dev's; reading without writing would break the lossless round trip).
-    Ok(())
+    decode_profile(src, adj)
+}
+
+/// Adobe's "Adobe Raw" looks (names and UUIDs as installed by Camera Raw / DNG Converter;
+/// stable across versions). Before Lightroom 7.3 these were DCP names, so a legacy
+/// `crs:CameraProfile="Adobe Vivid"` without `<crs:Look>` means DCP "Adobe Standard" + this look.
+pub const ADOBE_RAW_LOOKS: &[(&str, &str)] = &[
+    ("Adobe Color", "B952C231111CD8E0ECCF14B86BAA7077"),
+    ("Adobe Landscape", "6F9C877E84273F4E8271E6B91BEB36A1"),
+    ("Adobe Monochrome", "0CFE8F8AB5F63B2A73CE0B0077D20817"),
+    ("Adobe Neutral", "1E8E067A11CD44394A3C36A327BB34D1"),
+    ("Adobe Portrait", "D6496412E06A83789C499DF9540AA616"),
+    ("Adobe Vivid", "EA1DE074F188405965EF399C72C221D9"),
+];
+
+/// `crs:CameraProfile` value Lightroom uses for non-RAW files ("no camera profile").
+pub const EMBEDDED_PROFILE: &str = "Embedded";
+/// `crs:CameraProfileDigest`: MD5 of the DCP, recomputed by Lightroom when absent.
+pub const CAMERA_PROFILE_DIGEST: &str = "CameraProfileDigest";
+/// The look struct property.
+pub const LOOK: &str = "Look";
+
+fn truncate_name(s: &str) -> String {
+    s.trim().chars().take(ProfileSettings::MAX_NAME).collect()
 }
 
 /// Profile from a packet (rust-engine-dev, together with the `<crs:Look>` writer; call it
 /// from [`decode_parity`] then). Rules:
 /// - `crs:CameraProfile` -> `cameraProfile` (truncated to `ProfileSettings::MAX_NAME`);
-///   absent -> keep `adj`'s (the format default).
+///   absent -> keep `adj`'s (the format default). `"Embedded"` (non-RAW) -> `null`.
 /// - `<crs:Look>` parsed (`CrsSource::look`) -> `look`; no `<crs:Look>` but a
 ///   `crs:CameraProfile` (pre-2018 sidecars, bare DCP choices like "Camera ST") -> `null`.
+///   An unparsable `<crs:Look>` keeps `adj`'s look.
 /// - Legacy names that were DCPs before Lightroom 7.3 ("Adobe Color", "Adobe Vivid", ... as
-///   `crs:CameraProfile` without a look) map to "Adobe Standard" + the look of that name when
-///   it is installed (resolve through `profiles::ProfileLibrary` by name).
+///   `crs:CameraProfile` without a look) map to "Adobe Standard" + the look of that name
+///   ([`ADOBE_RAW_LOOKS`]).
 pub fn decode_profile(src: &dyn CrsSource, adj: &mut ParametricAdjustments) -> Result<(), String> {
-    let _ = (src, adj, CAMERA_PROFILE, ProfileSettings::MAX_NAME);
-    todo!("rust-engine-dev: xmp::crs::decode_profile (Phase 7b profiles)")
+    let camera = src.scalar(CRS_NS, CAMERA_PROFILE).map(|v| truncate_name(&v)).filter(|v| !v.is_empty());
+    let has_look = src.has(CRS_NS, LOOK);
+    if camera.is_none() && !has_look {
+        return Ok(());
+    }
+    let look = src.look();
+    if let Some(name) = &camera {
+        let legacy = ADOBE_RAW_LOOKS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name));
+        match (legacy, has_look) {
+            (Some((n, uuid)), false) => {
+                adj.profile.camera_profile = Some(ProfileSettings::ADOBE_STANDARD.into());
+                adj.profile.look = Some(LookSettings { name: (*n).into(), uuid: (*uuid).into(), amount: 1.0 });
+                return Ok(());
+            }
+            _ if name.eq_ignore_ascii_case(EMBEDDED_PROFILE) => adj.profile.camera_profile = None,
+            _ => adj.profile.camera_profile = Some(name.clone()),
+        }
+    }
+    match look {
+        Some(l) => adj.profile.look = Some(l),
+        None if has_look => {}
+        None => adj.profile.look = None,
+    }
+    Ok(())
+}
+
+/// The profile a packet records, `None` when it has neither `crs:CameraProfile` nor
+/// `<crs:Look>` (Lightroom then applies its default).
+pub fn current_profile(src: &dyn CrsSource) -> Option<ProfileSettings> {
+    if !src.has(CRS_NS, CAMERA_PROFILE) && !src.has(CRS_NS, LOOK) {
+        return None;
+    }
+    let mut adj = ParametricAdjustments::default();
+    decode_profile(src, &mut adj).ok()?;
+    Some(adj.profile)
 }
 
 /// Profile edits for a write (rust-engine-dev): see [`CAMERA_PROFILE`] for the rule. `current`
 /// is the sidecar's decoded profile (`None` = no sidecar / nothing recorded).
+/// Scalar part only: `crs:CameraProfile` (set, or removed for `null`) and removal of
+/// `crs:CameraProfileDigest` when the camera profile changes. The `<crs:Look>` struct is
+/// handled by [`look_change`] (applied by `packet::merge`).
 pub fn encode_profile(adj: &ParametricAdjustments, current: Option<&ProfileSettings>) -> Vec<PropertyEdit> {
-    let _ = (adj, current, LookSettings::adobe_color);
-    todo!("rust-engine-dev: xmp::crs::encode_profile (Phase 7b profiles; needs struct writes in packet)")
+    let want = &adj.profile;
+    let crs = |name: &str, value: Option<String>| PropertyEdit { ns: CRS_NS, name: name.to_owned(), value };
+    let unchanged = match current {
+        Some(c) => c.camera_profile == want.camera_profile,
+        // Nothing recorded = Lightroom's default; only write a different choice.
+        None => *want == ProfileSettings::default() || (want.camera_profile.is_none() && want.look.is_none()),
+    };
+    if unchanged {
+        return Vec::new();
+    }
+    vec![crs(CAMERA_PROFILE, want.camera_profile.clone()), crs(CAMERA_PROFILE_DIGEST, None)]
+}
+
+/// Replaces RAW defaults that `decode_source` assumed for properties the packet does not
+/// carry with `format`'s defaults (non-RAW: sharpening amount, colour NR, profile).
+pub fn overlay_format_defaults(src: &dyn CrsSource, adj: &mut ParametricAdjustments, format: ImageFormat) {
+    if format.is_raw() {
+        return;
+    }
+    let d = ParametricAdjustments::defaults_for(format);
+    if !src.has(CRS_NS, "Sharpness") {
+        adj.detail.sharpening.amount = d.detail.sharpening.amount;
+    }
+    if !src.has(CRS_NS, "ColorNoiseReduction") {
+        adj.detail.noise_reduction.color = d.detail.noise_reduction.color;
+    }
+    if current_profile(src).is_none() {
+        adj.profile = d.profile;
+    }
+}
+
+/// What to do with the sidecar's `<crs:Look>` for a profile write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookChange {
+    Keep,
+    /// Same look (UUID), new `crs:Amount`.
+    Amount(f32),
+    /// Replace (or create) the struct for the wanted look.
+    Replace,
+    Remove,
+}
+
+/// `<crs:Look>` edit for writing `want` over a sidecar recording `current` (`has_look`: the
+/// sidecar has a `<crs:Look>` element, parsable or not).
+pub fn look_change(want: &ProfileSettings, current: Option<&ProfileSettings>, has_look: bool) -> LookChange {
+    let Some(cur) = current else {
+        return match &want.look {
+            _ if *want == ProfileSettings::default() => LookChange::Keep,
+            Some(_) => LookChange::Replace,
+            None => LookChange::Keep,
+        };
+    };
+    match (&cur.look, &want.look) {
+        (_, None) if has_look => LookChange::Remove,
+        (_, None) => LookChange::Keep,
+        (Some(a), Some(b)) if a.uuid == b.uuid => {
+            if a.amount == b.amount {
+                LookChange::Keep
+            } else {
+                LookChange::Amount(b.amount)
+            }
+        }
+        (_, Some(_)) => LookChange::Replace,
+    }
 }
 
 /// `crs:` features found in a packet that Sieve preserves but does not render, as

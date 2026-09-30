@@ -21,11 +21,12 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::color;
-use crate::develop::pipeline::{self, RenderInput};
+use crate::develop::camera::Profile;
+use crate::develop::pipeline::{self, Quality, RenderInput, View};
 use crate::develop::source::{self, ColorInfo, LinearImage};
 use crate::ipc::error::AppResult;
 use crate::ipc::types::{
-    BitDepth, ExportSettings, OutputSharpening, ParametricAdjustments, ResizeMode, ResizeOptions, SharpenAmount,
+    BitDepth, CropSettings, ExportSettings, OutputSharpening, ParametricAdjustments, ResizeMode, ResizeOptions, SharpenAmount,
     SharpenMedia,
 };
 use crate::lut::Lut;
@@ -102,10 +103,15 @@ fn orientation(o: Option<u8>) -> u8 {
     o.filter(|o| (1..=8).contains(o)).unwrap_or(1)
 }
 
-/// Oriented output size of `src` under `resize`.
-pub fn planned_size(src: &LinearImage, orientation_tag: Option<u8>, resize: &ResizeOptions) -> (u32, u32) {
+/// Oriented output size of `src`'s cropped frame under `resize`.
+pub fn planned_size(
+    src: &LinearImage,
+    orientation_tag: Option<u8>,
+    crop: &CropSettings,
+    resize: &ResizeOptions,
+) -> (u32, u32) {
     let o = orientation(orientation_tag);
-    output_size(source::oriented_size(src.width, src.height, o), resize)
+    output_size(source::frame_size(src.width, src.height, o, crop), resize)
 }
 
 /// Lanczos-3 resample of interleaved RGB16 (linear light), rows in parallel: the same
@@ -115,47 +121,67 @@ pub fn resample_lanczos(src: &[u16], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<
     source::resample(src, sw as usize, sh as usize, [0.0, 0.0, f64::from(sw), f64::from(sh)], dw as usize, dh as usize)
 }
 
-/// Resamples `src` (unrotated) to the oriented output size `out` and applies orientation.
-/// `None` when the decode can be used as is (same size, orientation 1).
-pub fn prepare_output(src: &LinearImage, orientation_tag: Option<u8>, out: (u32, u32)) -> AppResult<Option<Vec<u16>>> {
+/// Crops/straightens `src` (unrotated) and resamples it to the oriented output size `out`
+/// with orientation applied, like the editor preview (`source::prepare_sized`). `None` when
+/// the decode can be used as is (no crop, same size, orientation 1).
+pub fn prepare_output(
+    src: &LinearImage,
+    orientation_tag: Option<u8>,
+    crop: &CropSettings,
+    out: (u32, u32),
+) -> AppResult<Option<Vec<u16>>> {
     let o = orientation(orientation_tag);
-    let (uw, uh) = if o >= 5 { (out.1, out.0) } else { out };
-    let resized = if (uw, uh) == (src.width, src.height) {
-        None
-    } else {
-        Some(resample_lanczos(&src.pixels, src.width, src.height, uw, uh))
-    };
-    if o == 1 {
-        return Ok(resized);
+    if !crop.enabled && o == 1 && out == (src.width, src.height) {
+        return Ok(None);
     }
-    let base: &[u16] = resized.as_deref().unwrap_or(&src.pixels);
-    Ok(Some(source::orient(base, uw as usize, uh as usize, o)))
+    Ok(Some(source::prepare_sized(src, o, crop, None, out.0, out.1).pixels))
 }
 
-/// Blocking: `src` (full decode) -> resample to `output_size` in linear light (orientation
-/// from EXIF `orientation`, 1..=8, applied) -> shared parametric pipeline -> output colour
-/// space -> output sharpening (`settings.sharpening`, radius/amount by media and output
-/// size, on the encoded luminance) -> quantize to `settings.format.bit_depth()`.
-/// `lut` is the resolved `adjustments.lut` (`None` if absent or missing from the library).
+/// Output px per full-resolution frame px for an export of `size` from `src`.
+pub fn export_scale(src: &LinearImage, orientation_tag: Option<u8>, crop: &CropSettings, size: (u32, u32)) -> f32 {
+    let o = orientation(orientation_tag);
+    let frame = source::frame_size(src.width, src.height, o, crop);
+    let half = src.width as f32 / src.full_width.max(1) as f32;
+    size.0 as f32 / frame.0.max(1) as f32 * half
+}
+
+/// Blocking: `src` (full decode) -> crop/straighten + resample to `output_size` in linear
+/// light (orientation from EXIF `orientation`, 1..=8, applied) -> shared pipeline with
+/// `profile` -> output colour space -> output sharpening (`settings.sharpening`,
+/// radius/amount by media and output size, on the encoded luminance) -> quantize to
+/// `settings.format.bit_depth()`. `lut` is the resolved `adjustments.lut`.
 pub fn render_full(
     src: &LinearImage,
     orientation: Option<u8>,
     adjustments: &ParametricAdjustments,
     lut: Option<&Lut>,
     settings: &ExportSettings,
+    profile: &Profile,
+    seed: u64,
 ) -> AppResult<ExportImage> {
-    let size = planned_size(src, orientation, &settings.resize);
-    let prepared = prepare_output(src, orientation, size)?;
+    let size = planned_size(src, orientation, &adjustments.crop, &settings.resize);
+    let scale = export_scale(src, orientation, &adjustments.crop, size);
+    let prepared = prepare_output(src, orientation, &adjustments.crop, size)?;
     let pixels: Cow<[u16]> = match prepared {
         Some(p) => Cow::Owned(p),
         None => Cow::Borrowed(&src.pixels),
     };
-    let encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings);
+    let ctx = DevelopContext { profile, scale, seed };
+    let encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings, &ctx);
     drop(pixels);
     Ok(finish(encoded, size, settings))
 }
 
-/// Pipeline + output colour space on prepared (oriented, output-size) camera RGB.
+/// Per-image context of an export develop.
+pub struct DevelopContext<'a> {
+    pub profile: &'a Profile,
+    /// Output px per full-resolution frame px.
+    pub scale: f32,
+    /// Grain seed (the image id).
+    pub seed: u64,
+}
+
+/// Pipeline + output colour space on prepared (cropped, oriented, output-size) camera RGB.
 pub fn develop_prepared(
     pixels: &[u16],
     size: (u32, u32),
@@ -163,9 +189,19 @@ pub fn develop_prepared(
     adjustments: &ParametricAdjustments,
     lut: Option<&Lut>,
     settings: &ExportSettings,
+    ctx: &DevelopContext,
 ) -> Vec<u16> {
-    let input =
-        RenderInput { width: size.0, height: size.1, pixels, color, frame_long_edge: size.0.max(size.1) as f32 };
+    let input = RenderInput {
+        width: size.0,
+        height: size.1,
+        pixels,
+        color,
+        frame_long_edge: size.0.max(size.1) as f32,
+        view: View::whole(size.0, size.1, ctx.scale),
+        profile: ctx.profile,
+        seed: ctx.seed,
+        quality: Quality::Export,
+    };
     pipeline::render_output(&input, adjustments, lut, color::output_space(settings.color_space))
 }
 
@@ -268,6 +304,10 @@ mod tests {
         MetadataInclude, MetadataOptions,
     };
 
+    fn prof() -> Profile {
+        Profile::matrix(crate::develop::pipeline::BASELINE_EV)
+    }
+
     fn opts(mode: ResizeMode, dont_enlarge: bool) -> ResizeOptions {
         ResizeOptions { mode, dont_enlarge, resolution_ppi: 300 }
     }
@@ -341,6 +381,8 @@ mod tests {
             },
             full_width: w,
             full_height: h,
+            display_referred: false,
+            source_color: None,
         }
     }
 
@@ -360,10 +402,11 @@ mod tests {
             ExportColorSpace::Srgb,
             ExportFormat::Jpeg { quality: 90, chroma_subsampling: ChromaSubsampling::Yuv444 },
         );
-        let img = render_full(&src, Some(1), &adj, None, &s).unwrap();
+        let img = render_full(&src, Some(1), &adj, None, &s, &prof(), 1).unwrap();
         let ExportPixels::Rgb8(out) = img.pixels else { panic!("8-bit expected") };
-        let input =
-            RenderInput { width: 320, height: 200, pixels: &src.pixels, color: &src.color, frame_long_edge: 320.0 };
+        let p = prof();
+        let mut input = RenderInput::simple(320, 200, &src.pixels, &src.color, &p);
+        input.seed = 1;
         let preview = render(&input, &adj, None);
         let max = out.iter().zip(&preview.rgb).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
         assert!(max <= 1, "max diff {max}");
@@ -372,10 +415,13 @@ mod tests {
     #[test]
     fn wide_gamut_spaces_differ_and_greys_stay_neutral() {
         let src = test_image(64, 16);
-        let adj = ParametricAdjustments::default();
+        // No detail processing: the grey rows must not pick up chroma from the colour rows.
+        let mut adj = ParametricAdjustments::default();
+        adj.detail.sharpening.amount = 0.0;
+        adj.detail.noise_reduction.color = 0.0;
         let tiff =
             ExportFormat::Tiff { bit_depth: BitDepth::Sixteen, compression: crate::ipc::types::TiffCompression::None };
-        let get = |cs| match render_full(&src, None, &adj, None, &settings(cs, tiff.clone())).unwrap().pixels {
+        let get = |cs| match render_full(&src, None, &adj, None, &settings(cs, tiff.clone()), &prof(), 1).unwrap().pixels {
             ExportPixels::Rgb16(v) => v,
             _ => panic!(),
         };
@@ -402,7 +448,7 @@ mod tests {
         let src = test_image(300, 200);
         let mut s = settings(ExportColorSpace::Srgb, ExportFormat::Png { bit_depth: BitDepth::Eight });
         s.resize = opts(ResizeMode::LongEdge { px: 150 }, true);
-        let img = render_full(&src, Some(6), &ParametricAdjustments::default(), None, &s).unwrap();
+        let img = render_full(&src, Some(6), &ParametricAdjustments::default(), None, &s, &prof(), 1).unwrap();
         assert_eq!((img.width, img.height), (100, 150));
         let ExportPixels::Rgb8(px) = img.pixels else { panic!() };
         assert_eq!(px.len(), 100 * 150 * 3);
@@ -460,13 +506,18 @@ mod tests {
         };
         for raw in raws.iter().take(3) {
             let half = source::decode_half_size(raw).unwrap();
-            let prep = source::prepare(&half, 1, None, 1024);
+            let prep = source::prepare(&half, 1, &CropSettings::default(), None, 1024);
+            let p = prof();
             let input = RenderInput {
                 width: prep.width,
                 height: prep.height,
                 pixels: &prep.pixels,
                 color: &half.color,
                 frame_long_edge: prep.frame_long_edge,
+                view: prep.view,
+                profile: &p,
+                seed: 1,
+                quality: crate::develop::pipeline::Quality::Preview,
             };
             let preview = render(&input, &adj, None);
             let full = decode_full(raw).unwrap();
@@ -475,7 +526,7 @@ mod tests {
                 ExportFormat::Jpeg { quality: 90, chroma_subsampling: ChromaSubsampling::Yuv444 },
             );
             s.resize = opts(ResizeMode::LongEdge { px: 1024 }, true);
-            let img = render_full(&full, Some(1), &adj, None, &s).unwrap();
+            let img = render_full(&full, Some(1), &adj, None, &s, &prof(), 1).unwrap();
             assert_eq!((img.width, img.height), (preview.width, preview.height));
             let ExportPixels::Rgb8(out) = img.pixels else { panic!() };
             let mut d: Vec<u8> = out.iter().zip(&preview.rgb).map(|(a, b)| a.abs_diff(*b)).collect();

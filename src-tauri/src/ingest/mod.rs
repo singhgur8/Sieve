@@ -594,4 +594,61 @@ mod tests {
             .unwrap();
         assert_eq!(mismatched, 0);
     }
+
+    /// v9: JPEG/PNG (and HEIC/TIFF where ImageIO exists) ingest with EXIF + oriented
+    /// thumbnails; a camera JPEG next to its RAW becomes the RAW's companion.
+    #[test]
+    fn non_raw_sources_and_companions() {
+        use crate::raw::raster::tests::fixtures;
+        let dir = tempfile::tempdir().unwrap();
+        let shoot = dir.path().join("shoot");
+        std::fs::create_dir(&shoot).unwrap();
+        std::fs::write(shoot.join("DSC0001.ARW"), synthetic_arw(1)).unwrap();
+        std::fs::write(shoot.join("DSC0001.JPG"), fixtures::camera_jpeg(64, 48, 1, None)).unwrap();
+        std::fs::write(shoot.join("IMG_0002.JPG"), fixtures::camera_jpeg(640, 480, 6, None)).unwrap();
+        let png = crate::raw::png::test_support::encode(
+            300,
+            200,
+            None,
+            Some(&fixtures::gradient(300, 200)),
+            None,
+            None,
+            None,
+        );
+        std::fs::write(shoot.join("scan.png"), png).unwrap();
+        let config = IngestConfig { catalog_path: dir.path().join("cat.sqlite"), cache_dir: dir.path().join("cache") };
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+        let summary = repo::import_folder(&mut conn, &shoot, &opts).unwrap();
+        assert_eq!((summary.added, summary.companions), (3, 1));
+
+        let rec = Recorder::default();
+        let running = AtomicBool::new(true);
+        let stats = run_until_idle(&config, &rec, &running).unwrap();
+        assert_eq!(stats, RunStats { done: 3, failed: 0 }, "{:?}", rec.failed.lock().unwrap());
+
+        let page = repo::list_images(
+            &conn,
+            &ImageQuery { sort: crate::ipc::types::ImageSort::FileName, ..Default::default() },
+        )
+        .unwrap();
+        let by_name = |n: &str| page.items.iter().find(|e| e.file_name == n).unwrap().clone();
+        let raw = by_name("DSC0001.ARW");
+        assert!(raw.companion_path.as_deref().is_some_and(|p| p.ends_with("DSC0001.JPG")));
+        let jpg = by_name("IMG_0002.JPG");
+        assert_eq!(jpg.format, crate::ipc::types::ImageFormat::Jpeg);
+        assert_eq!(jpg.orientation, Some(6));
+        assert_eq!((jpg.width, jpg.height), (Some(640), Some(480)));
+        assert_eq!(jpg.camera.model.as_deref(), Some("X-T5"));
+        assert_eq!(jpg.camera.sensor_layout, crate::ipc::types::SensorLayout::Unknown);
+        assert!(jpg.capture.captured_at_ms.is_some());
+        assert!(matches!(jpg.thumbnail, ThumbnailState::Ready { width: 384, height: 512, .. }), "{:?}", jpg.thumbnail);
+        let scan = by_name("scan.png");
+        assert_eq!(scan.camera.make, crate::ipc::types::CameraMake::Other);
+        assert!(
+            matches!(scan.thumbnail, ThumbnailState::Ready { width: 300, height: 200, .. }),
+            "{:?}",
+            scan.thumbnail
+        );
+    }
 }

@@ -11,9 +11,13 @@
 //! If no usable embedded JPEG is found, LibRaw's `unpack_thumb` is the fallback.
 
 pub mod cr3;
+pub mod heif;
+pub mod icc;
+pub mod imageio;
 pub mod jpeg;
 pub mod libraw;
 pub mod meta;
+pub mod png;
 pub mod preview;
 pub mod raf;
 pub mod raster;
@@ -120,15 +124,16 @@ pub fn parse_container(src: &(impl ByteSource + ?Sized), format: RawFormat) -> R
 /// Raw EXIF directories (IFD0, EXIF, GPS) of a RAW, values little-endian, for copying into
 /// exported files. ARW: the file's own IFDs; RAF: the embedded JPEG's EXIF; CR3: CMT1/2/4.
 pub fn exif_dirs(path: &Path) -> Result<tiff::ExifDirs, String> {
-    let format = format_from_extension(path).ok_or_else(|| format!("{}: not a supported RAW", path.display()))?;
+    let format = format_from_extension(path).ok_or_else(|| format!("{}: not a supported image", path.display()))?;
+    if !format.is_raw() {
+        return raster::exif_dirs(path, format);
+    }
     let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     match format {
         RawFormat::Arw => tiff::Tiff::new(&src)?.exif_dirs(),
         RawFormat::Raf => raf::exif_dirs(&src),
         RawFormat::Cr3 => cr3::exif_dirs(&src),
-        RawFormat::Jpeg | RawFormat::Heic | RawFormat::Tiff | RawFormat::Png => {
-            Err(format!("{}: EXIF copy for {} sources is not implemented yet", path.display(), format.as_str()))
-        }
+        RawFormat::Jpeg | RawFormat::Heic | RawFormat::Tiff | RawFormat::Png => unreachable!("handled above"),
     }
 }
 
