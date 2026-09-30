@@ -23,7 +23,7 @@ import {
   type ParametricAdjustments,
   type RenderSlot,
 } from "../ipc";
-import { neutralAdjustments } from "../lib/adjust";
+import { labelWithValue, neutralAdjustments } from "../lib/adjust";
 
 export interface RenderView {
   imageId: number;
@@ -188,7 +188,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     endDraft();
     const snapshot = adjRef.current;
     enqueue(async () => {
-      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, p.label));
+      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       // Profile / look availability warnings depend on the saved settings.

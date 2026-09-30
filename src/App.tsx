@@ -27,6 +27,7 @@ import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount } from "./lib/modal";
 import { getClipboard } from "./lib/clipboard";
+import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
 
@@ -44,10 +45,14 @@ export default function App() {
   importOptsRef.current = importOpts;
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
-  const [applyOpen, setApplyOpen] = useState<{ ids: number[]; scope: string } | null>(null);
+  const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
+  const [caps, setCaps] = useState(false);
+  const devPanels = usePanels("develop");
+  const loupePanels = usePanels("loupe");
+  const lastUndone = useRef<"cull" | "adj">("adj");
   const colsRef = useRef({ cols: 1, page: 1 });
   const loupe = useRef<LoupeHandle>(null);
   const develop = useRef<DevelopHandle>(null);
@@ -72,6 +77,17 @@ export default function App() {
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
     query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating";
+
+  // Caps Lock acts as auto-advance while on (Lightroom).
+  useEffect(() => {
+    const sync = (e: KeyboardEvent) => e.getModifierState && setCaps(e.getModifierState("CapsLock"));
+    window.addEventListener("keydown", sync, true);
+    window.addEventListener("keyup", sync, true);
+    return () => {
+      window.removeEventListener("keydown", sync, true);
+      window.removeEventListener("keyup", sync, true);
+    };
+  }, []);
 
   // Keep entries needed outside the grid range (active image, compare panes) loaded.
   const { pin } = lib;
@@ -210,12 +226,12 @@ export default function App() {
 
   const advanceIf = useCallback(
     (t: number[], force: boolean) => {
-      if ((force || autoAdvance) && t.length === 1) {
+      if ((force || autoAdvance || caps) && t.length === 1) {
         if (mode === "compare") stepCompare(1);
         else step(1);
       }
     },
-    [autoAdvance, mode, step, stepCompare],
+    [autoAdvance, caps, mode, step, stepCompare],
   );
 
   const mutate = useCallback(
@@ -249,25 +265,28 @@ export default function App() {
     [lib, cull, reportError, membershipSensitive],
   );
 
+  /** "DSC00010.ARW" for one photo, "3 photos" otherwise (undo toasts: "Undid: Reject DSC00010.ARW"). */
+  const what = useCallback((t: number[]) => (t.length === 1 ? (lib.getEntry(t[0])?.fileName ?? "1 photo") : plural(t.length, "photo")), [lib]);
+
   const doPick = useCallback(
     (pick: PickFlag, advance: boolean) => {
       const t = targets();
       if (t.length === 0) return;
-      const label = `${{ pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick]} ${plural(t.length, "photo")}`;
+      const label = `${{ pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick]} ${what(t)}`;
       void mutate(label, t, (e) => ({ ...e, pick }), () => unwrap(commands.setPick(t, pick)));
       advanceIf(t, advance);
     },
-    [targets, mutate, advanceIf],
+    [targets, mutate, advanceIf, what],
   );
 
   const doRating = useCallback(
     (rating: number) => {
       const t = targets();
       if (t.length === 0) return;
-      void mutate(`Rate ${plural(t.length, "photo")} ${rating}★`, t, (e) => ({ ...e, rating }), () => unwrap(commands.setRating(t, rating)));
+      void mutate(`Rate ${what(t)} ${rating}★`, t, (e) => ({ ...e, rating }), () => unwrap(commands.setRating(t, rating)));
       advanceIf(t, false);
     },
-    [targets, mutate, advanceIf],
+    [targets, mutate, advanceIf, what],
   );
 
   const doLabel = useCallback(
@@ -276,10 +295,10 @@ export default function App() {
       if (t.length === 0) return;
       const allHave = t.every((id) => lib.getEntry(id)?.colorLabel === label);
       const next = allHave ? null : label;
-      void mutate(`Label ${plural(t.length, "photo")} ${next ?? "none"}`, t, (e) => ({ ...e, colorLabel: next }), () => unwrap(commands.setColorLabel(t, next)));
+      void mutate(`Label ${what(t)} ${next ?? "none"}`, t, (e) => ({ ...e, colorLabel: next }), () => unwrap(commands.setColorLabel(t, next)));
       advanceIf(t, false);
     },
-    [targets, mutate, advanceIf, lib],
+    [targets, mutate, advanceIf, lib, what],
   );
 
   /** Make `id` the keeper of its burst (optionally Pick it too: Compare's K). */
@@ -384,10 +403,8 @@ export default function App() {
     });
 
   const askApplySuggestions = () => {
-    const explicit = sel.selected.size > 0;
-    const t = explicit ? [...sel.selected] : ids;
-    if (t.length === 0) return;
-    setApplyOpen({ ids: t, scope: explicit ? "The selected photos" : "All photos in the current view" });
+    if (ids.length === 0) return;
+    setApplyOpen({ selected: [...sel.selected], all: ids });
   };
 
   const applySuggestions = (t: number[], onlyUnset: boolean) =>
@@ -442,7 +459,7 @@ export default function App() {
   // ---- keyboard: one handler driven by the shared keymap ----
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
-    const def = matchKey(e, mode);
+    const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping() });
     if (!def) return;
     e.preventDefault();
     const k = e.key;
@@ -491,10 +508,29 @@ export default function App() {
       case "toGrid":
         return changeMode("grid");
       case "escape":
-        if (mode === "develop" && (develop.current?.cancelCrop() || develop.current?.cancelMaskTool())) return;
         if (mode !== "grid") changeMode("grid");
         else sel.clear();
         return;
+      case "developEscape":
+        return develop.current?.escape();
+      case "cropSwap":
+        return develop.current?.cropSwap();
+      case "cropLock":
+        return develop.current?.cropLock();
+      case "panelsToggle":
+        return toggleSidePanels();
+      case "panelsHide":
+        return toggleChrome(mode === "loupe" ? "loupe" : "develop");
+      case "bwToggle":
+        return develop.current?.toggleBw();
+      case "wbPicker":
+        return develop.current?.togglePicker();
+      case "faceDevelop":
+        return develop.current?.faceZoom(e.shiftKey ? -1 : 1);
+      case "pastePrev":
+        return develop.current?.pastePrevious();
+      case "savePreset":
+        return develop.current?.savePreset();
       case "develop":
         return openDevelop();
       case "compare":
@@ -537,10 +573,21 @@ export default function App() {
         return develop.current?.toggleBefore();
       case "split":
         return develop.current?.toggleSplit();
-      case "undoAdj":
-        return develop.current?.undo();
-      case "redoAdj":
-        return develop.current?.redo();
+      case "undoAdj": {
+        // One undo in Develop: the newest of the last culling change and the last adjustment.
+        const d = develop.current;
+        if (cull.undoAt() > (d?.lastCommitAt() ?? 0)) {
+          lastUndone.current = "cull";
+          return void cull.undo();
+        }
+        lastUndone.current = "adj";
+        return d?.undo();
+      }
+      case "redoAdj": {
+        const d = develop.current;
+        if (cull.redoAt() > 0 && (!d?.canRedo() || lastUndone.current === "cull")) return void cull.redo();
+        return d?.redo();
+      }
       case "copy":
         return develop.current?.copy();
       case "paste":
@@ -639,26 +686,26 @@ export default function App() {
       )}
       {applyOpen && (
         <ApplySuggestionsDialog
-          ids={applyOpen.ids}
-          scopeLabel={applyOpen.scope}
+          selected={applyOpen.selected}
+          all={applyOpen.all}
           onCancel={() => setApplyOpen(null)}
-          onConfirm={(onlyUnset) => {
-            const t = applyOpen.ids;
+          onConfirm={(t, onlyUnset) => {
             setApplyOpen(null);
             applySuggestions(t, onlyUnset);
           }}
         />
       )}
-      {cheatOpen && <CheatSheet onClose={() => setCheatOpen(false)} />}
+      {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 
       {mode === "grid" ? (
+        catalog != null && catalog.imageCount === 0 ? null : (
         <>
           {filtersOpen ? (
-            <FilterBar query={query} setQuery={setQuery} counts={counts} shown={ids.length} />
+            <FilterBar query={query} setQuery={setQuery} counts={counts} />
           ) : (
             <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} />
           )}
@@ -669,12 +716,15 @@ export default function App() {
             onSize={setSize}
             selectedCount={sel.selected.size}
             total={ids.length}
+            catalogTotal={counts?.total ?? null}
+            capsLock={caps}
             autoAdvance={autoAdvance}
             onAutoAdvance={setAutoAdvance}
             filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={catalog} /> : null}
           />
         </>
-      ) : (
+        )
+      ) : (mode === "develop" && devPanels.chrome) || (mode === "loupe" && loupePanels.chrome) ? null : (
         <FilterSummary
           query={query}
           shown={ids.length}
@@ -711,7 +761,16 @@ export default function App() {
           onClearFilters={clearFilters}
         />
         {mode === "develop" && (
-          <DevelopView key={devEpoch} ref={develop} lib={lib} sel={sel} onError={reportError} onNotice={setNotice} onBack={() => changeMode("grid")} />
+          <DevelopView
+            key={devEpoch}
+            ref={develop}
+            lib={lib}
+            sel={sel}
+            onError={reportError}
+            onNotice={setNotice}
+            onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
+            onBack={() => changeMode("grid")}
+          />
         )}
         {(mode === "loupe" || mode === "compare") && (
           <LoupeLayer

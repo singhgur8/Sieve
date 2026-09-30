@@ -18,6 +18,9 @@ export const CREATE_LABEL: Record<CreateKind, string> = {
   luminance: "Luminance Range",
 };
 
+/** Short labels for the 2-column Create grid (the full name is the tooltip). */
+export const CREATE_SHORT: Record<CreateKind, string> = { ...CREATE_LABEL, color: "Color", luminance: "Luminance", linear: "Linear", radial: "Radial" };
+
 export const CREATE_ORDER: CreateKind[] = ["subject", "sky", "background", "people", "object", "brush", "linear", "radial", "color", "luminance"];
 
 /** Capability family of an AI create kind (others need no model). */

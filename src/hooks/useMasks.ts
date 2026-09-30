@@ -185,7 +185,8 @@ export function useMasks({ editor, id, onError, onNotice }: Opts): MasksApi {
   // Selection follows undo/redo/delete.
   useEffect(() => {
     if (selGroup && !groups.some((g) => g.id === selGroup)) {
-      setSelGroup(null);
+      // After undo / delete the selection moves to the last remaining mask so Delete keeps working.
+      setSelGroup(groups.length > 0 ? groups[groups.length - 1].id : null);
       setSelComp(null);
     } else if (selGroup && selComp && !groups.find((g) => g.id === selGroup)?.components.some((c) => c.id === selComp)) setSelComp(null);
   }, [groups, selGroup, selComp]);

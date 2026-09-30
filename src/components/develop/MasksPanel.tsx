@@ -4,7 +4,7 @@ import { Brush, Copy, Eye, EyeOff, FlipHorizontal2, Loader2, MoreHorizontal, Mou
 import { defaultLocalAdjustments, type MaskBlendMode, type MaskComponent, type MaskGroup } from "../../ipc";
 import type { MasksApi } from "../../hooks/useMasks";
 import { hint } from "../../lib/keymap";
-import { CREATE_LABEL, CREATE_ORDER, LOCAL_GROUPS, MODE_GLYPH, OVERLAY_STYLES, componentTitle, type CreateKind } from "../../lib/masks";
+import { CREATE_LABEL, CREATE_ORDER, CREATE_SHORT, LOCAL_GROUPS, MODE_GLYPH, OVERLAY_STYLES, componentTitle, type CreateKind } from "../../lib/masks";
 import { Menu, menuItem } from "../Menu";
 import { Section, seg } from "./fields";
 import { Slider } from "./Slider";
@@ -43,22 +43,32 @@ interface Props {
 export function MasksPanel({ masks }: Props) {
   const sel = masks.groups.find((g) => g.id === masks.selGroup) ?? null;
   const selComp = sel?.components.find((c) => c.id === masks.selComp) ?? null;
+  const compact = masks.groups.length > 0;
   return (
-    <div className="flex h-full flex-col overflow-y-auto px-3 pb-6" data-testid="masks-panel">
-      <div className="py-2">
-        <div className="mb-1 flex items-center justify-between">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-300">Create new mask</h2>
+    <div className="flex h-full flex-col overflow-hidden px-3" data-testid="masks-panel" data-compact={compact}>
+      <div className="shrink-0 py-2">
+        <div className={`flex items-center justify-between ${compact ? "" : "mb-1"}`}>
+          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-neutral-300">{compact ? "Create" : "Create new mask"}</h2>
+          {compact && (
+            <div className="flex items-center gap-1" data-testid="mask-create">
+              {CREATE_ORDER.map((k) => (
+                <CreateButton key={k} kind={k} masks={masks} icon />
+              ))}
+            </div>
+          )}
           {masks.needsUpdate > 0 && (
             <button className="flex items-center gap-1 rounded bg-amber-900/70 px-2 py-0.5 text-[11px] text-amber-100 hover:bg-amber-800" onClick={() => void masks.updateAll()} data-testid="mask-update-all" title="Compute the AI selections that are missing for this photo">
               <RefreshCw className="size-3" /> Update {masks.needsUpdate}
             </button>
           )}
         </div>
-        <div className="grid grid-cols-2 gap-1" data-testid="mask-create">
-          {CREATE_ORDER.map((k) => (
-            <CreateButton key={k} kind={k} masks={masks} />
-          ))}
-        </div>
+        {!compact && (
+          <div className="grid grid-cols-2 gap-1" data-testid="mask-create">
+            {CREATE_ORDER.map((k) => (
+              <CreateButton key={k} kind={k} masks={masks} />
+            ))}
+          </div>
+        )}
         {masks.busy && (
           <p className="mt-2 flex items-center gap-1.5 text-xs text-sky-300" data-testid="mask-busy" role="status">
             <Loader2 className="size-3.5 animate-spin" /> {masks.busy.label}
@@ -66,7 +76,7 @@ export function MasksPanel({ masks }: Props) {
         )}
       </div>
 
-      <section className="border-t border-neutral-800 py-2" data-testid="mask-list">
+      <section className="flex max-h-[35%] min-h-[96px] shrink-0 flex-col overflow-hidden border-t border-neutral-800 py-2" data-testid="mask-list">
         <div className="mb-1 flex flex-wrap items-center justify-between gap-1">
           <h2 className="whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-neutral-300">Masks ({masks.groups.length})</h2>
           <div className="flex items-center gap-2 text-[11px] text-neutral-300">
@@ -97,7 +107,7 @@ export function MasksPanel({ masks }: Props) {
             No masks yet. Choose a tool above, then click or drag on the photo.
           </p>
         )}
-        <ul className="space-y-1">
+        <ul className="min-h-0 flex-1 space-y-1 overflow-y-auto" data-testid="mask-list-scroll">
           {masks.groups.map((g) => (
             <GroupRow key={g.id} g={g} masks={masks} />
           ))}
@@ -105,7 +115,7 @@ export function MasksPanel({ masks }: Props) {
       </section>
 
       {(sel || masks.tool) && (
-        <div data-testid="mask-settings" data-group={sel?.id ?? ""}>
+        <div className="min-h-0 flex-1 overflow-y-auto pb-6" data-testid="mask-settings" data-group={sel?.id ?? ""}>
           <ToolSettings masks={masks} group={sel} comp={selComp} />
           {sel && <LocalSliders masks={masks} g={sel} />}
         </div>
@@ -114,21 +124,23 @@ export function MasksPanel({ masks }: Props) {
   );
 }
 
-function CreateButton({ kind, masks, target }: { kind: CreateKind; masks: MasksApi; target?: { groupId: string | null; mode: MaskBlendMode } }) {
+function CreateButton({ kind, masks, target, icon }: { kind: CreateKind; masks: MasksApi; target?: { groupId: string | null; mode: MaskBlendMode }; icon?: boolean }) {
   const Icon = ICON[kind];
   const why = masks.unavailable(kind);
   const active = masks.tool?.kind === kind && !target;
   return (
     <button
-      className={`flex items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs ${active ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40 disabled:hover:bg-neutral-800`}
+      className={`flex items-center ${icon ? "size-6 shrink-0 justify-center rounded" : "gap-1.5 rounded px-2 py-1.5 text-left text-xs"} ${active ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40 disabled:hover:bg-neutral-800`}
       disabled={!!why || !!masks.busy}
-      title={why ? `Not available: ${why}` : `${CREATE_LABEL[kind]}${HINT[kind] ?? ""}`}
+      title={why ? `${CREATE_LABEL[kind]} is not available: ${why}` : `${CREATE_LABEL[kind]}${HINT[kind] ?? ""}`}
+      aria-label={CREATE_LABEL[kind]}
       data-testid={`mask-create-${kind}`}
       data-unavailable={why ? "true" : "false"}
       aria-pressed={active}
       onClick={() => masks.create(kind, target)}
     >
-      <Icon className="size-3.5 shrink-0" /> <span className="truncate">{CREATE_LABEL[kind]}</span>
+      <Icon className="size-3.5 shrink-0" />
+      {!icon && <span className="truncate">{CREATE_SHORT[kind]}</span>}
     </button>
   );
 }
@@ -172,11 +184,27 @@ function AddMenu({ g, mode, masks }: { g: MaskGroup; mode: MaskBlendMode; masks:
   );
 }
 
+function compKind(c: MaskComponent): CreateKind {
+  const sh = c.shape;
+  if (sh.kind === "ai") return sh.target.kind === "sky" ? "sky" : sh.target.kind === "background" ? "background" : sh.target.kind === "people" ? "people" : sh.target.kind === "object" ? "object" : "subject";
+  if (sh.kind === "brush" || sh.kind === "linear" || sh.kind === "radial" || sh.kind === "color" || sh.kind === "luminance") return sh.kind;
+  return "object";
+}
+
 function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
   const on = masks.selGroup === g.id;
   const [renaming, setRenaming] = useState(false);
+  const rowRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (on) rowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [on]);
+  const single = g.components.length === 1;
+  const KindIcon = ICON[compKind(g.components[0])];
+  const st = single && g.components[0].shape.kind === "ai" ? masks.aiState[g.components[0].id] : undefined;
+  const unsupported = g.components.some((c) => c.shape.kind === "unsupported");
   return (
     <li
+      ref={rowRef}
       className={`rounded border ${on ? "border-sky-600 bg-neutral-900" : "border-neutral-800 bg-neutral-900/50"}`}
       data-testid={`mask-group-${g.id}`}
       data-selected={on}
@@ -185,6 +213,7 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
       onMouseLeave={() => masks.setHover(null)}
     >
       <div className="flex items-center gap-1 px-1.5 py-1">
+        {single && <KindIcon className="size-3.5 shrink-0 text-neutral-400" aria-hidden />}
         <button className="text-neutral-300 hover:text-white" onClick={() => masks.toggleGroup(g.id)} title={g.active ? "Hide this mask's adjustments" : "Show this mask's adjustments"} aria-label="Toggle mask" aria-pressed={g.active} data-testid={`mask-group-eye-${g.id}`}>
           {g.active ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5 opacity-60" />}
         </button>
@@ -202,6 +231,8 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
             {g.name || "Mask"}
           </button>
         )}
+        {single && !on && st === "needs_update" && <span className="rounded bg-amber-900/70 px-1 text-[10px] text-amber-100" data-testid={`mask-group-update-${g.id}`}>update</span>}
+        {single && !on && unsupported && <span className="rounded bg-neutral-700 px-1 text-[10px]">not rendered</span>}
         <Menu
           trigger={<MoreHorizontal className="size-4" />}
           triggerClass="rounded p-0.5 text-neutral-300 hover:bg-neutral-800"
@@ -227,11 +258,13 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
           )}
         </Menu>
       </div>
-      <ul className="space-y-0.5 px-1.5 pb-1">
-        {g.components.map((c) => (
-          <ComponentRow key={c.id} g={g} c={c} masks={masks} />
-        ))}
-      </ul>
+      {(!single || on) && (
+        <ul className="space-y-0.5 px-1.5 pb-1">
+          {g.components.map((c) => (
+            <ComponentRow key={c.id} g={g} c={c} masks={masks} />
+          ))}
+        </ul>
+      )}
       {on && (
         <div className="flex gap-1 px-1.5 pb-1.5" data-testid={`mask-add-row-${g.id}`}>
           {MODES.map((m) => (
@@ -342,7 +375,7 @@ function ToolSettings({ masks, group, comp }: { masks: MasksApi; group: MaskGrou
     if (!live) masks.commit();
   };
   const pctSlider = (id: string, label: string, value: number, min: number, max: number, apply: (v: number) => void, reset: number, digits = 0) => (
-    <Slider id={id} label={label} value={value} min={min} max={max} step={1} digits={digits} onInput={apply} onCommit={masks.commit} onReset={() => { apply(reset); masks.commit(); }} />
+    <Slider id={id} label={label} value={value} min={min} max={max} step={1} digits={digits} defaultValue={reset} onInput={apply} onCommit={masks.commit} onReset={() => { apply(reset); masks.commit(); }} />
   );
   return (
     <section className="border-t border-neutral-800 py-2" data-testid="mask-tool-settings">
@@ -387,16 +420,28 @@ function ToolSettings({ masks, group, comp }: { masks: MasksApi; group: MaskGrou
 
       {group && comp && sh?.kind === "color" && (
         <div data-testid="mask-color-settings">
-          <p className="mb-1 text-[11px] text-neutral-400" data-testid="mask-color-samples">
-            {sh.samples.length} of 5 samples
-          </p>
+          <div className="mb-1 flex flex-wrap items-center gap-1" data-testid="mask-color-samples" data-count={sh.samples.length}>
+            {sh.samples.map((_, i) => (
+              <span key={i} className="flex items-center gap-0.5 rounded bg-neutral-800 py-0.5 pl-1.5 pr-0.5 text-[11px] text-neutral-200" data-testid={`mask-color-sample-${i}`} title={`Sample ${i + 1}`}>
+                <span className="size-3 rounded-sm border border-neutral-500 bg-sky-400/60" />
+                {i + 1}
+                <button
+                  className="rounded px-0.5 text-neutral-400 hover:bg-neutral-700 hover:text-white disabled:opacity-30"
+                  disabled={sh.samples.length <= 1}
+                  aria-label={`Remove sample ${i + 1}`}
+                  title="Remove this sample"
+                  data-testid={i === sh.samples.length - 1 ? "mask-color-remove-sample" : `mask-color-remove-sample-${i}`}
+                  onClick={() => patchShape((x) => (x.kind === "color" ? { ...x, samples: x.samples.filter((_, j) => j !== i) } : x), "Mask: Color Range", false)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
           {pctSlider("mask-color-amount", "Refine", sh.amount, 0, 100, (v) => patchShape((s) => (s.kind === "color" ? { ...s, amount: v } : s), "Mask: Color Range", true), 50)}
           <div className="flex gap-1">
             <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:opacity-40" disabled={sh.samples.length >= 5} onClick={() => masks.beginTool("color", { groupId: group.id, mode: comp.mode }, comp.id)} data-testid="mask-color-add-sample" title="Click or drag on the photo to add a colour sample">
               Add sample
-            </button>
-            <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:opacity-40" disabled={sh.samples.length <= 1} onClick={() => patchShape((s) => (s.kind === "color" ? { ...s, samples: s.samples.slice(0, -1) } : s), "Mask: Color Range", false)} data-testid="mask-color-remove-sample">
-              Remove last
             </button>
           </div>
         </div>
@@ -478,6 +523,7 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
           min={0}
           max={200}
           step={1}
+          defaultValue={100}
           display={(v) => `${v}%`}
           onInput={(v) => masks.liveGroup(g.id, (x) => ({ ...x, amount: v / 100 }), `Mask: ${g.name} Amount`)}
           onCommit={masks.commit}
@@ -489,6 +535,7 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
           key={grp.id}
           id={`mask-${grp.id}`}
           title={grp.title}
+          dirty={grp.defs.some((d) => g.adjustments[d.key] !== defaults[d.key])}
           onReset={() =>
             masks.changeGroup(g.id, (x) => ({ ...x, adjustments: { ...x.adjustments, ...Object.fromEntries(grp.defs.map((d) => [d.key, defaults[d.key]])) } }), `Mask: ${g.name} Reset ${grp.title}`)
           }
@@ -503,6 +550,7 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
               max={d.max}
               step={d.step}
               digits={d.digits}
+              defaultValue={defaults[d.key]}
               accent={d.accent}
               onInput={(v) => setLocal(d.key, v, `Mask: ${g.name} ${d.label}`, false)}
               onCommit={masks.commit}
@@ -511,7 +559,7 @@ function LocalSliders({ masks, g }: { masks: MasksApi; g: MaskGroup }) {
           ))}
         </Section>
       ))}
-      <Section id="mask-color" title="Color" onReset={() => masks.changeGroup(g.id, (x) => ({ ...x, adjustments: { ...x.adjustments, color: defaults.color } }), `Mask: ${g.name} Reset Color`)}>
+      <Section id="mask-color" dirty={color.saturation !== defaults.color.saturation || color.hue !== defaults.color.hue} title="Color" onReset={() => masks.changeGroup(g.id, (x) => ({ ...x, adjustments: { ...x.adjustments, color: defaults.color } }), `Mask: ${g.name} Reset Color`)}>
         <div className="mb-1 flex items-center gap-2 text-[11px] text-neutral-300">
           <span className="size-5 rounded border border-neutral-600" style={{ backgroundColor: color.saturation > 0 ? `hsl(${color.hue} ${color.saturation}% 50%)` : "transparent" }} data-testid="mask-color-swatch" title="Color tint applied inside the mask" />
           Tint

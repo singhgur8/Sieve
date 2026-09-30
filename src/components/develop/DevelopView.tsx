@@ -8,8 +8,7 @@ import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
 import { Stars } from "../Cell";
 import { Filmstrip } from "../Filmstrip";
-import { setPanelHidden, toggleChrome, toggleSidePanels, usePanels } from "../../lib/panels";
-import { sampleWhiteBalance } from "../../lib/wb";
+import { setPanelHidden, usePanels } from "../../lib/panels";
 import { dispToSensor, screenToDisp } from "../../lib/maskGeom";
 import { copyFields, FIELD_LABEL } from "../../lib/adjust";
 import { hint, type ActionId } from "../../lib/keymap";
@@ -81,6 +80,8 @@ interface Props {
 }
 
 const FILM = 72;
+/** Margin around the image while cropping, so the handles do not sit on the panel borders. */
+const CROP_INSET = 24;
 
 const TOOL_HELP: Record<string, string> = {
   brush: "Brush: drag to paint, Alt erases, [ ] size, Esc done",
@@ -105,9 +106,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [cropTool, setCropTool] = useState<CropTool | null>(null);
   const cropRef = useRef<CropTool | null>(null);
   cropRef.current = cropTool;
+  const [picking, setPicking] = useState(false);
   const pickerRef = useRef(false);
   pickerRef.current = picking;
-  const [picking, setPicking] = useState(false);
   const panels = usePanels("develop");
   const copied = useClipboard();
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
@@ -376,7 +377,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       const disp = screenToDisp(clientX - rect.left, clientY - rect.top, boxRef.current);
       const pt = dispToSensor({ x: Math.min(1, Math.max(0, disp.x)), y: Math.min(1, Math.max(0, disp.y)) }, frameRef.current);
       void run(async () => {
-        const r = await sampleWhiteBalance(id, pt, editor.adj as ParametricAdjustments);
+        const r = await unwrap(commands.sampleWhiteBalance(id, pt, editor.adj as ParametricAdjustments));
         editor.change((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: r.temperatureK, tint: r.tint } }), "White Balance: Picker");
       });
     },
@@ -464,21 +465,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
-  // ---- filmstrip ----
-  const stripRef = useRef<HTMLDivElement>(null);
-  const virt = useVirtualizer({ count: lib.ids.length, horizontal: true, getScrollElement: () => stripRef.current, estimateSize: () => FILM + 4, overscan: 6 });
-  const vitems = virt.getVirtualItems();
-  const { ensure } = lib;
-  const firstV = vitems[0]?.index ?? 0;
-  const lastV = vitems.length ? vitems[vitems.length - 1].index + 1 : 0;
-  useEffect(() => ensure(lib.ids.slice(firstV, lastV)), [ensure, lib.ids, firstV, lastV]);
-  const activeIndex = id == null ? -1 : lib.ids.indexOf(id);
-  useEffect(() => {
-    if (activeIndex >= 0) virt.scrollToIndex(activeIndex, { align: "auto" });
-  }, [activeIndex, virt]);
-
   const box = frameBox(zoom, size, fw, fh, editor.main);
   const frame: Frame | null = useMemo(() => (fw > 0 && fh > 0 ? { orientation, crop: editor.adj.crop, w: fw, h: fh } : null), [orientation, editor.adj.crop, fw, fh]);
+  const boxRef = useRef(box);
+  boxRef.current = box;
+  const frameRef = useRef(frame);
+  frameRef.current = frame;
   const thumb = entry?.thumbnail;
   const thumbUrl = thumb?.status === "ready" ? `${convertFileSrc(thumb.path)}?v=${id != null ? lib.version(id) : 0}` : null;
 
@@ -486,7 +478,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-neutral-950" data-testid="develop-view" data-image-id={id ?? ""}>
-      <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5 text-neutral-300">
+      {!panels.chrome && (
+      <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5 text-neutral-300" data-testid="develop-toolbar">
         <button className={btn()} onClick={onBack} title={`Back to Library${hint("toGrid")}`} data-testid="develop-back">
           <ArrowLeft className="size-3.5" /> Library
         </button>
@@ -525,20 +518,25 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             </button>
           </span>
           <button className={btn()} onClick={doReset} title={`Reset all adjustments${hint("reset")}`} data-testid="reset-all">
-            <RotateCcw className="size-3.5" /> Reset
+            <RotateCcw className="size-3.5" /> {targets().length > 1 ? `Reset (${targets().length})` : "Reset"}
           </button>
         </div>
         <WarningsChip
           warnings={info?.warnings ?? []}
-          actions={{ ai_mask_needs_update: { label: "Update AI masks", run: () => void masksRef.current.updateAll() } }}
+          actions={{
+            ai_mask_needs_update: { label: "Update AI masks", run: () => void masksRef.current.updateAll() },
+            masks_unsupported: { label: "Show in Masks panel", run: () => masksRef.current.setOpen(true) },
+          }}
         />
         <span className="ml-auto text-[11px] tabular-nums text-neutral-400" data-testid="render-ms">
           {editor.main ? `${editor.main.width}x${editor.main.height} · ${Math.round(editor.main.renderMs)} ms` : ""}
         </span>
       </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
-        <aside className="w-56 shrink-0 border-r border-neutral-800">
+        {!panels.left && (
+        <aside className="w-56 shrink-0 border-r border-neutral-800" data-testid="left-aside">
           <LeftPanel
             presets={presets}
             history={editor.history}
@@ -553,8 +551,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onUndo={editor.undo}
             onRedo={editor.redo}
             onGoto={editor.goto}
+            targetCount={targets().length}
           />
         </aside>
+        )}
         <div className="relative min-w-0 flex-1">
           <Viewer
             main={editor.main}
@@ -574,6 +574,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onPan={setZoom}
             onPanEnd={onPanEnd}
             onToggleZoom={toggleZoom}
+            inset={cropTool ? CROP_INSET : 0}
           />
           {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} onError={onError} />}
           {masks.open && masks.tool && !cropTool && (
@@ -581,14 +582,28 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               {TOOL_HELP[masks.tool.kind]}
             </span>
           )}
-          {cropTool && imageAspect > 0 && <CropOverlay tool={cropTool} size={size} imageAspect={imageAspect} onChange={setCropTool} />}
-          {cropTool && (
-            <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="crop-badge">
-              Crop: Enter applies, Esc cancels
-            </span>
+          {cropTool && imageAspect > 0 && (
+            <div className="absolute" style={{ inset: CROP_INSET }} data-testid="crop-inset">
+              <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} onChange={setCropTool} />
+            </div>
           )}
+          {cropTool && <CropBar crop={cropApi} />}
+          {picking && (
+            <div
+              className="absolute inset-0 z-20 cursor-crosshair"
+              data-testid="wb-picker-overlay"
+              onClick={(e) => pickWb(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
+            >
+              <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="wb-picker-badge">
+                Click a neutral grey or white. Esc cancels
+              </span>
+            </div>
+          )}
+          <PanelChevron side="left" hidden={panels.left} />
+          <PanelChevron side="right" hidden={panels.right} />
         </div>
-        <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800">
+        {!panels.right && (
+        <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside">
           <div className="flex gap-1 border-b border-neutral-800 px-3 py-1.5" role="tablist" aria-label="Develop panels">
             <button role="tab" aria-selected={!masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${!masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => { masks.endTool(); masks.setOpen(false); }} data-testid="panel-tab-adjust">
               Adjust
@@ -598,52 +613,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             </button>
           </div>
           <div className="min-h-0 flex-1">
-            {masks.open ? <MasksPanel masks={masks} /> : <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} />}
+            {masks.open ? <MasksPanel masks={masks} /> : <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} picker={{ active: picking, toggle: togglePicker }} />}
           </div>
         </aside>
+        )}
       </div>
 
-      <div ref={stripRef} className="h-[88px] shrink-0 overflow-x-auto overflow-y-hidden border-t border-neutral-800 bg-neutral-900" data-testid="filmstrip">
-        <div style={{ width: virt.getTotalSize(), height: "100%", position: "relative" }}>
-          {vitems.map((v) => {
-            const fid = lib.ids[v.index];
-            const e = lib.getEntry(fid);
-            const t = e?.thumbnail;
-            const active = fid === id;
-            return (
-              <button
-                key={v.key}
-                data-testid={`film-${fid}`}
-                data-active={active}
-                data-selected={sel.selected.has(fid)}
-                onClick={(ev) => sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey })}
-                className={`absolute top-2 overflow-hidden rounded bg-neutral-800 ${sel.selected.has(fid) ? "ring-2 ring-sky-500" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
-                style={{ left: v.start, width: FILM, height: FILM }}
-              >
-                {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(fid)}`} alt="" draggable={false} className="size-full object-cover" />}
-                {e && (e.pick !== "unflagged" || e.colorLabel) && (
-                  <span className="pointer-events-none absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
-                    {e.pick === "pick" && <Flag className="size-3 fill-green-500 text-green-500" />}
-                    {e.pick === "reject" && <X className="size-3.5 text-red-500" strokeWidth={3} />}
-                    {e.colorLabel && <span className={`size-2 rounded-full ${LABEL_COLOR[e.colorLabel]}`} />}
-                  </span>
-                )}
-                {e && e.rating > 0 && (
-                  <span className="pointer-events-none absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5 text-[10px] leading-3 text-amber-400" data-testid={`film-rating-${fid}`}>
-                    {e.rating}★
-                  </span>
-                )}
-                {e && e.sceneId != null && (
-                  <span className="absolute bottom-0.5 left-0.5">
-                    <SceneBadge entry={e} testPrefix="film-scene" />
-                  </span>
-                )}
-                {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited" data-testid={`film-edited-${fid}`} />}
-              </button>
-            );
-          })}
-        </div>
-      </div>
+      {!panels.chrome && (
+        <Filmstrip lib={lib} activeId={id} selected={sel.selected} onPick={(fid, ev) => sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey })} cellW={FILM} cellH={FILM} height={88} scenePrefix="film-scene" />
+      )}
 
       {masks.picker && id != null && (
         <PeoplePicker imageId={id} thumbUrl={thumbUrl} caps={masks.caps} onCreate={(pt, parts, name) => void masks.createPeople(pt, parts, name)} onCancel={masks.closePicker} onError={onError} />
@@ -694,3 +672,19 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     </div>
   );
 });
+
+/** 16 px chevron on a panel's inner edge: hides / shows that panel (Tab does both). */
+function PanelChevron({ side, hidden }: { side: "left" | "right"; hidden: boolean }) {
+  const Icon = (side === "left") === hidden ? ChevronRight : ChevronLeft;
+  return (
+    <button
+      className={`absolute top-1/2 z-30 flex h-12 w-4 -translate-y-1/2 items-center justify-center bg-neutral-900/70 text-neutral-300 hover:bg-neutral-800 hover:text-white ${side === "left" ? "left-0 rounded-r" : "right-0 rounded-l"}`}
+      title={hidden ? "Show panel (Tab)" : "Hide panel (Tab)"}
+      aria-label={hidden ? `Show ${side} panel` : `Hide ${side} panel`}
+      data-testid={`panel-chevron-${side}`}
+      onClick={() => setPanelHidden(side, !hidden)}
+    >
+      <Icon className="size-3.5" />
+    </button>
+  );
+}
