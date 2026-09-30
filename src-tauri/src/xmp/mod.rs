@@ -10,15 +10,15 @@
 //! - else `colorLabel = Some(c)`-> `xmp:Label = "Red" | "Yellow" | "Green" | "Blue" | "Purple"`
 //! - else                       -> remove `xmp:Label` only if it currently holds "Pick" or one of
 //!   those five names (custom label sets are preserved)
-//! - non-suppressed tags        -> `lr:hierarchicalSubject` item `LumenRAW|<tag>` and `dc:subject`
-//!   item `<tag>` (snake_case wire value). On write, first remove every `LumenRAW|*` item, and the
+//! - non-suppressed tags        -> `lr:hierarchicalSubject` item `Sieve|<tag>` and `dc:subject`
+//!   item `<tag>` (snake_case wire value). On write, first remove every `Sieve|*` item, and the
 //!   `dc:subject` leaf of each removed item; other keywords are kept.
 //! - update `xmp:MetadataDate` (so Lightroom notices the change); keep every other field,
 //!   namespace and packet as-is. Create a minimal `x:xmpmeta` packet if no sidecar exists.
 //!
 //! Sidecar -> catalog (reads): `xmp:Rating -1` -> `pick = reject` (rating unchanged);
 //! `0..=5` -> rating, and `pick = pick` iff `xmp:Label == "Pick"` else `unflagged`;
-//! label names above -> `colorLabel` ("Pick"/absent/unknown -> `None`). `LumenRAW|*` keywords
+//! label names above -> `colorLabel` ("Pick"/absent/unknown -> `None`). `Sieve|*` keywords
 //! are NOT read back (tags are catalog -> sidecar only; analysis regenerates them). A missing
 //! `xmp:Rating` reads as 0.
 //!
@@ -47,7 +47,7 @@
 //! - Auto-sync: `notify` (re)arms a deadline; one `xmp-sync` thread sleeps until it passes,
 //!   runs a pass on its own connection, and exits when no new deadline was set. File I/O is
 //!   serialized with explicit commands by `io_lock`. When newer-wins picks the sidecar and
-//!   the catalog's visible tags differ from its `LumenRAW|*` keywords, the merged state is
+//!   the catalog's visible tags differ from its `Sieve|*` keywords, the merged state is
 //!   written back so tags reach the sidecar too.
 
 mod packet;

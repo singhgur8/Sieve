@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use lumenraw_lib::db::{self, repo};
-use lumenraw_lib::ipc::events::{AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady};
-use lumenraw_lib::ipc::types::{CullThresholds, ShootType};
-use lumenraw_lib::ml::worker::{self, AnalysisSink};
-use lumenraw_lib::ml::{AnalysisConfig, Analyzer};
+use sieve_lib::db::{self, repo};
+use sieve_lib::ipc::events::{AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady};
+use sieve_lib::ipc::types::{CullThresholds, ShootType};
+use sieve_lib::ml::worker::{self, AnalysisSink};
+use sieve_lib::ml::{AnalysisConfig, Analyzer};
 
 const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
 
@@ -58,7 +58,7 @@ fn main() {
     let labels_path = arg(&args, "--labels").unwrap_or_else(|| format!("{ROOT}/labels.json"));
     let rescore_only = args.iter().any(|a| a == "--rescore");
     let shoot = ShootType::parse(&arg(&args, "--shoot").unwrap_or_else(|| "wedding".into())).expect("shoot type");
-    let models_dir = std::env::var("LUMENRAW_MODELS")
+    let models_dir = std::env::var("SIEVE_MODELS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
 
@@ -113,7 +113,7 @@ fn main() {
             stats.analyzed,
             stats.failed,
             stats.burst_groups,
-            std::env::var("LUMENRAW_ANALYSIS_THREADS").unwrap_or_else(|_| worker::default_threads().to_string()),
+            std::env::var("SIEVE_ANALYSIS_THREADS").unwrap_or_else(|_| worker::default_threads().to_string()),
             wall,
             wall / n as f64
         );

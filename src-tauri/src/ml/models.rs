@@ -71,12 +71,12 @@ fn base_builder() -> Result<SessionBuilder, String> {
         .map_err(|e| format!("session builder: {e}"))
 }
 
-/// CoreML first (unless `LUMENRAW_ML_CPU=1`), CPU fallback.
+/// CoreML first (unless `SIEVE_ML_CPU=1`), CPU fallback.
 fn build(path: &Path, dim: (&str, i64)) -> Result<(Session, Provider), String> {
     if !path.is_file() {
         return Err(format!("model not found: {} (run scripts/fetch-models.sh)", path.display()));
     }
-    let force_cpu = std::env::var("LUMENRAW_ML_CPU").is_ok_and(|v| v == "1");
+    let force_cpu = std::env::var("SIEVE_ML_CPU").is_ok_and(|v| v == "1");
     if !force_cpu {
         let coreml = ep::CoreML::default()
             .with_model_format(ep::coreml::ModelFormat::MLProgram)

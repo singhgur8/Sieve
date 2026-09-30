@@ -1,4 +1,4 @@
-# LumenRAW Roadmap
+# Sieve Roadmap
 
 Source of truth for autonomous execution (see "Autonomous Orchestration" in `CLAUDE.md`).
 The orchestrator works top to bottom: the first unchecked task is the next task.
@@ -9,7 +9,7 @@ Conventions
 - `Owner` = agent in `.claude/agents/`. Contract/schema changes always go through `architect` first.
 - Sample RAWs: `/Users/gurjotsingh/Pictures/test RAWS` (788 Sony `.ARW`, ~20 GB). **Read-only.**
   Copy subsets into `test-data/` (gitignored) for anything that writes (XMP, exports).
-  Set `LUMENRAW_SAMPLES` to point elsewhere; paths change per project.
+  Set `SIEVE_SAMPLES` to point elsewhere; paths change per project.
 - Baseline gate for every phase (run by `qa-engineer`):
   `cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check` and `pnpm build`.
 
@@ -40,7 +40,7 @@ Conventions
 
 ## Phase 4 — Culling UI + XMP write
 - [ ] **Contract** (architect): XMP sync commands (`write_xmp`, `read_xmp`, auto-sync setting), keyboard-driven batch ops.
-- [ ] **XMP sidecars** (rust-engine-dev): mapping — reject → `xmp:Rating -1`; stars → `xmp:Rating 0–5`; pick → `xmp:Label "Pick"` (color labels otherwise via `xmp:Label`); auto tags → `lr:hierarchicalSubject` `LumenRAW|<tag>` + `dc:subject`. Preserve unrelated existing XMP fields; read existing sidecars on import.
+- [ ] **XMP sidecars** (rust-engine-dev): mapping — reject → `xmp:Rating -1`; stars → `xmp:Rating 0–5`; pick → `xmp:Label "Pick"` (color labels otherwise via `xmp:Label`); auto tags → `lr:hierarchicalSubject` `Sieve|<tag>` + `dc:subject`. Preserve unrelated existing XMP fields; read existing sidecars on import.
 - [ ] **Grid** (frontend-dev): virtualized grid, 5,000+ items at 60 fps, thumbnail sizes, sort.
 - [ ] **Filter bar** (frontend-dev): include/exclude tags (any/all), pick, min rating, burst, folder.
 - [ ] **Loupe + compare** (frontend-dev): single loupe with zoom to 100%, 2-up burst compare, face-crop zoom.

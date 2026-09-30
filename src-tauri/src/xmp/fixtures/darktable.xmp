@@ -28,7 +28,7 @@
    <lr:hierarchicalSubject>
     <rdf:Seq>
      <rdf:li>darktable|format|ARW</rdf:li>
-     <rdf:li>LumenRAW|underexposed</rdf:li>
+     <rdf:li>Sieve|underexposed</rdf:li>
     </rdf:Seq>
    </lr:hierarchicalSubject>
   </rdf:Description>

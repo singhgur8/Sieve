@@ -21,12 +21,12 @@ use ml::{Analysis, AnalysisConfig};
 use xmp::{XmpSync, XmpSyncConfig};
 
 /// Overrides the catalog location (useful for tests and scratch catalogs).
-const CATALOG_ENV: &str = "LUMENRAW_CATALOG";
+const CATALOG_ENV: &str = "SIEVE_CATALOG";
 /// Overrides the derived-file cache root (thumbnails live in `<cache>/thumbs/`).
-const CACHE_ENV: &str = "LUMENRAW_CACHE";
+const CACHE_ENV: &str = "SIEVE_CACHE";
 /// Overrides the ONNX model directory (default: `src-tauri/models` in debug builds,
 /// `<resource_dir>/models` in release).
-const MODELS_ENV: &str = "LUMENRAW_MODELS";
+const MODELS_ENV: &str = "SIEVE_MODELS";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -113,7 +113,7 @@ pub fn run() {
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
-            // covers a `LUMENRAW_CACHE` override (and is a no-op widening otherwise).
+            // covers a `SIEVE_CACHE` override (and is a no-op widening otherwise).
             app.asset_protocol_scope().allow_directory(config.thumbs_dir(), true)?;
 
             let catalog = Catalog::open(path.clone())?;

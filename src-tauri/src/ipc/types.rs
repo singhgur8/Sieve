@@ -860,7 +860,7 @@ pub struct CatalogState {
     pub folders: Vec<FolderEntry>,
     /// Counts of non-suppressed tags, for the filter bar.
     pub tag_counts: Vec<TagCount>,
-    /// Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+    /// Root of the derived-file cache (`<app_cache_dir>` or `$SIEVE_CACHE`).
     /// Thumbnails/previews live in `<cacheDir>/thumbs/`.
     pub cache_dir: String,
     /// Analysis starts automatically after import / on launch (`set_auto_analyze`).

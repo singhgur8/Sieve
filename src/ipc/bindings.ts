@@ -257,7 +257,7 @@ export type CatalogState = {
 	/**  Counts of non-suppressed tags, for the filter bar. */
 	tagCounts: TagCount[],
 	/**
-	 *  Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+	 *  Root of the derived-file cache (`<app_cache_dir>` or `$SIEVE_CACHE`).
 	 *  Thumbnails/previews live in `<cacheDir>/thumbs/`.
 	 */
 	cacheDir: string,

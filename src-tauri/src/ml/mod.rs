@@ -60,7 +60,7 @@ pub const MODEL_VERSION: &str = "scrfd10g-2d106-eyecnn-mesh-v3";
 pub struct AnalysisConfig {
     /// Catalog file; the worker opens its own connection to it.
     pub catalog_path: PathBuf,
-    /// Directory holding `det_10g.onnx` and `2d106det.onnx` (`$LUMENRAW_MODELS` overrides).
+    /// Directory holding `det_10g.onnx` and `2d106det.onnx` (`$SIEVE_MODELS` overrides).
     pub models_dir: PathBuf,
 }
 

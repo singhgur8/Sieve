@@ -41,7 +41,7 @@ const BATCH: u32 = 64;
 /// Minimum spacing of `ImportProgress` events.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Overrides the extraction thread count (default: [`default_threads`]).
-const THREADS_ENV: &str = "LUMENRAW_INGEST_THREADS";
+const THREADS_ENV: &str = "SIEVE_INGEST_THREADS";
 
 /// Half the cores, 2..=8. Each thread holds ~30 MB of reusable buffers; 8 threads
 /// already exceed the throughput target several times over (measured ~170 files/s on
@@ -56,7 +56,7 @@ pub fn default_threads() -> usize {
 pub struct IngestConfig {
     /// Catalog file; the pipeline opens its own connection to it.
     pub catalog_path: PathBuf,
-    /// Cache root (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+    /// Cache root (`<app_cache_dir>` or `$SIEVE_CACHE`).
     pub cache_dir: PathBuf,
 }
 
@@ -144,7 +144,7 @@ pub fn spawn_worker<S: IngestSink + 'static>(config: IngestConfig, running: Arc<
         return Ok(());
     }
     let flag = running.clone();
-    let spawned = std::thread::Builder::new().name("lumenraw-ingest".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("sieve-ingest".into()).spawn(move || {
         if let Err(e) = run_until_idle(&config, &sink, &flag) {
             eprintln!("[ingest] worker stopped: {}", e.message);
             flag.store(false, Ordering::SeqCst);
@@ -178,7 +178,7 @@ pub fn run_until_idle(config: &IngestConfig, sink: &dyn IngestSink, running: &At
         .unwrap_or_else(default_threads);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .thread_name(|i| format!("lumenraw-extract-{i}"))
+        .thread_name(|i| format!("sieve-extract-{i}"))
         .build()
         .map_err(|e| AppError::internal(format!("thread pool: {e}")))?;
 
@@ -562,12 +562,11 @@ mod tests {
     }
 
     /// Real RAWs, read-only; catalog + cache go to a temp dir.
-    /// `LUMENRAW_SAMPLES=/dir cargo test --release -- --ignored real_samples`
+    /// `SIEVE_SAMPLES=/dir cargo test --release -- --ignored real_samples`
     #[test]
-    #[ignore = "needs sample RAWs ($LUMENRAW_SAMPLES)"]
+    #[ignore = "needs sample RAWs ($SIEVE_SAMPLES)"]
     fn real_samples_first_40() {
-        let folder =
-            std::env::var("LUMENRAW_SAMPLES").unwrap_or_else(|_| "/Users/gurjotsingh/Pictures/test RAWS".into());
+        let folder = std::env::var("SIEVE_SAMPLES").unwrap_or_else(|_| "/Users/gurjotsingh/Pictures/test RAWS".into());
         let folder = Path::new(&folder);
         assert!(folder.is_dir(), "{} missing", folder.display());
         let dir = tempfile::tempdir().unwrap();

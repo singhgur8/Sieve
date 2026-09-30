@@ -1,18 +1,18 @@
-# LumenRAW Architecture
+# Sieve Architecture
 
 ## File layout
 
 ```
 src-tauri/
   Cargo.toml
-  tauri.conf.json              productName LumenRAW, id com.lumenraw.app
+  tauri.conf.json              productName Sieve, id com.sieve.app
   capabilities/default.json    core:default + dialog:allow-open
   migrations/0001_init.sql     catalog schema v1 (append-only)
   migrations/0002_ingest.sql   v2: thumbnails.preview_path, idx_thumbnails_status
   migrations/0003_analysis.sql v3: image_analysis, quality_scores.suggested_*, auto_analyze
   migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
   src/
-    main.rs                    -> lumenraw_lib::run()
+    main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync, cache/models-dir resolution, asset scope,
                                specta_builder() (single registration point for commands + events),
                                debug-build export of src/ipc/bindings.ts
@@ -130,7 +130,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   `<id>_2048.jpg` (loupe), orientation applied → update `images` EXIF columns + `thumbnails` row →
   emit `thumbnailReady` or `thumbnailFailed` (reason also stored in `thumbnails.error`) and throttled
   `importProgress` (per run; `done == total` = idle).
-- Cache root: `app_cache_dir()` or `LUMENRAW_CACHE=/path`; exposed as `CatalogState.cacheDir`.
+- Cache root: `app_cache_dir()` or `SIEVE_CACHE=/path`; exposed as `CatalogState.cacheDir`.
 - Frontend loads images with `convertFileSrc(path)`. Asset protocol scope: `$APPCACHE/thumbs/**` plus
   the resolved `<cacheDir>/thumbs` added at runtime. CSP allows `asset:` / `http://asset.localhost`
   in `img-src` (production; `devCsp` is null for Vite HMR).
@@ -164,7 +164,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - Thresholds: `ml::thresholds::default_thresholds(shootType)`; overrides stored as JSON in
   `catalog_meta['cull_thresholds.<shoot_type>']`, overlaid on defaults when read (`repo::cull_thresholds`).
 - Ownership of SQL: repo.rs holds the command-side reads/user writes; the worker's SQL lives in `ml/`.
-- Models: `<models_dir>/det_10g.onnx`, `2d106det.onnx` (`scripts/fetch-models.sh`); `LUMENRAW_MODELS`
+- Models: `<models_dir>/det_10g.onnx`, `2d106det.onnx` (`scripts/fetch-models.sh`); `SIEVE_MODELS`
   overrides the dir (default `src-tauri/models` in debug, `<resource_dir>/models` in release).
 
 ## XMP sidecars (Phase 4)
@@ -179,11 +179,11 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   | `pick = pick` | `xmp:Label = "Pick"` (wins over a colour label) |
   | `colorLabel` (not picked) | `xmp:Label = "Red"/"Yellow"/"Green"/"Blue"/"Purple"` |
   | neither | `xmp:Label` removed only if it held "Pick" or one of those names |
-  | visible tags | `lr:hierarchicalSubject` `LumenRAW\|<tag>` + `dc:subject` `<tag>` |
-  Writes replace only `LumenRAW|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
+  | visible tags | `lr:hierarchicalSubject` `Sieve\|<tag>` + `dc:subject` `<tag>` |
+  Writes replace only `Sieve|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
   every other field/namespace. Atomic (temp file + rename).
 - Sidecar -> catalog (read/import): `-1` -> reject; `0..=5` -> rating, `pick` iff Label "Pick" else unflagged;
-  label names -> `colorLabel`. `LumenRAW|*` keywords are not read back (analysis owns tags).
+  label names -> `colorLabel`. `Sieve|*` keywords are not read back (analysis owns tags).
 - Dirty tracking is in the schema: triggers set `images.xmp_dirty = 1` + `meta_updated_at` when rating / pick /
   color_label or visible tags change, whoever writes them (commands, `apply_suggestions`, analysis auto tags).
   A successful write/read sets `xmp_dirty = 0`, `xmp_synced_at`, `xmp_mtime_ms` (sidecar mtime), clears `xmp_error`.
@@ -196,7 +196,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 
 ## Catalog (SQLite)
 
-Location: `<app_data_dir>/catalog.sqlite` (override with `LUMENRAW_CATALOG=/path`). WAL, `foreign_keys=ON`,
+Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
 migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |

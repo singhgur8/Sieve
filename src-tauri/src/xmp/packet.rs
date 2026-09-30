@@ -23,15 +23,15 @@ pub const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
 pub const NS_LR: &str = "http://ns.adobe.com/lightroom/1.0/";
 const NS_XMLNS_PREFIX: &str = "xmlns";
 
-/// Hierarchical keyword root owned by LumenRAW.
-pub const KEYWORD_ROOT: &str = "LumenRAW";
-/// `xmp:Label` values LumenRAW writes (and may therefore remove). Lightroom's default label set.
+/// Hierarchical keyword root owned by Sieve.
+pub const KEYWORD_ROOT: &str = "Sieve";
+/// `xmp:Label` values Sieve writes (and may therefore remove). Lightroom's default label set.
 pub const OWNED_LABELS: [&str; 6] = ["Pick", "Red", "Yellow", "Green", "Blue", "Purple"];
 
 const BOM: &str = "\u{feff}";
 
 /// Minimal Lightroom-style packet used when no sidecar exists yet.
-pub const NEW_PACKET: &str = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"LumenRAW\">\n \
+pub const NEW_PACKET: &str = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Sieve\">\n \
 <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  \
 <rdf:Description rdf:about=\"\"\n    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n  \
 </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n";
@@ -53,7 +53,7 @@ fn err(msg: impl Into<String>) -> PacketError {
     PacketError(msg.into())
 }
 
-/// Values LumenRAW reads from a sidecar.
+/// Values Sieve reads from a sidecar.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidecarValues {
     /// `xmp:Rating` rounded (`None` if absent or unparsable).
@@ -63,20 +63,20 @@ pub struct SidecarValues {
     pub subjects: Vec<String>,
 }
 
-/// The XMP-mapped state LumenRAW wants in the sidecar.
+/// The XMP-mapped state Sieve wants in the sidecar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Desired {
     /// -1 (reject) ..= 5.
     pub rating: i32,
     /// One of [`OWNED_LABELS`], or `None` to remove an owned label.
     pub label: Option<&'static str>,
-    /// Visible tags (snake_case), written as `LumenRAW|<tag>` and `<tag>`.
+    /// Visible tags (snake_case), written as `Sieve|<tag>` and `<tag>`.
     pub tags: Vec<String>,
     /// `xmp:MetadataDate` value (ISO 8601).
     pub metadata_date: String,
 }
 
-/// Reads the LumenRAW-relevant values of a packet.
+/// Reads the Sieve-relevant values of a packet.
 pub fn parse(src: &str) -> Result<SidecarValues> {
     let body = src.strip_prefix(BOM).unwrap_or(src);
     let doc = Doc::parse(body)?;
@@ -98,7 +98,7 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
 }
 
 /// Applies `want` to `existing` (or to a new minimal packet), touching only the fields
-/// LumenRAW owns.
+/// Sieve owns.
 pub fn merge(existing: Option<&str>, want: &Desired) -> Result<String> {
     let src = existing.unwrap_or(NEW_PACKET);
     let (bom, body) = match src.strip_prefix(BOM) {
@@ -137,7 +137,7 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
     }
     ed.set_scalar(NS_XMP, "MetadataDate", &want.metadata_date);
 
-    // Keywords: drop every LumenRAW|* item, then add the wanted ones.
+    // Keywords: drop every Sieve|* item, then add the wanted ones.
     let wanted_hier: Vec<String> = want.tags.iter().map(|t| format!("{KEYWORD_ROOT}|{t}")).collect();
     let existing_hier: Vec<String> = doc
         .list(NS_LR, "hierarchicalSubject")

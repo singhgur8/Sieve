@@ -31,7 +31,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 /// Poll interval while waiting for ingest to produce previews.
 const INGEST_POLL: Duration = Duration::from_millis(250);
 /// Overrides the analysis thread count.
-const THREADS_ENV: &str = "LUMENRAW_ANALYSIS_THREADS";
+const THREADS_ENV: &str = "SIEVE_ANALYSIS_THREADS";
 
 /// A quarter of the cores, 1..=4: the ONNX sessions run on CoreML (GPU/ANE, serialized
 /// by the OS anyway); CPU work per image is decode + sharpness. Measured on the 16-core
@@ -93,7 +93,7 @@ pub fn spawn_worker<S: AnalysisSink + 'static>(config: AnalysisConfig, flags: Wo
         return Ok(());
     }
     let running = flags.running.clone();
-    let spawned = std::thread::Builder::new().name("lumenraw-analysis".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("sieve-analysis".into()).spawn(move || {
         if let Err(e) = run_until_idle(&config, &sink, &flags) {
             eprintln!("[analysis] worker stopped: {}", e.message);
             flags.running.store(false, Ordering::SeqCst);
@@ -152,7 +152,7 @@ pub fn run_until_idle(config: &AnalysisConfig, sink: &dyn AnalysisSink, flags: &
         .unwrap_or_else(default_threads);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .thread_name(|i| format!("lumenraw-analyze-{i}"))
+        .thread_name(|i| format!("sieve-analyze-{i}"))
         .build()
         .map_err(|e| AppError::internal(format!("thread pool: {e}")))?;
     let analyzers = AnalyzerPool { models_dir: &config.models_dir, free: Mutex::new(Vec::new()) };

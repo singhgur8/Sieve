@@ -31,7 +31,7 @@ fn assert_unrelated_preserved(orig: &str, out: &str, owned: &[&str]) {
     }
 }
 
-const OWNED: &[&str] = &["Rating", "Label", "MetadataDate", "LumenRAW|", "<rdf:li>blink<", "<rdf:li>motion_blur<"];
+const OWNED: &[&str] = &["Rating", "Label", "MetadataDate", "Sieve|", "<rdf:li>blink<", "<rdf:li>motion_blur<"];
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -45,7 +45,7 @@ fn parses_lightroom_attribute_sidecar() {
     assert_eq!(v.subjects, ["wedding", "Smith & Jones", "blink", "motion_blur"]);
     assert_eq!(
         v.hierarchical_subjects,
-        ["Events|wedding", "Clients|Smith & Jones", "LumenRAW|blink", "LumenRAW|motion_blur"]
+        ["Events|wedding", "Clients|Smith & Jones", "Sieve|blink", "Sieve|motion_blur"]
     );
 }
 
@@ -59,7 +59,7 @@ fn parses_element_style_and_custom_prefixes() {
     let d = parse(DARKTABLE).unwrap();
     assert_eq!(d.rating, Some(4), "xap: prefix bound to the xmp namespace");
     assert_eq!(d.label, None);
-    assert_eq!(d.hierarchical_subjects, ["darktable|format|ARW", "LumenRAW|underexposed"]);
+    assert_eq!(d.hierarchical_subjects, ["darktable|format|ARW", "Sieve|underexposed"]);
 }
 
 #[test]
@@ -86,12 +86,12 @@ fn lightroom_merge_updates_owned_fields_only() {
     assert_eq!(v.label.as_deref(), Some("Pick"));
     assert_eq!(
         v.hierarchical_subjects,
-        ["Events|wedding", "Clients|Smith & Jones", "LumenRAW|blink", "LumenRAW|missed_focus"]
+        ["Events|wedding", "Clients|Smith & Jones", "Sieve|blink", "Sieve|missed_focus"]
     );
-    // motion_blur leaf removed with its LumenRAW item; blink kept (still wanted).
+    // motion_blur leaf removed with its Sieve item; blink kept (still wanted).
     assert_eq!(v.subjects, ["wedding", "Smith & Jones", "blink", "missed_focus"]);
     // New items use the existing indentation.
-    assert!(out.contains("     <rdf:li>LumenRAW|missed_focus</rdf:li>\n    </rdf:Bag>"));
+    assert!(out.contains("     <rdf:li>Sieve|missed_focus</rdf:li>\n    </rdf:Bag>"));
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn leaf_shared_with_foreign_hierarchy_is_kept() {
     let src = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
 <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:lr="http://ns.adobe.com/lightroom/1.0/">
 <dc:subject><rdf:Bag><rdf:li>blink</rdf:li><rdf:li>x</rdf:li></rdf:Bag></dc:subject>
-<lr:hierarchicalSubject><rdf:Bag><rdf:li>Mine|blink</rdf:li><rdf:li>LumenRAW|blink</rdf:li></rdf:Bag></lr:hierarchicalSubject>
+<lr:hierarchicalSubject><rdf:Bag><rdf:li>Mine|blink</rdf:li><rdf:li>Sieve|blink</rdf:li></rdf:Bag></lr:hierarchicalSubject>
 </rdf:Description></rdf:RDF></x:xmpmeta>"#;
     let v = parse(&merge(Some(src), &want(0, None, &[])).unwrap()).unwrap();
     assert_eq!(v.hierarchical_subjects, ["Mine|blink"]);
@@ -144,7 +144,7 @@ fn element_style_sidecars_are_edited_in_place() {
     assert!(!out.contains("Purple"), "Purple is ours and was cleared");
     let v = parse(&out).unwrap();
     assert_eq!(v.subjects, ["travel", "portrait", "blink"]);
-    assert_eq!(v.hierarchical_subjects, ["LumenRAW|blink"]);
+    assert_eq!(v.hierarchical_subjects, ["Sieve|blink"]);
     // lr namespace was not declared: declared on the description.
     assert!(out.contains("xmlns:lr=\"http://ns.adobe.com/lightroom/1.0/\""));
 
@@ -158,11 +158,11 @@ fn element_style_sidecars_are_edited_in_place() {
 #[test]
 fn multiple_descriptions_and_foreign_prefixes() {
     let out = merge(Some(DARKTABLE), &want(2, Some("Yellow"), &["blink"])).unwrap();
-    assert_unrelated_preserved(DARKTABLE, &out, &["Rating", "LumenRAW|"]);
+    assert_unrelated_preserved(DARKTABLE, &out, &["Rating", "Sieve|"]);
     assert!(out.contains("xap:Rating='2'"), "existing prefix and quote style kept");
     assert!(out.contains("xap:Label=\"Yellow\""));
     let v = parse(&out).unwrap();
-    assert_eq!(v.hierarchical_subjects, ["darktable|format|ARW", "LumenRAW|blink"]);
+    assert_eq!(v.hierarchical_subjects, ["darktable|format|ARW", "Sieve|blink"]);
     assert_eq!(v.subjects, ["blink"]);
     assert_eq!(v.label.as_deref(), Some("Yellow"));
 }
@@ -174,7 +174,7 @@ fn creates_minimal_packet() {
     let v = parse(&out).unwrap();
     assert_eq!(v.rating, Some(4));
     assert_eq!(v.label.as_deref(), Some("Pick"));
-    assert_eq!(v.hierarchical_subjects, ["LumenRAW|duplicate_burst"]);
+    assert_eq!(v.hierarchical_subjects, ["Sieve|duplicate_burst"]);
     assert_eq!(v.subjects, ["duplicate_burst"]);
     // No tags: no keyword properties at all.
     let bare = merge(None, &want(0, None, &[])).unwrap();
@@ -363,7 +363,7 @@ fn write_images_creates_sidecars_and_clears_dirty() {
     assert_eq!((report.succeeded, report.skipped, report.failed.len()), (3, 0, 0));
     let v0 = parse(&fs::read_to_string(f.sidecar(0)).unwrap()).unwrap();
     assert_eq!((v0.rating, v0.label.as_deref()), (Some(4), None));
-    assert_eq!(v0.hierarchical_subjects, ["LumenRAW|blink"]);
+    assert_eq!(v0.hierarchical_subjects, ["Sieve|blink"]);
     assert_eq!(parse(&fs::read_to_string(f.sidecar(1)).unwrap()).unwrap().rating, Some(-1));
     assert_eq!(parse(&fs::read_to_string(f.sidecar(2)).unwrap()).unwrap().label.as_deref(), Some("Green"));
     for (i, &id) in f.ids.iter().enumerate() {
@@ -522,7 +522,7 @@ fn auto_sync_newer_wins() {
     assert_eq!(f.values(f.ids[0]).0, 4);
     let v0 = parse(&fs::read_to_string(f.sidecar(0)).unwrap()).unwrap();
     assert_eq!(v0.rating, Some(4));
-    assert_eq!(v0.hierarchical_subjects, ["LumenRAW|blink"], "pending tag change still written");
+    assert_eq!(v0.hierarchical_subjects, ["Sieve|blink"], "pending tag change still written");
     assert_eq!(parse(&fs::read_to_string(f.sidecar(1)).unwrap()).unwrap().rating, Some(3));
     assert!(!f.state(f.ids[0]).0 && !f.state(f.ids[1]).0);
 }
@@ -556,13 +556,13 @@ fn exiftool_json(files: &[PathBuf]) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
-/// Copies 4 ARWs from `$LUMENRAW_XMP_SAMPLES` (default `~/Pictures/test RAWS`, read only)
+/// Copies 4 ARWs from `$SIEVE_XMP_SAMPLES` (default `~/Pictures/test RAWS`, read only)
 /// into a temp dir, imports them, culls, writes sidecars and checks them with exiftool,
 /// then edits a sidecar with exiftool and reads it back.
 #[test]
 #[ignore]
 fn xmp_exiftool_roundtrip_on_real_raws() {
-    let samples = std::env::var("LUMENRAW_XMP_SAMPLES")
+    let samples = std::env::var("SIEVE_XMP_SAMPLES")
         .unwrap_or_else(|_| format!("{}/Pictures/test RAWS", std::env::var("HOME").unwrap()));
     let mut arws: Vec<PathBuf> = fs::read_dir(&samples)
         .unwrap()
@@ -619,16 +619,16 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
     assert_eq!(j[0]["Rating"], 5);
     assert_eq!(j[0]["Label"], "Pick");
     assert_eq!(j[1]["Rating"], -1);
-    assert_eq!(j[1]["HierarchicalSubject"], "LumenRAW|blink");
+    assert_eq!(j[1]["HierarchicalSubject"], "Sieve|blink");
     assert_eq!(j[1]["Subject"], "blink");
     assert_eq!(j[2]["Rating"], 2);
     assert_eq!(j[2]["Label"], "Yellow");
-    assert_eq!(j[2]["HierarchicalSubject"], serde_json::json!(["LumenRAW|motion_blur", "LumenRAW|underexposed"]));
+    assert_eq!(j[2]["HierarchicalSubject"], serde_json::json!(["Sieve|motion_blur", "Sieve|underexposed"]));
     assert_eq!(j[3]["Rating"], 3);
     assert_eq!(j[3]["Label"], "Red");
     assert_eq!(
         j[3]["HierarchicalSubject"],
-        serde_json::json!(["Events|wedding", "Clients|Smith & Jones", "LumenRAW|missed_focus"])
+        serde_json::json!(["Events|wedding", "Clients|Smith & Jones", "Sieve|missed_focus"])
     );
     assert_eq!(j[3]["Subject"], serde_json::json!(["wedding", "Smith & Jones", "missed_focus"]));
     assert_eq!(j[3]["Exposure2012"], "+0.35", "crs: develop settings preserved");
@@ -667,7 +667,7 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
     println!("exiftool after re-write over exiftool output:\n{}", serde_json::to_string_pretty(&j).unwrap());
     assert_eq!(j[0]["Rating"], 1);
     assert_eq!(j[0]["Label"], "Blue");
-    assert_eq!(j[0]["HierarchicalSubject"], "LumenRAW|creative_blur");
+    assert_eq!(j[0]["HierarchicalSubject"], "Sieve|creative_blur");
     // The originals were only read.
     let xmps_in = |d: &str| {
         fs::read_dir(d)
@@ -677,7 +677,7 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
     };
     assert_eq!(xmps_in(&samples), samples_xmps_before);
     // Keep a copy for inspection when requested.
-    if let Ok(keep) = std::env::var("LUMENRAW_XMP_KEEP") {
+    if let Ok(keep) = std::env::var("SIEVE_XMP_KEEP") {
         let keep = PathBuf::from(keep);
         fs::create_dir_all(&keep).unwrap();
         for s in &sidecars {
