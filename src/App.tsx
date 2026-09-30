@@ -30,6 +30,7 @@ import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount } from "./lib/modal";
 import { getClipboard } from "./lib/clipboard";
+import { describeReason, noteFailure } from "./lib/errors";
 import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
@@ -327,12 +328,24 @@ export default function App() {
   );
 
   // ---- XMP ----
+  /** Success summary, or a persistent error toast (read-only folder, moved originals...) when some sidecars failed. */
+  const xmpToast = useCallback(
+    (prefix: string, r: { succeeded: number; failed: { imageId: number; reason: string }[] }) => {
+      if (r.failed.length === 0) return setNotice(`${prefix} ${plural(r.succeeded, "photo")}`);
+      r.failed.forEach((f) => noteFailure(f.reason));
+      const why = describeReason(r.failed[0].reason);
+      const lead = r.succeeded > 0 ? `${prefix} ${plural(r.succeeded, "photo")}; ` : "";
+      push(`${lead}${plural(r.failed.length, "sidecar")} could not be written. ${why.message}`, { kind: "error" });
+    },
+    [push, setNotice],
+  );
+
   const writeXmp = useCallback(async () => {
     const t = targets();
     if (t.length === 0) return;
     try {
       const r = await unwrap(commands.writeXmp(t));
-      setNotice(`Saved metadata for ${r.succeeded} photo${r.succeeded === 1 ? "" : "s"}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      xmpToast("Saved metadata for", r);
       await lib.refresh(t);
       status.refreshXmp();
     } catch (e) {
@@ -343,7 +356,7 @@ export default function App() {
   const saveAllDirty = useCallback(async () => {
     try {
       const r = await unwrap(commands.writeXmpAllDirty(null));
-      setNotice(`Saved XMP for ${plural(r.succeeded, "photo")}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      xmpToast("Saved XMP for", r);
       status.refreshXmp();
       await lib.refreshAll();
     } catch (e) {
@@ -681,6 +694,13 @@ export default function App() {
         onExport={openExport}
         onCheatSheet={() => setCheatOpen(true)}
         onModels={() => setModelsOpen(true)}
+        onRegenerate={() =>
+          void run(async () => {
+            const t = targets();
+            await unwrap(commands.regenerateThumbnails(t));
+            setNotice(`Regenerating previews for ${plural(t.length, "photo")}`);
+          })
+        }
         exportPct={exportPct}
       />
       <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
@@ -709,7 +729,7 @@ export default function App() {
       )}
       {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
-        <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
+        <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 

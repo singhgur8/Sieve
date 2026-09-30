@@ -92,7 +92,9 @@ export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onC
     }
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-neutral-400" data-testid="grid-empty">
-        No images match the current filters.
+        <span data-testid="grid-empty-text">
+          {filtered ? "No photos match the current filters." : "This folder has no photos to show."}
+        </span>
         {filtered && (
           <button onClick={onClearFilters} data-testid="empty-clear-filters" className="rounded bg-neutral-800 px-3 py-1.5 text-neutral-100 hover:bg-neutral-700">
             Clear filters

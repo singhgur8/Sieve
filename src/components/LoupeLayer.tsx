@@ -3,7 +3,7 @@ import { Flag, X } from "lucide-react";
 import { commands, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
-import { CompanionBadge, Stars, XmpBadge } from "./Cell";
+import { CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
 import { Filmstrip } from "./Filmstrip";
 import { usePanels } from "../lib/panels";
 import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
@@ -169,6 +169,7 @@ function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | unde
         {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} />}
         {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
         <Stars n={entry.rating} />
+        <HealthBadge entry={entry} testPrefix="loupe-health" />
         <XmpBadge entry={entry} />
         <CompanionBadge entry={entry} testPrefix="loupe-companion" />
         {showKeeper && entry.isBurstKeeper && (

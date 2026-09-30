@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ImageOff } from "lucide-react";
 import { convertFileSrc, type RawImageEntry } from "../ipc";
 
 /** Zoom relative to "fit" (1 = fit), centre of the viewport in normalised image coordinates. */
@@ -34,6 +35,7 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
+  const [broken, setBroken] = useState<string | null>(null);
   const t = entry?.thumbnail;
   const previewPath = t?.status === "ready" ? (t.previewPath ?? t.path) : null;
   const thumbPath = t?.status === "ready" ? t.path : null;
@@ -121,6 +123,12 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
       onDoubleClick={() => onView(view.scale > 1 ? FIT : { scale: Math.max(1, (metricsRef.current?.natW ?? fitW) / fitW), cx: 0.5, cy: 0.5 })}
     >
       {thumbPath && <img src={`${convertFileSrc(thumbPath)}?v=${version}`} alt="" draggable={false} className={imgClass} style={style} />}
+      {t?.status === "failed" && (
+        <Unavailable title="No preview for this photo" detail={t.reason} />
+      )}
+      {previewPath && broken === previewPath && (
+        <Unavailable title="Preview unavailable" detail="The cached preview could not be loaded (cache folder cleaned or drive offline). Use More > Regenerate previews, or re-import the folder." />
+      )}
       {previewPath && (
         <img
           src={`${convertFileSrc(previewPath)}?v=${version}`}
@@ -129,8 +137,19 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
           className={imgClass}
           style={style}
           onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+          onError={() => setBroken(previewPath)}
         />
       )}
+    </div>
+  );
+}
+
+function Unavailable({ title, detail }: { title: string; detail: string }) {
+  return (
+    <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center" data-testid="preview-unavailable">
+      <ImageOff className="size-8 text-neutral-500" />
+      <p className="text-sm font-medium text-neutral-200">{title}</p>
+      <p className="max-w-sm break-words text-xs text-neutral-400">{detail}</p>
     </div>
   );
 }

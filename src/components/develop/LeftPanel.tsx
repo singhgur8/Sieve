@@ -28,7 +28,7 @@ export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDel
             <Save className="size-3.5" /> Save
           </button>
         </div>
-        {presets.length === 0 && <p className="text-neutral-400">No presets yet</p>}
+        {presets.length === 0 && <p className="text-neutral-400">No presets yet. Save the current settings with Save.</p>}
         <ul data-testid="preset-list">
           {presets.map((p) => (
             <li key={p.id} className="group flex items-center justify-between rounded px-1.5 py-1 hover:bg-neutral-800">
@@ -77,7 +77,7 @@ export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDel
             </button>
           </div>
         </div>
-        {entries.length === 0 && <p className="text-neutral-400">No edits yet</p>}
+        {entries.length === 0 && <p className="text-neutral-400">No edits yet. Each change you make is listed here.</p>}
         <ul data-testid="history-list">
           {entries.map((e) => (
             <li key={e.id}>

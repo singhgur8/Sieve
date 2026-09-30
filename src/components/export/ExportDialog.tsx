@@ -348,6 +348,11 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
           <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 p-3" data-testid="export-presets">
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">Presets</h3>
             <ul className="min-h-0 flex-1 space-y-0.5 overflow-auto">
+              {presets.length === 0 && (
+                <li className="px-2 py-1 text-xs text-neutral-400" data-testid="export-presets-empty">
+                  No presets yet. Adjust the settings and use Save as.
+                </li>
+              )}
               {presets.map((p) => (
                 <li key={p.id}>
                   <button
