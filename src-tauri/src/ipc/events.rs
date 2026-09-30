@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
 
-use super::types::ImageId;
+use super::types::{ExportFailure, ExportJobId, ImageId};
 
 /// Progress of the ingest pipeline (thumbnail + EXIF extraction).
 /// Counts cover the current pipeline run: images queued since the pipeline was last
@@ -102,4 +102,37 @@ pub struct XmpSynced {
 pub struct XmpWriteFailed {
     pub image_id: ImageId,
     pub reason: String,
+}
+
+/// Progress of the running export job. Throttled like `ImportProgress`. `done` includes
+/// failures and skips.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    pub job_id: ExportJobId,
+    pub done: u32,
+    pub total: u32,
+    /// Of `done`, how many failed.
+    pub failed: u32,
+    /// Of `done`, how many were skipped (`collision = skip`).
+    pub skipped: u32,
+    /// Source RAW file name most recently started; `null` when none is in flight.
+    pub current_file: Option<String>,
+}
+
+/// An export job ended (completed or cancelled). Emitted exactly once per job, also for a
+/// job cancelled while still queued. `get_export_jobs()` then shows its final state.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFinished {
+    pub job_id: ExportJobId,
+    pub succeeded: u32,
+    pub skipped: u32,
+    pub failed: Vec<ExportFailure>,
+    /// Stopped by `cancel_export`; images not yet started were not exported.
+    pub cancelled: bool,
+    /// Resolved destination incl. subfolder; `null` for `source_folder`.
+    pub output_dir: Option<String>,
+    /// Wall time since the job started running (excludes time queued); 0 if it never ran.
+    pub elapsed_ms: u32,
 }

@@ -12,6 +12,7 @@ use super::error::{AppError, AppResult};
 use super::types::*;
 use crate::db::{self, repo};
 use crate::develop::{self, DevelopCache, SourceImage};
+use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::{self, Analysis};
@@ -534,6 +535,105 @@ pub async fn delete_lut(
     }
     let luts = luts.inner().clone();
     blocking(move || luts.delete(&id)).await
+}
+
+// ---------------------------------------------------------------------------
+// Export (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Which formats can be written here (WebP/HEIC depend on encoders), plus concurrency limits.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_export_capabilities(exporter: State<'_, Exporter>) -> AppResult<ExportCapabilities> {
+    Ok(exporter.capabilities())
+}
+
+/// Built-in presets (read-only, negative ids) first, then user presets by name.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_export_presets(catalog: State<'_, Catalog>) -> AppResult<Vec<ExportPreset>> {
+    catalog.run(|c| export::presets::list(c)).await
+}
+
+/// Creates (`id = null`) or overwrites a user preset. Built-ins cannot be overwritten
+/// (`invalid_argument`; save under a new name instead). Names are unique (case-insensitive).
+#[tauri::command]
+#[specta::specta]
+pub async fn save_export_preset(
+    catalog: State<'_, Catalog>,
+    id: Option<ExportPresetId>,
+    name: String,
+    settings: ExportSettings,
+) -> AppResult<ExportPreset> {
+    settings.validate().map_err(AppError::invalid)?;
+    catalog.run(move |c| export::presets::save(c, id, &name, &settings)).await
+}
+
+/// Deletes a user preset (built-ins -> `invalid_argument`).
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_export_preset(catalog: State<'_, Catalog>, id: ExportPresetId) -> AppResult<()> {
+    catalog.run(move |c| export::presets::delete(c, id)).await
+}
+
+/// Dry run: resolved output paths and which already exist (for the export dialog's
+/// "N files exist" warning). No pixels are developed.
+#[tauri::command]
+#[specta::specta]
+pub async fn plan_export(
+    catalog: State<'_, Catalog>,
+    ids: Vec<ImageId>,
+    settings: ExportSettings,
+) -> AppResult<ExportPlan> {
+    let ids = export_request(ids, &settings)?;
+    catalog.run(move |c| export::plan(c, &ids, &settings)).await
+}
+
+/// Queues an export of `ids` (in this order; `{seq}` follows it; duplicates dropped) with
+/// `settings` and returns the `queued` job immediately. Adjustments are snapshotted now.
+/// `presetName` labels the job. Progress: `exportProgress`; end: `exportFinished`.
+/// `settings.destination` must not be `choose`. Unknown ids -> `not_found`, nothing queued.
+#[tauri::command]
+#[specta::specta]
+pub async fn export_images(
+    app: AppHandle,
+    exporter: State<'_, Exporter>,
+    ids: Vec<ImageId>,
+    settings: ExportSettings,
+    preset_name: Option<String>,
+) -> AppResult<ExportJob> {
+    let ids = export_request(ids, &settings)?;
+    let exporter = exporter.inner().clone();
+    blocking(move || exporter.enqueue(&app, ids, settings, preset_name)).await
+}
+
+/// Cancels a queued or running job (files already written are kept). No-op for finished
+/// jobs; unknown id -> `not_found`. The job ends with `exportFinished { cancelled: true }`.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_export(app: AppHandle, exporter: State<'_, Exporter>, job_id: ExportJobId) -> AppResult<()> {
+    exporter.cancel(&app, job_id)
+}
+
+/// Queued/running jobs first, then recent finished jobs (newest first, max 50).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_export_jobs(exporter: State<'_, Exporter>) -> AppResult<Vec<ExportJob>> {
+    let exporter = exporter.inner().clone();
+    blocking(move || exporter.jobs()).await
+}
+
+/// Validates an export request; returns `ids` de-duplicated (first occurrence kept).
+fn export_request(ids: Vec<ImageId>, settings: &ExportSettings) -> AppResult<Vec<ImageId>> {
+    if ids.is_empty() {
+        return Err(AppError::invalid("ids must not be empty"));
+    }
+    settings.validate().map_err(AppError::invalid)?;
+    if settings.destination == ExportDestination::Choose {
+        return Err(AppError::invalid("choose a destination folder before exporting"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    Ok(ids.into_iter().filter(|id| seen.insert(*id)).collect())
 }
 
 // ---------------------------------------------------------------------------

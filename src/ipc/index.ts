@@ -2,7 +2,7 @@
 export * from "./bindings";
 export { convertFileSrc } from "@tauri-apps/api/core";
 
-import type { AdjustmentField, AppError, ImageQuery } from "./bindings";
+import type { AdjustmentField, AppError, ExportFormatKind, ImageQuery } from "./bindings";
 
 type CommandResult<T> = { status: "ok"; data: T } | { status: "error"; error: AppError };
 
@@ -52,3 +52,23 @@ const ADJUSTMENT_FIELD_SET: Record<AdjustmentField, true> = {
 
 /** Every `AdjustmentField`, in panel order (fields mask "select all"). */
 export const ALL_ADJUSTMENT_FIELDS = Object.keys(ADJUSTMENT_FIELD_SET) as AdjustmentField[];
+
+/** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */
+export const EXPORT_FILENAME_TOKENS: { token: string; description: string }[] = [
+  { token: "{filename}", description: "Original file name without extension" },
+  { token: "{seq}", description: "Sequence number from Start number ({seq:4} pads to 4 digits)" },
+  { token: "{date}", description: "Capture date ({date:YYYY-MM-DD_hhmmss}; default YYYYMMDD)" },
+  { token: "{rating}", description: "Star rating 0-5" },
+  { token: "{camera}", description: "Camera model" },
+  { token: "{folder}", description: "Name of the RAW's folder" },
+  { token: "{id}", description: "Catalog image id" },
+];
+
+/** File extension written per format (mirror of Rust `ExportFormatKind::extension`). */
+export const EXPORT_EXTENSIONS: Record<ExportFormatKind, string> = {
+  jpeg: "jpg",
+  tiff: "tif",
+  png: "png",
+  webp: "webp",
+  heic: "heic",
+};
