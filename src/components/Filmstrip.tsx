@@ -25,9 +25,11 @@ interface Props {
   badge?: (id: number) => React.ReactNode;
   /** Cells that get the secondary (candidate) ring. */
   marked?: Set<number>;
+  /** Space above the cells in px (default 8). */
+  top?: number;
 }
 
-export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, height, scenePrefix, align = "auto", onRate, badge, marked }: Props) {
+export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, height, scenePrefix, align = "auto", onRate, badge, marked, top = 8 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const { ids, ensure } = lib;
   const v = useVirtualizer({ horizontal: true, count: ids.length, getScrollElement: () => ref.current, estimateSize: () => cellW + 4, overscan: 8 });
@@ -62,8 +64,8 @@ export function Filmstrip({ lib, activeId, selected, onPick, cellW, cellH, heigh
               data-selected={isSel}
               data-marked={isMarked}
               onClick={(ev) => onPick(fid, ev)}
-              className={`absolute top-2 cursor-pointer overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${isMarked ? "ring-2 ring-amber-400" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
-              style={{ left: it.start, width: cellW, height: cellH }}
+              className={`absolute cursor-pointer overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${isMarked ? "ring-2 ring-amber-400" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
+              style={{ left: it.start, top, width: cellW, height: cellH }}
             >
               {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(fid)}`} alt="" draggable={false} className="size-full object-cover" />}
               {e && (e.pick !== "unflagged" || e.colorLabel) && (

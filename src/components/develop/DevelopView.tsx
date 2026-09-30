@@ -1,36 +1,38 @@
 // Develop module: filmstrip + viewer (before/after, split, 100% detail) + presets/history + adjustment sliders.
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, ChevronLeft, ChevronRight, ClipboardCopy, ClipboardPaste, Columns2, Columns3, Flag, RefreshCw, RotateCcw, SplitSquareHorizontal, X, ZoomIn } from "lucide-react";
-import { commands, convertFileSrc, unwrap, type FaceInfo, type LutInfo, type NormRect, type ParametricAdjustments, type Preset } from "../../ipc";
+import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
+import { applyAutoTone, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor, type Editor } from "../../hooks/useEditor";
 import { clearFileHealth, useEntryHealth } from "../../lib/errors";
 import { OriginalUnavailable } from "./OriginalUnavailable";
 import { Stars } from "../Cell";
+import { Menu, menuItem } from "../Menu";
 import { CompareBar, CompareTag } from "../CompareBar";
 import type { CompareState } from "../LoupeLayer";
 import { Filmstrip } from "../Filmstrip";
 import { setPanelHidden, usePanels } from "../../lib/panels";
 import { dispToSensor, screenToDisp } from "../../lib/maskGeom";
-import { copyFields, FIELD_LABEL } from "../../lib/adjust";
 import { hint, type ActionId } from "../../lib/keymap";
 import { useMasks } from "../../hooks/useMasks";
 import { MasksPanel } from "./MasksPanel";
 import { MaskLayer } from "./MaskLayer";
 import { PeoplePicker } from "./PeoplePicker";
 import type { Frame } from "../../lib/maskGeom";
-import { LABEL_COLOR } from "../../lib/format";
+import { formatShutter, LABEL_COLOR, trimNum } from "../../lib/format";
 import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
-import { AdjustPanel } from "./AdjustPanel";
+import { AdjustPanel, type AutoApi } from "./AdjustPanel";
+import { useHoverPreview, useStyleLibrary } from "../../hooks/useDevelopV14";
+import { Dialog } from "../Dialog";
 import { LeftPanel } from "./LeftPanel";
-import { FieldsDialog } from "./FieldsDialog";
+import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
+import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
+import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
 import { CropOverlay, constrainTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, loadCropAspect, previewRotation, toStored } from "../../lib/crop";
-import { setSectionOpen } from "../../lib/sections";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 
 export interface DevelopHandle {
@@ -38,7 +40,8 @@ export interface DevelopHandle {
   toggleZoom: () => void;
   copy: () => void;
   paste: () => void;
-  sync: () => void;
+  /** Sync… dialog, or (quiet) sync with the remembered fields straight away. */
+  sync: (quiet?: boolean) => void;
   reset: () => void;
   toggleSplit: () => void;
   /** R: start the crop tool, or apply it when already active. */
@@ -66,10 +69,10 @@ export interface DevelopHandle {
   faceZoom: (dir: 1 | -1) => void;
   pastePrevious: () => void;
   savePreset: () => void;
+  /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
+  autoTone: () => void;
+  autoWb: () => void;
 }
-
-/** Last photo edited in Develop (for Paste from previous); survives the module being re-entered. */
-let previousId: number | null = null;
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
 
@@ -93,7 +96,24 @@ interface Props {
   onToggleCompare?: () => void;
   /** Click on a star: rate that photo (0 clears). */
   onRate?: (id: number, rating: number) => void;
+  /** Pick / reject button on the viewer toolbar (clicking the current flag clears it). */
+  onFlag?: (id: number, flag: "pick" | "reject") => void;
+  /** Color label menu on the viewer toolbar (null clears). */
+  onLabel?: (id: number, label: ColorLabel | null) => void;
+  /** Filter summary shown in the filmstrip header (Develop has no separate filter row). */
+  filterSummary?: { text: string; onEdit: () => void };
 }
+
+const COLOR_LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
+
+/** "ISO 800 · 85 mm · f/1.8 · 1/250 s" for the histogram info line. */
+function exifLine(c: { iso: number | null; shutterSeconds: number | null; aperture: number | null; focalLengthMm: number | null } | undefined): string | null {
+  if (!c) return null;
+  const parts = [c.iso != null ? `ISO ${c.iso}` : null, c.focalLengthMm != null ? `${trimNum(c.focalLengthMm)} mm` : null, c.aperture != null ? `f/${trimNum(c.aperture)}` : null, c.shutterSeconds != null ? formatShutter(c.shutterSeconds) : null].filter(Boolean);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+const stem = (name: string | undefined) => (name ?? "").replace(/\.[^.]+$/, "");
 
 const FILM = 72;
 /** Margin around the image while cropping, so the handles do not sit on the panel borders. */
@@ -108,7 +128,20 @@ const TOOL_HELP: Record<string, string> = {
   object: "Objects: drag a rectangle around the object",
 };
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onBack, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate }, ref) {
+/** >= 1600 px: bigger filmstrip cells and wider panels (Tailwind's min-[1600px]). */
+function useWide(): boolean {
+  const q = typeof window === "undefined" ? null : window.matchMedia("(min-width: 1600px)");
+  const [wide, setWide] = useState(q?.matches ?? false);
+  useEffect(() => {
+    if (!q) return;
+    const on = () => setWide(q.matches);
+    q.addEventListener("change", on);
+    return () => q.removeEventListener("change", on);
+  }, [q]);
+  return wide;
+}
+
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -116,17 +149,21 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [showBefore, setShowBefore] = useState(false);
   const [split, setSplit] = useState(false);
   const [splitPos, setSplitPos] = useState(0.5);
-  const [luts, setLuts] = useState<LutInfo[]>([]);
-  const [presets, setPresets] = useState<Preset[]>([]);
+  const styles = useStyleLibrary(onError);
+  const [importReport, setImportReport] = useState<ImportStyleReport | null>(null);
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoWb, setAutoWb] = useState<{ id: number; t: number; tint: number } | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [cropTool, setCropTool] = useState<CropTool | null>(null);
   const cropRef = useRef<CropTool | null>(null);
   cropRef.current = cropTool;
+  const [browsing, setBrowsing] = useState(false);
   const [picking, setPicking] = useState(false);
   const pickerRef = useRef(false);
   pickerRef.current = picking;
   const panels = usePanels("develop");
   const copied = useClipboard();
+  const wide = useWide();
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
 
   const { refresh } = lib;
@@ -213,11 +250,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setZoom({ on: false, cx: 0.5, cy: 0.5 });
     setShowBefore(false);
     setSplit(false);
-    setSectionOpen("crop", true);
     setPicking(false);
     setCropTool({ rect: c.enabled ? fromStored(c, orientation, frameAspect) : FULL, angle: c.enabled ? c.angle : 0, aspect: loadCropAspect(), flip: false });
-    // Make sure the crop controls are on screen (the panel may be scrolled to another section).
-    setTimeout(() => document.querySelector('[data-testid="section-crop"]')?.scrollIntoView({ block: "nearest" }), 0);
   }, [id, editor.adj.crop, orientation, frameAspect]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
@@ -241,14 +275,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   const toggleZoom = useCallback((at?: { x: number; y: number }) => cropRef.current || setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
 
-  // Presets and LUTs.
-  const loadPresets = useCallback(() => unwrap(commands.listPresets()).then(setPresets).catch(onError), [onError]);
-  const loadLuts = useCallback(() => unwrap(commands.listLuts()).then(setLuts).catch(onError), [onError]);
-  useEffect(() => {
-    void loadPresets();
-    void loadLuts();
-  }, [loadPresets, loadLuts]);
-
   // Warm the develop cache for filmstrip neighbours.
   useEffect(() => {
     if (id == null) return;
@@ -261,6 +287,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     if (id == null) return [];
     return sel.selected.size > 1 && sel.selected.has(id) ? [...sel.selected] : [id];
   }, [id, sel.selected]);
+
+  const syncTargets = useMemo(() => [...sel.selected].filter((x) => x !== id), [sel.selected, id]);
 
   const afterBatch = useCallback(
     async (t: number[]) => {
@@ -281,19 +309,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [onError],
   );
 
-  const doPaste = useCallback(() => {
-    const c = getClipboard();
-    if (!c) return onNotice("Nothing copied yet (Cmd+Shift+C)");
-    const t = targets();
-    if (!t.length) return;
-    void run(async () => {
-      await editor.flush();
-      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
-      onNotice(`Pasted ${c.fields.length} setting group${c.fields.length === 1 ? "" : "s"} to ${t.length} photo${t.length === 1 ? "" : "s"}`);
-      await afterBatch(t);
-    });
-  }, [targets, run, editor, afterBatch, onNotice]);
-
   /** Undo of a multi-photo batch: one `undoAdjustments` per photo that changed. */
   const undoBatch = useCallback(
     (t: number[], what: string) => () =>
@@ -303,6 +318,57 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         onNotice(`Undid ${what}`);
       }),
     [run, afterBatch, onNotice],
+  );
+
+  /** Current history entry of every photo (cap: bigger batches skip the Undo toast). */
+  const heads = useCallback(async (t: number[]): Promise<Map<number, number | null> | null> => {
+    if (t.length > 200) return null;
+    const m = new Map<number, number | null>();
+    for (const x of t) m.set(x, (await unwrap(commands.getHistory(x))).currentEntryId);
+    return m;
+  }, []);
+
+  const doPaste = useCallback(() => {
+    const c = getClipboard();
+    if (!c) return onNotice("Nothing copied yet (Cmd+Shift+C)");
+    const t = targets();
+    if (!t.length) return;
+    void run(async () => {
+      await editor.flush();
+      const before = await heads(t);
+      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      await afterBatch(t);
+      const msg = `Pasted ${c.fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`;
+      if (!before) return onNotice(msg);
+      // Undo only the photos the paste changed (an unchanged photo has no new history entry).
+      const after = await heads(t);
+      const changed = t.filter((x) => after?.get(x) !== before.get(x));
+      if (changed.length === 0) return onNotice(`${msg} (no change)`);
+      onUndoToast(msg, undoBatch(changed, "paste"));
+    });
+  }, [targets, run, editor, afterBatch, onNotice, onUndoToast, heads, undoBatch]);
+
+  /** Copy with `fields` (dialog confirm, or Alt-click with the remembered ones). */
+  const copyWith = useCallback(
+    (fields: AdjustmentField[]) => {
+      setClipboard({ adjustments: structuredClone(editor.adj), fields, fromName: entry?.fileName });
+      onNotice(`Copied ${fields.length} settings from ${stem(entry?.fileName)}`);
+    },
+    [editor.adj, entry?.fileName, onNotice],
+  );
+
+  const syncTo = useCallback(
+    (fields: AdjustmentField[]) => {
+      if (id == null) return;
+      const t = syncTargets;
+      void run(async () => {
+        await editor.flush();
+        await unwrap(commands.syncSettings(id, t, fields));
+        onNotice(`Synchronized ${fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`);
+        await afterBatch(t);
+      });
+    },
+    [id, run, editor, afterBatch, onNotice, syncTargets],
   );
 
   const doReset = useCallback(
@@ -317,7 +383,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [run, targets, editor, afterBatch, onUndoToast, undoBatch],
   );
 
-  const doApplyPreset = (p: Preset) =>
+  const doApplyPreset = (p: { id: number; name: string }) =>
     void run(async () => {
       const t = targets();
       await editor.flush();
@@ -330,30 +396,96 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   useEffect(() => {
     if (id == null) return;
     return () => {
-      previousId = id;
+      setPreviousPhoto(id);
     };
   }, [id]);
   const pastePrevious = useCallback(
     () =>
       void run(async () => {
-        const from = previousId;
-        if (from == null || from === id) return onNotice("No previous photo to paste from");
-        const src = await unwrap(commands.getAdjustments(from));
-        const fields = (Object.keys(FIELD_LABEL) as (keyof typeof FIELD_LABEL)[]).filter((f) => f !== "crop" && (f as string) !== "masks");
-        editor.change((a) => copyFields(a, src, fields), "Paste Settings");
-        onNotice("Pasted settings from the previous photo");
+        const from = getPreviousPhoto();
+        const t = targets();
+        if (from == null || t.every((x) => x === from)) return onNotice("No previous photo to paste from");
+        await editor.flush();
+        const before = await heads(t);
+        await unwrap(commands.pastePrevious(t, from, null));
+        await afterBatch(t);
+        const msg = `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`;
+        if (!before) return onNotice(msg);
+        const after = await heads(t);
+        const changed = t.filter((x) => x !== from && after?.get(x) !== before.get(x));
+        if (changed.length === 0) return onNotice(`${msg} (no change)`);
+        onUndoToast(msg, undoBatch(changed, "paste from previous"));
       }),
-    [run, id, editor, onNotice],
+    [run, targets, editor, heads, afterBatch, lib, onNotice, onUndoToast, undoBatch],
   );
 
-  const importLut = () =>
-    void run(async () => {
-      const path = await open({ title: "Import .cube LUT", filters: [{ name: "Cube LUT", extensions: ["cube"] }] });
-      if (typeof path !== "string") return;
-      const l = await unwrap(commands.importLut(path));
-      await loadLuts();
-      editor.change((a) => ({ ...a, lut: { id: l.id, amount: 100 } }), "LUT");
-    });
+  // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
+  const runAuto = useCallback(
+    async (what: "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+      if (id == null || autoBusy) return;
+      setAutoBusy(true);
+      try {
+        await editor.flush();
+        const cur = editor.adj;
+        if (what === "tone" || what === "key") {
+          const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
+          editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
+        } else {
+          const w = await unwrap(commands.autoWhiteBalance(id, cur));
+          editor.change(
+            (a) => {
+              const as = info?.asShot ?? { temperatureK: w.temperatureK, tint: w.tint };
+              const base = a.whiteBalance.mode === "custom" ? a.whiteBalance : { temperatureK: as.temperatureK, tint: as.tint };
+              const next = what === "wb" ? { temperatureK: w.temperatureK, tint: w.tint } : what === "temp" ? { temperatureK: w.temperatureK, tint: base.tint } : { temperatureK: base.temperatureK, tint: w.tint };
+              return { ...a, whiteBalance: { mode: "custom", ...next } };
+            },
+            label ?? "Auto White Balance",
+          );
+          if (what === "wb") setAutoWb({ id, t: w.temperatureK, tint: w.tint });
+        }
+      } catch (e) {
+        onError(e);
+      } finally {
+        setAutoBusy(false);
+      }
+    },
+    [id, autoBusy, editor, info, onError],
+  );
+  const wbNow = editor.adj.whiteBalance;
+  const auto: AutoApi = {
+    busy: autoBusy,
+    tone: () => void runAuto("tone"),
+    wb: () => void runAuto("wb"),
+    slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
+    wbIsAuto: !!autoWb && autoWb.id === id && wbNow.mode === "custom" && wbNow.temperatureK === autoWb.t && wbNow.tint === autoWb.tint,
+  };
+  const autoRef = useRef(auto);
+  autoRef.current = auto;
+
+  // ---- style library: import, removal, hover previews ----
+  const importStyles = useCallback(async () => {
+    const r = await styles.importFolder();
+    if (!r) return;
+    const groups = r.groupIds.length;
+    onNotice(`Imported ${r.presets} preset${r.presets === 1 ? "" : "s"} in ${groups} group${groups === 1 ? "" : "s"} and ${r.profiles} profile${r.profiles === 1 ? "" : "s"}${r.skipped.length ? ` · ${r.skipped.length} file${r.skipped.length === 1 ? "" : "s"} skipped` : ""}`);
+    if (r.skipped.length > 0) setImportReport(r);
+  }, [styles, onNotice]);
+  const edgeFor = useCallback((to: "navigator" | "viewer") => (to === "navigator" ? 480 : maxEdge), [maxEdge]);
+  const hover = useHoverPreview(id, edgeFor);
+  const hoverPreset = useCallback(
+    (p: StylePreset | null) => {
+      if (!p || id == null) return hover.stop();
+      hover.start(p.name, "navigator", async () => unwrap(commands.resolvePreset(id, p.id, editor.adj)));
+    },
+    [hover, id, editor.adj],
+  );
+  const profileHover = useMemo(
+    () => ({
+      start: (label: string, adj: ParametricAdjustments) => hover.start(label, "viewer", async () => adj),
+      stop: hover.stop,
+    }),
+    [hover],
+  );
 
   const maskKey = useCallback(
     (action: ActionId, e: KeyboardEvent) => {
@@ -476,8 +608,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, []);
 
   // ---- Esc cascade: never changes the module ----
+  const browsingRef = useRef(false);
+  browsingRef.current = browsing;
   const escape = useCallback(() => {
     if (pickerRef.current) return setPicking(false);
+    if (browsingRef.current) return setBrowsing(false);
     if (cropRef.current) return setCropTool(null);
     const m = masksRef.current;
     if (m.tool) return m.endTool();
@@ -485,7 +620,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     if (m.open) m.setOpen(false);
   }, []);
 
-  const syncTargets = useMemo(() => [...sel.selected].filter((x) => x !== id), [sel.selected, id]);
 
   useImperativeHandle(
     ref,
@@ -494,7 +628,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       toggleZoom: () => toggleZoom(),
       copy: () => setDialog({ kind: "copy" }),
       paste: doPaste,
-      sync: () => (syncTargets.length > 0 ? setDialog({ kind: "sync" }) : onNotice("Cmd/Shift-click other photos in the filmstrip to sync to them")),
+      sync: (quiet) => {
+        if (syncTargets.length === 0) return onNotice("Cmd/Shift-click other photos in the filmstrip to sync to them");
+        if (quiet) syncTo(rememberedCopyFields());
+        else setDialog({ kind: "sync" });
+      },
       reset: doReset,
       toggleSplit: () => setSplit((v) => !v),
       toggleCrop: () => (cropRef.current ? commitCrop() : startCrop()),
@@ -519,8 +657,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       faceZoom,
       pastePrevious,
       savePreset: () => setDialog({ kind: "preset" }),
+      autoTone: () => autoRef.current.tone(),
+      autoWb: () => autoRef.current.wb(),
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw, fh, editor.main);
@@ -557,6 +697,14 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   );
   const activeLayers = (
     <>
+      {hover.preview?.to === "viewer" && (
+        <div className="pointer-events-none absolute inset-0 z-10" data-testid="hover-preview">
+          <img src={hover.preview.url} alt="" className="size-full object-contain" draggable={false} />
+          <span className="absolute left-2 top-2 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="hover-preview-label">
+            Preview: {hover.preview.label}
+          </span>
+        </div>
+      )}
           {health && !editor.main && entry && (
         <OriginalUnavailable
           health={health}
@@ -594,68 +742,100 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     </>
   );
 
-  const btn = (on = false) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40`;
+  const vbtn = (on = false) => `flex h-6 items-center gap-1 rounded px-2 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40`;
+  const nTargets = targets().length;
+  const prevId = usePreviousPhoto();
+  const filmCell = wide ? 88 : FILM;
+  const modified = modifiedFields(editor.adj, editor.defaults);
+  const dialogProps = { modified, hasLut: !!editor.adj.lut, hasMasks: editor.adj.masks.length > 0 };
+  const filmIdx = id != null ? lib.ids.indexOf(id) : -1;
+
+  const viewerToolbar = !panels.chrome && (
+    <div
+      className="flex h-9 shrink-0 items-center gap-2 border-t border-neutral-800 bg-neutral-950 px-2 text-neutral-300"
+      data-testid="viewer-toolbar"
+      data-render-ms={editor.main ? Math.round(editor.main.renderMs) : ""}
+      data-render-size={editor.main ? `${editor.main.width}x${editor.main.height}` : ""}
+    >
+      <button className={vbtn(showBefore)} disabled={!!compare} onClick={() => setShowBefore((v) => !v)} title={`Before / after${hint("before")}`} data-testid="before-toggle">
+        <Columns2 className="size-3.5" /> Before
+      </button>
+      <button className={vbtn(split)} disabled={!!compare} onClick={() => setSplit((v) => !v)} title={`Split view${hint("split")}`} data-testid="split-toggle">
+        <SplitSquareHorizontal className="size-3.5" /> Split
+      </button>
+      <button className={vbtn(!!compare)} onClick={() => onToggleCompare?.()} title={`Compare two photos side by side${hint("compare")}`} aria-pressed={!!compare} data-testid="develop-compare">
+        <Columns3 className="size-3.5" /> Compare
+      </button>
+      <div className="flex gap-px" role="group" aria-label="Zoom" data-testid="zoom-toggle" data-zoom={zoom.on ? "100" : "fit"}>
+        <button className={`${vbtn(!zoom.on)} rounded-r-none`} onClick={() => zoom.on && toggleZoom()} title={`Fit${hint("zoomDevelop")}`} aria-pressed={!zoom.on} data-testid="zoom-fit">
+          Fit
+        </button>
+        <button className={`${vbtn(zoom.on)} rounded-l-none`} onClick={() => !zoom.on && toggleZoom()} title={`Zoom to 100%${hint("zoomDevelop")}`} aria-pressed={zoom.on} data-testid="zoom-100">
+          100%
+        </button>
+      </div>
+      {entry && (
+        <span className="ml-2 flex items-center gap-1" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
+          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "pick")} title="Pick (P)" aria-pressed={entry.pick === "pick"} data-testid="develop-pick">
+            <Flag className={`size-3.5 ${entry.pick === "pick" ? "fill-green-500 text-green-500" : "text-neutral-400"}`} />
+          </button>
+          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "reject")} title="Reject (X)" aria-pressed={entry.pick === "reject"} data-testid="develop-reject">
+            <X className={`size-4 ${entry.pick === "reject" ? "text-red-500" : "text-neutral-400"}`} strokeWidth={entry.pick === "reject" ? 3 : 2} />
+          </button>
+          <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId="develop-stars" />
+          <Menu
+            trigger={<span className={`block size-2.5 rounded-full ${entry.colorLabel ? LABEL_COLOR[entry.colorLabel] : "border border-neutral-500"}`} data-label={entry.colorLabel ?? ""} />}
+            triggerClass="flex size-5 items-center justify-center rounded hover:bg-neutral-800"
+            triggerTestId="develop-label"
+            title={entry.colorLabel ? `Color label: ${entry.colorLabel}` : "Color label"}
+          >
+            {(close) => (
+              <>
+                {COLOR_LABELS.map((l) => (
+                  <button
+                    key={l}
+                    role="menuitem"
+                    className={menuItem}
+                    data-testid={`develop-label-${l}`}
+                    onClick={() => {
+                      close();
+                      onLabel?.(entry.id, entry.colorLabel === l ? null : l);
+                    }}
+                  >
+                    <span className={`size-2.5 rounded-full ${LABEL_COLOR[l]}`} /> <span className="capitalize">{l}</span>
+                  </button>
+                ))}
+                <button
+                  role="menuitem"
+                  className={menuItem}
+                  data-testid="develop-label-none"
+                  onClick={() => {
+                    close();
+                    onLabel?.(entry.id, null);
+                  }}
+                >
+                  No label
+                </button>
+              </>
+            )}
+          </Menu>
+        </span>
+      )}
+      <span className="min-w-0 flex-1 truncate text-xs text-neutral-300" title={entry?.path ?? ""} data-testid="develop-filename">
+        {entry?.fileName ?? ""}
+      </span>
+      <WarningsChip
+        warnings={info?.warnings ?? []}
+        actions={{
+          ai_mask_needs_update: { label: "Update AI masks", run: () => void masksRef.current.updateAll() },
+          masks_unsupported: { label: "Show in Masks panel", run: () => masksRef.current.setOpen(true) },
+        }}
+      />
+    </div>
+  );
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-neutral-950" data-testid="develop-view" data-image-id={id ?? ""}>
-      {!panels.chrome && (
-      <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5 text-neutral-300" data-testid="develop-toolbar">
-        <button className={btn()} onClick={onBack} title={`Back to Library${hint("toGrid")}`} data-testid="develop-back">
-          <ArrowLeft className="size-3.5" /> Library
-        </button>
-        <span className="text-xs text-neutral-300" data-testid="develop-filename">
-          {entry?.fileName ?? ""}
-        </span>
-        {entry && (
-          <span className="flex items-center gap-1.5" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
-            {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" aria-label="Picked" />}
-            {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} aria-label="Rejected" />}
-            <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId="develop-stars" />
-            {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={entry.colorLabel} />}
-          </span>
-        )}
-        <div className="ml-4 flex gap-1">
-          <button className={btn(showBefore)} disabled={!!compare} onClick={() => setShowBefore((v) => !v)} title={`Before / after${hint("before")}`} data-testid="before-toggle">
-            <Columns2 className="size-3.5" /> Before
-          </button>
-          <button className={btn(split)} disabled={!!compare} onClick={() => setSplit((v) => !v)} title={`Split view${hint("split")}`} data-testid="split-toggle">
-            <SplitSquareHorizontal className="size-3.5" /> Split
-          </button>
-          <button className={btn(zoom.on)} onClick={() => toggleZoom()} title={`Zoom to 100%${hint("zoomDevelop")}`} data-testid="zoom-toggle">
-            <ZoomIn className="size-3.5" /> 100%
-          </button>
-          <button className={btn(!!compare)} onClick={() => onToggleCompare?.()} title={`Compare two photos side by side${hint("compare")}`} aria-pressed={!!compare} data-testid="develop-compare">
-            <Columns3 className="size-3.5" /> Compare
-          </button>
-        </div>
-        <div className="flex gap-1">
-          <button className={btn()} onClick={() => setDialog({ kind: "copy" })} title={`Copy settings${hint("copy")}`} data-testid="copy-settings">
-            <ClipboardCopy className="size-3.5" /> Copy
-          </button>
-          <button className={btn()} disabled={!copied} onClick={doPaste} title={`Paste settings${hint("paste")}`} data-testid="paste-settings">
-            <ClipboardPaste className="size-3.5" /> Paste
-          </button>
-          <span title={syncTargets.length === 0 ? "Cmd/Shift-click other photos in the filmstrip to sync to them" : `Sync settings to the other selected photos${hint("sync")}`}>
-            <button className={`${btn()} disabled:pointer-events-none`} disabled={syncTargets.length === 0} onClick={() => setDialog({ kind: "sync" })} data-testid="sync-settings">
-              <RefreshCw className="size-3.5" /> Sync
-            </button>
-          </span>
-          <button className={btn()} onClick={doReset} title={`Reset all adjustments${hint("reset")}`} data-testid="reset-all">
-            <RotateCcw className="size-3.5" /> {targets().length > 1 ? `Reset (${targets().length})` : "Reset"}
-          </button>
-        </div>
-        <WarningsChip
-          warnings={info?.warnings ?? []}
-          actions={{
-            ai_mask_needs_update: { label: "Update AI masks", run: () => void masksRef.current.updateAll() },
-            masks_unsupported: { label: "Show in Masks panel", run: () => masksRef.current.setOpen(true) },
-          }}
-        />
-        <span className="ml-auto text-[11px] tabular-nums text-neutral-400" data-testid="render-ms">
-          {editor.main ? `${editor.main.width}x${editor.main.height} · ${Math.round(editor.main.renderMs)} ms` : ""}
-        </span>
-      </div>
-      )}
       {compare && !panels.chrome && (
         <CompareBar
           focus={compare.focus}
@@ -670,142 +850,216 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
       <div className="flex min-h-0 flex-1">
         {!panels.left && (
-        <aside className="w-56 shrink-0 border-r border-neutral-800" data-testid="left-aside">
-          <LeftPanel
-            presets={presets}
-            history={editor.history}
-            onApplyPreset={doApplyPreset}
-            onSavePreset={() => setDialog({ kind: "preset" })}
-            onDeletePreset={(p) =>
-              void run(async () => {
-                await unwrap(commands.deletePreset(p.id));
-                await loadPresets();
-              })
-            }
-            onUndo={editor.undo}
-            onRedo={editor.redo}
-            onGoto={editor.goto}
-            targetCount={targets().length}
-          />
-        </aside>
+          <aside className="w-56 shrink-0 border-r border-neutral-800 min-[1600px]:w-60" data-testid="left-aside">
+            <LeftPanel
+              groups={styles.groups}
+              importing={styles.importing}
+              onImport={() => void importStyles()}
+              onRemoveGroup={(g: StyleGroup) => void styles.removeGroup(g.id)}
+              onHoverPreset={hoverPreset}
+              navPreview={hover.preview?.to === "navigator" ? hover.preview : null}
+              history={editor.history}
+              imageId={id}
+              onApplyPreset={doApplyPreset}
+              onSavePreset={() => setDialog({ kind: "preset" })}
+              onDeletePreset={(p) =>
+                void run(async () => {
+                  await unwrap(commands.deletePreset(p.id));
+                  await styles.reload();
+                })
+              }
+              onUndo={editor.undo}
+              onRedo={editor.redo}
+              onGoto={editor.goto}
+              targetCount={nTargets}
+              navUrl={editor.main?.url ?? thumbUrl}
+              zoom={zoom}
+              region={region}
+              onZoom={(z) => cropRef.current || setZoom(z)}
+              onCopy={(alt) => (alt ? copyWith(rememberedCopyFields()) : setDialog({ kind: "copy" }))}
+              onPaste={doPaste}
+              copied={copied}
+            />
+          </aside>
         )}
-        {compare ? (
-          <div className="relative flex min-w-0 flex-1 gap-1" data-testid="dev-compare">
-            {(["a", "b"] as const).map((k) => {
-              const active = compare.focus === k;
-              const pid = compare[k];
-              const pe = lib.getEntry(pid);
-              return (
-                <div
-                  key={k}
-                  className={`relative min-w-0 flex-1 border-2 ${active ? "border-sky-500" : "border-transparent"}`}
-                  data-testid={`dev-compare-pane-${k}`}
-                  data-active={active}
-                  data-image-id={pid}
-                  onPointerDown={() => !active && onFocusPane?.(k)}
-                >
-                  {mkViewer(k === "a" ? editorA : editorB, active)}
-                  {active && activeLayers}
-                  <div className="absolute bottom-2 left-2 flex items-center gap-2 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-100" data-testid={`dev-compare-label-${k}`}>
-                    <span className={`rounded px-1 font-semibold ${k === "a" ? "bg-sky-700" : "bg-amber-400 text-black"}`}>{k === "a" ? "Select" : "Candidate"}</span>
-                    {pe?.fileName}
-                    {pe && <Stars n={pe.rating} className="size-3" onRate={onRate && ((r) => onRate(pid, r))} testId={`dev-compare-stars-${k}`} />}
-                    {active && <span className="text-sky-300">editing</span>}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {compare ? (
+            <div className="relative flex min-h-0 min-w-0 flex-1 gap-1" data-testid="dev-compare">
+              {(["a", "b"] as const).map((k) => {
+                const active = compare.focus === k;
+                const pid = compare[k];
+                const pe = lib.getEntry(pid);
+                return (
+                  <div
+                    key={k}
+                    className={`relative min-w-0 flex-1 border-2 ${active ? "border-sky-500" : "border-transparent"}`}
+                    data-testid={`dev-compare-pane-${k}`}
+                    data-active={active}
+                    data-image-id={pid}
+                    onPointerDown={() => !active && onFocusPane?.(k)}
+                  >
+                    {mkViewer(k === "a" ? editorA : editorB, active)}
+                    {active && activeLayers}
+                    <div className="absolute bottom-2 left-2 flex items-center gap-2 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-100" data-testid={`dev-compare-label-${k}`}>
+                      <span className={`rounded px-1 font-semibold ${k === "a" ? "bg-sky-700" : "bg-amber-400 text-black"}`}>{k === "a" ? "Select" : "Candidate"}</span>
+                      {pe?.fileName}
+                      {pe && <Stars n={pe.rating} className="size-3" onRate={onRate && ((r) => onRate(pid, r))} testId={`dev-compare-stars-${k}`} />}
+                      {active && <span className="text-sky-300">editing</span>}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
-            <PanelChevron side="left" hidden={panels.left} />
-            <PanelChevron side="right" hidden={panels.right} />
-          </div>
-        ) : (
-          <div className="relative min-w-0 flex-1">
-            {mkViewer(editor, true)}
-            {activeLayers}
-            <PanelChevron side="left" hidden={panels.left} />
-            <PanelChevron side="right" hidden={panels.right} />
-          </div>
-        )}
-        {!panels.right && (
-        <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside">
-          {compare && (
-            <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
-              Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}
+                );
+              })}
+              <PanelChevron side="left" hidden={panels.left} />
+              <PanelChevron side="right" hidden={panels.right} />
+            </div>
+          ) : (
+            <div className="relative min-h-0 min-w-0 flex-1">
+              {mkViewer(editor, true)}
+              {activeLayers}
+              <PanelChevron side="left" hidden={panels.left} />
+              <PanelChevron side="right" hidden={panels.right} />
             </div>
           )}
-          <div className="flex gap-1 border-b border-neutral-800 px-3 py-1.5" role="tablist" aria-label="Develop panels">
-            <button role="tab" aria-selected={!masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${!masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => { masks.endTool(); masks.setOpen(false); }} data-testid="panel-tab-adjust">
-              Adjust
-            </button>
-            <button role="tab" aria-selected={masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => masks.setOpen(true)} title={`Masks: local adjustments${hint("maskPanel")}`} data-testid="panel-tab-masks">
-              Masks{masks.groups.length > 0 ? ` (${masks.groups.length})` : ""}
-            </button>
-          </div>
-          <div className="min-h-0 flex-1">
-            {masks.open ? <MasksPanel masks={masks} /> : <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} picker={{ active: picking, toggle: togglePicker }} />}
-          </div>
-        </aside>
+          {viewerToolbar}
+        </div>
+        {!panels.right && (
+          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside">
+            {compare && (
+              <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
+                Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}
+              </div>
+            )}
+            <div className="min-h-0 flex-1">
+              <AdjustPanel
+                editor={editor}
+                styleVersion={styles.version}
+                importing={styles.importing}
+                onImportStyles={() => void importStyles()}
+                hover={profileHover}
+                auto={auto}
+                imageId={id}
+                onError={onError}
+                crop={cropApi}
+                picker={{ active: picking, toggle: togglePicker }}
+                masks={{
+                  open: masks.open,
+                  count: masks.groups.length,
+                  toggle: () => {
+                    if (masks.open) masks.endTool();
+                    masks.setOpen(!masks.open);
+                  },
+                  panel: <MasksPanel masks={masks} />,
+                }}
+                browser={{ open: browsing, setOpen: setBrowsing }}
+                exif={exifLine(entry?.capture)}
+                bar={{
+                  count: nTargets,
+                  hasPrevious: prevId != null && prevId !== id,
+                  onPrevious: pastePrevious,
+                  onSync: (alt) => (alt ? syncTo(rememberedCopyFields()) : setDialog({ kind: "sync" })),
+                  onReset: doReset,
+                }}
+              />
+            </div>
+          </aside>
         )}
       </div>
 
       {!panels.chrome && (
-        <Filmstrip
-          lib={lib}
-          activeId={compare ? compare.b : id}
-          selected={compare ? new Set([compare.a]) : sel.selected}
-          marked={compare ? new Set([compare.b]) : undefined}
-          onPick={(fid, ev) => (compare ? onCandidate?.(fid) : sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey }))}
-          onRate={onRate}
-          badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : undefined}
-          cellW={FILM}
-          cellH={FILM}
-          height={88}
-          scenePrefix="film-scene"
-        />
+        <>
+          <div className="flex h-[22px] shrink-0 items-center gap-3 overflow-hidden whitespace-nowrap border-t border-neutral-800 bg-neutral-900 px-3 text-[11px] text-neutral-400" data-testid="filmstrip-header">
+            <span>{filmIdx >= 0 ? `${filmIdx + 1} of ${lib.ids.length}` : `${lib.ids.length} photos`}</span>
+            {sel.selected.size > 1 && <span className="text-sky-300">{sel.selected.size} selected</span>}
+            {filterSummary && (
+              <>
+                <span className="ml-auto min-w-0 truncate" data-testid="filter-summary-text">
+                  {filterSummary.text}
+                </span>
+                <button className="shrink-0 rounded bg-neutral-800 px-1.5 text-neutral-200 hover:bg-neutral-700" onClick={filterSummary.onEdit} data-testid="edit-filters">
+                  Edit filters
+                </button>
+              </>
+            )}
+          </div>
+          <Filmstrip
+            lib={lib}
+            activeId={compare ? compare.b : id}
+            selected={compare ? new Set([compare.a]) : sel.selected}
+            marked={compare ? new Set([compare.b]) : undefined}
+            onPick={(fid, ev) => (compare ? onCandidate?.(fid) : sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey }))}
+            onRate={onRate}
+            badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : undefined}
+            cellW={filmCell}
+            cellH={filmCell}
+            height={filmCell + 8}
+            top={4}
+            scenePrefix="film-scene"
+          />
+        </>
       )}
 
+      {importReport && (
+        <Dialog label="Import report" testid="import-report" className="w-[460px] max-w-full rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl" onCancel={() => setImportReport(null)} onConfirm={() => setImportReport(null)}>
+          <h2 className="mb-1 text-sm font-semibold">Import report</h2>
+          <p className="mb-2 text-xs text-neutral-300">
+            Imported {importReport.presets} presets and {importReport.profiles} profiles. {importReport.skipped.length} files were skipped:
+          </p>
+          <ul className="max-h-56 overflow-y-auto rounded bg-neutral-950 p-2 text-xs" data-testid="import-skipped">
+            {importReport.skipped.map((k) => (
+              <li key={k.path} className="py-0.5">
+                <span className="text-neutral-200">{k.path.split("/").pop()}</span> <span className="text-neutral-400">{k.reason}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3 flex justify-end">
+            <button data-autofocus className="rounded bg-neutral-800 px-3 py-1 text-xs hover:bg-neutral-700" onClick={() => setImportReport(null)} data-testid="import-report-close">
+              Close
+            </button>
+          </div>
+        </Dialog>
+      )}
       {masks.picker && id != null && (
         <PeoplePicker imageId={id} thumbUrl={thumbUrl} caps={masks.caps} onCreate={(pt, parts, name) => void masks.createPeople(pt, parts, name)} onCancel={masks.closePicker} onError={onError} />
       )}
       {dialog?.kind === "copy" && (
-        <FieldsDialog
+        <SettingsFieldsDialog
           title="Copy Settings"
           confirm="Copy"
+          storageKey={COPY_FIELDS_KEY}
+          {...dialogProps}
           onCancel={() => setDialog(null)}
           onConfirm={(fields) => {
-            setClipboard({ adjustments: structuredClone(editor.adj), fields });
             setDialog(null);
-            onNotice(`Copied ${fields.length} setting group${fields.length === 1 ? "" : "s"}`);
+            copyWith(fields);
           }}
         />
       )}
       {dialog?.kind === "sync" && id != null && (
-        <FieldsDialog
-          title={`Sync Settings to ${syncTargets.length} photo${syncTargets.length === 1 ? "" : "s"}`}
-          confirm="Sync"
+        <SettingsFieldsDialog
+          title="Synchronize Settings"
+          confirm="Synchronize"
+          storageKey={COPY_FIELDS_KEY}
+          {...dialogProps}
           onCancel={() => setDialog(null)}
           onConfirm={(fields) => {
             setDialog(null);
-            void run(async () => {
-              await editor.flush();
-              await unwrap(commands.syncSettings(id, syncTargets, fields));
-              onNotice(`Synced settings to ${syncTargets.length} photo${syncTargets.length === 1 ? "" : "s"}`);
-              await afterBatch(syncTargets);
-            });
+            syncTo(fields);
           }}
         />
       )}
       {dialog?.kind === "preset" && (
-        <FieldsDialog
-          title="Save Preset"
-          confirm="Save"
+        <SettingsFieldsDialog
+          title="New Develop Preset"
+          confirm="Create"
           withName
+          storageKey={PRESET_FIELDS_KEY}
+          {...dialogProps}
           onCancel={() => setDialog(null)}
           onConfirm={(fields, name) => {
             setDialog(null);
             void run(async () => {
               await unwrap(commands.savePreset(null, name, editor.adj, fields));
-              await loadPresets();
+              await styles.reload();
             });
           }}
         />

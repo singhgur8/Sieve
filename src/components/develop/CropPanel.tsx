@@ -1,6 +1,5 @@
-// Crop section of the adjust panel: start/finish the crop tool, aspect presets, straighten angle.
-import { Crop as CropIcon, Lock, LockOpen, RectangleVertical } from "lucide-react";
-import type { Editor } from "../../hooks/useEditor";
+// Crop drawer of the adjust panel (right under the tool strip while the crop tool is active): start/finish the crop tool, aspect presets, straighten angle.
+import { Lock, LockOpen, RectangleVertical } from "lucide-react";
 import { hint } from "../../lib/keymap";
 import { ASPECTS, FULL, saveCropAspect, type AspectId } from "../../lib/crop";
 import { refit, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
@@ -17,33 +16,16 @@ export interface CropApi {
 
 const b = "rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700 disabled:opacity-40";
 
-export function CropPanel({ editor, crop }: { editor: Editor; crop: CropApi }) {
+export function CropPanel({ crop }: { crop: CropApi }) {
   const { tool } = crop;
-  const c = editor.adj.crop;
-  if (!tool) {
-    return (
-      <div data-testid="crop-panel" data-active="false">
-        <div className="flex items-center gap-1">
-          <button className={`${b} flex items-center gap-1`} onClick={crop.start} title={`Crop and straighten${hint("crop")}`} data-testid="crop-start">
-            <CropIcon className="size-3.5" /> Crop{hint("crop")}
-          </button>
-          <button className={b} disabled={!c.enabled} onClick={() => editor.change((a) => ({ ...a, crop: editor.defaults.crop }), "Crop: Remove")} data-testid="crop-remove">
-            Remove crop
-          </button>
-        </div>
-        <p className="mt-1 text-[11px] text-neutral-400" data-testid="crop-status">
-          {c.enabled ? `Cropped ${Math.round((c.right - c.left) * 100)}% x ${Math.round((c.bottom - c.top) * 100)}%${c.angle ? `, ${c.angle.toFixed(1)} deg` : ""}` : "Not cropped"}
-        </p>
-      </div>
-    );
-  }
+  if (!tool) return null; // the drawer exists only while the tool is active (tool strip, R)
   const setAspect = (id: AspectId) => {
     saveCropAspect(id);
     crop.change(refit({ ...tool, aspect: id, customRatio: undefined }, crop.imageAspect));
   };
   const flip = () => crop.change(swapTool(tool, crop.imageAspect));
   return (
-    <div data-testid="crop-panel" data-active="true">
+    <div className="border-b border-neutral-800 py-2" data-testid="crop-panel" data-active="true">
       <div className="mb-2 flex gap-1">
         <select
           className="min-w-0 flex-1 rounded bg-neutral-800 px-1.5 py-1 text-xs"

@@ -18,7 +18,7 @@ import {
   type Scene,
   type SceneProgress,
 } from "../../ipc";
-import { FieldsDialog } from "../develop/FieldsDialog";
+import { SettingsFieldsDialog } from "../develop/SettingsFieldsDialog";
 import { Dialog } from "../Dialog";
 import { formatError } from "../../lib/format";
 
@@ -257,7 +257,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
         </div>
       </>
       {fieldsOpen && (
-        <FieldsDialog
+        <SettingsFieldsDialog
           title="Copy from anchor"
           confirm="Use"
           initial={opts.copyFields}

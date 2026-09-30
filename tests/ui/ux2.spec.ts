@@ -220,7 +220,7 @@ test.describe("P1-1 mask tool keys open the panel", () => {
     // With masks present, O reopens the panel.
     await page.getByTestId("mask-create-subject").click();
     await expect(page.getByTestId("mask-busy")).toHaveCount(0);
-    await page.getByTestId("panel-tab-adjust").click();
+    await page.getByTestId("tool-masking").click(); // toggles the Masks panel closed
     await expect(page.getByTestId("masks-panel")).toHaveCount(0);
     await page.keyboard.press("o");
     await expect(page.getByTestId("masks-panel")).toBeVisible();
@@ -460,7 +460,7 @@ test.describe("P1-9 multi-photo reset and presets", () => {
     // Save a preset first (Cmd+Shift+N opens Save Preset).
     await page.keyboard.press("Meta+Shift+n");
     await page.getByTestId("preset-name").fill("Warm Film");
-    await page.getByTestId("fields-dialog").getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByTestId("fields-dialog").getByRole("button", { name: "Create", exact: true }).click();
     await expect(page.getByTestId("preset-list")).toContainText("Warm Film");
 
     await page.keyboard.press("Meta+Shift+b");
@@ -479,7 +479,7 @@ test.describe("P1-9 multi-photo reset and presets", () => {
     await expect.poll(async () => (await calls(page, "undo_adjustments")).length).toBe(n);
 
     await clearCalls(page);
-    await page.getByTestId("preset-list").locator("button[data-testid^='preset-']").first().click();
+    await page.getByTestId("preset-list").locator("li button").first().click();
     await expect(page.getByTestId("notice").last()).toContainText(`Applied 'Warm Film' to ${n} photos`);
   });
 });
@@ -576,7 +576,7 @@ test.describe("P1-12 white balance eyedropper", () => {
     const s = (await saved(page))[0];
     expect(s.args.label).toBe("White Balance: Picker");
     expect((s.args.adjustments as { whiteBalance: { mode: string } }).whiteBalance.mode).toBe("custom");
-    await expect(page.getByTestId("wb-custom")).toHaveClass(/bg-sky-800/);
+    await expect(page.getByTestId("wb-select")).toHaveValue("custom");
 
     // The panel button toggles it too.
     await page.getByTestId("wb-picker").click();
@@ -639,7 +639,7 @@ test.describe("P2 items", () => {
     await clearCalls(page);
     await page.keyboard.press("Meta+Alt+v");
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("+1.25");
-    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Paste Settings");
+    await expect(page.getByTestId("history-list")).toContainText("Paste from Previous");
     // Plain Cmd+V-style keys are unaffected: Alt without the chord does nothing.
     await page.keyboard.press("Meta+Shift+n");
     await expect(page.getByTestId("preset-name")).toBeVisible();

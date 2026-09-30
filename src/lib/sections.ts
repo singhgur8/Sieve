@@ -1,12 +1,12 @@
 // Collapsed/expanded state of the Develop panel sections, remembered across sessions (localStorage).
 import { useSyncExternalStore } from "react";
 
-const KEY = "sieve.develop.sections";
+const KEY = "sieve.develop.sections.v2";
 /** Sections that start closed (the long tail of Lightroom panels); everything else starts open. */
-const CLOSED_BY_DEFAULT = new Set(["tone-curve", "color-grading", "detail", "effects", "calibration", "crop"]);
+const CLOSED_BY_DEFAULT = new Set(["tone-curve", "hsl", "color-grading", "detail", "effects", "calibration"]);
 
 /** Every section id in panel order (solo mode closes the others). */
-export const SECTION_IDS = ["profile", "basic", "presence", "tone-curve", "hsl", "color-grading", "detail", "effects", "lut", "calibration", "crop"];
+export const SECTION_IDS = ["basic", "tone-curve", "hsl", "color-grading", "detail", "effects", "calibration"];
 
 function load(): Record<string, boolean> {
   try {

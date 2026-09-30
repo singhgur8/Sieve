@@ -52,6 +52,9 @@ export type ActionId =
   | "copy"
   | "paste"
   | "sync"
+  | "syncQuiet"
+  | "autoTone"
+  | "autoWb"
   | "reset"
   | "maskPanel"
   | "maskBrush"
@@ -179,7 +182,10 @@ export const KEYMAP: KeyDef[] = [
   { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
   { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
-  { id: "sync", group: "Develop", label: "Sync settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
+  { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
+  { id: "syncQuiet", group: "Develop", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
+  { id: "autoTone", group: "Develop", label: "Auto tone (Basic: Tone > Auto)", chords: [c("u", { mod: true })], modes: ["develop"], display: ["Cmd+U"], where: "Develop" },
+  { id: "autoWb", group: "Develop", label: "Auto white balance", chords: [c("u", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+U"], where: "Develop" },
   { id: "reset", group: "Develop", label: "Reset all adjustments", chords: [c("r", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+R"], where: "Develop" },
 
   // ---- masks (Develop; the tool keys open the Masks panel themselves, so K never clashes with Compare's keeper) ----

@@ -213,7 +213,7 @@ test.describe("empty states", () => {
     await page.getByTestId("empty-clear-filters").click();
     await page.getByTestId("cell-1").click();
     await page.keyboard.press("d");
-    await expect(page.getByTestId("left-panel")).toContainText("No presets yet. Save the current settings");
+    await expect(page.getByTestId("left-panel")).toContainText("No presets yet. Save one with +");
     await expect(page.getByTestId("left-panel")).toContainText("No edits yet");
     await page.keyboard.press("Shift+W");
     await expect(page.getByTestId("mask-empty")).toContainText("No masks yet");

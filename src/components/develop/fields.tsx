@@ -49,7 +49,7 @@ export function Section({
   );
 }
 
-export const seg = (on: boolean) => `flex-1 rounded px-2 py-0.5 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
+export const seg = (on: boolean) => `flex-1 whitespace-nowrap rounded px-1 py-0.5 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
 
 interface NumFieldProps {
   editor: Editor;

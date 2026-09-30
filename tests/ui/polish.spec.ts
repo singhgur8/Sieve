@@ -484,7 +484,7 @@ test.describe("masking polish", () => {
     const first = (await calls(page, "render_mask_overlay")).at(-1)!;
     expect((first.args.options as any).region).toBeNull();
     await clearCalls(page);
-    await page.getByTestId("zoom-toggle").click();
+    await page.getByTestId("zoom-100").click();
     await expect(page.getByTestId("viewer")).toHaveAttribute("data-zoomed", "true");
     await expect.poll(async () => ((await calls(page, "render_mask_overlay")).at(-1)?.args.options as any)?.region).not.toBeNull();
     const o = (await calls(page, "render_mask_overlay")).at(-1)!.args.options as { maxEdge: number; region: { x: number; y: number; width: number; height: number } };
@@ -502,7 +502,7 @@ test.describe("masking polish", () => {
     await shot(page, `${P}09-overlay-region`);
     // Back to fit: the whole frame again.
     await clearCalls(page);
-    await page.getByTestId("zoom-toggle").click();
+    await page.getByTestId("zoom-fit").click();
     await expect.poll(async () => ((await calls(page, "render_mask_overlay")).at(-1)?.args.options as any)?.region).toBeNull();
   });
 
