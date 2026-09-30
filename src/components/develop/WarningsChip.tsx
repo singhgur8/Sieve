@@ -7,6 +7,7 @@ const TEXT: Record<DevelopWarningCode, { short: string; long: string }> = {
   profile_unavailable: { short: "Profile not installed", long: "The camera profile (DCP) is not installed; Sieve's built-in colour matrix is used instead." },
   look_unavailable: { short: "Adobe Look not installed", long: "The Adobe Look is not installed on this Mac; the photo renders without it." },
   masks_unsupported: { short: "Masks not supported yet", long: "This photo has local adjustments (masks) from Lightroom. They are kept in the sidecar but not rendered or exported yet." },
+  ai_mask_needs_update: { short: "AI masks need update", long: "Some AI masks have not been computed for this photo yet (pasted or synced masks, or the model is not installed); they render as empty until updated." },
   retouch_unsupported: { short: "Retouching not supported yet", long: "Spot removal / healing from Lightroom is kept in the sidecar but not rendered yet." },
   lens_corrections_unsupported: { short: "Lens corrections not supported yet", long: "Lens profile corrections and chromatic aberration removal are not applied yet." },
   transform_unsupported: { short: "Transform not supported yet", long: "Upright / perspective transforms are not applied yet." },

@@ -226,4 +226,52 @@ mod tests {
         let conn = open(&path).unwrap();
         conn.execute("UPDATE images SET format = 'png' WHERE id = 2", []).unwrap();
     }
+
+    #[test]
+    fn v10_flags_unimported_sidecar_masks_and_caches_mattes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, sql) in schema::MIGRATIONS[..9].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(
+                r#"INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at, develop_warnings)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0,
+                         '[{"code":"masks_unsupported","detail":"1"},{"code":"retouch_unsupported","detail":null}]'),
+                        (2, 1, '/f/b.arw', 'b.arw', 'arw', 'sony', 1, 0, 0, '[{"code":"retouch_unsupported","detail":null}]'),
+                        (3, 1, '/f/c.arw', 'c.arw', 'arw', 'sony', 1, 0, 0, NULL);"#,
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let flags: Vec<(i64, i64, bool)> = conn
+            .prepare("SELECT id, masks_pending_import, xmp_dirty FROM images ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(flags, vec![(1, 1, false), (2, 0, false), (3, 0, false)], "flag set without dirtying");
+
+        let insert = "INSERT INTO mask_cache (image_id, digest, kind, origin, model_version, input_digest, path,
+                                              width, height, bounds_x, bounds_y, bounds_w, bounds_h, coverage, created_at)
+                      VALUES (1, 'E71A59AFC894F4F898F72751E30113DA', 'subject', ?1, 'lr:251659306', NULL,
+                              'masks/1/E71A59AFC894F4F898F72751E30113DA.png', 1605, 1332, 0.1028, 0.0, 0.5573, 0.6937, 0.3, 0)";
+        conn.execute(insert, ["lightroom"]).unwrap();
+        assert!(conn.execute(insert, ["lightroom"]).is_err(), "(image, digest) is unique");
+        conn.execute("DELETE FROM mask_cache", []).unwrap();
+        assert!(conn.execute(insert, ["photoshop"]).is_err(), "origin is checked");
+        conn.execute(insert, ["sieve"]).unwrap();
+        conn.execute("DELETE FROM images WHERE id = 1", []).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM mask_cache", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "cascade with the image");
+    }
 }
