@@ -779,7 +779,7 @@ export default function App() {
       />
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
-        <ErrorBoundary view="Library" onReload={() => void lib.reload()}>
+        <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid
           lib={lib}
           targetSize={size}

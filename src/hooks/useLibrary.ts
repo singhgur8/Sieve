@@ -22,6 +22,8 @@ export interface Library {
   /** Re-fetches every entry currently cached (after bulk changes such as scene edits). */
   refreshAll: () => Promise<void>;
   reload: () => Promise<void>;
+  /** Drops every cached entry and reloads (recovery after a view crash). */
+  reset: () => Promise<void>;
   touch: () => void;
 }
 
@@ -69,6 +71,13 @@ export function useLibrary(query: Query, onError: (e: unknown) => void): Library
   useEffect(() => {
     void reload();
   }, [queryKey, reload]);
+
+  const reset = useCallback(async () => {
+    entries.current.clear();
+    inflight.current.clear();
+    force();
+    await reload();
+  }, [reload]);
 
   const flush = useCallback(async () => {
     const want = [...pinned.current, ...wanted.current].filter((id) => !entries.current.has(id) && !inflight.current.has(id));
@@ -173,5 +182,5 @@ export function useLibrary(query: Query, onError: (e: unknown) => void): Library
   const getEntry = useCallback((id: number) => entries.current.get(id), []);
   const version = useCallback((id: number) => versions.current.get(id) ?? 0, []);
 
-  return { ids, epoch, loaded, getEntry, version, ensure, pin, patch, refresh, refreshAll, reload, touch };
+  return { ids, epoch, loaded, getEntry, version, ensure, pin, patch, refresh, refreshAll, reload, reset, touch };
 }

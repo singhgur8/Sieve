@@ -204,6 +204,12 @@ declare global {
     __mockModelDelay?: number;
     /** Test hook: when set, mock `download_models` fails with this error at the third file. */
     __mockModelFail?: string;
+    /** Test hook: commands that reject with the given AppError (`{ cmd: { kind, message } }`); `once` entries are consumed. */
+    __mockFail?: Record<string, { kind: string; message: string; once?: boolean }>;
+    /** Test hook: `get_images` returns malformed entries (exercises the view error boundaries). */
+    __mockCorruptImages?: boolean;
+    /** Test hook: every export item fails with this reason (e.g. a disk-full message). */
+    __mockExportFail?: string;
   }
 }
 
@@ -334,6 +340,21 @@ export function installMockBackend(count: number) {
       g.endedAtMs = entry.capture.capturedAtMs ?? 0;
       if (entry.isBurstKeeper) g.keeperImageId = id;
       bursts.set(group, g);
+    }
+  }
+  // `?errors=1`: failure fixtures. id % 10 === 3 -> original missing, 7 -> thumbnail decode failure, 5 -> sidecar not writable.
+  const errorsOn = new URLSearchParams(location.search).get("errors") === "1";
+  const mockMissing = (id: number) => errorsOn && id % 10 === 3;
+  const mockReadOnly = (id: number) => errorsOn && id % 10 === 5;
+  const missingError = (id: number) => ({
+    kind: "not_found",
+    message: `Original file is missing or was moved: /shoot/DSC${String(id).padStart(5, "0")}.ARW. Reconnect the drive or move the file back, then try again.`,
+  });
+  const READ_ONLY = (id: number) => `Could not write /shoot/DSC${String(id).padStart(5, "0")}.xmp: the volume is read-only. Choose a writable location.`;
+  if (errorsOn) {
+    for (const r of rows) {
+      if (r.id % 10 === 7) r.thumbnail = { status: "failed", reason: `Could not decode ${r.path}: unsupported RAW variant. The file may be damaged, still copying, or from an unsupported camera.` };
+      if (mockReadOnly(r.id)) r.xmp = { dirty: true, syncedAtMs: null, error: READ_ONLY(r.id) };
     }
   }
   // A few pre-set flags so screenshots show something.
@@ -551,9 +572,9 @@ export function installMockBackend(count: number) {
       const id = run.ids[run.job.done];
       const r = byId.get(id);
       run.job.done++;
-      if (id % 7 === 0) {
+      if (window.__mockExportFail || id % 7 === 0) {
         run.job.failed++;
-        run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: "Decode error (mock)" });
+        run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: window.__mockExportFail ?? "Decode error (mock)" });
       } else run.job.succeeded++;
       void emit("export-progress", {
         jobId: run.job.id,
@@ -741,6 +762,15 @@ export function installMockBackend(count: number) {
     (cmd, payload) => {
       const args = (payload ?? {}) as Record<string, unknown>;
       window.__ipcLog.push({ cmd, args });
+      const injected = window.__mockFail?.[cmd];
+      if (injected) {
+        if (injected.once) delete window.__mockFail![cmd];
+        throw { kind: injected.kind, message: injected.message };
+      }
+      if (errorsOn && ["get_adjustments", "get_history", "get_develop_info", "render_preview", "prepare_develop"].includes(cmd)) {
+        const target = (args.id as number | undefined) ?? (args.ids as number[] | undefined)?.[0];
+        if (target != null && mockMissing(target)) throw missingError(target);
+      }
       const ids = (args.ids as number[] | undefined) ?? [];
       switch (cmd) {
         case "get_catalog_state":
@@ -753,6 +783,8 @@ export function installMockBackend(count: number) {
           return { items: all.slice(q.offset, q.offset + q.limit).map((i) => byId.get(i)), total: all.length };
         }
         case "get_images":
+          // Test hook for the error boundary: entries the grid cannot render.
+          if (window.__mockCorruptImages) return ids.map((i) => ({ ...byId.get(i), tags: null }));
           return ids.map((i) => byId.get(i));
         case "get_image":
           return byId.get(args.id as number);
@@ -786,12 +818,14 @@ export function installMockBackend(count: number) {
           return faces(args.id as number);
         case "list_burst_groups":
           return [...bursts.values()];
-        case "write_xmp":
+        case "write_xmp": {
+          const bad = ids.filter((i) => mockReadOnly(i) || mockMissing(i));
           ids.forEach((i) => {
             const r = byId.get(i);
-            if (r) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
+            if (r && !bad.includes(i)) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
           });
-          return { ...ok, succeeded: ids.length, changed: [] };
+          return { ...ok, succeeded: ids.length - bad.length, failed: bad.map((i) => ({ imageId: i, reason: mockMissing(i) ? missingError(i).message : READ_ONLY(i) })), changed: [] };
+        }
         case "read_xmp":
           return { ...ok, skipped: ids.length };
         case "apply_suggestions": {
