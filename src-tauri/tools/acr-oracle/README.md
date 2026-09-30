@@ -37,7 +37,7 @@ Sources are only read (never write under `~/Pictures`).
 | `diff.py <out-dir> [stems]` | dL / da / db and dE binned by L* |
 | `tonefit.py`, `scale_probe.py`, `adapt_probe.py`, `local_probe.py` | slider delta in scene EV per pixel (inverting Camera Raw's neutral tone mapping); spatial / image-adaptivity probes |
 | `fit_local.py`, `gen_local.py`, `fit_ref.py` | first local-operator fits (Python features) |
-| `fit2.py [--write] [--loo]` | final fit on features computed by Sieve (`parity_eval` with `SIEVE_DUMP_EV=1` on `neutral`): references + tables -> `src/develop/local_tone_data.rs` |
+| `fit2.py [--write] [--loo]` | final fit (bilateral-grid bases since round 2) on features computed by Sieve (`parity_eval` with `SIEVE_DUMP_EV=1` on `neutral`): references + tables -> `src/develop/local_tone_data.rs` |
 | `check_local.py`, `halo_probe.py`, `align_probe.py`, `cc_probe.py`, `montage.py`, `settings.py` | per-image bias, Camera Raw step-edge halos, frame alignment, CameraCalibration derivation, visual montages, sidecar settings dump |
 
 Refit after changing the adaptation filter: build `parity_eval`, run
@@ -63,3 +63,18 @@ frames, with a geometric mask both renderers evaluate identically:
 
 The fitted constants live in `src/develop/local.rs` (`LOCAL_TEMP_WARM/COOL`, `LOCAL_TINT*`,
 `LOCAL_*_CURVE`).
+
+## Parity round 2 (2026-09-30)
+
+| Script | Does |
+|---|---|
+| `agg.py <variant>...` | dL / dE / dC by reference L* over all frames of a variant's `out/` dir |
+| `resp.py <variant>...` | slider response: Camera Raw vs Sieve dL / dC per neutral-L* band (Dehaze / Clarity calibration) |
+| `clip_shoulder.py` | equivalent scene-EV shift per image near the raw clip (the clip-anchored highlight shoulder) |
+| `clip_regions.py STEM...` | colour of raw-clipped regions by number of clipped channels (`parity_eval` with `SIEVE_DUMP_CAM=1`, out dir `$P2/out/clip`) |
+
+`parity_eval` also dumps white-balanced camera RGB with `SIEVE_DUMP_CAM=1` (`<stem>.cam.f32` +
+`<stem>.cam.txt`). The adaptation bases are hyper-Gaussian bilateral grids now (`fit2.py`
+`BASE`, written into `local_tone_data.rs`); `fit2.py` drops EV deltas beyond 4 EV (low-key
+frames make the neutral tone-map inversion ill-conditioned). The Clarity / Texture / Dehaze
+sweeps (`nCl`, `nTx`, `nDh` +-50) were rendered for the fit set with `variants.py`.

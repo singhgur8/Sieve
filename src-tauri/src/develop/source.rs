@@ -167,12 +167,14 @@ pub struct SourceMeta {
     /// Per-file raw baseline exposure when the file tells it (Fujifilm `RawExposureBias`,
     /// DNG `BaselineExposure`); `None` = the camera default.
     pub baseline_exposure: Option<f32>,
+    /// Fujifilm X-Trans colour filter array (LibRaw `filters == 9`).
+    pub xtrans: bool,
 }
 
 impl SourceMeta {
     /// Metadata of a non-RAW (display-referred) source.
     pub fn display_referred(format: crate::ipc::types::ImageFormat) -> Self {
-        SourceMeta { format, make: None, model: None, display_referred: true, baseline_exposure: None }
+        SourceMeta { format, make: None, model: None, display_referred: true, baseline_exposure: None, xtrans: false }
     }
 
     fn raw(path: &Path, c: &libraw::ColorData) -> Self {
@@ -188,7 +190,14 @@ impl SourceMeta {
         } else {
             None
         };
-        SourceMeta { format, make: name(&c.make), model: name(&c.model), display_referred: false, baseline_exposure }
+        SourceMeta {
+            format,
+            make: name(&c.make),
+            model: name(&c.model),
+            display_referred: false,
+            baseline_exposure,
+            xtrans: c.filters == 9,
+        }
     }
 }
 

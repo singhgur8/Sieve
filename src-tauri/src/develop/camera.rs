@@ -35,7 +35,15 @@ pub struct Profile {
     pub display_referred: bool,
     /// Missing profile/look.
     pub warnings: Vec<DevelopWarning>,
+    /// Minimum effective Colour noise reduction (0..=100) of this source: Camera Raw's X-Trans
+    /// demosaic leaves far less chroma noise than the half-size decode, so X-Trans sources
+    /// render like Colour NR >= [`XTRANS_CHROMA_NR`] even at 0.
+    pub chroma_nr_floor: f32,
 }
+
+/// [`Profile::chroma_nr_floor`] of X-Trans sources, measured on the fit set (Fuji frames at
+/// Colour 0: dE 2.73 -> 1.98, 2.99 -> 2.35, 3.27 -> 2.54; any value 10..25 gives the same).
+pub const XTRANS_CHROMA_NR: f32 = 10.0;
 
 impl Profile {
     /// Plain scene-referred profile (LibRaw matrix, no look, `baseline_ev`).
@@ -94,7 +102,8 @@ pub fn resolve(meta: &SourceMeta, settings: &ProfileSettings, lib: &ProfileLibra
             .unwrap_or_else(|| crate::profiles::raw_baseline_exposure(meta.make.as_deref(), meta.model.as_deref()))
             + dcp.as_ref().map_or(0.0, |d| d.baseline_exposure_offset)
     };
-    Profile { dcp, look, look_amount, baseline_ev, display_referred: meta.display_referred, warnings }
+    let chroma_nr_floor = if meta.xtrans { XTRANS_CHROMA_NR } else { 0.0 };
+    Profile { dcp, look, look_amount, baseline_ev, display_referred: meta.display_referred, warnings, chroma_nr_floor }
 }
 
 /// Single-matrix pseudo profile from the source's `ColorInfo` (LibRaw `cam_xyz`, a D65

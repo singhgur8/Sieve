@@ -3,18 +3,21 @@
 //! resolution and scaled). Camera Raw's (Lightroom's) processing model, Process Version
 //! 2012+, as far as it is observable (see `develop::tone`, `develop::parity`, `profiles`):
 //!
-//! A. Per pixel: camera RGB x white-balance multipliers (clipped at the sensor white) ->
+//! A. Per pixel: camera RGB x white-balance multipliers, raw-clipped channels rebuilt from
+//!    the unclipped ones and the local highlight colour (`develop::highlights`) ->
 //!    linear ProPhoto through the camera profile's matrices for this white balance
 //!    (`ForwardMatrix` / `ColorMatrix` interpolated by temperature, DNG model) with the
 //!    Calibration panel folded in (`develop::camera`).
-//! B. Noise reduction on that scene-linear image (`parity::denoise`; banded for exports).
+//! B. Noise reduction on that scene-linear image (`parity::denoise`; banded for exports;
+//!    X-Trans sources get a small colour-NR floor like Camera Raw's demosaic).
 //! C. Local operators on log-luminance fields, as luminance gains (hue/saturation
 //!    preserving): Shadows/Highlights = fitted response tables ([`LocalTone`]) at an
-//!    adaptation luminance from the whole uncropped source ([`ToneContext`]: two guided-filter
-//!    bases on a ~512 px grid + image-adaptive references), clarity/texture, dehaze.
+//!    adaptation luminance from the whole uncropped source ([`ToneContext`]: two halo-free
+//!    bilateral-grid bases on a ~512 px grid + image-adaptive references), clarity/texture,
+//!    dehaze (a veil from the local dark channel, removed or added).
 //! D. A pointwise chain evaluated through a shaped 3D LUT built per render (tetrahedral
 //!    interpolation; 33^3 drafts, 65^3 previews and exports): profile HueSatMap ->
-//!    exposure (+baseline) gain -> profile LookTable -> look HSV table ->
+//!    highlight shoulder at the raw clip -> exposure (+baseline) gain -> profile LookTable -> look HSV table ->
 //!    HSL/vibrance/saturation or the B&W mix -> shadow tint -> the global tone sliders
 //!    (Whites/Contrast/Blacks, exposure shoulder) composed with the base tone curve and the
 //!    look's and the user's parametric + master curves, applied hue-preservingly ("RGB
@@ -141,6 +144,11 @@ const LOG2_GREY: f32 = -2.473_931_2;
 const SIGMA_MASK: f32 = 0.012;
 const SIGMA_TEXTURE: f32 = 0.0022;
 const SIGMA_HAZE: f32 = 0.02;
+/// Dehaze veil per unit of the local haze (blurred dark channel) at +100 / -100, fitted to
+/// Camera Raw's Dehaze +-50 sweeps on the fit set (mean response within ~1-2 L* per tone
+/// band; dE 3.99 -> 2.98 at +50, 10.36 -> 4.30 at -50).
+const DEHAZE_REMOVE: f32 = 0.5;
+const DEHAZE_ADD: f32 = 1.5;
 /// Grid of the Shadows/Highlights delta tables over the adaptation luminance (pre-exposure
 /// EV): `TONE_LOCAL_N` nodes from `TONE_LOCAL_LO` over `TONE_LOCAL_SPAN` EV.
 pub(crate) const TONE_LOCAL_LO: f32 = -32.0;
@@ -913,7 +921,9 @@ fn develop(
     // B. Noise reduction.
     {
         let mut work = Working { width: w, height: h, rgb: &mut rgb };
-        parity::denoise_opts(&mut work, &adj.detail.noise_reduction, scale, quality != Quality::Draft);
+        let mut nr = adj.detail.noise_reduction;
+        nr.color = nr.color.max(profile.chroma_nr_floor);
+        parity::denoise_opts(&mut work, &nr, scale, quality != Quality::Draft);
     }
 
     // C. Local operators.
@@ -953,7 +963,7 @@ fn develop(
     let lneeds = |p| lops.as_ref().is_some_and(|o| o.needs(p));
     let need_clar = local.clarity != 0.0 || lneeds(LocalParam::Clarity);
     let need_tex = local.texture != 0.0 || lneeds(LocalParam::Texture);
-    let need_haze = local.dehaze > 0.0 || lneeds(LocalParam::Dehaze);
+    let need_haze = local.dehaze != 0.0 || lneeds(LocalParam::Dehaze);
     let (clar, tex, haze) = if need_clar || need_tex || need_haze {
         let f0 = if w.min(h) >= 1024 {
             4
@@ -1051,13 +1061,7 @@ fn develop(
             let mut v = [p[0], p[1], p[2]];
             let i = y * w + x;
             let adapt = adapt_ctx.map(|c| c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy));
-            if adapt.is_some()
-                || clar.is_some()
-                || tex.is_some()
-                || haze.is_some()
-                || local.dehaze < 0.0
-                || lops_c.is_some()
-            {
+            if adapt.is_some() || clar.is_some() || tex.is_some() || haze.is_some() || lops_c.is_some() {
                 let px = lops_c.map(|o| (o, i));
                 v = apply_local(v, x, y, &local, adapt, clar.as_ref(), tex.as_ref(), haze.as_ref(), px);
             }
@@ -1448,15 +1452,19 @@ fn apply_local(
         v = v.map(|c| c * g);
     }
     let dehaze = k.dehaze + px.map_or(0.0, |(o, i)| o.dehaze(i));
-    if let (Some(hz), true) = (haze, dehaze > 0.0) {
-        // Remove the locally estimated veil (scene white ~1).
-        let veil = (hz.sample(x, y).max(0.0) * dehaze * 0.9).min(0.9);
-        let t = 1.0 - veil;
-        v = v.map(|c| (c - veil).max(0.0) / t);
-    } else if dehaze < 0.0 {
-        let a = (-dehaze * 0.6).min(1.0);
-        let fog = 0.12;
-        v = v.map(|c| c + (fog - c) * a);
+    if let (Some(hz), true) = (haze, dehaze != 0.0) {
+        let h = hz.sample(x, y).max(0.0);
+        if dehaze > 0.0 {
+            // Remove the locally estimated veil (scene white ~1).
+            let veil = (h * dehaze * DEHAZE_REMOVE).min(0.9);
+            let t = 1.0 - veil;
+            v = v.map(|c| (c - veil).max(0.0) / t);
+        } else {
+            // Add a veil of the same local estimate (Camera Raw: lifts hazy mid tones most,
+            // dark areas less, leaves white).
+            let veil = (h * -dehaze * DEHAZE_ADD).min(0.9);
+            v = v.map(|c| c * (1.0 - veil) + veil);
+        }
     }
     v
 }

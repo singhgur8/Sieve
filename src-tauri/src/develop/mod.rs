@@ -59,6 +59,10 @@ use crate::profiles::ProfileLibrary;
 use camera::Profile;
 use source::{LinearImage, Prepared, SourceMeta};
 
+/// Tone contexts kept per image (white balance / calibration / profile variants: toggling
+/// between a few, e.g. before/after or presets, stays cached; ~1 MB each).
+const TONE_CONTEXTS: usize = 4;
+
 /// Custom URI scheme serving rendered previews (registered in `lib.rs`).
 pub const RENDER_SCHEME: &str = "sieve";
 /// JPEG quality of served previews (4:4:4).
@@ -151,7 +155,8 @@ struct Entry {
     /// Uncropped [`pipeline::TONE_GRID`] px source for the local tone context.
     tone_src: Mutex<Option<Arc<Prepared>>>,
     /// Last uncropped local tone context and the settings it depends on.
-    tone_ctx: Mutex<Option<(ToneKey, Arc<pipeline::ToneContext>)>>,
+    /// Most recently used tone contexts (newest last, at most [`TONE_CONTEXTS`]).
+    tone_ctx: Mutex<Vec<(ToneKey, Arc<pipeline::ToneContext>)>>,
 }
 
 /// What the uncropped local tone context depends on besides the source.
@@ -252,7 +257,16 @@ impl Entry {
         profile: &Profile,
     ) -> Option<pipeline::ToneContext> {
         let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
-        let cached = lock(&self.tone_ctx).as_ref().filter(|(k, _)| *k == key).map(|(_, c)| c.clone());
+        let cached = {
+            let mut list = lock(&self.tone_ctx);
+            let hit = list.iter().position(|(k, _)| *k == key);
+            hit.map(|i| {
+                let e = list.remove(i);
+                let c = e.1.clone();
+                list.push(e);
+                c
+            })
+        };
         let base = match cached {
             Some(c) => c,
             None => {
@@ -262,7 +276,11 @@ impl Entry {
                     })
                     .clone();
                 let c = Arc::new(pipeline::tone_context_uncropped(&whole, &self.image, adjustments, profile));
-                *lock(&self.tone_ctx) = Some((key, c.clone()));
+                let mut list = lock(&self.tone_ctx);
+                if list.len() >= TONE_CONTEXTS {
+                    list.remove(0);
+                }
+                list.push((key, c.clone()));
                 c
             }
         };
@@ -446,7 +464,7 @@ impl DevelopCache {
             prepared: Mutex::new(Vec::new()),
             profile: Mutex::new(None),
             tone_src: Mutex::new(None),
-            tone_ctx: Mutex::new(None),
+            tone_ctx: Mutex::new(Vec::new()),
         });
         {
             let mut lru = lock(&self.inner.lru);
