@@ -1151,6 +1151,641 @@ pub struct ImportStatus {
     pub running: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Export (Phase 6): presets, capabilities, jobs
+// ---------------------------------------------------------------------------
+
+/// Catalog row id of a user export preset; built-in presets have negative ids.
+pub type ExportPresetId = i64;
+/// Catalog row id of an export job (`export_jobs`).
+pub type ExportJobId = i64;
+
+string_enum! {
+    /// Output file formats. `webp` / `heic` depend on encoders: check
+    /// `get_export_capabilities()` before offering them.
+    pub enum ExportFormatKind {
+        Jpeg => "jpeg",
+        Tiff => "tiff",
+        Png => "png",
+        Webp => "webp",
+        Heic => "heic",
+    }
+}
+
+impl ExportFormatKind {
+    /// Lower-case file extension (without the dot) appended to expanded file names.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Tiff => "tif",
+            Self::Png => "png",
+            Self::Webp => "webp",
+            Self::Heic => "heic",
+        }
+    }
+}
+
+string_enum! {
+    /// Bits per channel of the written file. On the wire: `"8"` / `"16"`.
+    pub enum BitDepth {
+        Eight => "8",
+        Sixteen => "16",
+    }
+}
+
+string_enum! {
+    /// JPEG chroma subsampling. `444` keeps full colour resolution (larger files).
+    pub enum ChromaSubsampling {
+        Yuv444 => "444",
+        Yuv422 => "422",
+        Yuv420 => "420",
+    }
+}
+
+string_enum! {
+    pub enum TiffCompression {
+        None => "none",
+        Lzw => "lzw",
+        /// Deflate (Adobe "ZIP").
+        Zip => "zip",
+    }
+}
+
+/// File format and its encoder options. Quality values are 0..=100 (Lightroom scale,
+/// passed to the encoder as-is).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ExportFormat {
+    Jpeg {
+        quality: u8,
+        chroma_subsampling: ChromaSubsampling,
+    },
+    Tiff {
+        bit_depth: BitDepth,
+        compression: TiffCompression,
+    },
+    Png {
+        bit_depth: BitDepth,
+    },
+    /// `quality` is ignored when `lossless`.
+    Webp {
+        quality: u8,
+        lossless: bool,
+    },
+    /// 8-bit HEVC in a HEIF container (macOS ImageIO).
+    Heic {
+        quality: u8,
+    },
+}
+
+impl ExportFormat {
+    pub fn kind(&self) -> ExportFormatKind {
+        match self {
+            Self::Jpeg { .. } => ExportFormatKind::Jpeg,
+            Self::Tiff { .. } => ExportFormatKind::Tiff,
+            Self::Png { .. } => ExportFormatKind::Png,
+            Self::Webp { .. } => ExportFormatKind::Webp,
+            Self::Heic { .. } => ExportFormatKind::Heic,
+        }
+    }
+
+    /// Bits per channel written (JPEG / WebP / HEIC are always 8).
+    pub fn bit_depth(&self) -> BitDepth {
+        match self {
+            Self::Tiff { bit_depth, .. } | Self::Png { bit_depth } => *bit_depth,
+            _ => BitDepth::Eight,
+        }
+    }
+}
+
+/// Output size. Sizes refer to the orientation-corrected image; the aspect ratio is always
+/// preserved (no cropping). Rounding: the constrained edge is exact, the other rounds to nearest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ResizeMode {
+    /// Full resolution (`DevelopInfo.fullWidth x fullHeight`).
+    None,
+    /// Longer side = `px`.
+    LongEdge { px: u32 },
+    /// Shorter side = `px`.
+    ShortEdge { px: u32 },
+    /// Total pixels ~= `mp` x 1,000,000 (0.1..=200).
+    Megapixels {
+        #[specta(type = Number)]
+        mp: f32,
+    },
+    /// Fit within a `width` x `height` box (literal: not rotated for portrait frames).
+    WidthHeight { width: u32, height: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeOptions {
+    pub mode: ResizeMode,
+    /// Never upscale: if the target is larger than full resolution, export full resolution.
+    pub dont_enlarge: bool,
+    /// Pixels per inch written to the file (EXIF/TIFF resolution, JFIF density, PNG `pHYs`),
+    /// 1..=4800. Does not change pixel dimensions.
+    pub resolution_ppi: u32,
+}
+
+string_enum! {
+    /// Output colour space; its ICC profile is always embedded (sRGB IEC61966-2.1,
+    /// Display P3, Adobe RGB (1998)).
+    pub enum ExportColorSpace {
+        Srgb => "srgb",
+        DisplayP3 => "display_p3",
+        AdobeRgb => "adobe_rgb",
+    }
+}
+
+string_enum! {
+    /// Lightroom output-sharpening target.
+    pub enum SharpenMedia {
+        Screen => "screen",
+        Matte => "matte",
+        Glossy => "glossy",
+    }
+}
+
+string_enum! {
+    pub enum SharpenAmount {
+        Low => "low",
+        Standard => "standard",
+        High => "high",
+    }
+}
+
+/// Output sharpening, applied after resizing to the output-encoded pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputSharpening {
+    pub media: SharpenMedia,
+    pub amount: SharpenAmount,
+}
+
+string_enum! {
+    /// What to do when a target file already exists on disk. Two images of one job that
+    /// expand to the same name always get unique suffixes (never overwrite each other).
+    pub enum CollisionPolicy {
+        /// Append `-2`, `-3`, ... before the extension.
+        UniqueSuffix => "unique_suffix",
+        Overwrite => "overwrite",
+        /// Leave the existing file; the image counts as `skipped`.
+        Skip => "skip",
+    }
+}
+
+/// Output file names. `template` grammar: literal text plus tokens in braces (see
+/// [`parse_filename_template`]); the format's extension is appended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FileNaming {
+    /// e.g. `"{filename}"`, `"Smith-Wedding-{seq:4}"`, `"{date:YYYYMMDD}_{filename}"`.
+    pub template: String,
+    /// First value of `{seq}` (0..=999999999).
+    pub start_number: u32,
+    pub collision: CollisionPolicy,
+}
+
+/// Where exported files go (`ExportSettings.subfolder` is appended in every case).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ExportDestination {
+    /// Ask at export time. Allowed in presets; the export dialog must replace it with
+    /// `folder` before calling `export_images` / `plan_export` (they reject it).
+    Choose,
+    /// Absolute folder path; created (with the subfolder) if missing.
+    Folder { path: String },
+    /// Next to each RAW (its own folder).
+    SourceFolder,
+}
+
+string_enum! {
+    /// Which metadata is copied into exported files. Develop settings (`crs:`) and Sieve's
+    /// culling tags (`Sieve|*`) are never exported. Orientation is always written as 1
+    /// (pixels are rotated); the ICC profile and resolution are always present.
+    pub enum MetadataInclude {
+        /// EXIF of the RAW (camera, lens, exposure, capture time) + sidecar XMP/IPTC
+        /// (creator, rights, title, description, rating, label; keywords per `includeKeywords`).
+        All => "all",
+        /// Copyright notice only (EXIF `Copyright` + `dc:rights`).
+        CopyrightOnly => "copyright_only",
+        /// Copyright + creator and IPTC creator contact info (`dc:creator`, EXIF `Artist`,
+        /// `Iptc4xmpCore:CreatorContactInfo`).
+        CopyrightAndContact => "copyright_and_contact",
+        None => "none",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataOptions {
+    pub include: MetadataInclude,
+    /// Strip GPS EXIF and IPTC location fields (only matters for `all`).
+    pub remove_location: bool,
+    /// Copy the sidecar's keywords (`dc:subject` / `lr:hierarchicalSubject`, minus `Sieve|*`).
+    /// Only matters for `all`.
+    pub include_keywords: bool,
+    /// Overrides the copyright notice from the RAW/sidecar (ignored for `none`), <= 500 chars.
+    pub copyright: Option<String>,
+    /// Overrides the creator/artist (used by `all` and `copyright_and_contact`), <= 500 chars.
+    pub creator: Option<String>,
+}
+
+/// Everything that defines an export (the body of an `ExportPreset`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSettings {
+    pub format: ExportFormat,
+    pub color_space: ExportColorSpace,
+    pub resize: ResizeOptions,
+    /// `null` = no output sharpening.
+    pub sharpening: Option<OutputSharpening>,
+    pub naming: FileNaming,
+    pub destination: ExportDestination,
+    /// Relative path appended to the destination (e.g. `"Smith Wedding/Web"`); `null` = none.
+    /// `/`-separated; no `..`, `.`, empty components, `\` or `:`.
+    pub subfolder: Option<String>,
+    pub metadata: MetadataOptions,
+}
+
+impl ExportSettings {
+    pub const MIN_EDGE_PX: u32 = 16;
+    pub const MAX_EDGE_PX: u32 = 65_000;
+    pub const MAX_TEXT: usize = 500;
+
+    /// Returns a description of the first invalid value, if any. A `choose` destination
+    /// passes (presets may store it); `export_images` / `plan_export` reject it separately.
+    pub fn validate(&self) -> Result<(), String> {
+        match &self.format {
+            ExportFormat::Jpeg { quality, .. }
+            | ExportFormat::Webp { quality, .. }
+            | ExportFormat::Heic { quality }
+                if *quality > 100 =>
+            {
+                return Err(format!("quality = {quality} is outside 0..=100"));
+            }
+            _ => {}
+        }
+        let edge = |name: &str, v: u32| {
+            if (Self::MIN_EDGE_PX..=Self::MAX_EDGE_PX).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} = {v} is outside {}..={}", Self::MIN_EDGE_PX, Self::MAX_EDGE_PX))
+            }
+        };
+        match &self.resize.mode {
+            ResizeMode::None => {}
+            ResizeMode::LongEdge { px } => edge("longEdge.px", *px)?,
+            ResizeMode::ShortEdge { px } => edge("shortEdge.px", *px)?,
+            ResizeMode::Megapixels { mp } => {
+                if !(mp.is_finite() && (0.1..=200.0).contains(mp)) {
+                    return Err(format!("megapixels = {mp} is outside 0.1..=200"));
+                }
+            }
+            ResizeMode::WidthHeight { width, height } => {
+                edge("width", *width)?;
+                edge("height", *height)?;
+            }
+        }
+        if !(1..=4800).contains(&self.resize.resolution_ppi) {
+            return Err(format!("resolutionPpi = {} is outside 1..=4800", self.resize.resolution_ppi));
+        }
+        parse_filename_template(&self.naming.template)?;
+        if self.naming.start_number > 999_999_999 {
+            return Err("startNumber must be <= 999999999".into());
+        }
+        if let ExportDestination::Folder { path } = &self.destination {
+            if !std::path::Path::new(path).is_absolute() {
+                return Err(format!("destination folder {path:?} must be an absolute path"));
+            }
+        }
+        if let Some(sub) = &self.subfolder {
+            validate_subfolder(sub)?;
+        }
+        for (name, v) in [("copyright", &self.metadata.copyright), ("creator", &self.metadata.creator)] {
+            if v.as_ref().is_some_and(|s| s.chars().count() > Self::MAX_TEXT) {
+                return Err(format!("{name} is longer than {} characters", Self::MAX_TEXT));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_subfolder(sub: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("subfolder {sub:?}: {why}"));
+    if sub.is_empty() || sub.len() > 255 {
+        return bad("must be 1..=255 bytes");
+    }
+    if sub.starts_with('/') || sub.contains('\\') || sub.contains(':') {
+        return bad("must be a relative path using '/'");
+    }
+    for part in sub.split('/') {
+        if part.trim().is_empty() || part == "." || part == ".." || part.chars().any(char::is_control) {
+            return bad("empty, '.', '..' or control characters in a component");
+        }
+    }
+    Ok(())
+}
+
+/// A parsed piece of a file-name template (not on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplatePart {
+    /// Custom text, copied verbatim.
+    Text(String),
+    /// `{filename}`: the RAW's file name without extension (`DSC01234`).
+    Filename,
+    /// `{seq}` / `{seq:N}`: 0-based position in the export's `ids` + `startNumber`, zero-padded
+    /// to `N` digits (1..=9; `{seq}` = no padding).
+    Seq { digits: u8 },
+    /// `{date}` / `{date:FMT}`: capture wall-clock time (the RAW's mtime, local, if unknown).
+    /// `FMT` = `YYYY`, `YY`, `MM`, `DD`, `hh`, `mm`, `ss` and `-`, `_`, `.`, space; default `YYYYMMDD`.
+    Date { format: String },
+    /// `{rating}`: stars 0..=5.
+    Rating,
+    /// `{camera}`: camera model (else make; `Unknown`).
+    Camera,
+    /// `{folder}`: name of the RAW's parent folder.
+    Folder,
+    /// `{id}`: catalog image id.
+    Id,
+}
+
+/// Token names accepted in file-name templates (mirrored for UI help in `src/ipc/index.ts`).
+pub const FILENAME_TOKENS: &[&str] = &["filename", "seq", "date", "rating", "camera", "folder", "id"];
+
+/// Parses and validates a file-name template: 1..=200 chars, not blank; literal text must not
+/// contain `/`, `\`, `:`, unmatched braces or control characters. Expanded token values are
+/// sanitized by the exporter (`/ \ :` and control characters -> `_`), a leading `.` or space is
+/// stripped from the final name, and names are truncated to 240 bytes before the extension.
+pub fn parse_filename_template(template: &str) -> Result<Vec<TemplatePart>, String> {
+    if template.trim().is_empty() || template.chars().count() > 200 {
+        return Err("file name template must be 1..=200 characters".into());
+    }
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut rest = template;
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '{' => {
+                let end = rest.find('}').ok_or_else(|| format!("unclosed '{{' in template {template:?}"))?;
+                if !text.is_empty() {
+                    parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+                }
+                parts.push(parse_template_token(&rest[1..end])?);
+                rest = &rest[end + 1..];
+            }
+            '}' => return Err(format!("unmatched '}}' in template {template:?}")),
+            '/' | '\\' | ':' => return Err(format!("{c:?} is not allowed in file names")),
+            c if c.is_control() => return Err("control characters are not allowed in file names".into()),
+            c => {
+                text.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    if !text.is_empty() {
+        parts.push(TemplatePart::Text(text));
+    }
+    Ok(parts)
+}
+
+fn parse_template_token(inner: &str) -> Result<TemplatePart, String> {
+    let (name, arg) = match inner.split_once(':') {
+        Some((n, a)) => (n, Some(a)),
+        None => (inner, None),
+    };
+    let plain = |part: TemplatePart| match arg {
+        None => Ok(part),
+        Some(_) => Err(format!("token {{{name}}} takes no argument")),
+    };
+    match name {
+        "filename" => plain(TemplatePart::Filename),
+        "rating" => plain(TemplatePart::Rating),
+        "camera" => plain(TemplatePart::Camera),
+        "folder" => plain(TemplatePart::Folder),
+        "id" => plain(TemplatePart::Id),
+        "seq" => {
+            let digits = match arg {
+                None => 1,
+                Some(a) => a
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|d| (1..=9).contains(d))
+                    .ok_or_else(|| format!("{{seq:{a}}}: digits must be 1..=9"))?,
+            };
+            Ok(TemplatePart::Seq { digits })
+        }
+        "date" => {
+            let format = arg.unwrap_or("YYYYMMDD");
+            if format.is_empty() {
+                return Err("{date:}: empty format".into());
+            }
+            let mut rest = format;
+            while !rest.is_empty() {
+                if let Some(t) = ["YYYY", "YY", "MM", "DD", "hh", "mm", "ss"].iter().find(|t| rest.starts_with(**t)) {
+                    rest = &rest[t.len()..];
+                } else if rest.starts_with(['-', '_', '.', ' ']) {
+                    rest = &rest[1..];
+                } else {
+                    return Err(format!("{{date:{format}}}: use YYYY YY MM DD hh mm ss and - _ . space"));
+                }
+            }
+            Ok(TemplatePart::Date { format: format.to_string() })
+        }
+        _ => Err(format!("unknown token {{{name}}} (known: {})", FILENAME_TOKENS.join(", "))),
+    }
+}
+
+/// A named export configuration. Built-in presets (`builtIn`, negative ids) are read-only:
+/// "save as" creates a user preset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreset {
+    pub id: ExportPresetId,
+    /// Unique case-insensitively across built-in and user presets, 1..=100 chars (trimmed).
+    pub name: String,
+    pub built_in: bool,
+    pub settings: ExportSettings,
+    /// 0 for built-ins.
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl ExportPreset {
+    /// The built-in presets, in display order (listed before user presets).
+    pub fn builtins() -> Vec<ExportPreset> {
+        let metadata_all = MetadataOptions {
+            include: MetadataInclude::All,
+            remove_location: false,
+            include_keywords: true,
+            copyright: None,
+            creator: None,
+        };
+        let naming =
+            FileNaming { template: "{filename}".into(), start_number: 1, collision: CollisionPolicy::UniqueSuffix };
+        let preset = |id: ExportPresetId, name: &str, settings: ExportSettings| ExportPreset {
+            id,
+            name: name.into(),
+            built_in: true,
+            settings,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        vec![
+            preset(
+                -1,
+                "Client JPEG full-res sRGB q90",
+                ExportSettings {
+                    format: ExportFormat::Jpeg { quality: 90, chroma_subsampling: ChromaSubsampling::Yuv444 },
+                    color_space: ExportColorSpace::Srgb,
+                    resize: ResizeOptions { mode: ResizeMode::None, dont_enlarge: true, resolution_ppi: 300 },
+                    sharpening: None,
+                    naming: naming.clone(),
+                    destination: ExportDestination::Choose,
+                    subfolder: None,
+                    metadata: metadata_all.clone(),
+                },
+            ),
+            preset(
+                -2,
+                "Web 2048 sRGB",
+                ExportSettings {
+                    format: ExportFormat::Jpeg { quality: 80, chroma_subsampling: ChromaSubsampling::Yuv420 },
+                    color_space: ExportColorSpace::Srgb,
+                    resize: ResizeOptions {
+                        mode: ResizeMode::LongEdge { px: 2048 },
+                        dont_enlarge: true,
+                        resolution_ppi: 72,
+                    },
+                    sharpening: Some(OutputSharpening { media: SharpenMedia::Screen, amount: SharpenAmount::Standard }),
+                    naming: naming.clone(),
+                    destination: ExportDestination::Choose,
+                    subfolder: None,
+                    metadata: MetadataOptions {
+                        include: MetadataInclude::CopyrightOnly,
+                        remove_location: true,
+                        include_keywords: false,
+                        copyright: None,
+                        creator: None,
+                    },
+                },
+            ),
+            preset(
+                -3,
+                "Print TIFF 16-bit Adobe RGB",
+                ExportSettings {
+                    format: ExportFormat::Tiff { bit_depth: BitDepth::Sixteen, compression: TiffCompression::Lzw },
+                    color_space: ExportColorSpace::AdobeRgb,
+                    resize: ResizeOptions { mode: ResizeMode::None, dont_enlarge: true, resolution_ppi: 300 },
+                    sharpening: Some(OutputSharpening { media: SharpenMedia::Glossy, amount: SharpenAmount::Standard }),
+                    naming,
+                    destination: ExportDestination::Choose,
+                    subfolder: None,
+                    metadata: metadata_all,
+                },
+            ),
+        ]
+    }
+}
+
+/// Encoder availability for one format in this build / on this machine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFormatInfo {
+    pub kind: ExportFormatKind,
+    pub available: bool,
+    /// Why it is unavailable (e.g. "HEIC encoder not available"); `null` when available.
+    pub reason: Option<String>,
+    /// Bit depths the encoder writes (JPEG/WebP/HEIC `["8"]`, TIFF/PNG `["8", "16"]`).
+    pub bit_depths: Vec<BitDepth>,
+    /// EXIF/XMP metadata can be embedded. ICC profiles are embedded for every available format.
+    pub supports_metadata: bool,
+}
+
+/// What the export engine can do here (`get_export_capabilities`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCapabilities {
+    /// One entry per `ExportFormatKind`, in enum order.
+    pub formats: Vec<ExportFormatInfo>,
+    /// Upper bound of images developed concurrently (see `docs/architecture.md`, "Export").
+    pub max_parallel: u32,
+    /// Memory budget shared by concurrently developed images, MiB.
+    pub memory_budget_mb: u32,
+}
+
+/// One file an export would write (`plan_export`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedFile {
+    pub image_id: ImageId,
+    /// Final absolute path after the collision policy; `null` when it would be skipped.
+    pub path: Option<String>,
+    /// The template's path already exists on disk (before the collision policy).
+    pub exists: bool,
+}
+
+/// Dry run of an export: resolved paths, no pixels. Disk state may change before it runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPlan {
+    /// Resolved destination incl. subfolder; `null` for `source_folder` (one per RAW folder).
+    pub output_dir: Option<String>,
+    /// In `ids` order.
+    pub files: Vec<PlannedFile>,
+    /// How many `files` have `exists`.
+    pub existing: u32,
+}
+
+string_enum! {
+    pub enum ExportJobState {
+        /// Waiting for an earlier job (jobs run one at a time, in order).
+        Queued => "queued",
+        Running => "running",
+        /// Every image was processed (some may have failed or been skipped).
+        Completed => "completed",
+        /// Stopped by `cancel_export`; files already written are kept.
+        Cancelled => "cancelled",
+        /// The app quit while the job was queued/running (not resumed).
+        Interrupted => "interrupted",
+    }
+}
+
+/// An image that could not be exported.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFailure {
+    pub image_id: ImageId,
+    /// Source RAW file name (for display).
+    pub file_name: String,
+    pub reason: String,
+}
+
+/// An export job (live or from history).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportJob {
+    pub id: ExportJobId,
+    pub state: ExportJobState,
+    /// Label passed to `export_images` (usually the preset name).
+    pub preset_name: Option<String>,
+    pub format: ExportFormatKind,
+    pub total: u32,
+    /// `succeeded + failed + skipped`.
+    pub done: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    /// Existing files left alone (`collision = skip`).
+    pub skipped: u32,
+    /// Resolved destination incl. subfolder; `null` for `source_folder`.
+    pub output_dir: Option<String>,
+    pub failures: Vec<ExportFailure>,
+    pub created_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,5 +1837,69 @@ mod tests {
         assert!(RenderOptions { region: Some(region), ..ok.clone() }.validate().is_err());
         let region = NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
         assert!(RenderOptions { region: Some(region), ..ok }.validate().is_ok());
+    }
+
+    #[test]
+    fn filename_templates_parse() {
+        assert_eq!(
+            parse_filename_template("Smith {date:YYYY-MM-DD}_{seq:4}-{filename}").unwrap(),
+            vec![
+                TemplatePart::Text("Smith ".into()),
+                TemplatePart::Date { format: "YYYY-MM-DD".into() },
+                TemplatePart::Text("_".into()),
+                TemplatePart::Seq { digits: 4 },
+                TemplatePart::Text("-".into()),
+                TemplatePart::Filename,
+            ]
+        );
+        assert_eq!(parse_filename_template("{date}").unwrap(), vec![TemplatePart::Date { format: "YYYYMMDD".into() }]);
+        assert_eq!(parse_filename_template("{seq}").unwrap(), vec![TemplatePart::Seq { digits: 1 }]);
+        for t in ["{rating}{camera}{folder}{id}", "Ünïcödé name"] {
+            assert!(parse_filename_template(t).is_ok(), "{t}");
+        }
+        for bad in ["", "   ", "{nope}", "{filename", "a}b", "a/b", "a:b", "{seq:0}", "{seq:10}", "{date:Q}", "{id:1}"]
+        {
+            assert!(parse_filename_template(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn export_settings_validate_and_builtins_roundtrip() {
+        let builtins = ExportPreset::builtins();
+        assert_eq!(builtins.len(), 3);
+        for p in &builtins {
+            assert!(p.built_in && p.id < 0);
+            p.settings.validate().unwrap();
+            let json = serde_json::to_string(&p.settings).unwrap();
+            assert_eq!(serde_json::from_str::<ExportSettings>(&json).unwrap(), p.settings);
+        }
+        let json = serde_json::to_value(&builtins[2].settings).unwrap();
+        assert_eq!(json["format"], serde_json::json!({ "kind": "tiff", "bitDepth": "16", "compression": "lzw" }));
+        assert_eq!(json["colorSpace"], "adobe_rgb");
+        assert_eq!(json["destination"], serde_json::json!({ "kind": "choose" }));
+
+        let base = builtins[0].settings.clone();
+        let with = |f: &dyn Fn(&mut ExportSettings)| {
+            let mut s = base.clone();
+            f(&mut s);
+            s.validate()
+        };
+        assert!(with(
+            &|s| s.format = ExportFormat::Jpeg { quality: 101, chroma_subsampling: ChromaSubsampling::Yuv420 }
+        )
+        .is_err());
+        assert!(with(&|s| s.resize.mode = ResizeMode::LongEdge { px: 8 }).is_err());
+        assert!(with(&|s| s.resize.mode = ResizeMode::Megapixels { mp: f32::NAN }).is_err());
+        assert!(with(&|s| s.resize.mode = ResizeMode::WidthHeight { width: 1920, height: 1080 }).is_ok());
+        assert!(with(&|s| s.resize.resolution_ppi = 0).is_err());
+        assert!(with(&|s| s.destination = ExportDestination::Folder { path: "relative/dir".into() }).is_err());
+        assert!(with(&|s| s.destination = ExportDestination::Folder { path: "/tmp/out".into() }).is_ok());
+        for bad in ["", "/abs", "a/../b", "a//b", "./a", "a\\b"] {
+            assert!(with(&|s| s.subfolder = Some(bad.into())).is_err(), "{bad}");
+        }
+        assert!(with(&|s| s.subfolder = Some("Smith Wedding/Web".into())).is_ok());
+        assert!(with(&|s| s.metadata.copyright = Some("x".repeat(501))).is_err());
+        assert_eq!(ExportFormatKind::Tiff.extension(), "tif");
+        assert_eq!(base.format.bit_depth(), BitDepth::Eight);
     }
 }

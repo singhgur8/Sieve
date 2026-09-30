@@ -1,5 +1,6 @@
 pub mod db;
 pub mod develop;
+pub mod export;
 pub mod ingest;
 pub mod ipc;
 pub mod lut;
@@ -13,11 +14,12 @@ use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use develop::{DevelopCache, DevelopConfig};
+use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
-    AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ImportProgress, ThumbnailFailed, ThumbnailReady,
-    XmpSynced, XmpWriteFailed,
+    AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress, ImportProgress,
+    ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -35,6 +37,8 @@ const MODELS_ENV: &str = "SIEVE_MODELS";
 const LUTS_ENV: &str = "SIEVE_LUTS";
 /// Overrides the develop cache budget in MiB (default `DevelopConfig::DEFAULT_CACHE_MB`).
 const DEVELOP_CACHE_ENV: &str = "SIEVE_DEVELOP_CACHE_MB";
+/// Overrides the export memory budget in MiB (default: 25% of RAM, clamped to 2..=8 GiB).
+const EXPORT_MEMORY_ENV: &str = "SIEVE_EXPORT_MEMORY_MB";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -90,6 +94,14 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::list_luts,
             commands::import_lut,
             commands::delete_lut,
+            commands::get_export_capabilities,
+            commands::list_export_presets,
+            commands::save_export_preset,
+            commands::delete_export_preset,
+            commands::plan_export,
+            commands::export_images,
+            commands::cancel_export,
+            commands::get_export_jobs,
         ])
         .events(collect_events![
             ImportProgress,
@@ -100,7 +112,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             AnalysisFailed,
             AnalysisFinished,
             XmpSynced,
-            XmpWriteFailed
+            XmpWriteFailed,
+            ExportProgress,
+            ExportFinished
         ])
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
@@ -157,6 +171,7 @@ pub fn run() {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DevelopConfig::DEFAULT_CACHE_MB);
+            let export_memory_mb = std::env::var(EXPORT_MEMORY_ENV).ok().and_then(|v| v.parse::<u64>().ok());
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
@@ -168,9 +183,15 @@ pub fn run() {
             app.manage(catalog);
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
-            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path }));
+            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }));
             app.manage(DevelopCache::new(DevelopConfig { cache_bytes: develop_cache_mb * 1024 * 1024 }));
-            app.manage(LutLibrary::new(luts_dir));
+            let luts = LutLibrary::new(luts_dir);
+            let exporter =
+                Exporter::new(ExportConfig { catalog_path: path, memory_budget_mb: export_memory_mb }, luts.clone());
+            // Jobs cut off by a previous quit become `interrupted` (never resumed).
+            exporter.recover_interrupted()?;
+            app.manage(luts);
+            app.manage(exporter);
             // Auto tags change during analysis; flush them (if auto-sync is on) once it settles.
             let handle = app.handle().clone();
             AnalysisFinished::listen(app.handle(), move |_| handle.state::<XmpSync>().notify(&handle));
