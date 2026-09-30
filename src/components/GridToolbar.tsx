@@ -1,8 +1,8 @@
-import { ArrowDownAZ, ArrowUpAZ, Columns2, Grid3x3, Maximize, SkipForward } from "lucide-react";
+import { ArrowDownAZ, ArrowUpAZ, Columns2, Grid3x3, Maximize, SkipForward, SlidersHorizontal } from "lucide-react";
 import type { ImageSort } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 
-export type Mode = "grid" | "loupe" | "compare";
+export type Mode = "grid" | "loupe" | "compare" | "develop";
 
 const SORTS: { key: ImageSort; label: string }[] = [
   { key: "capture_time", label: "Capture time" },
@@ -38,6 +38,9 @@ export function GridToolbar(p: Props) {
         </button>
         <button className={seg(p.mode === "compare")} onClick={() => p.onMode("compare")} title="Compare (C)" data-testid="mode-compare">
           <Columns2 className="size-3.5" /> Compare
+        </button>
+        <button className={seg(p.mode === "develop")} onClick={() => p.onMode("develop")} title="Develop (D)" data-testid="mode-develop">
+          <SlidersHorizontal className="size-3.5" /> Develop
         </button>
       </div>
       <label className="flex items-center gap-2">

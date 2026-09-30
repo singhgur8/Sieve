@@ -2,13 +2,21 @@
 // Uses Tauri's official IPC mocks; image bytes are served by the test harness (Playwright route)
 // or fall back to broken images when opened by hand. Loaded only in dev builds (see main.tsx).
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { neutralAdjustments, copyFields } from "../lib/adjust";
 import type {
   BurstGroup,
   CatalogState,
   CullTag,
   FaceInfo,
+  AdjustmentField,
+  AdjustmentHistory,
   FilterCounts,
+  HistoryEntry,
   ImageQuery,
+  LutInfo,
+  ParametricAdjustments,
+  Preset,
+  RenderOptions,
   PickFlag,
   RawImageEntry,
 } from "../ipc";
@@ -24,6 +32,8 @@ export interface MockCall {
 declare global {
   interface Window {
     __ipcLog: MockCall[];
+    /** Test hook: delay (ms) before a `render_preview` call with this per-slot sequence number resolves. */
+    __mockRenderDelay?: (seq: number, slot: string) => number;
   }
 }
 
@@ -190,6 +200,101 @@ export function installMockBackend(count: number) {
           considered: true,
         }));
 
+  // ---- develop (v5) emulation: adjustments, linear history with cursor, presets, LUTs, renders ----
+  interface Hist {
+    entries: (HistoryEntry & { snap: ParametricAdjustments })[];
+    cursor: number; // index into entries, -1 = never edited
+    lastAt: number;
+  }
+  const adjs = new Map<number, ParametricAdjustments>();
+  const hists = new Map<number, Hist>();
+  const seqs = new Map<string, number>();
+  let entryId = 0;
+  let presetId = 0;
+  const presets: Preset[] = [];
+  const luts: LutInfo[] = [
+    { id: "film-warm", name: "Film Warm", kind: "lut_3d", size: 33, path: "/mock/luts/film-warm.cube" },
+    { id: "teal-orange", name: "Teal Orange", kind: "lut_3d", size: 33, path: "/mock/luts/teal-orange.cube" },
+  ];
+  const getAdj = (id: number) => adjs.get(id) ?? neutralAdjustments();
+  const histOf = (id: number): Hist => {
+    let h = hists.get(id);
+    if (!h) hists.set(id, (h = { entries: [], cursor: -1, lastAt: 0 }));
+    return h;
+  };
+  const historyDto = (id: number): AdjustmentHistory => {
+    const h = histOf(id);
+    return {
+      imageId: id,
+      entries: h.entries.map(({ id: i, label, createdAtMs }) => ({ id: i, label, createdAtMs })),
+      currentEntryId: h.cursor < 0 ? null : h.entries[h.cursor].id,
+      canUndo: h.cursor > 0,
+      canRedo: h.cursor >= 0 && h.cursor < h.entries.length - 1,
+    };
+  };
+  const isNeutral = (a: ParametricAdjustments) => JSON.stringify(a) === JSON.stringify(neutralAdjustments());
+  function commit(id: number, next: ParametricAdjustments, label: string) {
+    const cur = getAdj(id);
+    const h = histOf(id);
+    if (JSON.stringify(cur) === JSON.stringify(next)) return;
+    if (h.cursor < 0) {
+      h.entries.push({ id: ++entryId, label: "Original", createdAtMs: Date.now(), snap: cur });
+      h.cursor = 0;
+    }
+    const now = Date.now();
+    h.entries.length = h.cursor + 1;
+    const last = h.entries[h.cursor];
+    if (h.cursor > 0 && last.label === label && now - h.lastAt < 1500) {
+      last.snap = next;
+    } else {
+      h.entries.push({ id: ++entryId, label, createdAtMs: now, snap: next });
+      h.cursor++;
+    }
+    h.lastAt = now;
+    adjs.set(id, next);
+    const r = byId.get(id);
+    if (r) r.hasEdits = !isNeutral(next);
+  }
+  function jump(id: number, cursor: number) {
+    const h = histOf(id);
+    if (h.cursor < 0) return { adjustments: getAdj(id), history: historyDto(id) };
+    h.cursor = Math.max(0, Math.min(h.entries.length - 1, cursor));
+    h.lastAt = 0;
+    const snap = h.entries[h.cursor].snap;
+    adjs.set(id, snap);
+    const r = byId.get(id);
+    if (r) r.hasEdits = !isNeutral(snap);
+    return { adjustments: snap, history: historyDto(id) };
+  }
+  function histogram(a: ParametricAdjustments) {
+    const shift = a.exposure * 18 + a.contrast * 0.1;
+    const bump = (mu: number, sd: number) => Array.from({ length: 256 }, (_, i) => Math.round(4000 * Math.exp(-((i - mu) ** 2) / (2 * sd * sd))));
+    return { red: bump(120 + shift + 8, 40), green: bump(110 + shift, 36), blue: bump(95 + shift - 8, 44), luma: bump(112 + shift, 38) };
+  }
+  async function render(id: number, a: ParametricAdjustments, o: RenderOptions) {
+    const key = `${id}:${o.slot}`;
+    const seq = (seqs.get(key) ?? 0) + 1;
+    seqs.set(key, seq);
+    const delay = window.__mockRenderDelay?.(seq, o.slot) ?? 0;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    const q = new URLSearchParams({ v: String(seq), e: a.exposure.toFixed(2), lut: a.lut?.id ?? "", region: o.region ? "1" : "" });
+    return {
+      imageId: id,
+      slot: o.slot,
+      seq,
+      url: `/mock/render/${id}/${o.slot}?${q}`,
+      width: o.maxEdge,
+      height: Math.round(o.maxEdge * (o.region ? 1 : 2 / 3)),
+      histogram: histogram(a),
+      renderMs: 7 + (seq % 5),
+      lutMissing: !!a.lut && !luts.some((l) => l.id === a.lut!.id),
+    };
+  }
+  function batch(ids: number[], label: string, fn: (a: ParametricAdjustments) => ParametricAdjustments) {
+    ids.forEach((i) => commit(i, fn(getAdj(i)), label));
+    return null;
+  }
+
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
 
   mockIPC(
@@ -260,6 +365,73 @@ export function installMockBackend(count: number) {
         case "set_shoot_type":
           catalog = { ...catalog, shootType: args.shootType as CatalogState["shootType"] };
           return null;
+        case "get_adjustments":
+          return getAdj(args.id as number);
+        case "save_adjustments":
+          commit(args.id as number, args.adjustments as ParametricAdjustments, args.label as string);
+          return historyDto(args.id as number);
+        case "get_history":
+          return historyDto(args.id as number);
+        case "undo_adjustments": {
+          const h = histOf(args.id as number);
+          return jump(args.id as number, h.cursor - 1);
+        }
+        case "redo_adjustments": {
+          const h = histOf(args.id as number);
+          return jump(args.id as number, h.cursor + 1);
+        }
+        case "goto_history": {
+          const h = histOf(args.id as number);
+          return jump(args.id as number, h.entries.findIndex((e) => e.id === args.entryId));
+        }
+        case "get_develop_info":
+          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000 };
+        case "prepare_develop":
+          return null;
+        case "render_preview":
+          return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);
+        case "paste_settings":
+          return batch(ids, "Paste Settings", (a) => copyFields(a, args.adjustments as ParametricAdjustments, args.fields as AdjustmentField[]));
+        case "sync_settings": {
+          const src = getAdj(args.sourceId as number);
+          return batch(args.targetIds as number[], "Sync Settings", (a) => copyFields(a, src, args.fields as AdjustmentField[]));
+        }
+        case "reset_adjustments":
+          return batch(ids, "Reset", () => neutralAdjustments());
+        case "apply_preset": {
+          const p = presets.find((x) => x.id === args.presetId);
+          if (!p) throw { kind: "not_found", message: "preset" };
+          return batch(ids, `Preset: ${p.name}`, (a) => copyFields(a, p.adjustments, p.fields));
+        }
+        case "list_presets":
+          return [...presets].sort((a, b) => a.name.localeCompare(b.name));
+        case "save_preset": {
+          const now = Date.now();
+          const existing = presets.find((x) => x.id === args.id);
+          if (existing) {
+            Object.assign(existing, { name: args.name, adjustments: args.adjustments, fields: args.fields, updatedAtMs: now });
+            return existing;
+          }
+          const p: Preset = { id: ++presetId, name: args.name as string, adjustments: args.adjustments as ParametricAdjustments, fields: args.fields as AdjustmentField[], createdAtMs: now, updatedAtMs: now };
+          presets.push(p);
+          return p;
+        }
+        case "delete_preset":
+          presets.splice(presets.findIndex((x) => x.id === args.id), 1);
+          return null;
+        case "list_luts":
+          return luts;
+        case "import_lut": {
+          const name = (args.path as string).split("/").pop()!.replace(/\.cube$/i, "");
+          const l: LutInfo = { id: name.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name, kind: "lut_3d", size: 33, path: args.path as string };
+          if (!luts.some((x) => x.id === l.id)) luts.push(l);
+          return l;
+        }
+        case "delete_lut":
+          luts.splice(luts.findIndex((x) => x.id === args.id), 1);
+          return null;
+        case "plugin:dialog|open":
+          return "/mock/import/Moody Blue.cube";
         default:
           return null;
       }

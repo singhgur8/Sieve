@@ -12,6 +12,7 @@ import { FilterBar } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
 import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
+import { DevelopView, type DevelopHandle } from "./components/develop/DevelopView";
 import { AnalysisBar, ImportBar } from "./components/ProgressBars";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
@@ -26,6 +27,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const colsRef = useRef(1);
   const loupe = useRef<LoupeHandle>(null);
+  const develop = useRef<DevelopHandle>(null);
   const reloadRef = useRef<() => void>(() => {});
 
   const onLibraryChanged = useCallback(() => reloadRef.current(), []);
@@ -61,7 +63,7 @@ export default function App() {
 
   const targets = useCallback((): number[] => {
     if (mode === "compare" && cmp) return [cmp[cmp.focus]];
-    if (mode === "loupe") return sel.active != null ? [sel.active] : [];
+    if (mode === "loupe" || mode === "develop") return sel.active != null ? [sel.active] : [];
     if (sel.selected.size > 0) return [...sel.selected];
     return sel.active != null ? [sel.active] : [];
   }, [mode, cmp, sel.active, sel.selected]);
@@ -137,15 +139,25 @@ export default function App() {
     }
   }, [ids, mode, sel, lib, query.folderId, reportError]);
 
+  const openDevelop = useCallback(() => {
+    const target = sel.active ?? ids[0];
+    if (target == null) return;
+    // Keep a multi-selection (for sync / paste); otherwise select just the image.
+    if (!sel.selected.has(target)) sel.set([target], target);
+    setCmp(null);
+    setMode("develop");
+  }, [sel, ids]);
+
   const changeMode = useCallback(
     (m: Mode) => {
       if (m === "grid") {
         setMode("grid");
         setCmp(null);
-      } else if (m === "loupe") openLoupe();
+      } else if (m === "develop") openDevelop();
+      else if (m === "loupe") openLoupe();
       else void enterCompare();
     },
-    [openLoupe, enterCompare],
+    [openLoupe, openDevelop, enterCompare],
   );
 
   // ---- culling actions (batch over targets) ----
@@ -240,6 +252,24 @@ export default function App() {
   useKeyboard((e) => {
     const k = e.key;
     const lower = k.toLowerCase();
+    if ((e.metaKey || e.ctrlKey) && mode === "develop") {
+      if (lower === "z") {
+        e.preventDefault();
+        if (e.shiftKey) develop.current?.redo();
+        else develop.current?.undo();
+        return;
+      }
+      if (e.shiftKey && lower === "c") {
+        e.preventDefault();
+        develop.current?.copy();
+        return;
+      }
+      if (e.shiftKey && lower === "v") {
+        e.preventDefault();
+        develop.current?.paste();
+        return;
+      }
+    }
     if (e.metaKey || e.ctrlKey) {
       if (lower === "a") {
         e.preventDefault();
@@ -252,6 +282,15 @@ export default function App() {
     }
     if (e.altKey) return;
     const used = () => e.preventDefault();
+    if (mode === "develop") {
+      if (k === "\\") { used(); develop.current?.toggleBefore(); return; }
+      if (lower === "d") { used(); return; }
+      if (lower === "z") { used(); develop.current?.toggleZoom(); return; }
+      if (k === " " || k === "Enter" || k === "Tab" || lower === "c" || lower === "f" || lower === "e") {
+        if (lower === "e") { used(); changeMode("grid"); }
+        return;
+      }
+    }
     if (lower === "p") { used(); doPick("pick", e.shiftKey); return; }
     if (lower === "x") { used(); doPick("reject", e.shiftKey); return; }
     if (lower === "u") { used(); doPick("unflagged", false); return; }
@@ -304,6 +343,10 @@ export default function App() {
       case "g":
         used();
         changeMode("grid");
+        return;
+      case "d":
+        used();
+        openDevelop();
         return;
       case "c":
         used();
@@ -447,7 +490,10 @@ export default function App() {
           onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
           onCellDoubleClick={openLoupe}
         />
-        {mode !== "grid" && (
+        {mode === "develop" && (
+          <DevelopView ref={develop} lib={lib} sel={sel} onError={reportError} onNotice={setNotice} onBack={() => changeMode("grid")} />
+        )}
+        {(mode === "loupe" || mode === "compare") && (
           <LoupeLayer
             ref={loupe}
             mode={mode}
