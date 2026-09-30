@@ -83,6 +83,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::get_xmp_status,
             commands::render_preview,
             commands::get_develop_info,
+            commands::sample_white_balance,
             commands::prepare_develop,
             commands::get_history,
             commands::undo_adjustments,

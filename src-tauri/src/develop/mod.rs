@@ -45,8 +45,8 @@ use tauri::http;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect, ParametricAdjustments,
-    ProfileSettings, RenderOptions, RenderSlot, RenderedPreview,
+    CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormPoint, NormRect, ParametricAdjustments,
+    ProfileSettings, RenderOptions, RenderSlot, RenderedPreview, WhiteBalanceValues,
 };
 use crate::lut::LutLibrary;
 use crate::profiles::ProfileLibrary;
@@ -513,6 +513,79 @@ impl DevelopCache {
     }
 }
 
+impl DevelopCache {
+    /// Blocking. White balance picker: the temperature/tint that makes the 5x5 source-pixel
+    /// neighbourhood around `point` (sensor frame: normalized, un-oriented, uncropped) neutral,
+    /// through the colour matrices of `adjustments.profile` (same path as `DevelopInfo.asShot`).
+    /// `invalid_argument` if the sample is clipped or too dark. Decodes the source if needed.
+    pub fn sample_white_balance(
+        &self,
+        src: &SourceImage,
+        point: NormPoint,
+        adjustments: &ParametricAdjustments,
+    ) -> AppResult<WhiteBalanceValues> {
+        let entry = self.entry(src)?;
+        self.evict(src.id);
+        let mul = sample_multipliers(&entry.image, point)?;
+        let profile = entry.profile(&adjustments.profile);
+        camera::values_of_multipliers(mul, &entry.image.color, &profile)
+            .ok_or_else(|| AppError::invalid("could not measure a white balance at this point"))
+    }
+}
+
+/// Half-width of the white balance picker's sample window (5x5 source pixels).
+pub const WB_SAMPLE_RADIUS: u32 = 2;
+/// A sample pixel with any channel at or above this (white = 65535) counts as clipped.
+pub const WB_CLIP_LEVEL: u16 = 64_200;
+/// Mean channel values below this (about -12 EV) are too dark to measure.
+pub const WB_MIN_LEVEL: f64 = 16.0;
+
+/// Multipliers (R, G, B; G = 1) that neutralize the mean of the 5x5 window of `img`
+/// (un-oriented source pixels) around `point` (sensor frame). The window is shifted inside
+/// the image near edges. Errors (`invalid_argument`): point outside 0..=1, any sample pixel
+/// clipped, any channel mean too dark.
+pub fn sample_multipliers(img: &LinearImage, point: NormPoint) -> AppResult<[f32; 3]> {
+    let inside = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+    if !inside(point.x) || !inside(point.y) {
+        return Err(AppError::invalid("white balance sample point must be within 0..=1"));
+    }
+    if img.width == 0 || img.height == 0 || img.pixels.len() < img.width as usize * img.height as usize * 3 {
+        return Err(AppError::internal("develop source has no pixels"));
+    }
+    let span = |norm: f32, size: u32| {
+        let size = i64::from(size);
+        let r = i64::from(WB_SAMPLE_RADIUS);
+        let c = ((f64::from(norm) * size as f64).floor() as i64).clamp(0, size - 1);
+        let lo = (c - r).clamp(0, (size - 2 * r - 1).max(0));
+        let hi = (lo + 2 * r).min(size - 1);
+        (lo as usize, hi as usize)
+    };
+    let (x0, x1) = span(point.x, img.width);
+    let (y0, y1) = span(point.y, img.height);
+    let mut sum = [0.0f64; 3];
+    let mut n = 0.0f64;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = (y * img.width as usize + x) * 3;
+            let px = &img.pixels[i..i + 3];
+            if px.iter().any(|&v| v >= WB_CLIP_LEVEL) {
+                return Err(AppError::invalid(
+                    "the sampled area is clipped (overexposed); pick a neutral grey or white that is not blown out",
+                ));
+            }
+            for (s, &v) in sum.iter_mut().zip(px) {
+                *s += f64::from(v);
+            }
+            n += 1.0;
+        }
+    }
+    let mean = sum.map(|s| s / n);
+    if mean.iter().any(|&m| m < WB_MIN_LEVEL) {
+        return Err(AppError::invalid("the sampled area is too dark to measure; pick a brighter neutral"));
+    }
+    Ok([(mean[1] / mean[0]) as f32, 1.0, (mean[1] / mean[2]) as f32])
+}
+
 /// Result of [`DevelopCache::render_image`].
 #[derive(Debug, Clone)]
 pub struct RenderedPixels {
@@ -585,6 +658,117 @@ pub fn handle_protocol(cache: &DevelopCache, request: &http::Request<Vec<u8>>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sony ILCE-7M3 `ColorMatrix2` (XYZ -> camera).
+    const A7M3: [[f32; 3]; 3] = [[0.7374, -0.2389, -0.0551], [-0.5435, 1.3162, 0.2519], [-0.1006, 0.1795, 0.6552]];
+
+    /// Uniform `w` x `h` source of camera RGB `rgb` with one pixel overridden.
+    fn flat_source(w: u32, h: u32, rgb: [u16; 3], as_shot: [f32; 3], hot: Option<(u32, u32, [u16; 3])>) -> LinearImage {
+        let mut pixels: Vec<u16> = (0..w * h).flat_map(|_| rgb).collect();
+        if let Some((x, y, v)) = hot {
+            let i = ((y * w + x) * 3) as usize;
+            pixels[i..i + 3].copy_from_slice(&v);
+        }
+        LinearImage {
+            width: w,
+            height: h,
+            pixels,
+            color: source::ColorInfo {
+                as_shot_mul: Some(as_shot),
+                daylight_mul: [1.0; 3],
+                rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                xyz_to_cam: A7M3,
+            },
+            full_width: w * 2,
+            full_height: h * 2,
+            display_referred: false,
+            source_color: None,
+        }
+    }
+
+    /// Camera RGB of a grey card lit by the illuminant the multipliers neutralize.
+    fn grey_under(mul: [f32; 3], level: f32) -> [u16; 3] {
+        mul.map(|m| (level / m).round() as u16)
+    }
+
+    #[test]
+    fn wb_sample_of_as_shot_grey_returns_as_shot() {
+        let as_shot = [2.1, 1.0, 1.6];
+        let img = flat_source(40, 30, grey_under(as_shot, 20_000.0), as_shot, None);
+        let mul = sample_multipliers(&img, NormPoint { x: 0.5, y: 0.5 }).unwrap();
+        for (a, b) in mul.iter().zip(as_shot) {
+            assert!((a - b).abs() < 1e-3, "{mul:?}");
+        }
+        // Matrix path and DCP path both match what DevelopInfo.asShot reports.
+        let dcp = camera::Profile { dcp: Some(Arc::new(camera::matrix_dcp(&img.color))), ..Default::default() };
+        for profile in [camera::Profile::matrix(0.0), dcp] {
+            let want = camera::as_shot_values(&img.color, &profile).unwrap();
+            let got = camera::values_of_multipliers(mul, &img.color, &profile).unwrap();
+            assert!((got.temperature_k - want.temperature_k).abs() < 5.0, "{got:?} vs {want:?}");
+            assert!((got.tint - want.tint).abs() < 0.5, "{got:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn wb_sample_recovers_a_known_cast() {
+        // A grey card under 3200 K / +10 on a daylight-as-shot frame.
+        let target = WhiteBalanceValues { temperature_k: 3200.0, tint: 10.0 };
+        let cast = wb::multipliers_for(target, &A7M3);
+        let img = flat_source(20, 20, grey_under(cast, 15_000.0), [2.0, 1.0, 1.4], None);
+        // Corners: the window shifts inside the image.
+        for p in [NormPoint { x: 0.0, y: 0.0 }, NormPoint { x: 1.0, y: 1.0 }, NormPoint { x: 0.3, y: 0.7 }] {
+            let mul = sample_multipliers(&img, p).unwrap();
+            let v = camera::values_of_multipliers(mul, &img.color, &camera::Profile::matrix(0.0)).unwrap();
+            assert!((v.temperature_k - 3200.0).abs() < 15.0, "{v:?}");
+            assert!((v.tint - 10.0).abs() < 1.0, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn wb_sample_rejects_clipped_dark_and_out_of_range() {
+        let grey = grey_under([2.0, 1.0, 1.5], 20_000.0);
+        let hot = Some((10, 10, [30_000, 65_535, 20_000]));
+        let img = flat_source(21, 21, grey, [2.0, 1.0, 1.5], hot);
+        let e = sample_multipliers(&img, NormPoint { x: 0.5, y: 0.5 }).unwrap_err();
+        assert_eq!(e.kind, crate::ipc::error::ErrorKind::InvalidArgument);
+        assert!(e.message.contains("clipped"), "{}", e.message);
+        // Away from the clipped pixel (outside its 5x5 window) is fine.
+        assert!(sample_multipliers(&img, NormPoint { x: 0.05, y: 0.05 }).is_ok());
+        let dark = flat_source(10, 10, [3, 5, 4], [2.0, 1.0, 1.5], None);
+        let e = sample_multipliers(&dark, NormPoint { x: 0.5, y: 0.5 }).unwrap_err();
+        assert!(e.message.contains("too dark"), "{}", e.message);
+        for p in [NormPoint { x: -0.1, y: 0.5 }, NormPoint { x: 0.5, y: 1.2 }, NormPoint { x: f32::NAN, y: 0.5 }] {
+            let e = sample_multipliers(&img, p).unwrap_err();
+            assert_eq!(e.kind, crate::ipc::error::ErrorKind::InvalidArgument);
+        }
+    }
+
+    /// End to end through the cache on a display-referred PNG (orientation 6): the point is
+    /// in the un-oriented frame; grey neutralizes to ~D65, white is clipped.
+    #[test]
+    fn wb_sample_through_cache() {
+        let (w, h) = (24u32, 12u32);
+        let mut px = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&if x < w / 2 { [128u8, 128, 128] } else { [255, 255, 255] });
+            }
+        }
+        let bytes = crate::raw::png::test_support::encode(w, h, None, Some(&px), None, None, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grey.png");
+        std::fs::write(&path, bytes).unwrap();
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 64 << 20 });
+        let src = SourceImage { id: 1, path, orientation: Some(6) };
+        let adj = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Png);
+        let v = cache.sample_white_balance(&src, NormPoint { x: 0.2, y: 0.5 }, &adj).unwrap();
+        // sRGB grey = D65 in Adobe's temperature/tint model.
+        let (t65, n65) = wb::temp_tint_for(0.3127, 0.3290);
+        assert!((f64::from(v.temperature_k) - t65).abs() < 30.0, "{v:?} vs {t65}");
+        assert!((f64::from(v.tint) - n65).abs() < 1.0, "{v:?} vs {n65}");
+        let e = cache.sample_white_balance(&src, NormPoint { x: 0.8, y: 0.5 }, &adj).unwrap_err();
+        assert!(e.message.contains("clipped"), "{}", e.message);
+    }
 
     #[test]
     fn tickets_are_latest_wins_per_key() {
