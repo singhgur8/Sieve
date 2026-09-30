@@ -112,7 +112,11 @@ impl GuideStats {
         let (gw, gh) = (guide.width.max(1) as usize, guide.height.max(1) as usize);
         let k = (WORK_EDGE as f32 / gw.max(gh) as f32).min(1.0);
         let (ww, wh) = (((gw as f32 * k).round() as usize).max(1), ((gh as f32 * k).round() as usize).max(1));
-        let small = if (ww, wh) == (gw, gh) { guide.rgb[..gw * gh * 3].to_vec() } else { resize_rgb(guide.rgb, gw, gh, ww, wh) };
+        let small = if (ww, wh) == (gw, gh) {
+            guide.rgb[..gw * gh * 3].to_vec()
+        } else {
+            resize_rgb(guide.rgb, gw, gh, ww, wh)
+        };
         let n = ww * wh;
         let chan: [Vec<f32>; 3] = std::array::from_fn(|c| (0..n).map(|i| small[i * 3 + c] as f32 / 255.0).collect());
         // Frame long edge in solve-grid pixels.
@@ -215,7 +219,14 @@ pub fn refine_with(stats: &GuideStats, alpha: &AlphaMask, guide: &Guide, params:
         let cv = [m_ip[0][i] - mi[0] * m_p[i], m_ip[1][i] - mi[1] * m_p[i], m_ip[2][i] - mi[2] * m_p[i]];
         let c = &stats.cov;
         let (rr, rg, rb, gg, gb, bl) = (c[0][g] + eps, c[1][g], c[2][g], c[3][g] + eps, c[4][g], c[5][g] + eps);
-        let inv = [gg * bl - gb * gb, gb * rb - rg * bl, rg * gb - gg * rb, rr * bl - rb * rb, rg * rb - rr * gb, rr * gg - rg * rg];
+        let inv = [
+            gg * bl - gb * gb,
+            gb * rb - rg * bl,
+            rg * gb - gg * rb,
+            rr * bl - rb * rb,
+            rg * rb - rr * gb,
+            rr * gg - rg * rg,
+        ];
         let det = rr * inv[0] + rg * inv[1] + rb * inv[2];
         let (ar, ag, ab) = if det.abs() > 1e-12 {
             (
@@ -333,7 +344,8 @@ fn resize_rgb(src: &[u8], w: usize, h: usize, dw: usize, dh: usize) -> Vec<u8> {
         for y in 0..dh {
             for x in 0..dw {
                 let (sx, sy) = (x * w / dw, y * h / dh);
-                out[(y * dw + x) * 3..(y * dw + x) * 3 + 3].copy_from_slice(&src[(sy * w + sx) * 3..(sy * w + sx) * 3 + 3]);
+                out[(y * dw + x) * 3..(y * dw + x) * 3 + 3]
+                    .copy_from_slice(&src[(sy * w + sx) * 3..(sy * w + sx) * 3 + 3]);
             }
         }
     }
@@ -457,7 +469,12 @@ mod tests {
         // Guide = right half of the frame.
         let region = NormRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 };
         let guide = Guide { width: w as u32, height: h as u32, rgb: &rgb, region };
-        let alpha = AlphaMask { width: 10, height: 10, bounds: NormRect { x: 0.6, y: 0.2, width: 0.2, height: 0.5 }, data: vec![255; 100] };
+        let alpha = AlphaMask {
+            width: 10,
+            height: 10,
+            bounds: NormRect { x: 0.6, y: 0.2, width: 0.2, height: 0.5 },
+            data: vec![255; 100],
+        };
         let stats = GuideStats::new(&guide, RefineParams::PERSON.radius);
         let a = refine_with(&stats, &alpha, &guide, RefineParams::PERSON);
         let b = refine(&alpha, &guide, RefineParams::PERSON);
@@ -494,7 +511,8 @@ mod tests {
             let mut disp = vec![0u8; sw * sh];
             for y in 0..sh {
                 for x in 0..sw {
-                    let p = orient_point(NormPoint { x: (x as f32 + 0.5) / sw as f32, y: (y as f32 + 0.5) / sh as f32 }, o);
+                    let p =
+                        orient_point(NormPoint { x: (x as f32 + 0.5) / sw as f32, y: (y as f32 + 0.5) / sh as f32 }, o);
                     let (dx, dy) = ((p.x * dw as f32) as usize, (p.y * dh as f32) as usize);
                     assert_eq!(oriented_index(x, y, sw, sh, o), (dx, dy), "orientation {o}");
                     disp[dy * dw + dx] = sensor[y * sw + x];

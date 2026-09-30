@@ -126,7 +126,13 @@ pub struct RegisteredModel {
 /// the seam is testable without the catalog and independent of the cache internals).
 pub trait MatteStore: Send + Sync {
     /// A `sieve` matte of (image, kind, model) computed from `input_digest`, if cached.
-    fn find(&self, image_id: ImageId, kind: &str, model_version: &str, input_digest: &str) -> AppResult<Option<CachedMatte>>;
+    fn find(
+        &self,
+        image_id: ImageId,
+        kind: &str,
+        model_version: &str,
+        input_digest: &str,
+    ) -> AppResult<Option<CachedMatte>>;
     fn put(&self, image_id: ImageId, matte: &NewMatte, mask: &AlphaMask) -> AppResult<AiMaskInfo>;
 }
 
@@ -157,7 +163,13 @@ impl CatalogMatteStore {
 }
 
 impl MatteStore for CatalogMatteStore {
-    fn find(&self, image_id: ImageId, kind: &str, model_version: &str, input_digest: &str) -> AppResult<Option<CachedMatte>> {
+    fn find(
+        &self,
+        image_id: ImageId,
+        kind: &str,
+        model_version: &str,
+        input_digest: &str,
+    ) -> AppResult<Option<CachedMatte>> {
         let conn = self.conn()?;
         let row = conn
             .query_row(
@@ -448,7 +460,12 @@ impl Segmenter {
     }
 
     /// Model input for `src` (cached per image + fingerprint; concurrent decodes coalesced).
-    fn source(&self, src: &SourceImage, preview_path: Option<&Path>, fingerprint: &str) -> AppResult<Arc<SourcePixels>> {
+    fn source(
+        &self,
+        src: &SourceImage,
+        preview_path: Option<&Path>,
+        fingerprint: &str,
+    ) -> AppResult<Arc<SourcePixels>> {
         let cached = || {
             lock(&self.inner.sources).iter().find(|(id, fp, _)| *id == src.id && fp == fingerprint).map(|e| e.2.clone())
         };
@@ -556,7 +573,9 @@ pub fn load_source(src: &SourceImage, preview_path: Option<&Path>) -> AppResult<
 
 fn orient_target(t: &AiTarget, orientation: u8) -> AiTarget {
     match t {
-        AiTarget::Object { region } if orientation != 1 => AiTarget::Object { region: orient_rect(*region, orientation) },
+        AiTarget::Object { region } if orientation != 1 => {
+            AiTarget::Object { region: orient_rect(*region, orientation) }
+        }
         t => t.clone(),
     }
 }

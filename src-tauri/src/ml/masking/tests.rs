@@ -66,9 +66,12 @@ impl PeopleDetector for StubPeople {
     }
 }
 
+/// (image, kind, model, input digest, row).
+type MemRow = (ImageId, String, String, String, CachedMatte);
+
 #[derive(Default)]
 struct MemStore {
-    rows: Mutex<Vec<(ImageId, String, String, String, CachedMatte)>>,
+    rows: Mutex<Vec<MemRow>>,
     puts: AtomicUsize,
 }
 
@@ -153,7 +156,8 @@ fn fixture(delay: Duration, parts_file_present: bool) -> Fixture {
         }),
     };
     let config = SegmenterConfig { models_dir: dir.path().into(), catalog_path: dir.path().join("c.sqlite") };
-    let mattes = MaskCache::new(MaskCacheConfig { catalog_path: config.catalog_path.clone(), cache_dir: dir.path().into() });
+    let mattes =
+        MaskCache::new(MaskCacheConfig { catalog_path: config.catalog_path.clone(), cache_dir: dir.path().into() });
     Fixture { seg: Segmenter::with_parts(config, mattes, parts), model, store, loads, dir }
 }
 
@@ -360,7 +364,8 @@ mod real {
             loader: Arc::new(|s: &SourceImage, _: Option<&Path>| Ok(decode(&s.path))),
         };
         let config = SegmenterConfig { models_dir: dir, catalog_path: PathBuf::from("/nonexistent/c.sqlite") };
-        let mattes = MaskCache::new(MaskCacheConfig { catalog_path: config.catalog_path.clone(), cache_dir: "/tmp".into() });
+        let mattes =
+            MaskCache::new(MaskCacheConfig { catalog_path: config.catalog_path.clone(), cache_dir: "/tmp".into() });
         (Segmenter::with_parts(config, mattes, parts), store)
     }
 
@@ -391,7 +396,9 @@ mod real {
         for (m, col) in layers {
             for y in 0..h {
                 for x in 0..w {
-                    let a = crate::ml::refine::sample_alpha(m, (x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32) * 0.8;
+                    let a =
+                        crate::ml::refine::sample_alpha(m, (x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32)
+                            * 0.8;
                     if a <= 0.0 {
                         continue;
                     }
@@ -418,8 +425,14 @@ mod real {
         v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
     }
 
-    const PALETTE: [[f32; 3]; 6] =
-        [[255.0, 80.0, 80.0], [80.0, 160.0, 255.0], [255.0, 220.0, 60.0], [80.0, 230.0, 120.0], [230.0, 120.0, 255.0], [60.0, 230.0, 230.0]];
+    const PALETTE: [[f32; 3]; 6] = [
+        [255.0, 80.0, 80.0],
+        [80.0, 160.0, 255.0],
+        [255.0, 220.0, 60.0],
+        [80.0, 230.0, 120.0],
+        [230.0, 120.0, 255.0],
+        [60.0, 230.0, 230.0],
+    ];
 
     /// Subject non-empty everywhere, sky ~0 without sky, sane person counts, parts; timings
     /// (cold = first image incl. model load, warm = median over the rest, cached = hit);
@@ -484,25 +497,41 @@ mod real {
             assert!(everyone.coverage > 0.005, "{name}: people coverage {}", everyone.coverage);
 
             // One person: whole, then parts (regions, then features) - computed lazily.
-            let first = people.iter().max_by(|a, b| (a.bbox.width * a.bbox.height).total_cmp(&(b.bbox.width * b.bbox.height))).unwrap();
+            let first = people
+                .iter()
+                .max_by(|a, b| (a.bbox.width * a.bbox.height).total_cmp(&(b.bbox.width * b.bbox.height)))
+                .unwrap();
             let rp = Some(first.reference_point);
             let t = Instant::now();
-            let person =
-                seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(AiTarget::People { parts: vec![] }) }).unwrap();
+            let person = seg
+                .compute(
+                    &src,
+                    None,
+                    &AiMaskRequest { reference_point: rp, ..request(AiTarget::People { parts: vec![] }) },
+                )
+                .unwrap();
             rec(i, "person (after detect)", t);
-            assert!(person.coverage > 0.002 && person.coverage <= everyone.coverage + 1e-3, "{name}: person {}", person.coverage);
+            assert!(
+                person.coverage > 0.002 && person.coverage <= everyone.coverage + 1e-3,
+                "{name}: person {}",
+                person.coverage
+            );
             let skin = AiTarget::People { parts: vec![PersonPart::FaceSkin, PersonPart::BodySkin, PersonPart::Hair] };
             let t = Instant::now();
-            let skin_info = seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(skin.clone()) }).unwrap();
+            let skin_info =
+                seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(skin.clone()) }).unwrap();
             rec(i, "parts: face+body skin+hair", t);
             assert!(skin_info.coverage > 0.0 && skin_info.coverage < person.coverage + 1e-3, "{name}");
-            let feats = AiTarget::People { parts: vec![PersonPart::EyeSclera, PersonPart::IrisPupil, PersonPart::Lips] };
+            let feats =
+                AiTarget::People { parts: vec![PersonPart::EyeSclera, PersonPart::IrisPupil, PersonPart::Lips] };
             let t = Instant::now();
-            let feat_info = seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(feats.clone()) }).unwrap();
+            let feat_info =
+                seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(feats.clone()) }).unwrap();
             rec(i, "parts: eyes+lips", t);
             let t = Instant::now();
             let clothes = AiTarget::People { parts: vec![PersonPart::Clothes] };
-            let cl_info = seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(clothes.clone()) }).unwrap();
+            let cl_info =
+                seg.compute(&src, None, &AiMaskRequest { reference_point: rp, ..request(clothes.clone()) }).unwrap();
             rec(i, "parts: clothes (planes cached)", t);
             println!(
                 "{name} {}x{}: subject {:.1}% ({t_subject:.0} ms) sky {:.2}% people {} (all {:.1}%, picked {:.1}%, skin+hair {:.2}%, eyes+lips {:.3}%, clothes {:.1}%)",
@@ -529,7 +558,8 @@ mod real {
                 .iter()
                 .map(|p| refined(&seg, AiTarget::People { parts: vec![] }, Some(p.reference_point), &img))
                 .collect();
-            let layers: Vec<(&AlphaMask, [f32; 3])> = persons.iter().enumerate().map(|(k, m)| (m, PALETTE[k % 6])).collect();
+            let layers: Vec<(&AlphaMask, [f32; 3])> =
+                persons.iter().enumerate().map(|(k, m)| (m, PALETTE[k % 6])).collect();
             save(&name, "people", &img, &overlay(&img, &layers));
             let part = |parts: Vec<PersonPart>| refined(&seg, AiTarget::People { parts }, rp, &img);
             let (cl, hair, face, body) = (
@@ -575,7 +605,8 @@ mod real {
     #[ignore = "needs models and a RAW in test-data"]
     fn real_develop_source_subject() {
         let raw = walk(Path::new(ROOT)).into_iter().find(|p| {
-            p.extension().is_some_and(|e| ["arw", "raf", "cr3"].contains(&e.to_ascii_lowercase().to_str().unwrap_or("")))
+            p.extension()
+                .is_some_and(|e| ["arw", "raf", "cr3"].contains(&e.to_ascii_lowercase().to_str().unwrap_or("")))
         });
         let Some(raw) = raw else {
             eprintln!("no RAW under {ROOT}; skipped");

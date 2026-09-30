@@ -80,7 +80,15 @@ pub fn registry(models_dir: &Path, coreml_cache: Option<PathBuf>) -> Vec<Registe
         },
         RegisteredModel {
             model: people.clone(),
-            required: files(&[PERSON_MODEL, SAM_ENCODER_MODEL, SAM_DECODER_MODEL, FACE_MODELS[0], FACE_MODELS[1], FACE_MODELS[2], FACE_MODELS[3]]),
+            required: files(&[
+                PERSON_MODEL,
+                SAM_ENCODER_MODEL,
+                SAM_DECODER_MODEL,
+                FACE_MODELS[0],
+                FACE_MODELS[1],
+                FACE_MODELS[2],
+                FACE_MODELS[3],
+            ]),
             parts,
             people: Some(people),
         },
@@ -217,7 +225,12 @@ fn reference_of(insts: &[Instance], idx: usize) -> (f32, f32) {
 
 impl PeopleModel {
     /// Unrefined plane of `parts` (empty = whole person) for instance `idx`.
-    fn person_plane(eng: &mut SegmentEngine, img: RgbImage, idx: usize, parts: &[PersonPart]) -> Result<LowRes, String> {
+    fn person_plane(
+        eng: &mut SegmentEngine,
+        img: RgbImage,
+        idx: usize,
+        parts: &[PersonPart],
+    ) -> Result<LowRes, String> {
         let insts = eng.instances(img)?;
         let inst = &insts[idx];
         if parts.is_empty() {
@@ -232,11 +245,9 @@ impl PeopleModel {
             let r = eng.region_planes(img, idx)?;
             let g = &r.grid;
             let mut acc = vec![0.0f32; g.data.len()];
-            for (part, plane) in [
-                (PersonPart::Hair, &r.hair),
-                (PersonPart::BodySkin, &r.body_skin),
-                (PersonPart::Clothes, &r.clothes),
-            ] {
+            for (part, plane) in
+                [(PersonPart::Hair, &r.hair), (PersonPart::BodySkin, &r.body_skin), (PersonPart::Clothes, &r.clothes)]
+            {
                 if want(part) {
                     acc.iter_mut().zip(plane).for_each(|(a, v)| *a = a.max(*v));
                 }
@@ -293,7 +304,12 @@ impl SegmentModel for PeopleModel {
         let mut eng = lock(&self.engine);
         let lr = match &request.target {
             AiTarget::Object { region } => {
-                let b = [region.x * w as f32, region.y * h as f32, (region.x + region.width) * w as f32, (region.y + region.height) * h as f32];
+                let b = [
+                    region.x * w as f32,
+                    region.y * h as f32,
+                    (region.x + region.width) * w as f32,
+                    (region.y + region.height) * h as f32,
+                ];
                 eng.object_raw(img, b)?
             }
             AiTarget::People { parts } => {
@@ -384,7 +400,13 @@ mod tests {
     fn registry_reports_files() {
         let reg = registry(Path::new("/nonexistent-models"), None);
         let fams: Vec<AiTargetKind> = reg.iter().flat_map(|m| m.model.families().to_vec()).collect();
-        for f in [AiTargetKind::Subject, AiTargetKind::Background, AiTargetKind::Sky, AiTargetKind::People, AiTargetKind::Object] {
+        for f in [
+            AiTargetKind::Subject,
+            AiTargetKind::Background,
+            AiTargetKind::Sky,
+            AiTargetKind::People,
+            AiTargetKind::Object,
+        ] {
             assert!(fams.contains(&f), "{f:?}");
         }
         assert!(!fams.contains(&AiTargetKind::Landscape));

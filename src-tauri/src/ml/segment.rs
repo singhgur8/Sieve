@@ -36,7 +36,7 @@ use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use super::models::{nms, Detection, Models, Provider, DET_SIZE, DET_MODEL, EYE_MODEL, LMK_MODEL, MESH_MODEL};
+use super::models::{nms, Detection, Models, Provider, DET_MODEL, DET_SIZE, EYE_MODEL, LMK_MODEL, MESH_MODEL};
 use super::refine::{self, sample, Guide, RefineParams};
 use crate::develop::masks::AlphaMask;
 use crate::ipc::types::NormRect;
@@ -218,7 +218,11 @@ impl LowRes {
         if self.roi == [0, 0, img_w, img_h] {
             return LowRes { data: self.data.iter().map(|v| 1.0 - v).collect(), ..self.clone() };
         }
-        let mut out = self.resampled([0, 0, img_w, img_h], (self.scale().0 * img_w as f32).ceil() as usize, (self.scale().1 * img_h as f32).ceil() as usize);
+        let mut out = self.resampled(
+            [0, 0, img_w, img_h],
+            (self.scale().0 * img_w as f32).ceil() as usize,
+            (self.scale().1 * img_h as f32).ceil() as usize,
+        );
         out.data.iter_mut().for_each(|v| *v = 1.0 - *v);
         out
     }
@@ -228,14 +232,24 @@ impl LowRes {
         let (width, height) = (width.max(1), height.max(1));
         let (kx, ky) = ((roi[2] - roi[0]) as f32 / width as f32, (roi[3] - roi[1]) as f32 / height as f32);
         let data = (0..width * height)
-            .map(|i| self.at(roi[0] as f32 + ((i % width) as f32 + 0.5) * kx, roi[1] as f32 + ((i / width) as f32 + 0.5) * ky))
+            .map(|i| {
+                self.at(
+                    roi[0] as f32 + ((i % width) as f32 + 0.5) * kx,
+                    roi[1] as f32 + ((i / width) as f32 + 0.5) * ky,
+                )
+            })
             .collect();
         LowRes { roi, width, height, data }
     }
 
     /// Image-pixel mask (input resolution) over `roi` (refinement input for [`Mask`]s).
     fn from_mask(m: &Mask) -> LowRes {
-        LowRes { roi: [m.x0, m.y0, m.x0 + m.width, m.y0 + m.height], width: m.width.max(1), height: m.height.max(1), data: if m.data.is_empty() { vec![0.0] } else { m.data.clone() } }
+        LowRes {
+            roi: [m.x0, m.y0, m.x0 + m.width, m.y0 + m.height],
+            width: m.width.max(1),
+            height: m.height.max(1),
+            data: if m.data.is_empty() { vec![0.0] } else { m.data.clone() },
+        }
     }
 
     /// Tight bounds (image px) of `p > thresh`, if any.
@@ -568,7 +582,8 @@ impl SegmentEngine {
         let data: Vec<f32> = out.iter().map(|&v| sigmoid(v)).collect();
         drop(outputs);
         self.timings.push(("subject_infer", ms(t)));
-        let lr = Arc::new(LowRes { roi: [0, 0, img.width, img.height], width: SUBJECT_SIZE, height: SUBJECT_SIZE, data });
+        let lr =
+            Arc::new(LowRes { roi: [0, 0, img.width, img.height], width: SUBJECT_SIZE, height: SUBJECT_SIZE, data });
         self.cache.subject = Some(lr.clone());
         Ok(lr)
     }
@@ -723,7 +738,14 @@ impl SegmentEngine {
 
     /// Best SAM mask logits (`ww x wh`) for point/box prompts in working-grid pixels
     /// (labels: 1 positive, 0 negative, 2 / 3 box corners).
-    fn sam_decode(&mut self, emb: &[f32], pts: &[f32], labels: &[f32], ww: usize, wh: usize) -> Result<Vec<f32>, String> {
+    fn sam_decode(
+        &mut self,
+        emb: &[f32],
+        pts: &[f32],
+        labels: &[f32],
+        ww: usize,
+        wh: usize,
+    ) -> Result<Vec<f32>, String> {
         let n = labels.len();
         let dec = self.sam_dec.as_mut().ok_or("sam decoder not loaded")?;
         let size = [wh as i64, ww as i64];
@@ -1087,7 +1109,14 @@ impl SegmentEngine {
             } else {
                 None
             };
-            out.push(Person { bbox: inst.bbox, score: inst.score, from_face: inst.from_face, face: inst.face, mask, parts });
+            out.push(Person {
+                bbox: inst.bbox,
+                score: inst.score,
+                from_face: inst.from_face,
+                face: inst.face,
+                mask,
+                parts,
+            });
         }
         self.timings.push(("people_refine", ms(t)));
         Ok(out)
