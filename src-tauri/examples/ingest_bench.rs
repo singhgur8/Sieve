@@ -3,18 +3,18 @@
 //! ```text
 //! cargo run --release --example ingest_bench -- [folder] [limit]
 //! ```
-//! `folder` defaults to `$LUMENRAW_SAMPLES`, then "/Users/gurjotsingh/Pictures/test RAWS".
-//! The source folder is only read. Set `LUMENRAW_BENCH_KEEP=/dir` to keep the
+//! `folder` defaults to `$SIEVE_SAMPLES`, then "/Users/gurjotsingh/Pictures/test RAWS".
+//! The source folder is only read. Set `SIEVE_BENCH_KEEP=/dir` to keep the
 //! generated catalog + thumbnails there instead of a temp dir.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use lumenraw_lib::db::{self, repo};
-use lumenraw_lib::ingest::{default_threads, run_until_idle, IngestConfig, IngestSink};
-use lumenraw_lib::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
-use lumenraw_lib::ipc::types::ImportOptions;
+use sieve_lib::db::{self, repo};
+use sieve_lib::ingest::{default_threads, run_until_idle, IngestConfig, IngestSink};
+use sieve_lib::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
+use sieve_lib::ipc::types::ImportOptions;
 
 const DEFAULT_SAMPLES: &str = "/Users/gurjotsingh/Pictures/test RAWS";
 
@@ -71,11 +71,11 @@ fn peak_footprint_mb() -> Option<f64> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let folder =
-        args.next().or_else(|| std::env::var("LUMENRAW_SAMPLES").ok()).unwrap_or_else(|| DEFAULT_SAMPLES.to_owned());
+        args.next().or_else(|| std::env::var("SIEVE_SAMPLES").ok()).unwrap_or_else(|| DEFAULT_SAMPLES.to_owned());
     let limit: Option<u32> = args.next().map(|s| s.parse()).transpose()?;
 
     let tmp = tempfile::tempdir()?;
-    let work = std::env::var_os("LUMENRAW_BENCH_KEEP").map(PathBuf::from).unwrap_or_else(|| tmp.path().to_owned());
+    let work = std::env::var_os("SIEVE_BENCH_KEEP").map(PathBuf::from).unwrap_or_else(|| tmp.path().to_owned());
     std::fs::create_dir_all(&work)?;
     let folder_path = PathBuf::from(&folder).canonicalize()?;
     if work.canonicalize()?.starts_with(&folder_path) {
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let threads =
-        std::env::var("LUMENRAW_INGEST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(default_threads);
+        std::env::var("SIEVE_INGEST_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(default_threads);
     println!("threads: {threads}");
     let sink = Counter::default();
     let running = AtomicBool::new(true);
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(mb) = peak_footprint_mb() {
         println!("peak physical footprint: {mb:.1} MB");
     }
-    if std::env::var_os("LUMENRAW_BENCH_KEEP").is_some() {
+    if std::env::var_os("SIEVE_BENCH_KEEP").is_some() {
         println!("kept output in {}", work.display());
     }
     Ok(())

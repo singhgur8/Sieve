@@ -28,7 +28,7 @@ export function TopBar(p: Props) {
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-neutral-800 px-4 py-2" data-testid="top-bar">
       <Aperture className="size-5 text-amber-400" />
-      <h1 className="font-semibold tracking-tight">LumenRAW</h1>
+      <h1 className="font-semibold tracking-tight">Sieve</h1>
       <span className="text-xs text-neutral-500">{c ? `${c.imageCount} images` : "…"}</span>
       <button onClick={p.onImport} disabled={p.busy} className={btn}>
         <FolderOpen className="size-4" />

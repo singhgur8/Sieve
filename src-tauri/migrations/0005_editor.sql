@@ -1,4 +1,4 @@
--- LumenRAW catalog schema v5 (Phase 5: editor).
+-- Sieve catalog schema v5 (Phase 5: editor).
 --
 -- Adds per-image edit history (undo/redo), develop presets, and XMP dirty tracking for
 -- develop settings (crs:). LUT files live in a directory library, not in the catalog.

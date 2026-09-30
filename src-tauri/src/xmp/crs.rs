@@ -1,16 +1,16 @@
 //! Develop settings <-> XMP (Phase 5): `crs:` (Adobe Camera Raw Settings) 1:1 with
-//! `ParametricAdjustments`, plus LumenRAW-only fields in the `lumenraw:` namespace.
+//! `ParametricAdjustments`, plus Sieve-only fields in the `sieve:` namespace.
 //! The mapping table below is contract; the codec bodies belong to rust-engine-dev.
 //!
 //! Write (catalog -> sidecar), only for images that have an `adjustments` row (never add
-//! or remove `crs:` for images not edited in LumenRAW):
+//! or remove `crs:` for images not edited in Sieve):
 //! - Set every property in [`CRS_FIELDS`] / [`CRS_HSL_BANDS`], plus `crs:ProcessVersion
 //!   = "11.0"` and `crs:HasSettings = "True"`. Numbers are written signed with the shortest
 //!   decimal that round-trips the f32 (`+15`, `-7.5`, `+0.7`; zero as `0`), so
 //!   catalog -> XMP -> catalog is lossless for every valid value.
 //! - `whiteBalance = as_shot` -> `crs:WhiteBalance = "As Shot"` and remove `crs:Temperature`
 //!   / `crs:Tint`; `custom` -> `"Custom"` + both values.
-//! - `lut` -> `lumenraw:LutId`, `lumenraw:LutAmount`; `null` -> remove both.
+//! - `lut` -> `sieve:LutId`, `sieve:LutAmount`; `null` -> remove both.
 //! - Every other `crs:` property (tone curves, sharpening, crop, lens, masks, ...) and every
 //!   other namespace stays byte-for-byte (span-preserving merge, as in Phase 4).
 //!
@@ -24,7 +24,7 @@
 //!   Lightroom presets map to custom with Lightroom's values (Daylight 5500/+10, Cloudy
 //!   6500/+10, Shade 7500/+10, Tungsten 2850/0, Fluorescent 3800/+21, Flash 5500/0);
 //!   "Auto" -> `as_shot` (lossy; noted in `docs/architecture.md`).
-//! - `lumenraw:LutId` / `LutAmount` restore `lut` (kept even if the LUT is not in the
+//! - `sieve:LutId` / `LutAmount` restore `lut` (kept even if the LUT is not in the
 //!   library; the render reports `lutMissing`).
 //! - Applied through `develop::history::commit(.., LABEL_READ_XMP)` only when the values
 //!   differ from the catalog; such images are listed in `XmpSyncReport.changed`.
@@ -33,7 +33,7 @@
 use crate::ipc::types::ParametricAdjustments;
 
 pub const CRS_NS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
-pub const LUMENRAW_NS: &str = "http://lumenraw.app/ns/1.0/";
+pub const SIEVE_NS: &str = "http://sieve.app/ns/1.0/";
 /// Written with every develop write.
 pub const PROCESS_VERSION: &str = "11.0";
 
@@ -70,13 +70,13 @@ pub const CRS_HSL_BANDS: &[(&str, &str)] = &[
     ("Magenta", "magenta"),
 ];
 
-/// `lumenraw:` properties.
-pub const LUMENRAW_FIELDS: &[(&str, &str)] = &[("LutId", "lut.id"), ("LutAmount", "lut.amount")];
+/// `sieve:` properties.
+pub const SIEVE_FIELDS: &[(&str, &str)] = &[("LutId", "lut.id"), ("LutAmount", "lut.amount")];
 
 /// One property to set (`Some`) or remove (`None`) in the sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyEdit {
-    /// [`CRS_NS`] or [`LUMENRAW_NS`].
+    /// [`CRS_NS`] or [`SIEVE_NS`].
     pub ns: &'static str,
     pub name: String,
     pub value: Option<String>,

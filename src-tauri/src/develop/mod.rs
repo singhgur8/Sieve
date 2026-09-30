@@ -11,7 +11,7 @@
 //! - Source: LibRaw `half_size = 1` decode of the RAW (one pixel per 2x2 Bayer quad, or the
 //!   X-Trans equivalent), *unscaled camera RGB, no white balance, linear, 16-bit*, plus the
 //!   camera's as-shot multipliers, black/white levels and camera->XYZ matrix. Cached per
-//!   image in an LRU bounded by bytes (default 1 GiB, `LUMENRAW_DEVELOP_CACHE_MB`), with a
+//!   image in an LRU bounded by bytes (default 1 GiB, `SIEVE_DEVELOP_CACHE_MB`), with a
 //!   working-size f32 downsample kept alongside for the common loupe size. First decode
 //!   ~300-800 ms; cached renders must meet the < 100 ms slider budget at 2048 px.
 //! - Pipeline order: WB multipliers (AsShot = camera; Custom = temperature/tint -> xy ->
@@ -43,7 +43,7 @@ use crate::ipc::types::{DevelopInfo, ImageId, ParametricAdjustments, RenderOptio
 use crate::lut::LutLibrary;
 
 /// Custom URI scheme serving rendered previews (registered in `lib.rs`).
-pub const RENDER_SCHEME: &str = "lumen";
+pub const RENDER_SCHEME: &str = "sieve";
 
 /// Resolved at startup by `lib.rs`.
 #[derive(Debug, Clone)]
@@ -143,8 +143,8 @@ impl DevelopCache {
     }
 }
 
-/// URL of a render in the webview. `lumen://localhost/...` on macOS/Linux,
-/// `http://lumen.localhost/...` on Windows (WebView2 custom-scheme convention).
+/// URL of a render in the webview. `sieve://localhost/...` on macOS/Linux,
+/// `http://sieve.localhost/...` on Windows (WebView2 custom-scheme convention).
 pub fn render_url(image_id: ImageId, slot: RenderSlot, seq: u32) -> String {
     let base = if cfg!(windows) {
         format!("http://{RENDER_SCHEME}.localhost")

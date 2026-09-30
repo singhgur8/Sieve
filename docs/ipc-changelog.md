@@ -158,6 +158,12 @@ Who updates what
   "Save metadata" action (`writeXmp(selected)`, Cmd+S) and "Read metadata from file" (`readXmp`); listen to
   `xmpSynced` / `xmpWriteFailed`.
 
+## Rename — 2026-09-29
+- Product renamed LumenRAW → **Sieve** (user request). Crate `lumenraw`/`lumenraw_lib` → `sieve`/`sieve_lib`;
+  bundle id `com.lumenraw.app` → `com.sieve.app` (app data/cache dirs move; no user catalogs existed yet);
+  env vars `LUMENRAW_*` → `SIEVE_*`; XMP auto-tag keywords `LumenRAW|<tag>` → `Sieve|<tag>`.
+  No IPC type/command changes. Historical entries above keep the old name.
+
 ## v5 — 2026-09-29 (Phase 5: editor)
 Types
 - `LutRef` (BREAKING): `{ path, amount }` -> `{ id: LutId, amount }` (library id, `[a-z0-9-]{1,64}`,
@@ -200,9 +206,9 @@ Commands (new)
 Events: none new (renders resolve their command; `xmpSynced.read` covers develop settings read by auto-sync).
 
 Transport
-- New custom URI scheme `lumen` (`register_asynchronous_uri_scheme_protocol`, served on the blocking pool from
-  memory): `lumen://localhost/render/<id>/<slot>?v=<seq>` (Windows: `http://lumen.localhost/...`). CSP `img-src` and
-  `connect-src` allow `lumen: http://lumen.localhost`. Use `RenderedPreview.url` as `<img src>` directly.
+- New custom URI scheme `sieve` (`register_asynchronous_uri_scheme_protocol`, served on the blocking pool from
+  memory): `sieve://localhost/render/<id>/<slot>?v=<seq>` (Windows: `http://sieve.localhost/...`). CSP `img-src` and
+  `connect-src` allow `sieve: http://sieve.localhost`. Use `RenderedPreview.url` as `<img src>` directly.
 
 Schema (migration `0005_editor.sql`, user_version 5)
 - `adjustments.neutral` (drives `hasEdits`), `adjustments.history_entry_id` (history cursor).
@@ -212,10 +218,10 @@ Schema (migration `0005_editor.sql`, user_version 5)
 - Data fix: path-style `lut` objects removed from stored adjustments.
 
 Config
-- `LUMENRAW_LUTS=/dir` (default `<app_data_dir>/luts`, created at startup); `LUMENRAW_DEVELOP_CACHE_MB` (default 1024).
+- `SIEVE_LUTS=/dir` (default `<app_data_dir>/luts`, created at startup); `SIEVE_DEVELOP_CACHE_MB` (default 1024).
 
 Who updates what
-- architect (done): types + tests, commands, registration, `lumen` protocol registration, managed `DevelopCache` +
+- architect (done): types + tests, commands, registration, `sieve` protocol registration, managed `DevelopCache` +
   `LutLibrary`, CSP, migration + test, `repo::save_adjustments` keeps `neutral`, `ENTRY_SELECT` `hasEdits` via
   `neutral = 0`, `DevelopCache::ticket/is_current` (latest-wins bookkeeping), `render_url`, `ALL_ADJUSTMENT_FIELDS`
   in `src/ipc/index.ts`.

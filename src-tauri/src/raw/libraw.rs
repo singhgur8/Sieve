@@ -138,10 +138,9 @@ mod tests {
 
     /// The fallback path on a real RAW (read-only): LibRaw's pick must be a valid JPEG.
     #[test]
-    #[ignore = "needs sample RAWs ($LUMENRAW_SAMPLES)"]
+    #[ignore = "needs sample RAWs ($SIEVE_SAMPLES)"]
     fn real_sample_thumbnail() {
-        let folder =
-            std::env::var("LUMENRAW_SAMPLES").unwrap_or_else(|_| "/Users/gurjotsingh/Pictures/test RAWS".into());
+        let folder = std::env::var("SIEVE_SAMPLES").unwrap_or_else(|_| "/Users/gurjotsingh/Pictures/test RAWS".into());
         let raw = std::fs::read_dir(&folder)
             .unwrap()
             .filter_map(Result::ok)

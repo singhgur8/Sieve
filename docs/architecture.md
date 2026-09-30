@@ -1,11 +1,11 @@
-# LumenRAW Architecture
+# Sieve Architecture
 
 ## File layout
 
 ```
 src-tauri/
   Cargo.toml
-  tauri.conf.json              productName LumenRAW, id com.lumenraw.app
+  tauri.conf.json              productName Sieve, id com.sieve.app
   capabilities/default.json    core:default + dialog:allow-open
   migrations/0001_init.sql     catalog schema v1 (append-only)
   migrations/0002_ingest.sql   v2: thumbnails.preview_path, idx_thumbnails_status
@@ -13,9 +13,9 @@ src-tauri/
   migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
   migrations/0005_editor.sql   v5: adjustment_history, presets, adjustments.neutral/history_entry_id, develop dirty triggers
   src/
-    main.rs                    -> lumenraw_lib::run()
+    main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary,
-                               cache/models/luts-dir resolution, asset scope, `lumen` render URI scheme,
+                               cache/models/luts-dir resolution, asset scope, `sieve` render URI scheme,
                                specta_builder() (single registration point for commands + events),
                                debug-build export of src/ipc/bindings.ts
     ipc/
@@ -40,8 +40,8 @@ src-tauri/
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
     xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
-    xmp/crs.rs                 develop settings <-> crs:/lumenraw: properties (mapping table)
-    develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), lumen protocol
+    xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
+    develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
@@ -130,7 +130,7 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `thumbnailReady {imageId,path,previewPath,width,height}`, `thumbnailFailed {imageId,reason}` (Phase 2),
 `analysisProgress {done,total,failed}`, `analysisReady {imageId}`, `analysisFailed {imageId,reason}`,
 `analysisFinished {analyzed,failed,cancelled,burstGroups}` (Phase 3),
-`xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4). Rendered previews use the `lumen` URI scheme (Phase 5).
+`xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4). Rendered previews use the `sieve` URI scheme (Phase 5).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -155,10 +155,10 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   `<id>_2048.jpg` (loupe), orientation applied → update `images` EXIF columns + `thumbnails` row →
   emit `thumbnailReady` or `thumbnailFailed` (reason also stored in `thumbnails.error`) and throttled
   `importProgress` (per run; `done == total` = idle).
-- Cache root: `app_cache_dir()` or `LUMENRAW_CACHE=/path`; exposed as `CatalogState.cacheDir`.
+- Cache root: `app_cache_dir()` or `SIEVE_CACHE=/path`; exposed as `CatalogState.cacheDir`.
 - Frontend loads images with `convertFileSrc(path)`. Asset protocol scope: `$APPCACHE/thumbs/**` plus
   the resolved `<cacheDir>/thumbs` added at runtime. CSP allows `asset:` / `http://asset.localhost`
-  in `img-src` (production; `devCsp` is null for Vite HMR). Since v5 also `lumen: http://lumen.localhost` (renders).
+  in `img-src` (production; `devCsp` is null for Vite HMR). Since v5 also `sieve: http://sieve.localhost` (renders).
 
 ## Analysis / culling (Phase 3)
 
@@ -189,7 +189,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - Thresholds: `ml::thresholds::default_thresholds(shootType)`; overrides stored as JSON in
   `catalog_meta['cull_thresholds.<shoot_type>']`, overlaid on defaults when read (`repo::cull_thresholds`).
 - Ownership of SQL: repo.rs holds the command-side reads/user writes; the worker's SQL lives in `ml/`.
-- Models: `<models_dir>/det_10g.onnx`, `2d106det.onnx` (`scripts/fetch-models.sh`); `LUMENRAW_MODELS`
+- Models: `<models_dir>/det_10g.onnx`, `2d106det.onnx` (`scripts/fetch-models.sh`); `SIEVE_MODELS`
   overrides the dir (default `src-tauri/models` in debug, `<resource_dir>/models` in release).
 
 ## XMP sidecars (Phase 4)
@@ -204,11 +204,11 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   | `pick = pick` | `xmp:Label = "Pick"` (wins over a colour label) |
   | `colorLabel` (not picked) | `xmp:Label = "Red"/"Yellow"/"Green"/"Blue"/"Purple"` |
   | neither | `xmp:Label` removed only if it held "Pick" or one of those names |
-  | visible tags | `lr:hierarchicalSubject` `LumenRAW\|<tag>` + `dc:subject` `<tag>` |
-  Writes replace only `LumenRAW|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
+  | visible tags | `lr:hierarchicalSubject` `Sieve\|<tag>` + `dc:subject` `<tag>` |
+  Writes replace only `Sieve|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
   every other field/namespace. Atomic (temp file + rename).
 - Sidecar -> catalog (read/import): `-1` -> reject; `0..=5` -> rating, `pick` iff Label "Pick" else unflagged;
-  label names -> `colorLabel`. `LumenRAW|*` keywords are not read back (analysis owns tags).
+  label names -> `colorLabel`. `Sieve|*` keywords are not read back (analysis owns tags).
 - Dirty tracking is in the schema: triggers set `images.xmp_dirty = 1` + `meta_updated_at` when rating / pick /
   color_label or visible tags change, whoever writes them (commands, `apply_suggestions`, analysis auto tags).
   A successful write/read sets `xmp_dirty = 0`, `xmp_synced_at`, `xmp_mtime_ms` (sidecar mtime), clears `xmp_error`.
@@ -228,8 +228,8 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
    path, then on the blocking pool: skip if a newer ticket exists -> render -> store the JPEG in memory as the newest
    for `(id, slot)` -> return metadata. At most one render per key runs; requests queued behind it that are no
    longer newest resolve `null`, so a fast drag renders "current, then latest" instead of every frame.
-3. The frontend sets `<img src={preview.url}>` (`lumen://localhost/render/<id>/<slot>?v=<seq>`), served from memory
-   by the async `lumen` URI scheme handler (`Cache-Control: no-store`); `?v=` busts WebKit's cache. It ignores
+3. The frontend sets `<img src={preview.url}>` (`sieve://localhost/render/<id>/<slot>?v=<seq>`), served from memory
+   by the async `sieve` URI scheme handler (`Cache-Control: no-store`); `?v=` busts WebKit's cache. It ignores
    results with a `seq` lower than the one displayed.
 4. On slider release (or debounced): `saveAdjustments(id, adj, "Exposure")` -> history entry + XMP dirty.
 - Histogram (256 bins R/G/B/luma of the 8-bit output) and `renderMs` come back with every render.
@@ -238,7 +238,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 ### Develop source + cache
 - LibRaw `half_size` decode (camera RGB, no WB, linear, 16-bit; ~3000 px long edge for 24 MP) + as-shot multipliers,
   colour matrix, levels. Decoded once per image (~0.3-0.8 s), kept in `DevelopCache` (LRU by bytes, default 1 GiB,
-  `LUMENRAW_DEVELOP_CACHE_MB`) with a working-size f32 copy. `prepareDevelop(neighbourIds)` warms it in the background.
+  `SIEVE_DEVELOP_CACHE_MB`) with a working-size f32 copy. `prepareDevelop(neighbourIds)` warms it in the background.
 - White balance happens in the pipeline on raw data: `as_shot` uses the camera multipliers; `custom` converts
   temperature/tint -> multipliers through the camera matrix (`develop::wb`). `getDevelopInfo().asShot` gives the
   as-shot temperature/tint for the sliders.
@@ -258,14 +258,14 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - `RawImageEntry.hasEdits` = adjustments differ from neutral (`adjustments.neutral = 0`).
 
 ### LUTs
-- Library = directory `<app_data_dir>/luts/` (`LUMENRAW_LUTS`), files `<id>.cube`, shared by all catalogs; Phase 9
+- Library = directory `<app_data_dir>/luts/` (`SIEVE_LUTS`), files `<id>.cube`, shared by all catalogs; Phase 9
   writes generated LUTs there. `importLut` validates + copies (idempotent by content hash in the id).
   `ParametricAdjustments.lut = { id, amount }`; a missing id renders without the LUT (`lutMissing`).
   `deleteLut` refuses while referenced unless `force`.
 
 ### XMP develop settings
-- `crs:` properties map 1:1 to `ParametricAdjustments` (table in `xmp/crs.rs`); LUT in `lumenraw:LutId/LutAmount`.
-  Written only for images with an adjustments row, so Lightroom edits of images never touched in LumenRAW survive;
+- `crs:` properties map 1:1 to `ParametricAdjustments` (table in `xmp/crs.rs`); LUT in `sieve:LutId/LutAmount`.
+  Written only for images with an adjustments row, so Lightroom edits of images never touched in Sieve survive;
   all unowned `crs:` properties (curves, crop, sharpening, masks...) are preserved.
 - Read on `read_xmp`, import and newer-wins auto-sync when PV2012+ settings exist; applied as a "Read from XMP"
   history entry. Lossy only for WB "Auto" (-> as shot) and named WB presets (-> custom with Lightroom's values).
@@ -274,7 +274,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 
 ## Catalog (SQLite)
 
-Location: `<app_data_dir>/catalog.sqlite` (override with `LUMENRAW_CATALOG=/path`). WAL, `foreign_keys=ON`,
+Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
 migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |

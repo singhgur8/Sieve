@@ -25,16 +25,16 @@ use ml::{Analysis, AnalysisConfig};
 use xmp::{XmpSync, XmpSyncConfig};
 
 /// Overrides the catalog location (useful for tests and scratch catalogs).
-const CATALOG_ENV: &str = "LUMENRAW_CATALOG";
+const CATALOG_ENV: &str = "SIEVE_CATALOG";
 /// Overrides the derived-file cache root (thumbnails live in `<cache>/thumbs/`).
-const CACHE_ENV: &str = "LUMENRAW_CACHE";
+const CACHE_ENV: &str = "SIEVE_CACHE";
 /// Overrides the ONNX model directory (default: `src-tauri/models` in debug builds,
 /// `<resource_dir>/models` in release).
-const MODELS_ENV: &str = "LUMENRAW_MODELS";
+const MODELS_ENV: &str = "SIEVE_MODELS";
 /// Overrides the LUT library directory (default `<app_data_dir>/luts`).
-const LUTS_ENV: &str = "LUMENRAW_LUTS";
+const LUTS_ENV: &str = "SIEVE_LUTS";
 /// Overrides the develop cache budget in MiB (default `DevelopConfig::DEFAULT_CACHE_MB`).
-const DEVELOP_CACHE_ENV: &str = "LUMENRAW_DEVELOP_CACHE_MB";
+const DEVELOP_CACHE_ENV: &str = "SIEVE_DEVELOP_CACHE_MB";
 
 /// Generated TypeScript bindings, relative to this crate.
 pub const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
@@ -120,7 +120,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(builder.invoke_handler())
-        // Rendered previews (`lumen://localhost/render/<id>/<slot>?v=<seq>`), served from
+        // Rendered previews (`sieve://localhost/render/<id>/<slot>?v=<seq>`), served from
         // memory off the main thread.
         .register_asynchronous_uri_scheme_protocol(develop::RENDER_SCHEME, |ctx, request, responder| {
             let Some(cache) = ctx.app_handle().try_state::<DevelopCache>().map(|s| s.inner().clone()) else {
@@ -160,7 +160,7 @@ pub fn run() {
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
-            // covers a `LUMENRAW_CACHE` override (and is a no-op widening otherwise).
+            // covers a `SIEVE_CACHE` override (and is a no-op widening otherwise).
             app.asset_protocol_scope().allow_directory(config.thumbs_dir(), true)?;
 
             let catalog = Catalog::open(path.clone())?;

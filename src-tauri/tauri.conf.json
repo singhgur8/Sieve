@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "LumenRAW",
+  "productName": "Sieve",
   "version": "0.1.0",
-  "identifier": "com.lumenraw.app",
+  "identifier": "com.sieve.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "LumenRAW",
+        "title": "Sieve",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost lumen: http://lumen.localhost data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost lumen: http://lumen.localhost",
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost sieve: http://sieve.localhost data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost sieve: http://sieve.localhost",
       "devCsp": null,
       "assetProtocol": {
         "enable": true,

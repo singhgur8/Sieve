@@ -128,8 +128,8 @@ export const commands = {
 	/**  Monotonic per (image, slot); larger = newer. */
 	seq: number,
 	/**
-	 *  `lumen://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
-	 *  (`http://lumen.localhost/...` on Windows).
+	 *  `sieve://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+	 *  (`http://sieve.localhost/...` on Windows).
 	 */
 	url: string,
 	/**  Output pixel size (orientation applied). */
@@ -364,7 +364,7 @@ export type CatalogState = {
 	/**  Counts of non-suppressed tags, for the filter bar. */
 	tagCounts: TagCount[],
 	/**
-	 *  Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+	 *  Root of the derived-file cache (`<app_cache_dir>` or `$SIEVE_CACHE`).
 	 *  Thumbnails/previews live in `<cacheDir>/thumbs/`.
 	 */
 	cacheDir: string,
@@ -650,7 +650,7 @@ export type ImportSummary = {
 	sidecarsRead: number,
 };
 
-/**  A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$LUMENRAW_LUTS`). */
+/**  A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$SIEVE_LUTS`). */
 export type LutInfo = {
 	id: string,
 	/**  `TITLE` from the file, else the imported file's name without extension. */
@@ -829,7 +829,7 @@ export type RenderSlot =
 
 /**
  *  A finished preview render. Pixels are an in-memory JPEG (sRGB, quality ~90, 4:4:4)
- *  served by the `lumen` URI scheme at `url`; set it as an `<img src>` directly (do not
+ *  served by the `sieve` URI scheme at `url`; set it as an `<img src>` directly (do not
  *  pass it through `convertFileSrc`). The URL is unique per render (`?v=<seq>`).
  */
 export type RenderedPreview = {
@@ -838,8 +838,8 @@ export type RenderedPreview = {
 	/**  Monotonic per (image, slot); larger = newer. */
 	seq: number,
 	/**
-	 *  `lumen://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
-	 *  (`http://lumen.localhost/...` on Windows).
+	 *  `sieve://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+	 *  (`http://sieve.localhost/...` on Windows).
 	 */
 	url: string,
 	/**  Output pixel size (orientation applied). */

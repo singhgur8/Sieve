@@ -5,7 +5,7 @@
 //! generated `.cube` files into the same directory, so the directory is the source of truth
 //! (no catalog table): LUTs are shared by every catalog, like Lightroom profiles.
 //!
-//! - Library dir: `<app_data_dir>/luts/` (`$LUMENRAW_LUTS` overrides), created at startup.
+//! - Library dir: `<app_data_dir>/luts/` (`$SIEVE_LUTS` overrides), created at startup.
 //!   Files are `<id>.cube`; `id` = slug of the source name + `-` + 8 hex digits of a content
 //!   hash (`[a-z0-9-]{1,64}`, see `ipc::types::is_valid_lut_id`), so re-importing the same
 //!   file is idempotent (returns the existing entry).

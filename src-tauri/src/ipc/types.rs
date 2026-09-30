@@ -831,7 +831,7 @@ impl Histogram {
 }
 
 /// A finished preview render. Pixels are an in-memory JPEG (sRGB, quality ~90, 4:4:4)
-/// served by the `lumen` URI scheme at `url`; set it as an `<img src>` directly (do not
+/// served by the `sieve` URI scheme at `url`; set it as an `<img src>` directly (do not
 /// pass it through `convertFileSrc`). The URL is unique per render (`?v=<seq>`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -840,8 +840,8 @@ pub struct RenderedPreview {
     pub slot: RenderSlot,
     /// Monotonic per (image, slot); larger = newer.
     pub seq: u32,
-    /// `lumen://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
-    /// (`http://lumen.localhost/...` on Windows).
+    /// `sieve://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+    /// (`http://sieve.localhost/...` on Windows).
     pub url: String,
     /// Output pixel size (orientation applied).
     pub width: u32,
@@ -938,7 +938,7 @@ string_enum! {
     }
 }
 
-/// A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$LUMENRAW_LUTS`).
+/// A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$SIEVE_LUTS`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LutInfo {
@@ -1128,7 +1128,7 @@ pub struct CatalogState {
     pub folders: Vec<FolderEntry>,
     /// Counts of non-suppressed tags, for the filter bar.
     pub tag_counts: Vec<TagCount>,
-    /// Root of the derived-file cache (`<app_cache_dir>` or `$LUMENRAW_CACHE`).
+    /// Root of the derived-file cache (`<app_cache_dir>` or `$SIEVE_CACHE`).
     /// Thumbnails/previews live in `<cacheDir>/thumbs/`.
     pub cache_dir: String,
     /// Analysis starts automatically after import / on launch (`set_auto_analyze`).

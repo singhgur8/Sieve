@@ -1,4 +1,4 @@
-# Project: LumenRAW (Autonomous Local Culling, Editing & RAW Engine)
+# Project: Sieve (Autonomous Local Culling, Editing & RAW Engine)
 
 ## Vision
 A 100% offline, local desktop application built with Tauri v2 (Rust + React/TypeScript) designed to replace Adobe Lightroom Classic for culling, editing, and exporting high-volume shoots.
@@ -25,7 +25,7 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 2. Auto-cull, then review/override: pass/fail flags + 0–5 stars.
 3. Culling results are written to XMP sidecars next to the RAWs (Lightroom/Bridge-readable):
    reject = `xmp:Rating -1`; stars = `xmp:Rating 0–5`; pick = `xmp:Label "Pick"`;
-   auto tags = `lr:hierarchicalSubject` `LumenRAW|<tag>`. Never clobber unrelated XMP fields.
+   auto tags = `lr:hierarchicalSubject` `Sieve|<tag>`. Never clobber unrelated XMP fields.
 4. Edit keepers in-app (no export needed until culling + editing are done).
 5. Export client deliverables with Lightroom-style presets: JPEG (quality), TIFF 8/16, PNG, optional
    WebP/HEIC; resize; sRGB / Display P3 / Adobe RGB with ICC; output sharpening; filename template;
@@ -58,7 +58,7 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 ## Development
 - Toolchain: Rust stable (rustup; `~/.cargo/bin` may need adding to PATH), Node 24, pnpm (via corepack),
   `brew install libraw exiftool` (LibRaw + libjpeg-turbo are linked dynamically).
-- Run app: `pnpm tauri dev` (set `LUMENRAW_CATALOG=/tmp/x.sqlite` for a scratch catalog).
+- Run app: `pnpm tauri dev` (set `SIEVE_CATALOG=/tmp/x.sqlite` for a scratch catalog).
 - Rust tests/lint: `cd src-tauri && cargo test && cargo clippy --all-targets && cargo fmt --check`.
 - Frontend type check + build: `pnpm build`.
 - IPC contract: Rust types in `src-tauri/src/ipc/` are the source of truth; `src/ipc/bindings.ts` is generated
