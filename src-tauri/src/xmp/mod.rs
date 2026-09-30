@@ -51,11 +51,8 @@
 //!   written back so tags reach the sidecar too.
 
 pub mod crs;
-<<<<<<< HEAD
 pub mod looks;
-=======
 pub mod masks;
->>>>>>> worktree-agent-a65997577a1135f12
 pub mod packet;
 mod store;
 
