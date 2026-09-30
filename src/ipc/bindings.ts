@@ -12,7 +12,8 @@ export const commands = {
 	setBurstWindow: (ms: number) => typedError<null, AppError>(__TAURI_INVOKE("set_burst_window", { ms })),
 	/**
 	 *  Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
-	 *  reads existing XMP sidecars (rating/pick/label) of new or externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
+	 *  reads existing XMP sidecars (rating/pick/label, and crs: develop settings from v5) of new or
+	 *  externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 	 *  returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 	 *  (and `analysis*`) events.
 	 */
@@ -26,7 +27,13 @@ export const commands = {
 	setUserTag: (ids: number[], tag: CullTag, present: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_user_tag", { ids, tag, present })),
 	/**  Stored adjustments, or neutral defaults for an unedited image. */
 	getAdjustments: (id: number) => typedError<ParametricAdjustments, AppError>(__TAURI_INVOKE("get_adjustments", { id })),
-	saveAdjustments: (id: number, adjustments: ParametricAdjustments) => typedError<null, AppError>(__TAURI_INVOKE("save_adjustments", { id, adjustments })),
+	/**
+	 *  Persists `adjustments` and records a history entry labelled `label` (e.g. the slider
+	 *  name). Call on slider release / debounced (not per drag frame: use `render_preview`
+	 *  for live feedback). Consecutive saves with the same label within 1.5 s coalesce into
+	 *  one entry; saving unchanged values is a no-op. Marks the sidecar dirty (crs:).
+	 */
+	saveAdjustments: (id: number, adjustments: ParametricAdjustments, label: string) => typedError<AdjustmentHistory, AppError>(__TAURI_INVOKE("save_adjustments", { id, adjustments, label })),
 	/**
 	 *  Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
 	 *  `pending` and returns immediately; results arrive as events. With `autoAnalyze`, the
@@ -102,13 +109,83 @@ export const commands = {
 	 */
 	writeXmp: (ids: number[]) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("write_xmp", { ids })),
 	/**
-	 *  Reads rating/pick/label from existing sidecars of `ids` into the catalog (sidecar wins).
+	 *  Reads rating/pick/label (and crs: develop settings, see `xmp::crs`) from existing sidecars
+	 *  of `ids` into the catalog (sidecar wins).
 	 *  Images without a sidecar are `skipped`; refetch `report.changed`.
 	 */
 	readXmp: (ids: number[]) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("read_xmp", { ids })),
 	/**  Turns automatic (debounced) sidecar writing on/off. Enabling flushes every dirty image. */
 	setXmpAutoSync: (enabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_xmp_auto_sync", { enabled })),
 	getXmpStatus: () => typedError<XmpStatus, AppError>(__TAURI_INVOKE("get_xmp_status")),
+	/**
+	 *  Renders `adjustments` (live, unsaved) for image `id`. Latest-wins per (id, slot):
+	 *  resolves `null` when a newer request for the same (id, slot) superseded this one
+	 *  (ignore it). First call per image decodes the RAW (~0.3-0.8 s); later calls reuse it.
+	 */
+	renderPreview: (id: number, adjustments: ParametricAdjustments, options: RenderOptions) => typedError<{
+	imageId: number,
+	slot: RenderSlot,
+	/**  Monotonic per (image, slot); larger = newer. */
+	seq: number,
+	/**
+	 *  `lumen://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+	 *  (`http://lumen.localhost/...` on Windows).
+	 */
+	url: string,
+	/**  Output pixel size (orientation applied). */
+	width: number,
+	height: number,
+	histogram: Histogram,
+	/**  Wall time of this request inside the backend (decode if uncached + pipeline + encode). */
+	renderMs: number,
+	/**  `adjustments.lut` refers to a LUT not in the library; rendered without it. */
+	lutMissing: boolean,
+} | null, AppError>(__TAURI_INVOKE("render_preview", { id, adjustments, options })),
+	/**  As-shot white balance and develop-source sizes (decodes the RAW if not cached). */
+	getDevelopInfo: (id: number) => typedError<DevelopInfo, AppError>(__TAURI_INVOKE("get_develop_info", { id })),
+	/**
+	 *  Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
+	 *  the image being edited). Returns immediately.
+	 */
+	prepareDevelop: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("prepare_develop", { ids })),
+	getHistory: (id: number) => typedError<AdjustmentHistory, AppError>(__TAURI_INVOKE("get_history", { id })),
+	/**  Steps back one history entry (no-op at the first). Marks the sidecar dirty. */
+	undoAdjustments: (id: number) => typedError<EditState, AppError>(__TAURI_INVOKE("undo_adjustments", { id })),
+	/**  Steps forward one history entry (no-op at the last). Marks the sidecar dirty. */
+	redoAdjustments: (id: number) => typedError<EditState, AppError>(__TAURI_INVOKE("redo_adjustments", { id })),
+	/**  Jumps to history entry `entryId` of image `id` (Lightroom's History panel click). */
+	gotoHistory: (id: number, entryId: number) => typedError<EditState, AppError>(__TAURI_INVOKE("goto_history", { id, entryId })),
+	/**
+	 *  Pastes the `fields` groups of `adjustments` (the frontend's copied settings) onto
+	 *  every image in `ids`; one "Paste Settings" history entry per changed image. Atomic.
+	 */
+	pasteSettings: (ids: number[], adjustments: ParametricAdjustments, fields: AdjustmentField[]) => typedError<null, AppError>(__TAURI_INVOKE("paste_settings", { ids, adjustments, fields })),
+	/**
+	 *  Copies the `fields` groups of `sourceId`'s stored adjustments onto `targetIds`
+	 *  ("Sync Settings"). Atomic.
+	 */
+	syncSettings: (sourceId: number, targetIds: number[], fields: AdjustmentField[]) => typedError<null, AppError>(__TAURI_INVOKE("sync_settings", { sourceId, targetIds, fields })),
+	/**  Resets `ids` to neutral adjustments ("Reset" history entry). Atomic. */
+	resetAdjustments: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("reset_adjustments", { ids })),
+	/**  Applies preset `presetId` (its `fields` only) to `ids` ("Preset: <name>"). Atomic. */
+	applyPreset: (ids: number[], presetId: number) => typedError<null, AppError>(__TAURI_INVOKE("apply_preset", { ids, presetId })),
+	/**  Presets sorted by name. */
+	listPresets: () => typedError<Preset[], AppError>(__TAURI_INVOKE("list_presets")),
+	/**  Creates (`id = null`) or overwrites a preset. Names are unique (case-insensitive). */
+	savePreset: (id: number | null, name: string, adjustments: ParametricAdjustments, fields: AdjustmentField[]) => typedError<Preset, AppError>(__TAURI_INVOKE("save_preset", { id, name, adjustments, fields })),
+	deletePreset: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("delete_preset", { id })),
+	/**  LUTs in the library, sorted by name. */
+	listLuts: () => typedError<LutInfo[], AppError>(__TAURI_INVOKE("list_luts")),
+	/**
+	 *  Validates and copies a `.cube` file into the library. Idempotent per file content.
+	 *  Invalid file -> `invalid_argument`.
+	 */
+	importLut: (path: string) => typedError<LutInfo, AppError>(__TAURI_INVOKE("import_lut", { path })),
+	/**
+	 *  Deletes a LUT from the library. If images still reference it, fails with
+	 *  `invalid_argument` unless `force` (they then render without it, `lutMissing`).
+	 */
+	deleteLut: (id: string, force: boolean) => typedError<null, AppError>(__TAURI_INVOKE("delete_lut", { id, force })),
 };
 
 /** Events */
@@ -125,6 +202,36 @@ export const events = {
 };
 
 /* Types */
+/**
+ *  Groups of `ParametricAdjustments` selectable in a fields mask (Lightroom's
+ *  "Copy Settings" / preset checkboxes). `ALL` selects everything.
+ */
+export type AdjustmentField = 
+/**  `whiteBalance` (mode + temperature + tint). */
+"white_balance" | "exposure" | "contrast" | "highlights" | "shadows" | "whites" | "blacks" | "texture" | "clarity" | "dehaze" | "vibrance" | "saturation" | 
+/**  `hsl.hue` (all 8 bands). */
+"hsl_hue" | 
+/**  `hsl.saturation` (all 8 bands). */
+"hsl_saturation" | 
+/**  `hsl.luminance` (all 8 bands). */
+"hsl_luminance" | 
+/**  `lut` (reference + amount; copying a `null` removes the target's LUT). */
+"lut";
+
+/**
+ *  Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
+ *  and make that entry's snapshot the image's adjustments; a new edit after an undo
+ *  discards the entries after the cursor.
+ */
+export type AdjustmentHistory = {
+	imageId: number,
+	entries: HistoryEntry[],
+	/**  Entry whose snapshot is the current adjustments; `null` = never edited (no entries). */
+	currentEntryId: number | null,
+	canUndo: boolean,
+	canRedo: boolean,
+};
+
 /**  Analysis failed for an image (unreadable preview, model error). */
 export type AnalysisFailed = {
 	imageId: number,
@@ -321,6 +428,29 @@ export type CullThresholds = {
 	weights: ScoreWeights,
 };
 
+/**  Facts about an image's develop source, for initializing the editor. */
+export type DevelopInfo = {
+	imageId: number,
+	/**
+	 *  The camera's as-shot white balance expressed as temperature/tint (from LibRaw's
+	 *  camera multipliers and colour matrix); `null` if the file has none. Seeds the
+	 *  Temp/Tint sliders when switching from `as_shot` to `custom`.
+	 */
+	asShot: WhiteBalanceValues | null,
+	/**  Size of the cached develop source (half-size demosaic), orientation applied. */
+	sourceWidth: number,
+	sourceHeight: number,
+	/**  Full sensor output size, orientation applied (Phase 6 export size). */
+	fullWidth: number,
+	fullHeight: number,
+};
+
+/**  Adjustments + history after an undo/redo/jump. */
+export type EditState = {
+	adjustments: ParametricAdjustments,
+	history: AdjustmentHistory,
+};
+
 export type ErrorKind = "not_found" | "invalid_argument" | "io" | "database" | "internal";
 
 export type ExposureStats = {
@@ -382,6 +512,29 @@ export type FolderEntry = {
 	id: number,
 	path: string,
 	imageCount: number,
+};
+
+/**
+ *  256-bin histograms of the rendered output (8-bit sRGB-encoded values, what the user
+ *  sees). `luma` uses Rec.709 weights on the encoded values. Each vector has 256 entries;
+ *  every channel sums to `width * height` of the render.
+ */
+export type Histogram = {
+	red: number[],
+	green: number[],
+	blue: number[],
+	luma: number[],
+};
+
+/**  One state in an image's edit history. */
+export type HistoryEntry = {
+	id: number,
+	/**
+	 *  e.g. "Exposure", "Paste Settings", "Preset: Warm", "Reset", "Read from XMP".
+	 *  The first entry of every history is "Original" (the state before the first edit).
+	 */
+	label: string,
+	createdAtMs: number,
 };
 
 export type HslAdjustments = {
@@ -497,10 +650,35 @@ export type ImportSummary = {
 	sidecarsRead: number,
 };
 
-/**  A 3D LUT (`.cube`) applied after the parametric stage. */
-export type LutRef = {
+/**  A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$LUMENRAW_LUTS`). */
+export type LutInfo = {
+	id: string,
+	/**  `TITLE` from the file, else the imported file's name without extension. */
+	name: string,
+	kind: LutKind,
+	/**  Entries per axis (2..=65 for 3D, 2..=65536 for 1D). */
+	size: number,
+	/**  Absolute path of the library copy. */
 	path: string,
-	/**  Blend amount 0..=100. */
+};
+
+export type LutKind = 
+/**  `LUT_1D_SIZE`: per-channel curves. */
+"lut_1d" | 
+/**  `LUT_3D_SIZE`: RGB cube. */
+"lut_3d";
+
+/**
+ *  A `.cube` LUT from the LUT library, applied after the parametric stage
+ *  (on display-referred sRGB-encoded values, before output encoding).
+ */
+export type LutRef = {
+	/**
+	 *  `LutInfo.id` (library file stem). A missing LUT renders as if absent and sets
+	 *  `RenderedPreview.lutMissing`.
+	 */
+	id: string,
+	/**  Blend amount 0..=100 (100 = full LUT output). */
 	amount: number,
 };
 
@@ -547,6 +725,18 @@ export type ParametricAdjustments = {
 };
 
 export type PickFlag = "pick" | "reject" | "unflagged";
+
+/**  A saved develop preset: applies `adjustments` restricted to `fields`. */
+export type Preset = {
+	id: number,
+	/**  Unique (case-insensitive), 1..=100 chars. */
+	name: string,
+	adjustments: ParametricAdjustments,
+	/**  Non-empty; groups outside it are ignored when applying. */
+	fields: AdjustmentField[],
+	createdAtMs: number,
+	updatedAtMs: number,
+};
 
 /**  Culling-engine scores. All scores are normalized to 0..=1, higher is better. */
 export type QualityScore = {
@@ -608,8 +798,58 @@ export type RawImageEntry = {
 	tags: CullTagEntry[],
 	quality: QualityScore | null,
 	hasEdits: boolean,
-	/**  Sidecar sync state of the XMP-mapped values (rating, pick, label, tags). */
+	/**  Sidecar sync state of the XMP-mapped values (rating, pick, label, tags, develop settings). */
 	xmp: XmpSyncState,
+};
+
+/**  How to render a preview. */
+export type RenderOptions = {
+	/**
+	 *  Long edge of the output in px, 64..=8192 (use CSS size x devicePixelRatio).
+	 *  Never upscaled beyond the develop source (`DevelopInfo.sourceWidth/Height`, or the
+	 *  region's share of it).
+	 */
+	maxEdge: number,
+	slot: RenderSlot,
+	/**  Render only this part of the (orientation-corrected) frame; `null` = whole frame. */
+	region: NormRect | null,
+};
+
+/**
+ *  Independent latest-wins render stream per image. A newer request in the same
+ *  (image, slot) supersedes older ones; different slots never cancel each other.
+ */
+export type RenderSlot = 
+/**  The edited image in the loupe (slider feedback). */
+"main" | 
+/**  Before/after view (the frontend sends the "before" adjustments, e.g. neutral). */
+"before" | 
+/**  A zoomed region (`RenderOptions.region`), e.g. 1:1 loupe detail. */
+"detail";
+
+/**
+ *  A finished preview render. Pixels are an in-memory JPEG (sRGB, quality ~90, 4:4:4)
+ *  served by the `lumen` URI scheme at `url`; set it as an `<img src>` directly (do not
+ *  pass it through `convertFileSrc`). The URL is unique per render (`?v=<seq>`).
+ */
+export type RenderedPreview = {
+	imageId: number,
+	slot: RenderSlot,
+	/**  Monotonic per (image, slot); larger = newer. */
+	seq: number,
+	/**
+	 *  `lumen://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+	 *  (`http://lumen.localhost/...` on Windows).
+	 */
+	url: string,
+	/**  Output pixel size (orientation applied). */
+	width: number,
+	height: number,
+	histogram: Histogram,
+	/**  Wall time of this request inside the backend (decode if uncached + pipeline + encode). */
+	renderMs: number,
+	/**  `adjustments.lut` refers to a LUT not in the library; rendered without it. */
+	lutMissing: boolean,
 };
 
 /**
@@ -695,6 +935,14 @@ export type WhiteBalance = { mode: "as_shot" } |
 /**  `temperatureK` 2000..=50000, `tint` -150..=150 (Lightroom scale). */
 { mode: "custom"; temperatureK: number; tint: number };
 
+/**  White balance as Lightroom shows it for RAW files. */
+export type WhiteBalanceValues = {
+	/**  Kelvin, 2000..=50000. */
+	temperatureK: number,
+	/**  -150..=150. */
+	tint: number,
+};
+
 export type XmpFailure = {
 	imageId: number,
 	reason: string,
@@ -723,7 +971,7 @@ export type XmpSyncReport = {
 	skipped: number,
 	failed: XmpFailure[],
 	/**
-	 *  Images whose catalog rating/pick/label changed as a result (reads only);
+	 *  Images whose catalog rating/pick/label or develop settings changed as a result (reads only);
 	 *  refetch them with `get_images`.
 	 */
 	changed: number[],
@@ -731,7 +979,10 @@ export type XmpSyncReport = {
 
 /**  Per-image XMP sidecar state (`<basename>.xmp` next to the RAW). */
 export type XmpSyncState = {
-	/**  Rating/pick/label/tags changed in the catalog since the sidecar was last written. */
+	/**
+	 *  Rating/pick/label/tags or develop settings (crs:) changed in the catalog since the
+	 *  sidecar was last written.
+	 */
 	dirty: boolean,
 	/**  Unix ms when catalog and sidecar last agreed (write or read); `None` = never synced. */
 	syncedAtMs: number | null,

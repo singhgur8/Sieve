@@ -11,9 +11,11 @@ src-tauri/
   migrations/0002_ingest.sql   v2: thumbnails.preview_path, idx_thumbnails_status
   migrations/0003_analysis.sql v3: image_analysis, quality_scores.suggested_*, auto_analyze
   migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
+  migrations/0005_editor.sql   v5: adjustment_history, presets, adjustments.neutral/history_entry_id, develop dirty triggers
   src/
     main.rs                    -> lumenraw_lib::run()
-    lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync, cache/models-dir resolution, asset scope,
+    lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary,
+                               cache/models/luts-dir resolution, asset scope, `lumen` render URI scheme,
                                specta_builder() (single registration point for commands + events),
                                debug-build export of src/ipc/bindings.ts
     ipc/
@@ -38,9 +40,15 @@ src-tauri/
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
     xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
+    xmp/crs.rs                 develop settings <-> crs:/lumenraw: properties (mapping table)
+    develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), lumen protocol
+      source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
+      wb.rs                    temperature/tint <-> camera multipliers
+      history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
+    lut/mod.rs                 .cube LUT library (directory) + parse/apply
 src/
   ipc/bindings.ts              GENERATED from Rust. Do not edit.
-  ipc/index.ts                 re-exports bindings + unwrap() + DEFAULT_QUERY
+  ipc/index.ts                 re-exports bindings + unwrap() + DEFAULT_QUERY + ALL_ADJUSTMENT_FIELDS
   App.tsx                      Phase 1 smoke-test UI (catalog state, import, list)
 docs/                          this file, ipc-changelog.md, phase plans
 .claude/agents/                specialist subagent definitions
@@ -53,7 +61,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
 | rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
-| `src-tauri/src/xmp/` | rust-engine-dev |
+| `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
 | everything, read-only | qa-engineer |
 
@@ -79,7 +87,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `set_color_label` / `setColorLabel` | `ids: number[], label: ColorLabel \| null` | `null` |
 | `set_user_tag` / `setUserTag` | `ids: number[], tag: CullTag, present: boolean` | `null` |
 | `get_adjustments` / `getAdjustments` | `id: number` | `ParametricAdjustments` (neutral if unedited) |
-| `save_adjustments` / `saveAdjustments` | `id: number, adjustments: ParametricAdjustments` | `null` |
+| `save_adjustments` / `saveAdjustments` | `id: number, adjustments: ParametricAdjustments, label: string` | `AdjustmentHistory` (pushes/coalesces a history entry) |
 | `analyze_images` / `analyzeImages` | `scope: AnalysisScope` | `null` (background) |
 | `cancel_analysis` / `cancelAnalysis` | – | `null` |
 | `get_analysis_status` / `getAnalysisStatus` | – | `AnalysisStatus` |
@@ -96,6 +104,23 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `read_xmp` / `readXmp` | `ids: number[]` | `XmpSyncReport` (sidecar wins) |
 | `set_xmp_auto_sync` / `setXmpAutoSync` | `enabled: boolean` | `null` (enabling flushes dirty images) |
 | `get_xmp_status` / `getXmpStatus` | – | `XmpStatus` |
+| `render_preview` / `renderPreview` | `id: number, adjustments: ParametricAdjustments, options: RenderOptions` | `RenderedPreview \| null` (`null` = superseded) |
+| `get_develop_info` / `getDevelopInfo` | `id: number` | `DevelopInfo` |
+| `prepare_develop` / `prepareDevelop` | `ids: number[]` | `null` (background decode) |
+| `get_history` / `getHistory` | `id: number` | `AdjustmentHistory` |
+| `undo_adjustments` / `undoAdjustments` | `id: number` | `EditState` |
+| `redo_adjustments` / `redoAdjustments` | `id: number` | `EditState` |
+| `goto_history` / `gotoHistory` | `id: number, entryId: number` | `EditState` |
+| `paste_settings` / `pasteSettings` | `ids: number[], adjustments: ParametricAdjustments, fields: AdjustmentField[]` | `null` |
+| `sync_settings` / `syncSettings` | `sourceId: number, targetIds: number[], fields: AdjustmentField[]` | `null` |
+| `reset_adjustments` / `resetAdjustments` | `ids: number[]` | `null` |
+| `apply_preset` / `applyPreset` | `ids: number[], presetId: number` | `null` |
+| `list_presets` / `listPresets` | – | `Preset[]` |
+| `save_preset` / `savePreset` | `id: number \| null, name: string, adjustments: ParametricAdjustments, fields: AdjustmentField[]` | `Preset` |
+| `delete_preset` / `deletePreset` | `id: number` | `null` |
+| `list_luts` / `listLuts` | – | `LutInfo[]` |
+| `import_lut` / `importLut` | `path: string` | `LutInfo` |
+| `delete_lut` / `deleteLut` | `id: string, force: boolean` | `null` |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -105,7 +130,7 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `thumbnailReady {imageId,path,previewPath,width,height}`, `thumbnailFailed {imageId,reason}` (Phase 2),
 `analysisProgress {done,total,failed}`, `analysisReady {imageId}`, `analysisFailed {imageId,reason}`,
 `analysisFinished {analyzed,failed,cancelled,burstGroups}` (Phase 3),
-`xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4).
+`xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4). Rendered previews use the `lumen` URI scheme (Phase 5).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -133,7 +158,7 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - Cache root: `app_cache_dir()` or `LUMENRAW_CACHE=/path`; exposed as `CatalogState.cacheDir`.
 - Frontend loads images with `convertFileSrc(path)`. Asset protocol scope: `$APPCACHE/thumbs/**` plus
   the resolved `<cacheDir>/thumbs` added at runtime. CSP allows `asset:` / `http://asset.localhost`
-  in `img-src` (production; `devCsp` is null for Vite HMR).
+  in `img-src` (production; `devCsp` is null for Vite HMR). Since v5 also `lumen: http://lumen.localhost` (renders).
 
 ## Analysis / culling (Phase 3)
 
@@ -194,6 +219,59 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   SQLite connection, never the command mutex) syncs all dirty images, emits `xmpSynced` per pass and
   `xmpWriteFailed` per failure. Notified after culling writes, on enabling, on launch and on `analysisFinished`.
 
+## Editor (Phase 5)
+
+### Render path (slider feedback < 100 ms)
+1. Slider input -> `renderPreview(id, liveAdjustments, { maxEdge, slot: "main", region: null })` on every input
+   event (no client throttling needed; the backend coalesces). Nothing is saved.
+2. The command validates, takes a **ticket** `(id, slot, seq)` on the async side (arrival order), resolves the RAW
+   path, then on the blocking pool: skip if a newer ticket exists -> render -> store the JPEG in memory as the newest
+   for `(id, slot)` -> return metadata. At most one render per key runs; requests queued behind it that are no
+   longer newest resolve `null`, so a fast drag renders "current, then latest" instead of every frame.
+3. The frontend sets `<img src={preview.url}>` (`lumen://localhost/render/<id>/<slot>?v=<seq>`), served from memory
+   by the async `lumen` URI scheme handler (`Cache-Control: no-store`); `?v=` busts WebKit's cache. It ignores
+   results with a `seq` lower than the one displayed.
+4. On slider release (or debounced): `saveAdjustments(id, adj, "Exposure")` -> history entry + XMP dirty.
+- Histogram (256 bins R/G/B/luma of the 8-bit output) and `renderMs` come back with every render.
+- Slots are independent streams: `before` (before/after view), `detail` (region renders for 1:1 zoom).
+
+### Develop source + cache
+- LibRaw `half_size` decode (camera RGB, no WB, linear, 16-bit; ~3000 px long edge for 24 MP) + as-shot multipliers,
+  colour matrix, levels. Decoded once per image (~0.3-0.8 s), kept in `DevelopCache` (LRU by bytes, default 1 GiB,
+  `LUMENRAW_DEVELOP_CACHE_MB`) with a working-size f32 copy. `prepareDevelop(neighbourIds)` warms it in the background.
+- White balance happens in the pipeline on raw data: `as_shot` uses the camera multipliers; `custom` converts
+  temperature/tint -> multipliers through the camera matrix (`develop::wb`). `getDevelopInfo().asShot` gives the
+  as-shot temperature/tint for the sliders.
+- Pipeline (shared with Phase 6 full-res export): WB -> camera->linear Rec.2020 -> exposure -> tone (contrast,
+  highlights/shadows/whites/blacks) -> texture/clarity/dehaze -> vibrance/saturation -> HSL -> sRGB encode -> LUT
+  (amount blend) -> 8-bit -> histogram -> JPEG (TurboJPEG q90 4:4:4). Orientation applied; `region` crops first.
+
+### History, presets, copy/paste
+- Per-image linear history of full snapshots (`adjustment_history`), cursor in `adjustments.history_entry_id`;
+  first entry "Original". Undo/redo/goto move the cursor and rewrite `adjustments`. New edits after an undo drop the
+  redo tail. Same-label saves within 1.5 s coalesce; max 200 entries per image. All command-path adjustment writes go
+  through `develop::history` (`commit`, `apply_fields`).
+- Fields masks (`AdjustmentField[]`) select groups; semantics = `ParametricAdjustments::copy_fields`. Copy lives in
+  frontend state; `pasteSettings(ids, copied, fields)`; `syncSettings(sourceId, targetIds, fields)` reads the source's
+  stored adjustments; presets store adjustments + fields; `applyPreset` copies only its fields. Batches are atomic and
+  push one entry per changed image.
+- `RawImageEntry.hasEdits` = adjustments differ from neutral (`adjustments.neutral = 0`).
+
+### LUTs
+- Library = directory `<app_data_dir>/luts/` (`LUMENRAW_LUTS`), files `<id>.cube`, shared by all catalogs; Phase 9
+  writes generated LUTs there. `importLut` validates + copies (idempotent by content hash in the id).
+  `ParametricAdjustments.lut = { id, amount }`; a missing id renders without the LUT (`lutMissing`).
+  `deleteLut` refuses while referenced unless `force`.
+
+### XMP develop settings
+- `crs:` properties map 1:1 to `ParametricAdjustments` (table in `xmp/crs.rs`); LUT in `lumenraw:LutId/LutAmount`.
+  Written only for images with an adjustments row, so Lightroom edits of images never touched in LumenRAW survive;
+  all unowned `crs:` properties (curves, crop, sharpening, masks...) are preserved.
+- Read on `read_xmp`, import and newer-wins auto-sync when PV2012+ settings exist; applied as a "Read from XMP"
+  history entry. Lossy only for WB "Auto" (-> as shot) and named WB presets (-> custom with Lightroom's values).
+  Rendering of imported settings approximates Adobe's, not pixel-identical.
+- Dirty tracking: triggers on `adjustments` (0005) join the 0004 triggers, so one `xmp_dirty` flag covers both.
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `LUMENRAW_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -209,7 +287,9 @@ migrations tracked by `PRAGMA user_version`.
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
 | `image_analysis` | per-image analysis status (queued/done/failed), model version, error, `phash` (u64 as i64), `faces_json` (`FaceInfo[]`), `metrics_json` (`ml::ImageMetrics`) |
 | `burst_groups` | time/similarity clusters, optional keeper |
-| `adjustments` | `ParametricAdjustments` JSON + process version, XMP sync time |
+| `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
+| `adjustment_history` | per-image snapshots (label, params JSON, created/updated) |
+| `presets` | name (unique, NOCASE), params JSON, fields JSON |
 
 Deferred: `scenes` (Phase 7).
 

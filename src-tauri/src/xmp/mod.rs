@@ -50,6 +50,7 @@
 //!   the catalog's visible tags differ from its `LumenRAW|*` keywords, the merged state is
 //!   written back so tags reach the sidecar too.
 
+pub mod crs;
 mod packet;
 mod store;
 
