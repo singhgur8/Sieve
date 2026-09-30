@@ -51,16 +51,22 @@ pub fn apply_pins(burst: &mut Burst, pins: &HashSet<ImageId>, overall: impl Fn(I
     }
 }
 
-/// Lowers a burst non-keeper's suggestions: never a pick, one star less, and rejected
-/// (the keeper covers the moment). Its own defects already lowered the rating.
-pub fn demote(q: &mut QualityScore) {
-    q.suggested_pick = PickFlag::Reject;
-    q.suggested_rating = q.suggested_rating.saturating_sub(1);
+/// Lowers a burst non-keeper's suggestions: never a pick, and at most one star below the
+/// keeper (`keeper_rating`). It is *not* rejected for being a duplicate: photographers
+/// often keep several frames of a moment (on a real proposal shoot 38% of burst
+/// non-keepers were kept), so only its own hard defects can make it a reject.
+/// `duplicate_burst` stays a tag for filtering / collapsing.
+pub fn demote(q: &mut QualityScore, keeper_rating: u8) {
+    if q.suggested_pick == PickFlag::Pick {
+        q.suggested_pick = PickFlag::Unflagged;
+    }
+    q.suggested_rating = q.suggested_rating.min(keeper_rating.saturating_sub(1));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::types::ExposureStats;
 
     fn f(id: i64, t: i64, phash: u64, overall: f32) -> BurstFrame {
         BurstFrame { id, captured_at_ms: t, phash, overall }
@@ -95,6 +101,31 @@ mod tests {
         assert_eq!(group_bursts(&frames, 1500, 0), vec![Burst { members: vec![1, 2], keeper: 1 }]);
         assert!(group_bursts(&[], 1500, 10).is_empty());
         assert!(group_bursts(&[f(1, 0, 0, 1.0)], 1500, 10).is_empty());
+    }
+
+    #[test]
+    fn demote_caps_below_keeper_and_never_rejects() {
+        let q = |pick, stars| QualityScore {
+            overall: 0.8,
+            face_sharpness: None,
+            global_sharpness: 0.8,
+            eyes_open: None,
+            composition: None,
+            face_count: 0,
+            exposure: ExposureStats { clipped_highlights_pct: 0.0, clipped_shadows_pct: 0.0, mean_luma: 0.5 },
+            model_version: String::new(),
+            suggested_rating: stars,
+            suggested_pick: pick,
+        };
+        let mut a = q(PickFlag::Pick, 5);
+        demote(&mut a, 4);
+        assert_eq!((a.suggested_pick, a.suggested_rating), (PickFlag::Unflagged, 3));
+        let mut b = q(PickFlag::Unflagged, 2);
+        demote(&mut b, 5);
+        assert_eq!((b.suggested_pick, b.suggested_rating), (PickFlag::Unflagged, 2), "own rating already lower");
+        let mut c = q(PickFlag::Reject, 0);
+        demote(&mut c, 3);
+        assert_eq!(c.suggested_pick, PickFlag::Reject, "own hard defect stays a reject");
     }
 
     #[test]

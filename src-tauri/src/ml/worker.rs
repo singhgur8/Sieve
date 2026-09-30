@@ -308,9 +308,10 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
         let plain: Vec<BurstFrame> = frames.iter().map(|(f, _)| *f).collect();
         for mut b in group_bursts(&plain, window, thresholds.burst_hash_distance) {
             apply_pins(&mut b, &pins, |m| scored[index[&m]].quality.overall);
+            let keeper_rating = scored[index[&b.keeper]].quality.suggested_rating;
             for &m in &b.members {
                 if m != b.keeper {
-                    demote(&mut scored[index[&m]].quality);
+                    demote(&mut scored[index[&m]].quality, keeper_rating);
                 }
             }
             rows.push(BurstRow {
@@ -490,7 +491,8 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(pick1, "reject");
+        // Burst non-keepers are not rejected for being duplicates (never a pick either).
+        assert_eq!(pick1, "unflagged");
         assert_ne!(pick2, "reject");
         // The engine never writes the user's rating / pick.
         let untouched: u32 =
@@ -506,9 +508,16 @@ mod tests {
         assert_eq!(groups[0].keeper_image_id, Some(1));
         assert!(tags_of(&conn, 1).is_empty());
         assert_eq!(tags_of(&conn, 2), vec!["duplicate_burst", "motion_blur"]);
-        let pick2: String =
-            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = 2", [], |r| r.get(0)).unwrap();
-        assert_eq!(pick2, "reject");
+        let (pick1, stars1, pick2, stars2): (String, u8, String, u8) = conn
+            .query_row(
+                "SELECT a.suggested_pick, a.suggested_rating, b.suggested_pick, b.suggested_rating
+                 FROM quality_scores a, quality_scores b WHERE a.image_id = 1 AND b.image_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(pick2, "unflagged");
+        assert!(stars2 < stars1 && pick1 != "reject", "{pick1} {stars1} / {pick2} {stars2}");
 
         // Narrower burst window (rescore) dissolves the group and its duplicate tag.
         repo::set_burst_window(&conn, 400).unwrap();

@@ -22,6 +22,14 @@
 //! - **focus faces**: subjects at least [`FOCUS_MIN_FACE`] tall and not cut off by the
 //!   frame edge. `missed_focus` needs a frontal focus face and *no* sharp subject;
 //!   without focus faces the whole-frame rule decides (detail shots, wide scenes).
+//! - **overexposed**: blown subject skin or a mostly blown frame ("blown" = every channel
+//!   at the clip point), never merely a bright scene or white sky.
+//!
+//! Suggestions (validated against a photographer's own cull with
+//! `examples/keeper_eval.rs`): reject only for hard, trustworthy defects (missed focus
+//! with nothing sharp in the frame, exposure beyond recovery, stacked defects); other
+//! defects lower the stars and withhold `pick`. Burst non-keepers are capped below the
+//! keeper by `bursts::demote`, never rejected for being duplicates.
 
 use super::{AutoTag, FaceMetrics, ImageMetrics, Scored, MODEL_VERSION};
 use crate::ipc::types::{CullTag, CullThresholds, FaceInfo, PickFlag, QualityScore, ShootType};
@@ -70,6 +78,21 @@ pub const CREATIVE_SHARPNESS_GAP: f32 = 0.15;
 /// Eye-openness stand-in when eyes matter (Wedding/Portrait) but no frontal subject
 /// face could be judged (backs, profiles, detail shots): keeps them below clean portraits.
 pub const UNJUDGED_EYES: f32 = 0.6;
+
+/// `overexposed` also fires (whatever the faces) when this share of the whole frame is
+/// blown: pure white with no colour left in any channel. A bright sky behind well-exposed
+/// subjects stays well below (outdoor proposal set: at most 0.49, typically 0.1-0.3).
+pub const OVER_FRAME_BLOWN: f32 = 0.6;
+/// Beyond recovery (suggested reject): this share of a subject face's skin blown, this
+/// share of the frame blown, or a frame darker than [`GROSS_DARK_LUMA`] mean luma.
+pub const GROSS_FACE_BLOWN: f32 = 0.5;
+pub const GROSS_FRAME_BLOWN: f32 = 0.75;
+pub const GROSS_DARK_LUMA: f32 = 0.04;
+/// `missed_focus` is a suggested reject only when the whole frame is soft too: global
+/// sharpness below `globalSharpnessMin` minus this. A soft face in a frame with sharp
+/// detail elsewhere may be deliberate (ring shots, foreground focus) or still a moment
+/// the photographer keeps: tag + lowest stars, never an automatic reject.
+pub const SEVERE_GLOBAL_MARGIN: f32 = 0.05;
 
 /// Eye openness 0..=1 from the EAR of the more-open eye: 0.45 at the blink threshold,
 /// 1.0 at 1.6x the threshold.
@@ -128,13 +151,16 @@ fn sharp_score(s: f32, min: f32) -> f32 {
     ((s - (min - 0.15)) / 0.45).clamp(0.0, 1.0)
 }
 
-fn exposure_score(m: &ImageMetrics) -> f32 {
+/// Exposure 0..=1: mid-tone mean, shadow clipping, blown subject skin and a mostly blown
+/// frame. Bright-but-textured scenes (sky with colour, white dresses) are not penalized.
+fn exposure_score(m: &ImageMetrics, face_blown: f32) -> f32 {
     let e = &m.exposure;
     let luma = e.mean_luma;
     let mut s = 1.0;
     s -= (0.25 - luma).max(0.0) * 3.0;
-    s -= (luma - 0.7).max(0.0) * 3.0;
-    s -= e.clipped_highlights_pct * 5.0;
+    s -= (luma - 0.8).max(0.0) * 3.0;
+    s -= face_blown * 3.0;
+    s -= (m.highlights.blown - 0.3).max(0.0) * 2.0;
     s -= (e.clipped_shadows_pct - 0.05).max(0.0) * 2.0;
     s.clamp(0.0, 1.0)
 }
@@ -273,6 +299,8 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
 
     // Exposure.
     let e = &m.exposure;
+    // Blown skin on the subjects (judged on faces big enough to matter).
+    let face_blown = (0..n).filter(|&i| subject[i]).map(|i| m.faces[i].blown).fold(0.0, f32::max);
     if e.mean_luma < t.underexposed_mean_luma || e.clipped_shadows_pct > t.underexposed_clip_pct {
         let c = if e.mean_luma < t.underexposed_mean_luma {
             margin_conf(e.mean_luma, t.underexposed_mean_luma)
@@ -281,11 +309,15 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         };
         tags.push(AutoTag { tag: CullTag::Underexposed, confidence: c });
     }
-    if e.clipped_highlights_pct > t.overexposed_clip_pct {
-        tags.push(AutoTag {
-            tag: CullTag::Overexposed,
-            confidence: margin_conf(e.clipped_highlights_pct, t.overexposed_clip_pct),
-        });
+    // Overexposed = blown subject skin, or most of the frame blown. Not "bright": sky or a
+    // white dress with any colour left in a channel does not count.
+    if face_blown > t.overexposed_clip_pct || m.highlights.blown > OVER_FRAME_BLOWN {
+        let c = if face_blown > t.overexposed_clip_pct {
+            margin_conf(face_blown, t.overexposed_clip_pct)
+        } else {
+            margin_conf(m.highlights.blown, OVER_FRAME_BLOWN)
+        };
+        tags.push(AutoTag { tag: CullTag::Overexposed, confidence: c });
     }
 
     // Component scores (undetermined eyes are left out, never penalized).
@@ -295,7 +327,7 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
     let w = t.weights;
     let mut parts: Vec<(f32, f32)> = vec![
         (w.global_sharpness, sharp_score(m.global_sharpness, t.global_sharpness_min)),
-        (w.exposure, exposure_score(m)),
+        (w.exposure, exposure_score(m, face_blown)),
     ];
     let eyes_weighted = w.eyes_open > w.global_sharpness;
     match eyes_open {
@@ -324,9 +356,16 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
     // Suggestions. Exposure problems (often intentional low key) only withhold `pick`.
     let badly_exposed = tags.iter().any(|t| matches!(t.tag, CullTag::Underexposed | CullTag::Overexposed));
     let defect = missed_focus.is_some() || (!blinking.is_empty() && eyes_matter);
+    // Suggested reject only on strong, trustworthy signals (see `docs/decisions.md`):
+    // - missed focus with nothing sharp in the frame (soft faces in an otherwise crisp
+    //   frame may be deliberate, and photographers keep soft moments: lowest stars instead);
+    // - exposure beyond recovery.
     // A blink lowers the stars but never rejects on its own: closed eyes cannot be told
-    // apart from a lowered gaze with certainty in a single still.
-    let hard_reject = missed_focus.is_some();
+    // apart from a lowered, smiling gaze with certainty in a single still.
+    let severe_focus = missed_focus.is_some() && m.global_sharpness < t.global_sharpness_min - SEVERE_GLOBAL_MARGIN;
+    let gross_exposure =
+        e.mean_luma < GROSS_DARK_LUMA || m.highlights.blown >= GROSS_FRAME_BLOWN || face_blown >= GROSS_FACE_BLOWN;
+    let hard_reject = severe_focus || gross_exposure;
     let suggested_pick = if hard_reject || overall < t.reject_max_overall {
         PickFlag::Reject
     } else if !defect && !badly_exposed && overall >= t.pick_min_overall {
@@ -370,7 +409,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::ipc::types::{ExposureStats, NormPoint, NormRect};
     use crate::ml::thresholds::default_thresholds;
-    use crate::ml::TileStats;
+    use crate::ml::{HighlightStats, TileStats};
 
     /// A frontal face; `ear` < 0.15 gives a genuinely closed-eye face (CNN closed,
     /// broad smile as when laughing, lips together).
@@ -399,6 +438,7 @@ pub(crate) mod tests {
             face_luma: 0.4,
             anisotropy: 0.2,
             frontal: true,
+            blown: 0.0,
         }
     }
 
@@ -411,6 +451,7 @@ pub(crate) mod tests {
             exposure: ExposureStats { clipped_highlights_pct: 0.0, clipped_shadows_pct: 0.0, mean_luma: 0.45 },
             phash: 0,
             tiles: TileStats { p90: 0.8, p50: 0.6, textured: 0.8, anisotropy: 0.05 },
+            highlights: Default::default(),
         }
     }
 
@@ -533,8 +574,15 @@ pub(crate) mod tests {
         let t = default_thresholds(W);
         let s = score(&metrics(vec![face(0.4, 0.15, 0.3, 0.28)]), &t, W);
         assert!(has(&s, CullTag::MissedFocus) && !has(&s, CullTag::MotionBlur));
-        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
-        assert!(s.quality.overall <= 0.35);
+        // Something else in the frame is sharp: lowest stars, but not an automatic reject.
+        assert_eq!(s.quality.suggested_pick, PickFlag::Unflagged);
+        assert!(s.quality.overall <= 0.35 && s.quality.suggested_rating <= 1);
+        // Nothing sharp anywhere: reject.
+        let mut m = metrics(vec![face(0.4, 0.15, 0.3, 0.28)]);
+        m.global_sharpness = t.global_sharpness_min - SEVERE_GLOBAL_MARGIN - 0.01;
+        let s = score(&m, &t, W);
+        assert!(has(&s, CullTag::MissedFocus));
+        assert_eq!((s.quality.suggested_pick, s.quality.suggested_rating), (PickFlag::Reject, 0));
         let mut moving = face(0.4, 0.15, 0.3, 0.28);
         moving.anisotropy = 0.5;
         let s = score(&metrics(vec![moving]), &t, W);
@@ -553,8 +601,40 @@ pub(crate) mod tests {
         let s = score(&m, &t, W);
         assert!(has(&s, CullTag::Underexposed));
         assert!(!s.quality.overall.is_nan());
-        m.exposure = ExposureStats { clipped_highlights_pct: 0.2, clipped_shadows_pct: 0.0, mean_luma: 0.6 };
+        assert_ne!(s.quality.suggested_pick, PickFlag::Reject, "dark is often intentional");
+        m.exposure.mean_luma = GROSS_DARK_LUMA / 2.0;
+        assert_eq!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
+    }
+
+    #[test]
+    fn bright_sky_is_not_overexposed_but_blown_skin_is() {
+        let t = default_thresholds(W);
+        // Outdoor portrait against a white sky: lots of luma-clipped and some blown sky,
+        // well-exposed face.
+        let mut m = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m.exposure = ExposureStats { clipped_highlights_pct: 0.4, clipped_shadows_pct: 0.0, mean_luma: 0.72 };
+        m.highlights = HighlightStats { blown: 0.45, center: 0.7, region: 0.25 };
+        let s = score(&m, &t, W);
+        assert!(!has(&s, CullTag::Overexposed), "{:?}", s.tags);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Pick);
+        // Blown skin on the subject.
+        let mut blown = face(0.4, 0.15, 0.7, 0.28);
+        blown.blown = 0.3;
+        m.faces = vec![blown.clone()];
+        let s = score(&m, &t, W);
+        assert!(has(&s, CullTag::Overexposed));
+        assert_eq!(s.quality.suggested_pick, PickFlag::Unflagged);
+        // A small background face's highlights do not count.
+        m.faces =
+            vec![face(0.2, 0.15, 0.7, 0.28), FaceMetrics { bbox: NormRect { height: 0.045, ..blown.bbox }, ..blown }];
+        assert!(!has(&score(&m, &t, W), CullTag::Overexposed));
+        // Most of the frame pure white: overexposed; beyond recovery: reject.
+        let mut m = metrics(vec![]);
+        m.highlights.blown = OVER_FRAME_BLOWN + 0.05;
         assert!(has(&score(&m, &t, W), CullTag::Overexposed));
+        assert_ne!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
+        m.highlights.blown = GROSS_FRAME_BLOWN;
+        assert_eq!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
     }
 
     #[test]

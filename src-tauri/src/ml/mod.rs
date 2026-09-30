@@ -49,7 +49,7 @@ use crate::ipc::types::{
 
 /// Stored in `image_analysis.model_version` / `quality_scores.model_version`. Bump when
 /// models or measurement code change: rows with another version count as pending.
-pub const MODEL_VERSION: &str = "scrfd10g-2d106-eyecnn-mesh-v3";
+pub const MODEL_VERSION: &str = "scrfd10g-2d106-eyecnn-mesh-v4";
 
 // ---------------------------------------------------------------------------
 // Managed state (fixed surface)
@@ -174,6 +174,10 @@ pub struct FaceMetrics {
     pub face_luma: f32,
     /// Mouth width / outer eye-corner span (wide = smiling).
     pub mouth_width: Option<f32>,
+    /// Share 0..=1 of the inner face box (skin) that is blown (every channel >=
+    /// `imgproc::BLOWN_MIN`).
+    #[serde(default)]
+    pub blown: f32,
 }
 
 /// Tiled whole-frame sharpness over textured tiles (~1024 px luma).
@@ -186,6 +190,18 @@ pub struct TileStats {
     pub textured: f32,
     /// Mean directional anisotropy of the sharpest quarter of tiles.
     pub anisotropy: f32,
+}
+
+/// Blown highlights (every channel >= `imgproc::BLOWN_MIN`, no colour left) of a
+/// preview, as shares 0..=1 of the frame / region.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct HighlightStats {
+    /// Whole frame.
+    pub blown: f32,
+    /// Central area (middle half of width and height), where subjects usually are.
+    pub center: f32,
+    /// Largest connected blown region (coarse cells), as frame share.
+    pub region: f32,
 }
 
 /// Threshold-independent measurements of one preview: the expensive part, stored as
@@ -204,6 +220,8 @@ pub struct ImageMetrics {
     /// 64-bit perceptual hash (also stored as `image_analysis.phash`, bit-cast to i64).
     pub phash: u64,
     pub tiles: TileStats,
+    #[serde(default)]
+    pub highlights: HighlightStats,
 }
 
 /// Loaded ONNX sessions (SCRFD + 106-pt landmarks) plus reusable buffers. One per

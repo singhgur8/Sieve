@@ -263,6 +263,101 @@ pub fn exposure(g: &Gray) -> ExposureStats {
     }
 }
 
+/// A pixel is *blown* when every channel is at or above this (no colour information
+/// left: pure white in the preview). A bright sky or white dress with a colour cast or
+/// texture in any channel is not blown.
+pub const BLOWN_MIN: u8 = 250;
+
+/// Coarse map of blown pixels: share of blown pixels per `cell x cell` block of the RGB
+/// image (sampled every `step` pixels in both directions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlownMap {
+    pub gw: usize,
+    pub gh: usize,
+    pub cell: usize,
+    /// Blown share per cell, row-major.
+    pub cells: Vec<f32>,
+}
+
+impl BlownMap {
+    pub fn new(rgb: &[u8], w: usize, h: usize, cell: usize, step: usize) -> Self {
+        let (cell, step) = (cell.max(1), step.max(1));
+        let (gw, gh) = (w.div_ceil(cell), h.div_ceil(cell));
+        let mut hits = vec![0u32; gw * gh];
+        let mut tot = vec![0u32; gw * gh];
+        for y in (0..h).step_by(step) {
+            let row = &rgb[y * w * 3..(y + 1) * w * 3];
+            let gy = y / cell;
+            for x in (0..w).step_by(step) {
+                let p = &row[x * 3..x * 3 + 3];
+                let i = gy * gw + x / cell;
+                tot[i] += 1;
+                if p[0] >= BLOWN_MIN && p[1] >= BLOWN_MIN && p[2] >= BLOWN_MIN {
+                    hits[i] += 1;
+                }
+            }
+        }
+        let cells = hits.iter().zip(&tot).map(|(&a, &t)| if t > 0 { a as f32 / t as f32 } else { 0.0 }).collect();
+        Self { gw, gh, cell, cells }
+    }
+
+    /// Blown share of the whole frame.
+    pub fn total(&self) -> f32 {
+        self.cells.iter().sum::<f32>() / self.cells.len().max(1) as f32
+    }
+
+    /// Blown share inside the normalized rectangle `[x0, x1) x [y0, y1)` (0..=1).
+    pub fn share_in(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+        let cx = |v: f32| ((v.clamp(0.0, 1.0) * self.gw as f32) as usize).min(self.gw);
+        let cy = |v: f32| ((v.clamp(0.0, 1.0) * self.gh as f32) as usize).min(self.gh);
+        let (a, b) = (cx(x0), cx(x1).max(cx(x0) + 1).min(self.gw));
+        let (c, d) = (cy(y0), cy(y1).max(cy(y0) + 1).min(self.gh));
+        if a >= b || c >= d {
+            return 0.0;
+        }
+        let mut s = 0.0;
+        for y in c..d {
+            s += self.cells[y * self.gw + a..y * self.gw + b].iter().sum::<f32>();
+        }
+        s / ((b - a) * (d - c)) as f32
+    }
+
+    /// Frame share of the largest 8-connected region of cells at least half blown.
+    pub fn largest_region(&self) -> f32 {
+        let n = self.cells.len();
+        let mut seen = vec![false; n];
+        let mut best = 0usize;
+        let mut stack = Vec::new();
+        for start in 0..n {
+            if seen[start] || self.cells[start] < 0.5 {
+                continue;
+            }
+            seen[start] = true;
+            stack.push(start);
+            let mut size = 0;
+            while let Some(i) = stack.pop() {
+                size += 1;
+                let (x, y) = ((i % self.gw) as isize, (i / self.gw) as isize);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx >= self.gw as isize || ny >= self.gh as isize {
+                            continue;
+                        }
+                        let j = ny as usize * self.gw + nx as usize;
+                        if !seen[j] && self.cells[j] >= 0.5 {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    }
+                }
+            }
+            best = best.max(size);
+        }
+        best as f32 / n.max(1) as f32
+    }
+}
+
 /// Area-average resize to `dw x dh` (downscale only; fine for hashing).
 pub fn resize_area(g: &Gray, dw: usize, dh: usize) -> Gray {
     let mut out = Gray::new(dw, dh);
@@ -464,6 +559,29 @@ mod tests {
         assert!((e.clipped_highlights_pct - 0.1).abs() < 1e-6);
         assert!((e.clipped_shadows_pct - 0.6).abs() < 1e-6);
         assert!((e.mean_luma - (2550.0 + 30.0 * 128.0) / 100.0 / 255.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn blown_map_needs_all_channels_and_finds_regions() {
+        let (w, h) = (80, 40);
+        let mut rgb = vec![128u8; w * h * 3];
+        // Left quarter: pure white (blown). Right quarter: bright sky with a blue cast.
+        for y in 0..h {
+            for x in 0..w {
+                let p = &mut rgb[(y * w + x) * 3..(y * w + x) * 3 + 3];
+                if x < 20 {
+                    p.copy_from_slice(&[255, 255, 255]);
+                } else if x >= 60 {
+                    p.copy_from_slice(&[235, 250, 255]);
+                }
+            }
+        }
+        let m = BlownMap::new(&rgb, w, h, 10, 1);
+        assert_eq!((m.gw, m.gh), (8, 4));
+        assert!((m.total() - 0.25).abs() < 1e-6);
+        assert!((m.share_in(0.0, 0.0, 0.25, 1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(m.share_in(0.75, 0.0, 1.0, 1.0), 0.0);
+        assert!((m.largest_region() - 0.25).abs() < 1e-6);
     }
 
     #[test]
