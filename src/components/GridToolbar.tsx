@@ -42,7 +42,7 @@ export function GridToolbar(p: Props) {
       <span className="mx-1 h-4 w-px shrink-0 bg-neutral-700" />
       <label className="flex items-center gap-1.5">
         Size
-        <input type="range" className="w-20" min={90} max={420} step={10} value={p.size} onChange={(e) => p.onSize(Number(e.target.value))} data-testid="thumb-size" />
+        <input type="range" className="solid-range w-24" min={90} max={420} step={10} value={p.size} onChange={(e) => p.onSize(Number(e.target.value))} data-testid="thumb-size" />
       </label>
       <label className="flex items-center gap-1.5">
         Sort

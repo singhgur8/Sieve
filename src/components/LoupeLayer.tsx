@@ -5,11 +5,12 @@ import type { Library } from "../hooks/useLibrary";
 import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
 import { CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
 import { Filmstrip } from "./Filmstrip";
+import { CompareBar, CompareTag } from "./CompareBar";
 import { usePanels } from "../lib/panels";
 import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
 
+/** Compare pair: `a` is the Select (the keeper so far), `b` the Candidate. `focus` is the active pane. */
 export interface CompareState {
-  pool: number[];
   a: number;
   b: number;
   focus: "a" | "b";
@@ -29,12 +30,20 @@ interface Props {
   compare: CompareState | null;
   onFocusPane: (which: "a" | "b") => void;
   onOpen: (id: number) => void;
+  /** Compare: filmstrip click picks the Candidate. */
+  onCandidate?: (id: number) => void;
+  onSwap?: () => void;
+  onMakeSelect?: () => void;
+  onEditCompare?: () => void;
+  onExitCompare?: () => void;
+  /** Click on a star: rate that photo (0 clears). */
+  onRate?: (id: number, rating: number) => void;
   /** "Locate folder…" for the folder of image `imageId`. */
   onLocate?: (imageId: number) => void;
 }
 
 /** Full-area loupe / 2-up compare. Owns zoom/pan state so pans do not re-render the grid. */
-export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen, onLocate }, ref) {
+export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen, onCandidate, onSwap, onMakeSelect, onEditCompare, onExitCompare, onRate, onLocate }, ref) {
   const [view, setView] = useState<View>(FIT);
   const [faces, setFaces] = useState<FaceInfo[]>([]);
   const [info, setInfo] = useState<InfoLevel>("full");
@@ -95,6 +104,18 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-neutral-950" data-testid={mode === "compare" ? "compare" : "loupe"}>
+      {mode === "compare" && compare && (
+        <CompareBar
+          focus={compare.focus}
+          aName={lib.getEntry(compare.a)?.fileName ?? ""}
+          bName={lib.getEntry(compare.b)?.fileName ?? ""}
+          onSwap={() => onSwap?.()}
+          onMakeSelect={() => onMakeSelect?.()}
+          onFocus={onFocusPane}
+          onEdit={onEditCompare}
+          onExit={onExitCompare}
+        />
+      )}
       <div className="relative flex min-h-0 flex-1 gap-1">
         {mode === "compare" && compare ? (
           <>
@@ -108,7 +129,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-image-id={id}
                 >
                   <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} />
-                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} />
+                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} />
                 </div>
               );
             })}
@@ -116,7 +137,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
             <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} testId="zoom-a" />
-            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} />
+            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} onRate={onRate} />
           </div>
         ) : null}
         <div
@@ -127,8 +148,24 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
           {faces.length > 0 ? ` · ${faces.length} face${faces.length > 1 ? "s" : ""}` : ""}
         </div>
       </div>
+      {mode === "compare" && compare && (
+        <Filmstrip
+          lib={lib}
+          activeId={compare.b}
+          selected={new Set([compare.a])}
+          marked={new Set([compare.b])}
+          onPick={(id) => onCandidate?.(id)}
+          onRate={onRate}
+          badge={(id) => <CompareTag id={id} a={compare.a} b={compare.b} />}
+          cellW={64}
+          cellH={48}
+          height={60}
+          scenePrefix="compare-film-scene"
+          align="center"
+        />
+      )}
       {mode === "loupe" && !panels.chrome && (
-        <Filmstrip lib={lib} activeId={activeId} onPick={(id) => onOpen(id)} cellW={80} cellH={64} height={72} scenePrefix="loupe-film-scene" align="center" />
+        <Filmstrip lib={lib} activeId={activeId} onPick={(id) => onOpen(id)} onRate={onRate} cellW={80} cellH={64} height={72} scenePrefix="loupe-film-scene" align="center" />
       )}
     </div>
   );
@@ -146,7 +183,7 @@ function suggestion(entry: RawImageEntry): string | null {
   return `Suggested: ${PICK_LABEL[q.suggestedPick]} · ${q.suggestedRating}★`;
 }
 
-function InfoOverlay({ entry, level, showKeeper, onLocate }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean; onLocate?: (id: number) => void }) {
+function InfoOverlay({ entry, level, showKeeper, onLocate, onRate }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean; onLocate?: (id: number) => void; onRate?: (id: number, rating: number) => void }) {
   if (!entry || level === "off") return null;
   if (level === "name")
     return (
@@ -170,7 +207,7 @@ function InfoOverlay({ entry, level, showKeeper, onLocate }: { entry: RawImageEn
         {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" />}
         {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} />}
         {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
-        <Stars n={entry.rating} />
+        <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId={`loupe-stars-${entry.id}`} />
         <HealthBadge entry={entry} testPrefix="loupe-health" />
         {onLocate && entry.missingSinceMs != null && (
           <button onClick={() => onLocate(entry.id)} data-testid="loupe-locate" className="pointer-events-auto rounded bg-neutral-800 px-1.5 text-[10px] text-neutral-200 hover:bg-neutral-700">

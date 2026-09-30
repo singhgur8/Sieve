@@ -13,13 +13,59 @@ interface Props {
   active: boolean;
   onClick: (id: number, e: React.MouseEvent) => void;
   onDoubleClick: (id: number) => void;
+  /** Click on a star: rate this photo only (0 clears). */
+  onRate?: (id: number, rating: number) => void;
 }
 
-export function Stars({ n, className = "size-3" }: { n: number; className?: string }) {
+const stopAll = (e: React.SyntheticEvent) => e.stopPropagation();
+
+/**
+ * Star row. With `onRate` each star is a button: click sets that rating, clicking the current rating clears it,
+ * hovering previews the result. Events never bubble, so rating does not change the selection or open the loupe.
+ */
+export function Stars({ n, className = "size-3", onRate, testId }: { n: number; className?: string; onRate?: (rating: number) => void; testId?: string }) {
+  const [hover, setHover] = useState(0);
+  if (!onRate)
+    return (
+      <span className="flex" aria-label={`${n} stars`}>
+        {[1, 2, 3, 4, 5].map((i) => (
+          <Star key={i} className={`${className} ${i <= n ? "fill-amber-400 text-amber-400" : "text-neutral-700"}`} />
+        ))}
+      </span>
+    );
+  const shown = hover || n;
   return (
-    <span className="flex" aria-label={`${n} stars`}>
+    <span
+      className="pointer-events-auto flex"
+      role="group"
+      aria-label={`${n} stars`}
+      data-testid={testId}
+      data-rating={n}
+      onMouseLeave={() => setHover(0)}
+      onClick={stopAll}
+      onDoubleClick={stopAll}
+      onMouseDown={stopAll}
+      onPointerDown={stopAll}
+    >
       {[1, 2, 3, 4, 5].map((i) => (
-        <Star key={i} className={`${className} ${i <= n ? "fill-amber-400 text-amber-400" : "text-neutral-700"}`} />
+        <button
+          key={i}
+          type="button"
+          tabIndex={-1}
+          aria-label={i === n ? `Clear rating (${i} stars)` : `Rate ${i} star${i === 1 ? "" : "s"}`}
+          title={i === n ? "Click to clear the rating" : `${i} star${i === 1 ? "" : "s"}`}
+          data-testid={testId ? `${testId}-${i}` : undefined}
+          data-filled={i <= shown}
+          className="cursor-pointer p-0.5"
+          onMouseEnter={() => setHover(i === n ? 0 : i)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setHover(0);
+            onRate(i === n ? 0 : i);
+          }}
+        >
+          <Star className={`${className} ${i <= shown ? (hover ? "fill-amber-200 text-amber-200" : "fill-amber-400 text-amber-400") : "text-neutral-400"}`} />
+        </button>
       ))}
     </span>
   );
@@ -97,7 +143,7 @@ function Thumb({ src, name }: { src: string; name: string | undefined }) {
   return <img src={src} decoding="async" draggable={false} alt={name} className="size-full object-contain" onError={() => setBroken(src)} />;
 }
 
-export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick }: Props) {
+export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick, onRate }: Props) {
   const t = entry?.thumbnail;
   const compact = size < 150;
   const tags = entry?.tags.filter((x) => !x.suppressed) ?? [];
@@ -159,7 +205,7 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
                 </span>
               ))}
             </div>
-            {entry.rating > 0 && (compact ? <span className="text-[10px] text-amber-400">{entry.rating}★</span> : <Stars n={entry.rating} />)}
+            {entry.rating > 0 && <Stars n={entry.rating} className={compact ? "size-3" : "size-3.5"} onRate={onRate && ((r) => onRate(id, r))} testId={`stars-cell-${id}`} />}
           </div>
         </>
       )}

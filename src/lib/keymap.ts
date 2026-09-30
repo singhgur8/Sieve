@@ -30,7 +30,10 @@ export type ActionId =
   | "savePreset"
   | "develop"
   | "compare"
-  | "tab"
+  | "compareSwap"
+  | "compareMakeSelect"
+  | "compareFocus"
+  | "scenesToggle"
   | "zoomLoupe"
   | "zoomDevelop"
   | "face"
@@ -101,12 +104,16 @@ export interface KeyDef {
   /** Handled elsewhere (modal system); documented only. */
   external?: boolean;
   /** Only active while the crop tool is open (matched before the culling keys, so X / A do not cull or auto-mask). */
-  needs?: "crop";
+  needs?: "crop" | "compare";
+  /** Not listed in the cheat sheet (a per-mode variant of a listed row). */
+  hidden?: boolean;
 }
 
 /** Tool state the matcher needs to pick between chords that share a key. */
 export interface KeyContext {
   cropping?: boolean;
+  /** A Compare pair is open (Library Compare, or Compare inside Develop). */
+  comparing?: boolean;
 }
 
 const c = (key: string, o: Omit<Chord, "key"> = {}): Chord => ({ key, ...o });
@@ -124,14 +131,14 @@ export const KEYMAP: KeyDef[] = [
   { id: "rate", group: "Culling", label: "Star rating", chords: digits(0, 5), modes: ALL, display: ["0-5"], where: "Everywhere" },
   { id: "label", group: "Culling", label: "Color label (red, yellow, green, blue)", chords: digits(6, 9), modes: ALL, display: ["6-9"], where: "Everywhere" },
   { id: "keeper", group: "Culling", label: "Make this frame the burst keeper and Pick it", chords: [c("k")], modes: ["compare"], display: ["K"], where: "Compare" },
-  { id: "keeperSet", group: "Culling", label: "Make the active photo its burst keeper", chords: [c("k", { shift: true })], modes: LIB, display: ["Shift+K"], where: "Grid, Loupe" },
+  { id: "keeperSet", group: "Culling", label: "Make the active photo its burst keeper", chords: [c("k", { shift: true })], modes: ALL, display: ["Shift+K"], where: "Everywhere" },
   { id: "undoCull", group: "Culling", label: "Undo culling change", chords: [c("z", { mod: true })], modes: LIB, display: ["Cmd+Z"], where: "Outside Develop" },
   { id: "redoCull", group: "Culling", label: "Redo culling change", chords: [c("z", { mod: true, shift: true })], modes: LIB, display: ["Cmd+Shift+Z"], where: "Outside Develop" },
   { id: "anchor", group: "Scenes", label: "Toggle scene anchor", chords: [c("a", { shift: true })], modes: ALL, display: ["Shift+A"], where: "Everywhere" },
   { id: "selectBurst", group: "Scenes", label: "Select the active photo's burst", chords: [c("b", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+B"], where: "Everywhere" },
 
   // ---- navigation ----
-  { id: "navH", group: "Navigate", label: "Previous / next photo (Compare: focused pane; Grid: Shift extends)", chords: [c("ArrowLeft", { shift: "any" }), c("ArrowRight", { shift: "any" })], modes: ALL, display: ["Left / Right"], where: "Everywhere" },
+  { id: "navH", group: "Navigate", label: "Previous / next photo (Compare: the candidate; Grid: Shift extends)", chords: [c("ArrowLeft", { shift: "any" }), c("ArrowRight", { shift: "any" })], modes: ALL, display: ["Left / Right"], where: "Everywhere" },
   { id: "navV", group: "Navigate", label: "Row up / down", chords: [c("ArrowUp", { shift: "any" }), c("ArrowDown", { shift: "any" })], modes: ["grid"], display: ["Up / Down"], where: "Grid" },
   { id: "gridJump", group: "Navigate", label: "First / last / page up / page down (Shift extends)", chords: [c("Home", { shift: "any" }), c("End", { shift: "any" }), c("PageUp", { shift: "any" }), c("PageDown", { shift: "any" })], modes: ["grid"], display: ["Home / End / PgUp / PgDn"], where: "Grid" },
   { id: "toggleLoupe", group: "Navigate", label: "Grid to Loupe and back", chords: [c(" "), c("Enter"), c("e")], modes: LIB, display: ["Space", "Enter", "E"], where: "Grid, Loupe, Compare" },
@@ -142,8 +149,12 @@ export const KEYMAP: KeyDef[] = [
   { id: "panelsToggle", group: "Navigate", label: "Hide / show the side panels", chords: [c("Tab")], modes: ["develop"], display: ["Tab"], where: "Develop" },
   { id: "panelsHide", group: "Navigate", label: "Hide / show all panels, filmstrip and toolbar", chords: [c("Tab", { shift: true })], modes: ["develop", "loupe"], display: ["Shift+Tab"], where: "Develop, Loupe" },
   { id: "develop", group: "Navigate", label: "Develop", chords: [c("d")], modes: LIB, display: ["D"], where: "Grid, Loupe, Compare" },
-  { id: "compare", group: "Navigate", label: "Compare (from Compare: back to Loupe)", chords: [c("c")], modes: LIB, display: ["C"], where: "Grid, Loupe, Compare" },
-  { id: "tab", group: "Navigate", label: "Switch the focused Compare pane", chords: [c("Tab")], modes: ["compare"], display: ["Tab"], where: "Compare" },
+  { id: "compare", group: "Navigate", label: "Compare view: two photos side by side (again: leave it; in Library it returns to Loupe)", chords: [c("c")], modes: ALL, display: ["C"], where: "Library and Develop" },
+  { id: "compareSwap", group: "Navigate", label: "Swap Select and Candidate", chords: [c("ArrowDown")], modes: ["compare", "develop"], display: ["Down"], where: "Compare (Library and Develop)", needs: "compare" },
+  { id: "compareMakeSelect", group: "Navigate", label: "Make the Candidate the Select (next photo becomes the Candidate)", chords: [c("ArrowUp")], modes: ["compare", "develop"], display: ["Up"], where: "Compare (Library and Develop)", needs: "compare" },
+  { id: "compareFocus", group: "Navigate", label: "Switch the active pane (ratings, flags and edits go to it)", chords: [c("Tab"), c("c", { shift: true })], modes: ["compare"], display: ["Tab", "Shift+C"], where: "Library Compare" },
+  { id: "compareFocus", group: "Navigate", label: "Switch the active pane", chords: [c("c", { shift: true })], modes: ["develop"], display: ["Shift+C"], where: "Develop Compare", needs: "compare", hidden: true },
+  { id: "scenesToggle", group: "Scenes", label: "Show / hide the scene strip (hiding clears the scene filter)", chords: [c("s", { shift: true })], modes: ALL, display: ["Shift+S"], where: "Everywhere" },
   { id: "selectAll", group: "Navigate", label: "Select all", chords: [c("a", { mod: true })], modes: ["grid"], display: ["Cmd+A"], where: "Grid" },
   { id: "selectNone", group: "Navigate", label: "Select none", chords: [c("d", { mod: true })], modes: ["grid"], display: ["Cmd+D"], where: "Grid" },
   { id: "filterBar", group: "Navigate", label: "Show / hide the filter bar", chords: [c("f", { mod: true })], modes: ALL, display: ["Cmd+F"], where: "Library" },
@@ -215,6 +226,7 @@ export function matchKey(e: KeyboardEvent, mode: Mode, ctx: KeyContext = {}): Ke
   for (const d of KEYMAP) {
     if (d.external || !d.modes.includes(mode)) continue;
     if (d.needs === "crop" && !ctx.cropping) continue;
+    if (d.needs === "compare" && !ctx.comparing) continue;
     if (d.chords.some((ch) => chordMatches(ch, e))) return d;
   }
   return null;
@@ -230,6 +242,7 @@ export function hint(id: ActionId, index = 0): string {
 export function keymapGroups(): { group: string; items: KeyDef[] }[] {
   const out: { group: string; items: KeyDef[] }[] = [];
   for (const d of KEYMAP) {
+    if (d.hidden) continue;
     let g = out.find((x) => x.group === d.group);
     if (!g) out.push((g = { group: d.group, items: [] }));
     g.items.push(d);

@@ -587,7 +587,7 @@ test.describe("P1-5/6 Develop flags and library-level settings clipboard", () =>
     await expect(page.getByTestId("film-flag-8")).toHaveAttribute("data-pick", "reject");
     await page.keyboard.press("3");
     await expect(page.getByTestId("develop-flags")).toHaveAttribute("data-rating", "3");
-    await expect(page.getByTestId("film-rating-8")).toHaveText("3★");
+    await expect(page.getByTestId("film-rating-8")).toHaveAttribute("data-rating", "3");
     await shot(page, "5x-ux-develop-flags");
 
     await page.getByTestId("slider-exposure").fill("1.5");

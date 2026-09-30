@@ -34,6 +34,9 @@ interface Props {
 
 type Pt = { x: number; y: number };
 const DEG = 180 / Math.PI;
+/** Overlay strength (55-60 % per the UX spec) and fade-out time. */
+const OVERLAY_ALPHA = 0.58;
+const OVERLAY_FADE_MS = 250;
 
 /** L* / 100 of an sRGB pixel (the space `luminance_weight` works in). */
 function lightness(px: ArrayLike<number>): number {
@@ -136,15 +139,17 @@ export function MaskLayer({ masks, editor, id, frame, box, region = null, onErro
   }, [onError]);
   const adj = editor.adj;
   useEffect(() => {
-    if (id == null || !masks.overlayOn || !targetOk || !target || maxEdge === 0) {
+    if (id == null || !masks.overlayVisible || !targetOk || !target || maxEdge === 0) {
       ovReq.current.latest = null;
-      setOv(null);
-      return;
+      // Keep the last overlay while it fades out, then drop it so a later show never flashes a stale matte.
+      const t = setTimeout(() => setOv(null), OVERLAY_FADE_MS + 50);
+      return () => clearTimeout(t);
     }
     ovReq.current.latest = { id, adj, groupId: target.groupId, componentId: target.componentId, maxEdge, region };
     pump();
+    return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, masks.overlayOn, targetOk, target?.groupId, target?.componentId, adj, maxEdge, regionKey, pump]);
+  }, [id, masks.overlayVisible, targetOk, target?.groupId, target?.componentId, adj, maxEdge, regionKey, pump]);
   useEffect(() => setOv(null), [id]);
 
   // ---- geometry helpers ----
@@ -461,7 +466,8 @@ export function MaskLayer({ masks, editor, id, frame, box, region = null, onErro
   };
 
   const brushR = tool?.kind === "brush" ? brushRadiusPx(sizeToRadius(masks.brush.size), frame, box) : 0;
-  const showOv = ov && masks.overlayOn && targetOk;
+  const showOv = ov && targetOk;
+  const ovShown = masks.overlayVisible;
   const ovRegion = ovState?.region ?? null;
   const ovBox = ovRegion
     ? { left: box.x + ovRegion.x * box.w, top: box.y + ovRegion.y * box.h, width: ovRegion.width * box.w, height: ovRegion.height * box.h }
@@ -471,9 +477,23 @@ export function MaskLayer({ masks, editor, id, frame, box, region = null, onErro
     <div ref={root} className="pointer-events-none absolute inset-0 overflow-hidden" data-testid="mask-layer" data-tool={tool?.kind ?? ""} data-box={JSON.stringify(box)}>
       {showOv &&
         (style.mode === "color" ? (
-          <div className="absolute isolate" style={{ ...ovBox, mixBlendMode: "screen" }} data-testid="mask-overlay" data-overlay-seq={ov!.seq} data-overlay-style={style.id} data-overlay-region={ovRegion ? JSON.stringify(ovRegion) : ""}>
-            <div className="absolute inset-0" style={{ backgroundColor: style.color, opacity: 0.6 }} />
-            <img src={ov!.url} alt="" draggable={false} className="absolute inset-0 size-full" style={{ mixBlendMode: "multiply" }} />
+          <div
+            className="absolute"
+            style={{ ...ovBox, opacity: ovShown ? 1 : 0, transition: `opacity ${OVERLAY_FADE_MS}ms ease-out` }}
+            data-testid="mask-overlay"
+            data-overlay-seq={ov!.seq}
+            data-overlay-style={style.id}
+            data-overlay-visible={ovShown}
+            data-overlay-pinned={masks.overlayOn}
+            data-overlay-region={ovRegion ? JSON.stringify(ovRegion) : ""}
+          >
+            {/* Dark red reads as a mask even on bright areas: the photo is darkened inside the mask (inverted matte, multiply)... */}
+            <img src={ov!.url} alt="" draggable={false} className="absolute inset-0 size-full" style={{ mixBlendMode: "multiply", filter: "invert(1)", opacity: OVERLAY_ALPHA }} />
+            {/* ...and tinted with the colour at the same strength (screen). */}
+            <div className="absolute inset-0 isolate" style={{ mixBlendMode: "screen" }}>
+              <div className="absolute inset-0" style={{ backgroundColor: style.color, opacity: OVERLAY_ALPHA }} data-testid="mask-overlay-tint" />
+              <img src={ov!.url} alt="" draggable={false} className="absolute inset-0 size-full" style={{ mixBlendMode: "multiply" }} />
+            </div>
           </div>
         ) : (
           <img
@@ -481,10 +501,12 @@ export function MaskLayer({ masks, editor, id, frame, box, region = null, onErro
             alt=""
             draggable={false}
             className="absolute"
-            style={{ ...ovBox, opacity: style.mode === "gray" ? 0.65 : 1 }}
+            style={{ ...ovBox, opacity: ovShown ? (style.mode === "gray" ? 0.65 : 1) : 0, transition: `opacity ${OVERLAY_FADE_MS}ms ease-out` }}
             data-testid="mask-overlay"
             data-overlay-seq={ov!.seq}
             data-overlay-style={style.id}
+            data-overlay-visible={ovShown}
+            data-overlay-pinned={masks.overlayOn}
             data-overlay-region={ovRegion ? JSON.stringify(ovRegion) : ""}
           />
         ))}

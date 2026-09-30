@@ -88,8 +88,8 @@ export function MasksPanel({ masks }: Props) {
         <div className="mb-1 flex flex-wrap items-center justify-between gap-1">
           <h2 className="whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-neutral-300">Masks ({masks.groups.length})</h2>
           <div className="flex items-center gap-2 text-[11px] text-neutral-300">
-            <label className="flex items-center gap-1" title={`Show the selected mask as an overlay${hint("maskOverlay")}`}>
-              <input type="checkbox" checked={masks.overlayOn} onChange={masks.toggleOverlay} data-testid="mask-overlay-toggle" /> Overlay
+            <label className="flex items-center gap-1" title={`Keep the selected mask overlay on. Off: it appears while you paint or adjust and fades out afterwards${hint("maskOverlay")}`}>
+              <input type="checkbox" checked={masks.overlayOn} onChange={masks.toggleOverlay} data-testid="mask-overlay-toggle" /> Show overlay
             </label>
             <select
               className="rounded bg-neutral-800 px-1 py-0.5 text-[11px]"
