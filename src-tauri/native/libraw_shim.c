@@ -45,6 +45,14 @@ typedef struct {
   char model[64];
   float fuji_expo_shift;
   float dng_baseline_exposure;
+  unsigned linear_max;
+  /* Camera WB presets (R, G, B, G2): Daylight (EXIF light source 1) and D65 (21). */
+  int wb_daylight[4];
+  int wb_d65[4];
+  /* Default crop ("raw inset", = Adobe's DefaultCrop) in raw coordinates and the image
+   * origin in raw coordinates. */
+  unsigned inset[4]; /* left, top, width, height */
+  unsigned margin[2]; /* left, top */
 } sieve_lr_color_t;
 
 /* Colour data after open_file (before processing rewrites pre_mul). */
@@ -68,6 +76,30 @@ void sieve_lr_get_color(libraw_data_t *lr, sieve_lr_color_t *out)
   out->model[sizeof out->model - 1] = 0;
   out->fuji_expo_shift = lr->makernotes.fuji.ExpoMidPointShift;
   out->dng_baseline_exposure = lr->color.dng_levels.baseline_exposure;
+  out->linear_max = lr->color.linear_max[0];
+  memcpy(out->wb_daylight, lr->color.WB_Coeffs[LIBRAW_WBI_Daylight], sizeof out->wb_daylight);
+  memcpy(out->wb_d65, lr->color.WB_Coeffs[LIBRAW_WBI_D65], sizeof out->wb_d65);
+  out->inset[0] = lr->sizes.raw_inset_crops[0].cleft;
+  out->inset[1] = lr->sizes.raw_inset_crops[0].ctop;
+  out->inset[2] = lr->sizes.raw_inset_crops[0].cwidth;
+  out->inset[3] = lr->sizes.raw_inset_crops[0].cheight;
+  out->margin[0] = lr->sizes.left_margin;
+  out->margin[1] = lr->sizes.top_margin;
+}
+
+/* Clips/scales at `white` (absolute raw units) instead of LibRaw's maximum. Call after
+ * unpack (black levels known). LibRaw applies user_sat to the black-subtracted range when
+ * the black level lives in cblack (CR3), so the per-channel black is taken off here. */
+void sieve_lr_set_white(libraw_data_t *lr, unsigned white)
+{
+  unsigned black = lr->color.black;
+  unsigned cb = lr->color.cblack[0];
+  for (int i = 1; i < 4; i++)
+    if (lr->color.cblack[i] < cb)
+      cb = lr->color.cblack[i];
+  black += cb;
+  if (white > black + 1024)
+    lr->params.user_sat = (int)(white - black);
 }
 
 /* Copies the processed image (after dcraw_process) as interleaved RGB16 into `out`

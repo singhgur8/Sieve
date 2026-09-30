@@ -376,6 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             profile: &profile,
             seed: 1,
             quality: pipeline::Quality::Preview,
+            tone: None,
         };
         let lut_obj = match &adj.lut {
             Some(l) => luts.load(&l.id)?,

@@ -44,6 +44,7 @@ extern "C" {
     // native/libraw_shim.c
     fn sieve_lr_set_linear(lr: *mut LibrawData, half_size: c_int);
     fn sieve_lr_get_color(lr: *mut LibrawData, out: *mut ShimColor);
+    fn sieve_lr_set_white(lr: *mut LibrawData, white: c_uint);
     fn sieve_lr_copy_rgb16(lr: *mut LibrawData, out: *mut u16, cap: usize, w: *mut c_int, h: *mut c_int) -> c_int;
 }
 
@@ -65,6 +66,11 @@ struct ShimColor {
     model: [c_char; 64],
     fuji_expo_shift: f32,
     dng_baseline_exposure: f32,
+    linear_max: c_uint,
+    wb_daylight: [c_int; 4],
+    wb_d65: [c_int; 4],
+    inset: [c_uint; 4],
+    margin: [c_uint; 2],
 }
 
 impl Default for ShimColor {
@@ -104,6 +110,10 @@ pub struct ColorData {
     /// Fujifilm `RawExposureBias` (EV; 0 if none) and a DNG's `BaselineExposure`.
     pub fuji_expo_shift: f32,
     pub dng_baseline_exposure: f32,
+    /// Camera white-balance presets (R, G, B, G2 coefficients; zeros if absent): Daylight
+    /// (EXIF light source 1) and D65 (21).
+    pub wb_daylight: [i32; 4],
+    pub wb_d65: [i32; 4],
 }
 
 /// Linear 16-bit camera RGB (no white balance, black-subtracted, white level = 65535),
@@ -136,6 +146,10 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
     if rc != 0 {
         return Err(err(rc));
     }
+    if let Some(white) = adobe_white_level(&c) {
+        // SAFETY: unpacked handle; sets a processing parameter only.
+        unsafe { sieve_lr_set_white(h.0, white) };
+    }
     // SAFETY: unpacked above.
     let rc = unsafe { libraw_dcraw_process(h.0) };
     if rc != 0 {
@@ -151,7 +165,7 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
         // SAFETY: `pixels` holds w*h*3 values, as passed in `cap`.
         let rc = unsafe { sieve_lr_copy_rgb16(h.0, pixels.as_mut_ptr(), pixels.len(), &mut w, &mut hgt) };
         if rc == 0 {
-            return Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color });
+            return Ok(default_crop(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color }, &c, half_size));
         }
     }
     let mut code: c_int = 0;
@@ -175,7 +189,7 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
                 pixels.as_mut_ptr().cast::<u8>(),
                 pixels.len() * 2,
             );
-            Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color })
+            Ok(default_crop(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color }, &c, half_size))
         }
     };
     // SAFETY: img came from dcraw_make_mem_image and is freed once.
@@ -211,6 +225,61 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
     }
 }
 
+/// The default crop of a decode (LibRaw's "raw inset", which equals Adobe's `DefaultCrop`
+/// for Sony and Canon), so crop coordinates and framing match Lightroom's. `ColorData`
+/// `width`/`height` become the cropped full-size dimensions. Fujifilm: Adobe uses the
+/// inset's left edge and bottom with a 3:2 frame (6240 x 4160 for the X-M5, where LibRaw's
+/// inset is 4155 high; verified by aligning Camera Raw renders).
+fn default_crop(img: LinearRgb16, c: &ShimColor, half: bool) -> LinearRgb16 {
+    let make = c_name(&c.make);
+    let fuji = make.eq_ignore_ascii_case("fujifilm");
+    let supported = fuji || make.eq_ignore_ascii_case("sony") || make.eq_ignore_ascii_case("canon");
+    let [il, it, iw, ih] = c.inset;
+    let [ml, mt] = c.margin;
+    if !supported || iw == 0 || ih == 0 || il < ml || it < mt {
+        return img;
+    }
+    let (fx, mut fy) = ((il - ml) as usize, (it - mt) as usize);
+    let (fw, mut fh) = (iw as usize, ih as usize);
+    if fuji && fw > fh {
+        // Same bottom edge as LibRaw's inset (best alignment with Camera Raw renders).
+        let tall = fh.max((fw * 2).div_ceil(3));
+        fy = (fy + fh).saturating_sub(tall);
+        fh = tall;
+    }
+    if fx + fw > c.width.max(0) as usize || fy + fh > c.height.max(0) as usize {
+        return img;
+    }
+    let s = if half { 2 } else { 1 };
+    let (x0, y0) = (fx / s, fy / s);
+    let (w, h) = ((fw / s).min(img.width as usize - x0), (fh / s).min(img.height as usize - y0));
+    if (w, h) == (img.width as usize, img.height as usize) {
+        return img;
+    }
+    let src_w = img.width as usize;
+    let mut pixels = img.pixels;
+    // In place: rows move towards the start (destination index <= source index).
+    for y in 0..h {
+        let from = ((y0 + y) * src_w + x0) * 3;
+        pixels.copy_within(from..from + w * 3, y * w * 3);
+    }
+    pixels.truncate(w * h * 3);
+    let mut color = img.color;
+    color.width = fw as u32;
+    color.height = fh as u32;
+    LinearRgb16 { width: w as u32, height: h as u32, pixels, color }
+}
+
+/// White level Adobe's raw pipeline uses when it differs from LibRaw's: for Canon, Camera
+/// Raw / DNG Converter clip at the sensor's highlight linearity limit (e.g. 13660 for the
+/// EOS M6 Mark II, LibRaw's `linear_max`) rather than the ADC maximum, so the same raw
+/// value is ~0.3 EV brighter there. Other makes keep LibRaw's level (Sony's linearity
+/// limit, 15360, is *not* what Adobe uses; its DNGs keep 16383).
+fn adobe_white_level(c: &ShimColor) -> Option<c_uint> {
+    let canon = c_name(&c.make).eq_ignore_ascii_case("canon");
+    (canon && c.linear_max > 1024 && c.linear_max < c.maximum).then_some(c.linear_max)
+}
+
 fn color_data(c: &ShimColor) -> ColorData {
     let mut rgb_cam = [[0.0; 3]; 3];
     let mut cam_xyz = [[0.0; 3]; 3];
@@ -232,6 +301,8 @@ fn color_data(c: &ShimColor) -> ColorData {
         model: c_name(&c.model),
         fuji_expo_shift: if c.fuji_expo_shift.is_finite() { c.fuji_expo_shift } else { 0.0 },
         dng_baseline_exposure: if c.dng_baseline_exposure.is_finite() { c.dng_baseline_exposure } else { 0.0 },
+        wb_daylight: c.wb_daylight,
+        wb_d65: c.wb_d65,
     }
 }
 

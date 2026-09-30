@@ -7,18 +7,20 @@
 //!    linear ProPhoto through the camera profile's matrices for this white balance
 //!    (`ForwardMatrix` / `ColorMatrix` interpolated by temperature, DNG model) with the
 //!    Calibration panel folded in (`develop::camera`).
-//! B. Noise reduction on that scene-linear image (`parity::denoise`).
-//! C. Local operators on log-luminance fields: Shadows/Highlights evaluated at an
-//!    edge-aware local luminance (guided filter), clarity/texture (local contrast), dehaze.
-//!    They act as luminance gains (hue/saturation preserving).
+//! B. Noise reduction on that scene-linear image (`parity::denoise`; banded for exports).
+//! C. Local operators on log-luminance fields, as luminance gains (hue/saturation
+//!    preserving): Shadows/Highlights = fitted response tables ([`LocalTone`]) at an
+//!    adaptation luminance from the whole uncropped source ([`ToneContext`]: two guided-filter
+//!    bases on a ~512 px grid + image-adaptive references), clarity/texture, dehaze.
 //! D. A pointwise chain evaluated through a shaped 3D LUT built per render (tetrahedral
 //!    interpolation; 33^3 drafts, 65^3 previews and exports): profile HueSatMap ->
-//!    Whites/Exposure(+baseline)/Contrast/Blacks as a luminance gain -> profile LookTable ->
-//!    look HSV table -> HSL/vibrance/saturation or the B&W mix -> shadow tint -> base tone
-//!    curve composed with the look's and the user's parametric + master curves, applied
-//!    hue-preservingly ("RGB tone": max/min channels through the curve, the middle one
-//!    interpolated) -> look RGB table -> per-channel point curves -> colour grading ->
-//!    output colour space (+ `.cube` LUT on sRGB-encoded values).
+//!    exposure (+baseline) gain -> profile LookTable -> look HSV table ->
+//!    HSL/vibrance/saturation or the B&W mix -> shadow tint -> the global tone sliders
+//!    (Whites/Contrast/Blacks, exposure shoulder) composed with the base tone curve and the
+//!    look's and the user's parametric + master curves, applied hue-preservingly ("RGB
+//!    tone": max/min channels through the curve, the middle one interpolated; so Contrast
+//!    and Blacks change saturation like Camera Raw) -> look RGB table -> per-channel point
+//!    curves -> colour grading -> output colour space (+ `.cube` LUT on sRGB values).
 //! E. On the encoded output: post-crop vignette and grain (fused with D), then capture
 //!    sharpening on luminance.
 //!
@@ -35,7 +37,7 @@ use crate::profiles::table::{BigTable, RgbTable};
 use super::camera::{self, ColorSetup, Profile, PROPHOTO_TO_XYZ};
 use super::parity::{self, CurveLuts, Grade, GrainGen, Vignette, Working, PROPHOTO_Y};
 use super::source::ColorInfo;
-use super::tone::{self, ToneModel, ToneSliders};
+use super::tone::{self, LocalTone, ToneModel, ToneSliders};
 use super::wb;
 
 /// Display-referred 8-bit sRGB output.
@@ -103,6 +105,9 @@ pub struct RenderInput<'a> {
     /// Grain seed (the image id).
     pub seed: u64,
     pub quality: Quality,
+    /// Whole-frame local tone context; `None` = compute from this input (whole frame).
+    /// Region renders must pass the whole frame's ([`ToneContext::compute`]).
+    pub tone: Option<&'a ToneContext>,
 }
 
 impl<'a> RenderInput<'a> {
@@ -118,6 +123,7 @@ impl<'a> RenderInput<'a> {
             profile,
             seed: 0,
             quality: Quality::Preview,
+            tone: None,
         }
     }
 }
@@ -129,10 +135,6 @@ const LOG2_GREY: f32 = -2.473_931_2;
 
 // Radii as a fraction of the frame's long edge (gaussian sigma).
 const SIGMA_MASK: f32 = 0.012;
-/// Shadows/Highlights base layer: spatial extent (fraction of the long edge) and the edge
-/// strength (EV) it keeps.
-const SIGMA_BASE: f32 = 0.01;
-const BASE_RANGE_EV: f32 = 0.5;
 const SIGMA_TEXTURE: f32 = 0.0022;
 const SIGMA_HAZE: f32 = 0.02;
 
@@ -210,11 +212,6 @@ struct EvTable {
 }
 
 impl EvTable {
-    fn new(lo: f32, hi: f32, n: usize, f: impl Fn(f32) -> f32) -> Self {
-        let step = (hi - lo) / (n - 1) as f32;
-        EvTable { lo, inv_step: 1.0 / step, values: (0..n).map(|i| f(lo + i as f32 * step)).collect() }
-    }
-
     #[inline]
     fn eval(&self, x: f32) -> f32 {
         let t = ((x - self.lo) * self.inv_step).max(0.0);
@@ -288,15 +285,6 @@ impl Grid {
         let g = ((sigma / (self.factor as f32 * 3.0)).floor() as usize).max(1);
         let grid = self.downsample(g);
         let data = parity::blur(&grid.data, grid.w, grid.h, sigma / grid.factor as f32);
-        Field { w: grid.w, h: grid.h, factor: grid.factor as f32, data }
-    }
-
-    /// Edge-aware, halo-free smoothing (domain transform) over ~`sigma` full-res px; edges
-    /// stronger than `sigma_r` (field units) are kept.
-    fn edge_aware(&self, sigma: f32, sigma_r: f32) -> Field {
-        let g = ((sigma / (self.factor as f32 * 8.0)).floor() as usize).max(1);
-        let grid = self.downsample(g);
-        let data = parity::domain_transform(&grid.data, grid.w, grid.h, sigma / grid.factor as f32, sigma_r);
         Field { w: grid.w, h: grid.h, factor: grid.factor as f32, data }
     }
 }
@@ -618,7 +606,8 @@ const LUMA_709: [f32; 3] = [0.2126, 0.7152, 0.0722];
 /// Everything after the local operators, per pixel.
 struct Chain<'a> {
     hsm: Option<&'a HsvTable>,
-    tone: ToneModel,
+    /// Exposure (+ baseline) as a linear gain; the rest of the global tone is in `curve`.
+    exposure_gain: f32,
     display_referred: bool,
     dcp_look: Option<&'a HsvTable>,
     look_hsv: Option<(&'a HsvTable, f32)>,
@@ -626,7 +615,9 @@ struct Chain<'a> {
     bw: Option<crate::ipc::types::HslChannels>,
     color: ColorOps,
     shadow_tint: f32,
-    /// Base curve composed with the master curves: linear -> linear (RGB tone).
+    /// Global tone sliders (Whites, Contrast, Blacks, the exposure shoulder) + base curve +
+    /// master curves: post-exposure linear -> display linear, applied as Camera Raw's
+    /// hue-preserving RGB tone (so Contrast/Blacks change saturation like an RGB curve).
     curve: SqrtTable,
     rgb_curves: [Option<Vec<f32>>; 3],
     grade: Grade,
@@ -673,15 +664,7 @@ impl Chain<'_> {
         if let Some(t) = self.hsm {
             v = t.apply(v, 1.0);
         }
-        // Whites / exposure / contrast / blacks: a luminance gain.
-        let y = dot(PROPHOTO_Y, v);
-        if y > 1e-12 {
-            let ev = y.log2();
-            let g = (self.tone.global(ev) - ev).clamp(-30.0, 30.0);
-            v = v.map(|c| c * g.exp2());
-        } else {
-            v = [0.0; 3];
-        }
+        v = v.map(|c| c * self.exposure_gain);
         if let Some(t) = self.dcp_look {
             v = t.apply(v, 1.0);
         }
@@ -712,6 +695,19 @@ impl Chain<'_> {
         // Display-linear ProPhoto; the output stage runs per pixel after the LUT.
         e.map(|c| srgb_decode(c.clamp(0.0, 1.0)))
     }
+}
+
+/// The RGB tone curve of the global sliders: post-exposure linear `c` (exposure
+/// `exposure` EV, baseline included) -> `finish` (base + master curves) of the tone model's
+/// output, `2^global(log2(c) - exposure)`.
+fn global_tone_curve(model: &ToneModel, exposure: f32, finish: impl Fn(f32) -> f32) -> SqrtTable {
+    let max = (LUT_LOG_MAX + exposure.max(0.0)).exp2();
+    SqrtTable::new(max, 8192, |c| {
+        if c <= 0.0 {
+            return finish(0.0);
+        }
+        finish(model.global(c.log2() - exposure).exp2())
+    })
 }
 
 /// Settings after merging the look's own parameters (at the look amount) under the user's.
@@ -827,6 +823,7 @@ struct Developed {
 
 /// Local operator constants.
 struct Local {
+    /// Shadows/Highlights: delta (EV) at the adaptation luminance (pre-exposure EV).
     tone_local: Option<EvTable>,
     clarity: f32,
     texture: f32,
@@ -848,19 +845,7 @@ fn develop(
     let scale = input.view.scale.max(1e-3);
 
     // A. camera -> linear ProPhoto (pre-exposure; neutral clip = 1).
-    let mul = setup.mul.map(|m| m / 65535.0);
-    let m = setup.m;
-    let mut rgb = vec![0.0f32; w * h * 3];
-    rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
-        for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
-            let c = [
-                (f32::from(p[0]) * mul[0]).min(1.0),
-                (f32::from(p[1]) * mul[1]).min(1.0),
-                (f32::from(p[2]) * mul[2]).min(1.0),
-            ];
-            o.copy_from_slice(&mat3(&m, c));
-        }
-    });
+    let mut rgb = to_working(input, &setup);
 
     // B. Noise reduction.
     {
@@ -878,7 +863,7 @@ fn develop(
         whites: adj.whites,
         blacks: adj.blacks,
     };
-    let local_model = ToneModel::new(ToneSliders { exposure: 0.0, ..tone_sliders });
+    let local_tone = LocalTone::new(sh, hl);
     let mut local = Local {
         tone_local: None,
         clarity: adj.clarity / 100.0 * 0.6,
@@ -886,11 +871,22 @@ fn develop(
         dehaze: adj.dehaze / 100.0,
     };
     let edge = input.frame_long_edge.max(1.0);
-    let need_base = local_model.has_local();
+    let need_base = !local_tone.is_identity();
+    // Whole-frame adaptation (given by region renders; else computed from this input).
+    let own_ctx = (need_base && input.tone.is_none()).then(|| ToneContext::from_working(&rgb, w, h));
+    let ctx = input.tone.or(own_ctx.as_ref());
+    if let Some(c) = ctx.filter(|_| need_base) {
+        let (rs, rh) = LocalTone::references(&c.stats, adj.exposure + profile.baseline_ev);
+        const LO: f32 = -32.0;
+        const N: usize = 1281;
+        let step = 40.0 / (N - 1) as f32;
+        let values = local_tone.deltas(rs, rh, LO, step, N);
+        local.tone_local = Some(EvTable { lo: LO, inv_step: 1.0 / step, values });
+    }
     let need_clar = local.clarity != 0.0;
     let need_tex = local.texture != 0.0;
     let need_haze = local.dehaze > 0.0;
-    let (base, clar, tex, haze) = if need_base || need_clar || need_tex || need_haze {
+    let (clar, tex, haze) = if need_clar || need_tex || need_haze {
         let f0 = if w.min(h) >= 1024 {
             4
         } else if w.min(h) >= 256 {
@@ -899,23 +895,13 @@ fn develop(
             1
         };
         let (lum, dark) = base_grids(&rgb, w, h, f0, need_haze);
-        if need_base {
-            // Image key (mean log2 luminance) for the image-adaptive Highlights slider.
-            let key = lum.data.iter().map(|v| v.max(-14.0)).sum::<f32>() / lum.data.len().max(1) as f32;
-            let mut sorted: Vec<f32> = lum.data.clone();
-            let k = (sorted.len() * 995 / 1000).min(sorted.len().saturating_sub(1));
-            let white = if sorted.is_empty() { 0.0 } else { *sorted.select_nth_unstable_by(k, f32::total_cmp).1 };
-            let m = local_model.with_key(key, white.min(0.0));
-            local.tone_local = Some(EvTable::new(-16.0, 4.0, 512, |e| m.local_delta(e)));
-        }
         (
-            need_base.then(|| lum.edge_aware(SIGMA_BASE * edge, BASE_RANGE_EV)),
             need_clar.then(|| lum.blurred(SIGMA_MASK * edge)),
             need_tex.then(|| lum.blurred(SIGMA_TEXTURE * edge)),
             dark.map(|d| d.blurred(SIGMA_HAZE * edge)),
         )
     } else {
-        (None, None, None, None)
+        (None, None, None)
     };
 
     // D. The pointwise chain through a 3D LUT.
@@ -951,7 +937,8 @@ fn develop(
     let display = profile.display_referred;
     let base_fn = tone::profile_curve(tone_curve.as_deref());
     let master = luts.master.clone();
-    let curve = SqrtTable::new(1.0, 8192, |x| {
+    let tone_model = ToneModel::new(ToneSliders { shadows: 0.0, highlights: 0.0, ..tone_sliders });
+    let curve = global_tone_curve(&tone_model, tone_sliders.exposure, |x| {
         let t = if display { x.clamp(0.0, 1.0) } else { base_fn(x) };
         match &master {
             Some(lut) => srgb_decode(parity::eval_lut(lut, srgb_encode(t))),
@@ -963,7 +950,7 @@ fn develop(
     let out = Output::new(space, cube.filter(|_| lut_amount > 0.0).map(|l| (l, lut_amount)), quality);
     let chain = Chain {
         hsm: setup.hsm.as_ref(),
-        tone: ToneModel::new(ToneSliders { shadows: 0.0, highlights: 0.0, ..tone_sliders }),
+        exposure_gain: tone_sliders.exposure.exp2(),
         display_referred: display,
         dcp_look: profile.dcp.as_ref().and_then(|d| d.look_table.as_ref()),
         look_hsv,
@@ -989,8 +976,12 @@ fn develop(
         for x in 0..w {
             let p = &mut row[x * 3..x * 3 + 3];
             let mut v = [p[0], p[1], p[2]];
-            if base.is_some() || clar.is_some() || tex.is_some() || haze.is_some() || local.dehaze < 0.0 {
-                v = apply_local(v, x, y, &local, base.as_ref(), clar.as_ref(), tex.as_ref(), haze.as_ref());
+            let adapt = match (&local.tone_local, ctx) {
+                (Some(_), Some(c)) => Some(c.sample((x as f32 + 0.5 - view.frame_x) / view.frame_w.max(1e-3), fy)),
+                _ => None,
+            };
+            if adapt.is_some() || clar.is_some() || tex.is_some() || haze.is_some() || local.dehaze < 0.0 {
+                v = apply_local(v, x, y, &local, adapt, clar.as_ref(), tex.as_ref(), haze.as_ref());
             }
             let mut e = out.apply(lut.eval(v));
             if vig.is_some() || grain.is_some() {
@@ -1013,6 +1004,220 @@ fn develop(
         parity::sharpen(&mut work, &adj.detail.sharpening, scale);
     }
     Developed { width: w, height: h, rgb }
+}
+
+/// Camera RGB16 -> white-balanced linear ProPhoto (pre-exposure; neutral clip = 1).
+fn to_working(input: &RenderInput, setup: &ColorSetup) -> Vec<f32> {
+    let (w, h) = (input.width as usize, input.height as usize);
+    let mul = setup.mul.map(|m| m / 65535.0);
+    let m = setup.m;
+    let mut rgb = vec![0.0f32; w * h * 3];
+    rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
+        for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
+            let c = [
+                (f32::from(p[0]) * mul[0]).min(1.0),
+                (f32::from(p[1]) * mul[1]).min(1.0),
+                (f32::from(p[2]) * mul[2]).min(1.0),
+            ];
+            o.copy_from_slice(&mat3(&m, c));
+        }
+    });
+    rgb
+}
+
+/// Calibration aid (`tools/acr-oracle`): log2 of the scene luminance (linear ProPhoto Y,
+/// pre-exposure, neutral clip = 0 EV) that the local tone operators see, per pixel.
+pub fn scene_log_luminance(input: &RenderInput, adjustments: &ParametricAdjustments) -> Vec<f32> {
+    let adj = effective(adjustments, input.profile);
+    let setup = camera::color_setup(input.color, input.profile, &adj.white_balance, &adj.calibration);
+    to_working(input, &setup).as_chunks::<3>().0.iter().map(|v| dot(PROPHOTO_Y, *v).max(1e-9).log2()).collect()
+}
+
+/// Scene log2-luminance statistics of the whole (uncropped) source, pre-exposure EV.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ToneStats {
+    pub key: f32,
+    pub p50: f32,
+    pub p90: f32,
+    pub p95: f32,
+    pub p99: f32,
+    pub white: f32,
+}
+
+/// Context of the local tone operator (Shadows / Highlights, [`LocalTone`]), computed on
+/// the whole *uncropped, un-oriented* source like Camera Raw (a crop or zoomed region is
+/// adapted exactly as in the full frame): log-luminance statistics for the image reference
+/// and the adaptation luminance, an edge-aware multi-scale base of the scene log2
+/// luminance (two self-guided filters with box radii `RADIUS_FINE` / `RADIUS_COARSE` px
+/// per 2048 px of the source's long edge) on a ~512 px grid. Render pixels are mapped into
+/// it through the crop geometry ([`ToneContext::with_crop`]).
+#[derive(Debug, Clone)]
+pub struct ToneContext {
+    pub stats: ToneStats,
+    fine: Vec<f32>,
+    coarse: Vec<f32>,
+    bw: usize,
+    bh: usize,
+    /// Render frame (normalized, oriented, cropped) -> context grid (normalized).
+    map: [f32; 6],
+}
+
+/// Grid long edge of the adaptation field (and size of the source it is computed from).
+pub const TONE_GRID: u32 = 512;
+
+impl ToneContext {
+    /// Context from `input` = the whole uncropped, un-oriented source (any size; ~512 px
+    /// long edge is plenty) for `adjustments` (white balance / profile as rendered). The
+    /// map is the identity until [`Self::with_crop`].
+    pub fn compute(input: &RenderInput, adjustments: &ParametricAdjustments) -> ToneContext {
+        let adj = effective(adjustments, input.profile);
+        let setup = camera::color_setup(input.color, input.profile, &adj.white_balance, &adj.calibration);
+        let rgb = to_working(input, &setup);
+        ToneContext::from_working(&rgb, input.width as usize, input.height as usize)
+    }
+
+    /// Maps render frames of `crop` + EXIF `orientation` (un-oriented source `src_w` x
+    /// `src_h`) into this context (which must be of the un-oriented, uncropped source).
+    pub fn with_crop(
+        mut self,
+        crop: &crate::ipc::types::CropSettings,
+        src_w: u32,
+        src_h: u32,
+        orientation: u8,
+    ) -> Self {
+        let g = parity::crop_geometry(crop, src_w, src_h, orientation);
+        self.map = g.to_source.map(|v| v as f32);
+        self
+    }
+
+    fn from_working(rgb: &[f32], w: usize, h: usize) -> ToneContext {
+        use super::local_tone_data as ld;
+        const LO: f32 = -32.0;
+        const BINS_PER_EV: f32 = 16.0;
+        const NB: usize = 36 * 16;
+        let f = w.max(h).div_ceil(TONE_GRID as usize).max(1);
+        let (gw, gh) = (w.div_ceil(f), h.div_ceil(f));
+        // Block means of log2 Y + a histogram / sum of the per-pixel values.
+        let rows: Vec<(Vec<f32>, Vec<u32>, f64)> = (0..gh)
+            .into_par_iter()
+            .map(|gy| {
+                let mut sums = vec![0.0f32; gw];
+                let mut counts = vec![0u32; gw];
+                let mut hist = vec![0u32; NB];
+                let mut total = 0.0f64;
+                for y in gy * f..((gy + 1) * f).min(h) {
+                    let row = &rgb[y * w * 3..(y + 1) * w * 3];
+                    for (x, v) in row.as_chunks::<3>().0.iter().enumerate() {
+                        let e = dot(PROPHOTO_Y, *v).max(1e-9).log2();
+                        sums[x / f] += e;
+                        counts[x / f] += 1;
+                        total += f64::from(e);
+                        hist[(((e - LO) * BINS_PER_EV).max(0.0) as usize).min(NB - 1)] += 1;
+                    }
+                }
+                let means = sums.iter().zip(&counts).map(|(s, c)| s / (*c).max(1) as f32).collect();
+                (means, hist, total)
+            })
+            .collect();
+        let mut grid = Vec::with_capacity(gw * gh);
+        let mut hist = vec![0u64; NB];
+        let mut total = 0.0f64;
+        for (means, hh, t) in rows {
+            grid.extend(means);
+            hist.iter_mut().zip(hh).for_each(|(a, b)| *a += u64::from(b));
+            total += t;
+        }
+        let n = (w * h).max(1) as u64;
+        let pct = |p: f64| {
+            let target = ((n as f64) * p).ceil().max(1.0) as u64;
+            let mut acc = 0u64;
+            for (i, c) in hist.iter().enumerate() {
+                acc += c;
+                if acc >= target {
+                    return LO + (i as f32 + 0.5) / BINS_PER_EV;
+                }
+            }
+            LO + NB as f32 / BINS_PER_EV
+        };
+        let key = (total / n as f64) as f32;
+        let stats = ToneStats { key, p50: pct(0.5), p90: pct(0.9), p95: pct(0.95), p99: pct(0.99), white: pct(0.995) };
+        // Guided filters on the centred field (f32 variance precision).
+        grid.iter_mut().for_each(|v| *v -= key);
+        let long = gw.max(gh) as f32;
+        let radius = |r: f32| ((r * long / 2048.0).round() as usize).max(1);
+        let mut fine = parity::guided(&grid, &grid, gw, gh, radius(ld::RADIUS_FINE), ld::EPS);
+        let mut coarse = parity::guided(&grid, &grid, gw, gh, radius(ld::RADIUS_COARSE), ld::EPS);
+        fine.iter_mut().chain(coarse.iter_mut()).for_each(|v| *v += key);
+        ToneContext { stats, fine, coarse, bw: gw, bh: gh, map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] }
+    }
+
+    /// Fine and coarse bases (log2 Y) at render-frame coordinates `u`, `v` (0..=1).
+    #[inline]
+    pub fn bases(&self, u: f32, v: f32) -> (f32, f32) {
+        let m = &self.map;
+        let (su, sv) = (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+        let gx = (su * self.bw as f32 - 0.5).clamp(0.0, (self.bw - 1) as f32);
+        let gy = (sv * self.bh as f32 - 0.5).clamp(0.0, (self.bh - 1) as f32);
+        let (x0, y0) = (gx as usize, gy as usize);
+        let (x1, y1) = ((x0 + 1).min(self.bw - 1), (y0 + 1).min(self.bh - 1));
+        let (fx, fy) = (gx - x0 as f32, gy - y0 as f32);
+        let bil = |d: &[f32]| {
+            let (r0, r1) = (&d[y0 * self.bw..], &d[y1 * self.bw..]);
+            let a = r0[x0] + (r0[x1] - r0[x0]) * fx;
+            let b = r1[x0] + (r1[x1] - r1[x0]) * fx;
+            a + (b - a) * fy
+        };
+        (bil(&self.fine), bil(&self.coarse))
+    }
+
+    /// Adaptation luminance (log2 Y) at render-frame coordinates `u`, `v` (0..=1).
+    #[inline]
+    pub fn sample(&self, u: f32, v: f32) -> f32 {
+        let (f, c) = self.bases(u, v);
+        let w = super::local_tone_data::WEIGHT_FINE;
+        w * f + (1.0 - w) * c
+    }
+}
+
+/// Local tone context of `src` (decoded source, un-oriented) for renders of `adjustments`
+/// with EXIF `orientation`: computed on a [`TONE_GRID`] px uncropped version of the source.
+pub fn tone_context(
+    src: &super::source::LinearImage,
+    orientation: u8,
+    adjustments: &ParametricAdjustments,
+    profile: &Profile,
+) -> ToneContext {
+    let whole = super::source::prepare(src, 1, &crate::ipc::types::CropSettings::default(), None, TONE_GRID);
+    tone_context_prepared(&whole, src, orientation, adjustments, profile)
+}
+
+/// [`tone_context`] from an already prepared uncropped, un-oriented `whole` source.
+pub fn tone_context_prepared(
+    whole: &super::source::Prepared,
+    src: &super::source::LinearImage,
+    orientation: u8,
+    adjustments: &ParametricAdjustments,
+    profile: &Profile,
+) -> ToneContext {
+    tone_context_uncropped(whole, src, adjustments, profile).with_crop(
+        &adjustments.crop,
+        src.width,
+        src.height,
+        orientation,
+    )
+}
+
+/// The context before [`ToneContext::with_crop`]: depends only on the source and the white
+/// balance / calibration / profile of `adjustments` (cacheable across slider changes).
+pub fn tone_context_uncropped(
+    whole: &super::source::Prepared,
+    src: &super::source::LinearImage,
+    adjustments: &ParametricAdjustments,
+    profile: &Profile,
+) -> ToneContext {
+    let mut input = RenderInput::simple(whole.width, whole.height, &whole.pixels, &src.color, profile);
+    input.quality = Quality::Draft;
+    ToneContext::compute(&input, adjustments)
 }
 
 /// Block means of log2 luminance and of the dark channel (min RGB) of the working image.
@@ -1052,7 +1257,7 @@ fn base_grids(rgb: &[f32], w: usize, h: usize, f: usize, dark: bool) -> (Grid, O
     (lum, dk)
 }
 
-/// Local tone gain (shadows/highlights at the edge-aware base luminance, clarity, texture)
+/// Local tone gain (shadows/highlights at the adaptation luminance, clarity, texture)
 /// and dehaze, on linear ProPhoto.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -1061,7 +1266,7 @@ fn apply_local(
     x: usize,
     y: usize,
     k: &Local,
-    base: Option<&Field>,
+    adapt: Option<f32>,
     clar: Option<&Field>,
     tex: Option<&Field>,
     haze: Option<&Field>,
@@ -1070,8 +1275,7 @@ fn apply_local(
     let yl = dot(PROPHOTO_Y, v).max(1e-9);
     let ev = yl.log2();
     let mut delta = 0.0f32;
-    if let (Some(t), Some(b)) = (&k.tone_local, base) {
-        let m = b.sample(x, y) * 0.8 + ev * 0.2;
+    if let (Some(t), Some(m)) = (&k.tone_local, adapt) {
         delta += t.eval(m);
     }
     if let Some(c) = clar {
@@ -1182,6 +1386,7 @@ mod tests {
                 [-0.969266, 1.8760108, 0.041556],
                 [0.0556434, -0.2040259, 1.0572252],
             ],
+            calibration: [1.0; 3],
         }
     }
 
@@ -1208,6 +1413,105 @@ mod tests {
             }
         }
         px
+    }
+
+    /// Grey step edge: left half at `dark`, right half at `bright` (linear, pre-WB).
+    fn step(w: u32, h: u32, dark: f32, bright: f32) -> Vec<u16> {
+        let mut px = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { dark } else { bright };
+                px.push((v / 2.0 * 65535.0) as u16);
+                px.push((v * 65535.0) as u16);
+                px.push((v / 1.5 * 65535.0) as u16);
+            }
+        }
+        px
+    }
+
+    /// Shadows / Highlights are edge-aware: next to an edge a flat area gets nearly the same
+    /// local tone as far from it, while the slider clearly acts. Regression bounds: Camera
+    /// Raw is halo-free on both steps (`tools/acr-oracle/halo_probe.py`), the guided
+    /// adaptation base (best fit to real frames) leaves a small rim that decays within a
+    /// few dozen px (measured worst: 15/255 at 3 px for Shadows +100 on a 3.9 EV step; 7 for
+    /// a user-like Shadows +64 / Highlights -66). A halo-free base (domain transform) fits the
+    /// real frames worse (held-out dE 3.13 vs 2.88), see docs/decisions.md.
+    #[test]
+    fn local_tone_has_no_halo_on_a_step_edge() {
+        let (w, h) = (512u32, 128u32);
+        let c = color();
+        let p = Profile::matrix(BASELINE_EV);
+        for (dark, bright, tol) in [(0.02f32, 0.3f32, 16), (0.004, 0.6, 9)] {
+            let px = step(w, h, dark, bright);
+            let row = |img: &RenderedImage, x: u32| i32::from(img.rgb[((h / 2 * w + x) * 3 + 1) as usize]);
+            let base = render(&RenderInput::simple(w, h, &px, &c, &p), &plain(), None);
+            for (sh, hl) in [(100.0, 0.0), (-100.0, 0.0), (0.0, -100.0), (64.0, -66.0)] {
+                let adj = ParametricAdjustments { shadows: sh, highlights: hl, ..plain() };
+                let img = render(&RenderInput::simple(w, h, &px, &c, &p), &adj, None);
+                // Dark side: 3 px from the edge vs 200 px away; bright side likewise.
+                let (near_d, far_d) = (row(&img, w / 2 - 3), row(&img, w / 2 - 200));
+                let (near_b, far_b) = (row(&img, w / 2 + 2), row(&img, w / 2 + 200));
+                let msg = format!("step {dark}|{bright} S {sh} H {hl}");
+                assert!((near_d - far_d).abs() <= tol, "{msg}: dark side halo {near_d} vs {far_d}");
+                assert!((near_b - far_b).abs() <= tol, "{msg}: bright side halo {near_b} vs {far_b}");
+                // The rim decays away from the edge.
+                assert!((row(&img, w / 2 - 30) - far_d).abs() <= 7, "{msg}: dark rim at 30 px");
+                assert!((row(&img, w / 2 + 30) - far_b).abs() <= 7, "{msg}: bright rim at 30 px");
+                if sh > 0.0 {
+                    assert!(far_d > row(&base, w / 2 - 200), "{msg}: shadows lift the dark side");
+                }
+                if sh < 0.0 {
+                    assert!(far_d < row(&base, w / 2 - 200), "{msg}: negative shadows darken the dark side");
+                }
+                if hl < 0.0 {
+                    assert!(far_b < row(&base, w / 2 + 200), "{msg}: highlights darken the bright side");
+                }
+            }
+        }
+    }
+
+    /// A zoomed region with the whole frame's context renders like the same pixels of the
+    /// whole-frame render (the local tone adapts to the whole image, not the crop).
+    #[test]
+    fn region_uses_the_whole_frame_tone_context() {
+        let (w, h) = (400u32, 200u32);
+        let c = color();
+        let p = Profile::matrix(BASELINE_EV);
+        let px = ramp(w, h);
+        let adj = ParametricAdjustments { shadows: 60.0, highlights: -50.0, ..plain() };
+        let whole = render(&RenderInput::simple(w, h, &px, &c, &p), &adj, None);
+        // Region: the left quarter (dark end of the ramp), same scale.
+        let (rw, rh) = (w / 4, h);
+        let mut rpx = Vec::new();
+        for y in 0..rh {
+            let s = (y * w * 3) as usize;
+            rpx.extend_from_slice(&px[s..s + (rw * 3) as usize]);
+        }
+        let src = super::super::source::LinearImage {
+            width: w,
+            height: h,
+            pixels: px.clone(),
+            color: c.clone(),
+            full_width: w,
+            full_height: h,
+            display_referred: false,
+            source_color: None,
+        };
+        let ctx = tone_context(&src, 1, &adj, &p);
+        let mut input = RenderInput::simple(rw, rh, &rpx, &c, &p);
+        input.view = View { frame_x: 0.0, frame_y: 0.0, frame_w: w as f32, frame_h: h as f32, scale: 1.0 };
+        input.frame_long_edge = w as f32;
+        input.tone = Some(&ctx);
+        let region = render(&input, &adj, None);
+        let mut worst = 0;
+        for y in [10u32, 50, 150] {
+            for x in [5u32, 40, 90] {
+                let a = whole.rgb[((y * w + x) * 3) as usize];
+                let b = region.rgb[((y * rw + x) * 3) as usize];
+                worst = worst.max((i32::from(a) - i32::from(b)).abs());
+            }
+        }
+        assert!(worst <= 3, "region differs from the whole frame by {worst}");
     }
 
     fn run(adj: &ParametricAdjustments, lut: Option<&Lut>) -> RenderedImage {
@@ -1352,7 +1656,7 @@ mod tests {
         let master = luts.master.clone();
         let chain = Chain {
             hsm: setup.hsm.as_ref(),
-            tone: ToneModel::new(ToneSliders { exposure: 0.35, contrast: -40.0, ..Default::default() }),
+            exposure_gain: 0.35f32.exp2(),
             display_referred: false,
             dcp_look: None,
             look_hsv: None,
@@ -1360,10 +1664,14 @@ mod tests {
             bw: None,
             color: ColorOps::new(&adj),
             shadow_tint: 0.0,
-            curve: SqrtTable::new(1.0, 8192, |x| {
-                let t = tone::base_curve(x);
-                srgb_decode(parity::eval_lut(master.as_ref().unwrap(), srgb_encode(t)))
-            }),
+            curve: global_tone_curve(
+                &ToneModel::new(ToneSliders { exposure: 0.35, contrast: -40.0, ..Default::default() }),
+                0.35,
+                |x| {
+                    let t = tone::base_curve(x);
+                    srgb_decode(parity::eval_lut(master.as_ref().unwrap(), srgb_encode(t)))
+                },
+            ),
             rgb_curves: [None, None, None],
             grade: Grade::new(&adj.color_grading),
             _marker: std::marker::PhantomData,

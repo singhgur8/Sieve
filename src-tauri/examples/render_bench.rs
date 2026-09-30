@@ -290,6 +290,7 @@ fn main() {
                 profile: &profile,
                 seed: 1,
                 quality: pipeline::Quality::Preview,
+                tone: None,
             };
             let t = Instant::now();
             let out = pipeline::render(&input, adj, lut.as_deref());

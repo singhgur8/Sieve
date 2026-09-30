@@ -166,7 +166,8 @@ pub fn render_full(
         Some(p) => Cow::Owned(p),
         None => Cow::Borrowed(&src.pixels),
     };
-    let ctx = DevelopContext { profile, scale, seed };
+    let tone = crate::develop::pipeline::tone_context(src, orientation_code(orientation), adjustments, profile);
+    let ctx = DevelopContext { profile, scale, seed, tone: Some(&tone) };
     let encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings, &ctx);
     drop(pixels);
     Ok(finish(encoded, size, settings))
@@ -179,6 +180,13 @@ pub struct DevelopContext<'a> {
     pub scale: f32,
     /// Grain seed (the image id).
     pub seed: u64,
+    /// Local tone context of the whole uncropped source (`pipeline::tone_context`).
+    pub tone: Option<&'a crate::develop::pipeline::ToneContext>,
+}
+
+/// EXIF orientation code (1..=8) of an optional tag.
+pub fn orientation_code(tag: Option<u8>) -> u8 {
+    orientation(tag)
 }
 
 /// Pipeline + output colour space on prepared (cropped, oriented, output-size) camera RGB.
@@ -201,6 +209,7 @@ pub fn develop_prepared(
         profile: ctx.profile,
         seed: ctx.seed,
         quality: Quality::Export,
+        tone: ctx.tone,
     };
     pipeline::render_output(&input, adjustments, lut, color::output_space(settings.color_space))
 }
@@ -378,6 +387,7 @@ mod tests {
                     [-0.969266, 1.8760108, 0.041556],
                     [0.0556434, -0.2040259, 1.0572252],
                 ],
+                calibration: [1.0; 3],
             },
             full_width: w,
             full_height: h,
@@ -519,6 +529,7 @@ mod tests {
                 profile: &p,
                 seed: 1,
                 quality: crate::develop::pipeline::Quality::Preview,
+                tone: None,
             };
             let preview = render(&input, &adj, None);
             let full = decode_full(raw).unwrap();

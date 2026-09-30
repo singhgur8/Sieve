@@ -366,12 +366,15 @@ impl Dcp {
 
     /// White xy of a camera neutral (camera RGB of a neutral, e.g. `1 / multipliers`), found
     /// by iterating the illuminant interpolation (DNG SDK `dng_color_spec::NeutralToXY`).
-    pub fn neutral_to_xy(&self, neutral: [f64; 3]) -> (f64, f64) {
+    ///
+    /// `cc`: the raw file's per-unit `CameraCalibration` diagonal (reference camera ->
+    /// this camera; `[1; 3]` if none): the DNG model's XYZ -> camera is `CC * CM`.
+    pub fn neutral_to_xy(&self, neutral: [f64; 3], cc: [f64; 3]) -> (f64, f64) {
         let mut xy = D50_XY;
         for _ in 0..30 {
             let (t, _) = crate::develop::wb::temp_tint_for(xy.0, xy.1);
             let g = self.illuminant_weight(t as f32);
-            let Some(inv) = invert3(&self.color_matrix(g)) else { return D50_XY };
+            let Some(inv) = invert3(&self.calibrated_matrix(g, cc)) else { return D50_XY };
             let xyz = mul_mv(&inv, neutral);
             let sum = xyz[0] + xyz[1] + xyz[2];
             if !(sum.is_finite() && sum.abs() > 1e-12) {
@@ -387,10 +390,10 @@ impl Dcp {
     }
 
     /// Camera neutral (max component 1) for a white point xy.
-    pub fn xy_to_neutral(&self, xy: (f64, f64)) -> [f64; 3] {
+    pub fn xy_to_neutral(&self, xy: (f64, f64), cc: [f64; 3]) -> [f64; 3] {
         let (t, _) = crate::develop::wb::temp_tint_for(xy.0, xy.1);
         let g = self.illuminant_weight(t as f32);
-        let n = mul_mv(&self.color_matrix(g), xy_to_xyz(xy));
+        let n = mul_mv(&self.calibrated_matrix(g, cc), xy_to_xyz(xy));
         let m = n[0].max(n[1]).max(n[2]);
         if m > 1e-12 && n.iter().all(|v| v.is_finite() && *v > 0.0) {
             n.map(|v| v / m)
@@ -403,7 +406,9 @@ impl Dcp {
     /// (max 1), per the DNG spec: with forward matrices `FM * diag(1 / neutral)`, else
     /// `Bradford(white -> D50) * inverse(CM)` normalized so the neutral maps to D50 with
     /// Y = 1. Also returns the illuminant-1 weight used.
-    pub fn camera_to_pcs(&self, xy: (f64, f64), neutral: [f64; 3]) -> ([[f64; 3]; 3], f32) {
+    /// A diagonal `cc` cancels out of the forward-matrix path
+    /// (`FM * diag(1 / inv(CC) n) * inv(CC) = FM * diag(1 / n)`).
+    pub fn camera_to_pcs(&self, xy: (f64, f64), neutral: [f64; 3], cc: [f64; 3]) -> ([[f64; 3]; 3], f32) {
         let (t, _) = crate::develop::wb::temp_tint_for(xy.0, xy.1);
         let g = self.illuminant_weight(t as f32);
         if let Some(fm) = self.forward_matrix(g) {
@@ -416,7 +421,16 @@ impl Dcp {
             }
             return (m, g);
         }
-        (color_matrix_to_pcs(&self.color_matrix(g), xy), g)
+        (color_matrix_to_pcs(&self.calibrated_matrix(g, cc), xy), g)
+    }
+
+    /// `diag(cc) * ColorMatrix(g)`.
+    pub fn calibrated_matrix(&self, g: f32, cc: [f64; 3]) -> [[f64; 3]; 3] {
+        let mut m = self.color_matrix(g);
+        for (row, c) in m.iter_mut().zip(cc) {
+            row.iter_mut().for_each(|v| *v *= c);
+        }
+        m
     }
 }
 
@@ -837,11 +851,11 @@ mod tests {
         let d = Dcp::parse(&sample()).unwrap();
         for (t, tint) in [(2850.0, 0.0), (4300.0, 5.0), (6500.0, -10.0)] {
             let xy = crate::develop::wb::xy_for(t, tint);
-            let neutral = d.xy_to_neutral(xy);
+            let neutral = d.xy_to_neutral(xy, [1.0; 3]);
             assert!((neutral.iter().cloned().fold(0.0, f64::max) - 1.0).abs() < 1e-9);
-            let back = d.neutral_to_xy(neutral);
+            let back = d.neutral_to_xy(neutral, [1.0; 3]);
             assert!((back.0 - xy.0).abs() < 1e-5 && (back.1 - xy.1).abs() < 1e-5, "{xy:?} {back:?}");
-            let (m, _) = d.camera_to_pcs(xy, neutral);
+            let (m, _) = d.camera_to_pcs(xy, neutral, [1.0; 3]);
             let w = mul_mv(&m, neutral);
             let d50 = xy_to_xyz(D50_XY);
             for i in 0..3 {

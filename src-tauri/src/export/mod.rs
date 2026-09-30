@@ -718,6 +718,12 @@ fn export_one(
         &crate::profiles::ProfileLibrary::shared(),
         Some(&crate::xmp::sidecar_path(raw)),
     );
+    let tone = crate::develop::pipeline::tone_context(
+        &src,
+        develop::orientation_code(orientation),
+        &item.adjustments,
+        &profile,
+    );
     let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
@@ -733,7 +739,7 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64 };
+    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64, tone: Some(&tone) };
     let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;

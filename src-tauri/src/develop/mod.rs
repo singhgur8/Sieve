@@ -25,6 +25,7 @@
 
 pub mod camera;
 pub mod history;
+mod local_tone_data;
 mod param_data;
 pub mod parity;
 pub mod pipeline;
@@ -44,8 +45,8 @@ use tauri::http;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect, ParametricAdjustments,
-    ProfileSettings, RenderOptions, RenderSlot, RenderedPreview,
+    CameraCalibration, CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect,
+    ParametricAdjustments, ProfileSettings, RenderOptions, RenderSlot, RenderedPreview, WhiteBalance,
 };
 use crate::lut::LutLibrary;
 use crate::profiles::ProfileLibrary;
@@ -125,7 +126,14 @@ struct Entry {
     prepared: Mutex<Vec<(PrepKey, Arc<Prepared>)>>,
     /// Last resolved profile (resolution reads the sidecar when a look is not installed).
     profile: Mutex<Option<(ProfileSettings, Arc<Profile>)>>,
+    /// Uncropped [`pipeline::TONE_GRID`] px source for the local tone context.
+    tone_src: Mutex<Option<Arc<Prepared>>>,
+    /// Last uncropped local tone context and the settings it depends on.
+    tone_ctx: Mutex<Option<(ToneKey, Arc<pipeline::ToneContext>)>>,
 }
+
+/// What the uncropped local tone context depends on besides the source.
+type ToneKey = (WhiteBalance, CameraCalibration, ProfileSettings);
 
 impl Entry {
     fn bytes(&self) -> u64 {
@@ -178,6 +186,7 @@ impl Entry {
         profile: &'a Profile,
         seed: ImageId,
         quality: pipeline::Quality,
+        tone: Option<&'a pipeline::ToneContext>,
     ) -> pipeline::RenderInput<'a> {
         pipeline::RenderInput {
             width: prepared.width,
@@ -189,7 +198,40 @@ impl Entry {
             profile,
             seed: seed as u64,
             quality,
+            tone,
         }
+    }
+
+    /// Local tone context of the whole uncropped source (so drafts, previews, zoomed
+    /// regions and exports adapt alike); `None` when Shadows/Highlights are neutral.
+    fn tone_context(
+        &self,
+        orientation: u8,
+        adjustments: &ParametricAdjustments,
+        profile: &Profile,
+    ) -> Option<pipeline::ToneContext> {
+        let look = profile.look.as_ref().map(|l| (l.parameters.shadows, l.parameters.highlights));
+        let (ls, lh) = look.unwrap_or((0.0, 0.0));
+        if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 {
+            return None;
+        }
+        let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
+        let cached = lock(&self.tone_ctx).as_ref().filter(|(k, _)| *k == key).map(|(_, c)| c.clone());
+        let base = match cached {
+            Some(c) => c,
+            None => {
+                let whole = lock(&self.tone_src)
+                    .get_or_insert_with(|| {
+                        Arc::new(source::prepare(&self.image, 1, &CropSettings::default(), None, pipeline::TONE_GRID))
+                    })
+                    .clone();
+                let c = Arc::new(pipeline::tone_context_uncropped(&whole, &self.image, adjustments, profile));
+                *lock(&self.tone_ctx) = Some((key, c.clone()));
+                c
+            }
+        };
+        let (w, h) = (self.image.width, self.image.height);
+        Some((*base).clone().with_crop(&adjustments.crop, w, h, orientation))
     }
 }
 
@@ -310,6 +352,8 @@ impl DevelopCache {
             meta,
             prepared: Mutex::new(Vec::new()),
             profile: Mutex::new(None),
+            tone_src: Mutex::new(None),
+            tone_ctx: Mutex::new(None),
         });
         {
             let mut lru = lock(&self.inner.lru);
@@ -375,7 +419,8 @@ impl DevelopCache {
             return Ok(None);
         }
         let profile = entry.profile(&adjustments.profile);
-        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge));
+        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
         let img = pipeline::render(&input, adjustments, lut.as_deref());
         if !self.is_current(ticket) {
             return Ok(None);
@@ -505,7 +550,8 @@ impl DevelopCache {
         };
         let lut_missing = adjustments.lut.is_some() && lut.is_none();
         let profile = entry.profile(&adjustments.profile);
-        let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge));
+        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge), tone.as_ref());
         let image = pipeline::render(&input, adjustments, lut.as_deref());
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
