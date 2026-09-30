@@ -1928,6 +1928,7 @@ dependencies = [
  "fast_image_resize",
  "libc",
  "ort",
+ "quick-xml",
  "rayon",
  "rusqlite",
  "serde",

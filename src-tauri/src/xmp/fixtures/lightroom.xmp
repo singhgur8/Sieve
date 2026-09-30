@@ -1,0 +1,72 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmlns:exif="http://ns.adobe.com/exif/1.0/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:aux="http://ns.adobe.com/exif/1.0/aux/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+    xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   tiff:Make="SONY"
+   tiff:Model="ILCE-7M4"
+   exif:ExposureTime="1/250"
+   exif:FNumber="18/10"
+   xmp:ModifyDate="2026-06-14T15:32:10+02:00"
+   xmp:CreateDate="2026-06-14T15:32:10.21"
+   xmp:CreatorTool="ILCE-7M4 v3.01"
+   xmp:Rating="3"
+   xmp:Label="Red"
+   xmp:MetadataDate="2026-06-20T10:01:44+02:00"
+   aux:Lens="FE 85mm F1.8"
+   photoshop:DateCreated="2026-06-14T15:32:10.21"
+   xmpMM:DocumentID="xmp.did:5e3c1a2b-7f7a-4f58-9d22-0c1f3a9b8e11"
+   xmpMM:OriginalDocumentID="C0A1B2C3D4E5F60718293A4B5C6D7E8F"
+   xmpMM:InstanceID="xmp.iid:5e3c1a2b-7f7a-4f58-9d22-0c1f3a9b8e11"
+   crs:Version="16.4"
+   crs:ProcessVersion="15.4"
+   crs:WhiteBalance="As Shot"
+   crs:Exposure2012="+0.35"
+   crs:Contrast2012="+12"
+   crs:Highlights2012="-40"
+   crs:Shadows2012="+25"
+   crs:CameraProfile="Adobe Color"
+   crs:HasSettings="True">
+   <xmpMM:History>
+    <rdf:Seq>
+     <rdf:li
+      stEvt:action="saved"
+      stEvt:instanceID="xmp.iid:5e3c1a2b-7f7a-4f58-9d22-0c1f3a9b8e11"
+      stEvt:when="2026-06-20T10:01:44+02:00"
+      stEvt:softwareAgent="Adobe Photoshop Lightroom Classic 13.4 (Macintosh)"
+      stEvt:changed="/metadata"/>
+    </rdf:Seq>
+   </xmpMM:History>
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>wedding</rdf:li>
+     <rdf:li>Smith &amp; Jones</rdf:li>
+     <rdf:li>blink</rdf:li>
+     <rdf:li>motion_blur</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+   <lr:hierarchicalSubject>
+    <rdf:Bag>
+     <rdf:li>Events|wedding</rdf:li>
+     <rdf:li>Clients|Smith &amp; Jones</rdf:li>
+     <rdf:li>LumenRAW|blink</rdf:li>
+     <rdf:li>LumenRAW|motion_blur</rdf:li>
+    </rdf:Bag>
+   </lr:hierarchicalSubject>
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
