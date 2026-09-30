@@ -184,6 +184,16 @@ pub struct Exporter {
     config: ExportConfig,
     luts: LutLibrary,
     inner: Arc<Inner>,
+    /// Matte cache + segmenter for masked exports (Phase 7c); `None` = AI mask components
+    /// render empty.
+    masks: Option<ExportMasks>,
+}
+
+/// What an export needs for AI masks: computes missing mattes, then renders them.
+#[derive(Clone)]
+pub struct ExportMasks {
+    pub cache: crate::develop::masks::MaskCache,
+    pub segmenter: crate::ml::masking::Segmenter,
 }
 
 impl Exporter {
@@ -193,7 +203,18 @@ impl Exporter {
             config,
             luts,
             inner: Arc::new(Inner { state: Mutex::new(State::default()), idle: Condvar::new(), budget }),
+            masks: None,
         }
+    }
+
+    /// Enables AI masks in exports: missing mattes are computed with `segmenter` first.
+    pub fn with_masks(
+        mut self,
+        cache: crate::develop::masks::MaskCache,
+        segmenter: crate::ml::masking::Segmenter,
+    ) -> Self {
+        self.masks = Some(ExportMasks { cache, segmenter });
+        self
     }
 
     pub fn config(&self) -> &ExportConfig {
@@ -552,9 +573,10 @@ impl Exporter {
                         break;
                     }
                     let _ = tx.send(Msg::Started(item.entry.file_name.clone()));
-                    let outcome =
-                        catch_unwind(AssertUnwindSafe(|| export_one(item, settings, path, &self.luts, &cancelled)))
-                            .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        export_one(item, settings, path, &self.luts, self.masks.as_ref(), &cancelled)
+                    }))
+                    .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
                     budget.release(need);
                     let _ = tx.send(Msg::Done(*i, outcome));
                 });
@@ -699,12 +721,28 @@ fn export_one(
     settings: &ExportSettings,
     path: &Path,
     luts: &LutLibrary,
+    masks: Option<&ExportMasks>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, Failure> {
+    use crate::develop::masks::{self as dmasks, render as mrender};
     let check = || if cancelled() { Err(Failure::Cancelled) } else { Ok(()) };
     let raw = Path::new(&item.entry.path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
+    }
+    // Masks (Phase 7c): AI mattes the image does not have yet are computed first.
+    let masked = mrender::any_rendered(&item.adjustments.masks);
+    let source =
+        crate::develop::SourceImage { id: item.entry.id, path: raw.to_path_buf(), orientation: item.entry.orientation };
+    if let (true, Some(m)) = (masked, masks) {
+        let preview = match &item.entry.thumbnail {
+            crate::ipc::types::ThumbnailState::Ready { preview_path: Some(p), .. } => Some(PathBuf::from(p)),
+            _ => None,
+        };
+        for e in mrender::compute_missing(&m.segmenter, &source, preview.as_deref(), &item.adjustments.masks) {
+            eprintln!("export {}: AI mask not computed: {e}", raw.display());
+        }
+        check()?;
     }
     let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
     check()?;
@@ -718,6 +756,15 @@ fn export_one(
         &crate::profiles::ProfileLibrary::shared(),
         Some(&crate::xmp::sidecar_path(raw)),
     );
+    let mut mattes = if masked {
+        mrender::ResolvedMattes::resolve(masks.map(|m| &m.cache), item.entry.id, &item.adjustments.masks)
+    } else {
+        mrender::ResolvedMattes::none(item.entry.id)
+    };
+    if mattes.needs_guide() {
+        mattes.refine(|| Some(develop::sensor_guide(&src, &profile)));
+    }
+    let (sensor_width, sensor_height) = (src.full_width, src.full_height);
     let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
@@ -733,7 +780,30 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64 };
+    let (local, _) = if masked {
+        let geom = dmasks::MaskGeometry {
+            sensor_width,
+            sensor_height,
+            orientation: orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1),
+            crop: *crop,
+            region: None,
+            width: size.0,
+            height: size.1,
+        };
+        mrender::local_planes(
+            &item.adjustments.masks,
+            &geom,
+            item.entry.id,
+            &mattes,
+            || crate::develop::local::range_guide(&pixels, &color, &profile, &item.adjustments),
+            0,
+            None,
+        )
+    } else {
+        (None, Vec::new())
+    };
+    drop(mattes);
+    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64, masks: local.as_ref() };
     let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;

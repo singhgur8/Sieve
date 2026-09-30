@@ -1,7 +1,7 @@
 //! Local adjustments (Phase 7c, IPC v10): mask evaluation at any resolution, per-pixel local
 //! parameters for the shared pipeline (preview + export), mask overlays and the AI matte
 //! cache. Owned by rust-engine-dev; the architect fixed the surface below (types, function
-//! signatures, semantics). Bodies marked `todo!` are the owner's.
+//! signatures, semantics); the bodies are rust-engine-dev's.
 //!
 //! # Frames
 //! Every mask coordinate is in the **sensor frame** (`ipc::masks` docs): normalized
@@ -70,6 +70,7 @@ mod cache;
 mod eval;
 mod overlay;
 mod planes;
+pub mod render;
 
 #[cfg(test)]
 mod tests_eval;
@@ -370,6 +371,11 @@ impl MaskCache {
     }
 }
 
+/// Read-only catalog connection (renders / `DevelopInfo` resolve mattes with it).
+pub fn open_catalog_read_only(path: &std::path::Path) -> AppResult<Connection> {
+    cache::open_read_only(path)
+}
+
 impl MatteSource for MaskCache {
     fn matte(&self, image_id: ImageId, ai: &AiMask) -> Option<Arc<AlphaMask>> {
         let digest = match &ai.digest {
@@ -517,12 +523,21 @@ pub struct GroupBlend {
 }
 
 /// Per-pixel sums over groups of `weight_g * local_g.param` for each [`LocalParam`]
-/// (a plane is `None` when every active group has 0 for it), plus the group blends.
+/// (unset when every active group has 0 for it), plus the group blends. The sums are
+/// evaluated per pixel from the shared group weight planes ([`LocalPlanes::value`]); a
+/// materialized plane ([`LocalPlanes::get`]) is only built on request, so a render holds one
+/// plane per active group, not one per parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalPlanes {
     pub width: u32,
     pub height: u32,
-    planes: Vec<Option<Vec<f32>>>,
+    /// Weight planes of the groups that set any additive parameter.
+    weights: Vec<Arc<Vec<f32>>>,
+    /// Per parameter: (index into `weights`, the group's value).
+    terms: Vec<Vec<(usize, f32)>>,
+    /// Per parameter: upper bound of `|value|`.
+    bounds: Vec<f32>,
+    planes: Vec<std::sync::OnceLock<Vec<f32>>>,
     pub blends: Vec<GroupBlend>,
 }
 
@@ -532,15 +547,24 @@ impl LocalPlanes {
         planes::build(masks, weights)
     }
 
-    /// The offset plane for `param` (row-major, `width * height`), if any group sets it.
-    pub fn get(&self, param: LocalParam) -> Option<&[f32]> {
-        self.planes.get(param as usize).and_then(|p| p.as_deref())
+    /// [`Self::build`] over shared weight planes (`weights[i]` = group `masks[i]`, `None` =
+    /// inactive/empty) on a `width x height` grid; no copies (the render's weight cache).
+    pub fn from_shared(
+        masks: &[MaskGroup],
+        weights: &[Option<Arc<Vec<f32>>>],
+        width: u32,
+        height: u32,
+    ) -> Option<LocalPlanes> {
+        planes::from_shared(masks, weights, width, height)
     }
 }
 
+pub use planes::PreparedBlends;
+
 /// Per-group point curve (+ refine saturation) and colour tint, each blended by the group
-/// weight, on the working image (linear Rec.2020 RGB, row-major). Called once after the
-/// global point curves.
+/// weight, on the working image: **display-linear ProPhoto** RGB (the pipeline's colour
+/// after the global point curves, before the output space), row-major. The pipeline applies
+/// the same per pixel through [`LocalPlanes::prepare_blends`].
 pub fn apply_group_blends(rgb: &mut [[f32; 3]], local: &LocalPlanes) {
     planes::apply_group_blends(rgb, local)
 }

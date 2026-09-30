@@ -231,15 +231,39 @@ pub fn run() {
             app.manage(catalog);
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
-            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }));
-            app.manage(DevelopCache::new(DevelopConfig { cache_bytes: develop_cache_mb * 1024 * 1024 }));
+            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }).with_mask_cache(mask_cache.clone()));
+            app.manage(DevelopCache::new(DevelopConfig {
+                cache_bytes: develop_cache_mb * 1024 * 1024,
+                mask_cache: Some(mask_cache.clone()),
+            }));
             // Adobe DCPs / looks installed on this Mac, read in place (never copied).
             app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
+            let luts = LutLibrary::new(luts_dir);
+            let exporter = Exporter::new(
+                ExportConfig { catalog_path: path.clone(), memory_budget_mb: export_memory_mb },
+                luts.clone(),
+            )
+            .with_masks(mask_cache.clone(), segmenter.clone());
+            // Masks catch-up (migration 0010) + orphaned matte sweep, off the startup path.
+            {
+                let xmp = app.state::<XmpSync>().inner().clone();
+                let cache = mask_cache.clone();
+                let catalog_path = path.clone();
+                let _ = std::thread::Builder::new().name("masks-catch-up".into()).spawn(move || {
+                    match xmp.import_pending_masks() {
+                        Ok(n) if n > 0 => eprintln!("imported sidecar masks of {n} image(s)"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("masks catch-up: {}", e.message),
+                    }
+                    if let Ok(conn) = db::open(&catalog_path) {
+                        if let Err(e) = cache.sweep(&conn) {
+                            eprintln!("mask cache sweep: {}", e.message);
+                        }
+                    }
+                });
+            }
             app.manage(mask_cache);
             app.manage(segmenter);
-            let luts = LutLibrary::new(luts_dir);
-            let exporter =
-                Exporter::new(ExportConfig { catalog_path: path, memory_budget_mb: export_memory_mb }, luts.clone());
             // Jobs cut off by a previous quit become `interrupted` (never resumed).
             exporter.recover_interrupted()?;
             app.manage(luts);

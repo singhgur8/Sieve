@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cache = DevelopCache::new(DevelopConfig { cache_bytes: 6 << 30 });
+    let cache = DevelopCache::new(DevelopConfig { cache_bytes: 6 << 30, mask_cache: None });
     let luts = LutLibrary::new(work.join("luts"));
 
     if args.iter().any(|a| a == "--calibrate") {

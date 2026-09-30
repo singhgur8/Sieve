@@ -1,6 +1,6 @@
 //! Per-pixel local parameter planes and the non-additive per-group blends.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 
@@ -55,52 +55,123 @@ fn curves_identity(c: &PointCurves) -> bool {
 }
 
 pub fn build(masks: &[MaskGroup], weights: &GroupWeights) -> Option<LocalPlanes> {
-    let n = weights.width as usize * weights.height as usize;
-    let active: Vec<(&MaskGroup, &Vec<f32>)> = masks
-        .iter()
-        .zip(&weights.groups)
-        .filter_map(|(g, w)| w.as_ref().filter(|w| w.len() == n).map(|w| (g, w)))
-        .collect();
-    let mut planes: Vec<Option<Vec<f32>>> = vec![None; LocalParam::COUNT];
-    for p in ALL_PARAMS {
-        let parts: Vec<(&[f32], f32)> = active
-            .iter()
-            .map(|(g, w)| (w.as_slice(), param_value(&g.adjustments, p)))
-            .filter(|(_, v)| *v != 0.0)
-            .collect();
-        if parts.is_empty() {
+    let shared: Vec<Option<Arc<Vec<f32>>>> = weights.groups.iter().map(|w| w.clone().map(Arc::new)).collect();
+    from_shared(masks, &shared, weights.width, weights.height)
+}
+
+/// [`build`] over shared weight planes (`weights[i]` belongs to `masks[i]`; no copies).
+pub fn from_shared(
+    masks: &[MaskGroup],
+    weights: &[Option<Arc<Vec<f32>>>],
+    width: u32,
+    height: u32,
+) -> Option<LocalPlanes> {
+    let n = width as usize * height as usize;
+    let active: Vec<(&MaskGroup, &Arc<Vec<f32>>)> =
+        masks.iter().zip(weights).filter_map(|(g, w)| w.as_ref().filter(|w| w.len() == n).map(|w| (g, w))).collect();
+    let mut planes: Vec<Arc<Vec<f32>>> = Vec::new();
+    let mut max_w: Vec<f32> = Vec::new();
+    let mut terms: Vec<Vec<(usize, f32)>> = vec![Vec::new(); LocalParam::COUNT];
+    for (g, w) in &active {
+        let values: Vec<(LocalParam, f32)> =
+            ALL_PARAMS.iter().map(|&p| (p, param_value(&g.adjustments, p))).filter(|(_, v)| *v != 0.0).collect();
+        if values.is_empty() {
             continue;
         }
-        let mut plane = vec![0.0f32; n];
-        plane.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-            let off = ci * 4096;
-            let len = chunk.len();
-            for (w, v) in &parts {
-                for (o, x) in chunk.iter_mut().zip(&w[off..off + len]) {
-                    *o += x * v;
-                }
-            }
-        });
-        planes[p as usize] = Some(plane);
+        let k = planes.len();
+        planes.push(Arc::clone(w));
+        max_w.push(w.par_iter().copied().reduce(|| 0.0f32, f32::max));
+        for (p, v) in values {
+            terms[p as usize].push((k, v));
+        }
     }
     let blends: Vec<GroupBlend> = active
         .iter()
         .filter(|(g, _)| g.adjustments.color.saturation > 0.0 || !curves_identity(&g.adjustments.tone_curve))
         .map(|(g, w)| GroupBlend {
-            weight: Arc::new((*w).clone()),
+            weight: Arc::clone(w),
             color: g.adjustments.color,
             tone_curve: g.adjustments.tone_curve.clone(),
             curve_refine_saturation: g.adjustments.curve_refine_saturation,
         })
         .collect();
-    if planes.iter().all(Option::is_none) && blends.is_empty() {
+    if terms.iter().all(Vec::is_empty) && blends.is_empty() {
         return None;
     }
-    Some(LocalPlanes { width: weights.width, height: weights.height, planes, blends })
+    let bounds = terms.iter().map(|t| t.iter().map(|&(k, v)| v.abs() * max_w[k]).sum()).collect();
+    Some(LocalPlanes {
+        width,
+        height,
+        weights: planes,
+        terms,
+        bounds,
+        planes: (0..LocalParam::COUNT).map(|_| OnceLock::new()).collect(),
+        blends,
+    })
 }
 
-/// Rec.2020 luminance weights.
-const Y2020: [f32; 3] = [0.2627, 0.6780, 0.0593];
+impl LocalPlanes {
+    /// Some active group sets `param`.
+    #[inline]
+    pub fn has(&self, param: LocalParam) -> bool {
+        !self.terms[param as usize].is_empty()
+    }
+
+    /// Upper bound of `|value(param, i)|` over the frame (0 when unset).
+    pub fn bound(&self, param: LocalParam) -> f32 {
+        self.bounds[param as usize]
+    }
+
+    /// The offset of `param` at pixel `i` (row-major index): sum over groups of weight x value.
+    #[inline]
+    pub fn value(&self, param: LocalParam, i: usize) -> f32 {
+        let mut s = 0.0;
+        for &(k, v) in &self.terms[param as usize] {
+            s += self.weights[k][i] * v;
+        }
+        s
+    }
+
+    /// Materialized plane of `param` (computed on first use), `None` when unset.
+    pub fn get(&self, param: LocalParam) -> Option<&[f32]> {
+        if !self.has(param) {
+            return None;
+        }
+        let plane = self.planes[param as usize].get_or_init(|| {
+            let n = self.width as usize * self.height as usize;
+            let mut plane = vec![0.0f32; n];
+            plane.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
+                let off = ci * 4096;
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    *o = self.value(param, off + k);
+                }
+            });
+            plane
+        });
+        Some(plane)
+    }
+
+    /// Curve LUTs / tints of the group blends, ready for per-pixel use.
+    pub fn prepare_blends(&self) -> PreparedBlends {
+        PreparedBlends { blends: self.blends.iter().map(PreparedBlend::new).collect() }
+    }
+}
+
+/// Luminance weights of linear ProPhoto (the pipeline's working space).
+const Y_PP: [f32; 3] = crate::develop::parity::PROPHOTO_Y;
+
+/// Linear sRGB (D65) -> linear ProPhoto (D50, Bradford).
+fn srgb_to_prophoto() -> &'static [[f32; 3]; 3] {
+    static M: OnceLock<[[f32; 3]; 3]> = OnceLock::new();
+    M.get_or_init(|| {
+        use crate::profiles::dcp::{bradford, invert3, mul_mm, xy_to_xyz, D50_XY};
+        const SRGB_TO_XYZ: [[f64; 3]; 3] =
+            [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]];
+        let d65_d50 = bradford(xy_to_xyz((0.3127, 0.3290)), xy_to_xyz(D50_XY));
+        let xyz_to_pp = invert3(&crate::develop::camera::PROPHOTO_TO_XYZ).expect("invertible");
+        mul_mm(&xyz_to_pp, &mul_mm(&d65_d50, &SRGB_TO_XYZ)).map(|r| r.map(|v| v as f32))
+    })
+}
 
 #[inline]
 fn srgb_encode(x: f32) -> f32 {
@@ -185,7 +256,7 @@ fn lut_eval(lut: &[f32], x: f32) -> f32 {
     lut[i] + (lut[i + 1] - lut[i]) * (t - i as f32)
 }
 
-/// Linear RGB of a fully saturated hue (degrees), normalized to luminance 1.
+/// Linear ProPhoto of a fully saturated sRGB hue (degrees), normalized to luminance 1.
 fn tint_rgb(hue: f32) -> [f32; 3] {
     let h = (hue.rem_euclid(360.0)) / 60.0;
     let x = 1.0 - (h % 2.0 - 1.0).abs();
@@ -198,19 +269,25 @@ fn tint_rgb(hue: f32) -> [f32; 3] {
         _ => (1.0, 0.0, x),
     };
     let lin = [srgb_decode(r), srgb_decode(g), srgb_decode(b)];
-    let y = (lin[0] * Y2020[0] + lin[1] * Y2020[1] + lin[2] * Y2020[2]).max(1e-6);
-    [lin[0] / y, lin[1] / y, lin[2] / y]
+    let m = srgb_to_prophoto();
+    let pp = [0, 1, 2].map(|k| m[k][0] * lin[0] + m[k][1] * lin[1] + m[k][2] * lin[2]);
+    let y = (pp[0] * Y_PP[0] + pp[1] * Y_PP[1] + pp[2] * Y_PP[2]).max(1e-6);
+    [pp[0] / y, pp[1] / y, pp[2] / y]
 }
 
-pub fn apply_group_blends(rgb: &mut [[f32; 3]], local: &LocalPlanes) {
-    const SIZE: usize = 1024;
-    for b in &local.blends {
-        if b.weight.len() != rgb.len() {
-            continue;
-        }
+/// One group blend with its curve LUTs built.
+struct PreparedBlend {
+    weight: Arc<Vec<f32>>,
+    luts: Option<[Vec<f32>; 3]>,
+    refine: f32,
+    tint: Option<([f32; 3], f32)>,
+}
+
+impl PreparedBlend {
+    fn new(b: &GroupBlend) -> Self {
+        const SIZE: usize = 1024;
         let c = &b.tone_curve;
-        let has_curves = !curves_identity(c);
-        let luts: Option<[Vec<f32>; 3]> = has_curves.then(|| {
+        let luts = (!curves_identity(c)).then(|| {
             let master = curve_lut(&c.master, SIZE);
             let chan = |pts: &Vec<CurvePoint>| {
                 let l = curve_lut(pts, SIZE);
@@ -218,42 +295,71 @@ pub fn apply_group_blends(rgb: &mut [[f32; 3]], local: &LocalPlanes) {
             };
             [chan(&c.red), chan(&c.green), chan(&c.blue)]
         });
-        let refine = (b.curve_refine_saturation / 100.0).clamp(0.0, 1.0);
-        let tint = (b.color.saturation > 0.0).then(|| (tint_rgb(b.color.hue), b.color.saturation / 100.0 * 0.5));
-        let weight = &b.weight;
-        rgb.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-            let off = ci * 4096;
-            for (k, px) in chunk.iter_mut().enumerate() {
-                let w = weight[off + k];
-                if w <= 0.0 {
-                    continue;
-                }
-                let c0 = *px;
-                let mut c1 = c0;
-                if let Some(l) = &luts {
-                    let cur = [
-                        srgb_decode(lut_eval(&l[0], srgb_encode(c0[0]))),
-                        srgb_decode(lut_eval(&l[1], srgb_encode(c0[1]))),
-                        srgb_decode(lut_eval(&l[2], srgb_encode(c0[2]))),
-                    ];
-                    let y0 = c0[0] * Y2020[0] + c0[1] * Y2020[1] + c0[2] * Y2020[2];
-                    let y1 = cur[0] * Y2020[0] + cur[1] * Y2020[1] + cur[2] * Y2020[2];
-                    // Refine saturation 0: luminance-only (hue/saturation kept), 100: per channel.
-                    let k = if y0 > 1e-6 { y1 / y0 } else { 1.0 };
-                    for i in 0..3 {
-                        let lum = c0[i] * k;
-                        c1[i] = lum + (cur[i] - lum) * refine;
-                    }
-                }
-                if let Some((t, s)) = tint {
-                    for i in 0..3 {
-                        c1[i] *= 1.0 + (t[i] - 1.0) * s;
-                    }
-                }
-                for i in 0..3 {
-                    px[i] = (c0[i] + (c1[i] - c0[i]) * w).max(0.0);
-                }
-            }
-        });
+        PreparedBlend {
+            weight: Arc::clone(&b.weight),
+            luts,
+            refine: (b.curve_refine_saturation / 100.0).clamp(0.0, 1.0),
+            tint: (b.color.saturation > 0.0).then(|| (tint_rgb(b.color.hue), b.color.saturation / 100.0 * 0.5)),
+        }
     }
+
+    #[inline]
+    fn apply(&self, i: usize, c0: [f32; 3]) -> [f32; 3] {
+        let w = self.weight.get(i).copied().unwrap_or(0.0);
+        if w <= 0.0 {
+            return c0;
+        }
+        let mut c1 = c0;
+        if let Some(l) = &self.luts {
+            let cur = [
+                srgb_decode(lut_eval(&l[0], srgb_encode(c0[0]))),
+                srgb_decode(lut_eval(&l[1], srgb_encode(c0[1]))),
+                srgb_decode(lut_eval(&l[2], srgb_encode(c0[2]))),
+            ];
+            let y0 = c0[0] * Y_PP[0] + c0[1] * Y_PP[1] + c0[2] * Y_PP[2];
+            let y1 = cur[0] * Y_PP[0] + cur[1] * Y_PP[1] + cur[2] * Y_PP[2];
+            // Refine saturation 0: luminance-only (hue/saturation kept), 100: per channel.
+            let k = if y0 > 1e-6 { y1 / y0 } else { 1.0 };
+            for i in 0..3 {
+                let lum = c0[i] * k;
+                c1[i] = lum + (cur[i] - lum) * self.refine;
+            }
+        }
+        if let Some((t, s)) = self.tint {
+            for (c, t) in c1.iter_mut().zip(t) {
+                *c *= 1.0 + (t - 1.0) * s;
+            }
+        }
+        [0, 1, 2].map(|k| (c0[k] + (c1[k] - c0[k]) * w).max(0.0))
+    }
+}
+
+/// Group blends ready for the pipeline's per-pixel loop.
+pub struct PreparedBlends {
+    blends: Vec<PreparedBlend>,
+}
+
+impl PreparedBlends {
+    pub fn is_empty(&self) -> bool {
+        self.blends.is_empty()
+    }
+
+    /// Applies every blend, in group order, to display-linear ProPhoto `c` at pixel `i`.
+    #[inline]
+    pub fn apply(&self, i: usize, c: [f32; 3]) -> [f32; 3] {
+        self.blends.iter().fold(c, |c, b| b.apply(i, c))
+    }
+}
+
+pub fn apply_group_blends(rgb: &mut [[f32; 3]], local: &LocalPlanes) {
+    let prepared = local.prepare_blends();
+    if prepared.is_empty() || local.width as usize * local.height as usize != rgb.len() {
+        return;
+    }
+    rgb.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
+        let off = ci * 4096;
+        for (k, px) in chunk.iter_mut().enumerate() {
+            *px = prepared.apply(off + k, *px);
+        }
+    });
 }

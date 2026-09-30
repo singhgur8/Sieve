@@ -367,6 +367,70 @@ impl XmpSync {
         Ok(read)
     }
 
+    /// Launch catch-up (migration 0010): images whose sidecar masks were read before v10
+    /// (`masks_pending_import`) get those masks imported (only `masks`; every other setting
+    /// stays as it is in the catalog), their Lightroom mattes cached, and the flag cleared.
+    /// Images without a sidecar (or without masks in it) just clear the flag. Per-image
+    /// errors are logged and leave the flag set (retried next launch / on `read_xmp`).
+    /// Returns the number of images whose masks were imported. Blocking.
+    pub fn import_pending_masks(&self) -> AppResult<u32> {
+        let mut conn = db::open(&self.config.catalog_path)?;
+        let mut imported = 0;
+        for id in store::masks_pending_ids(&conn)? {
+            let Some(row) = store::load(&conn, id)? else { continue };
+            match self.import_masks_only(&mut conn, &row) {
+                Ok(true) => imported += 1,
+                Ok(false) => {}
+                Err(reason) => eprintln!("masks catch-up, image {id}: {reason}"),
+            }
+        }
+        Ok(imported)
+    }
+
+    fn import_masks_only(&self, conn: &mut Connection, row: &ImageRow) -> Result<bool, String> {
+        let _io = lock_ignore_poison(&self.io_lock);
+        let path = resolve_sidecar(&row.path);
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+                return Ok(false);
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let Some(read) = masks::read(&text).map_err(|e| format!("{}: {e}", path.display()))? else {
+            store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+            return Ok(false);
+        };
+        if let (Some(cache), false) = (&self.mask_cache, read.mattes.is_empty()) {
+            match masks::mattes_supported() {
+                Ok(()) => {
+                    for e in cache.import_lightroom(conn, row.id, &read.mattes) {
+                        eprintln!("{}: {e}", path.display());
+                    }
+                }
+                Err(e) => eprintln!("{}: Lightroom masks not decoded: {e}", path.display()),
+            }
+        }
+        let current = repo::get_adjustments(conn, row.id).map_err(|e| e.message)?;
+        let changed = current.masks != read.groups;
+        if changed {
+            let was_dirty = store::is_dirty(conn, row.id).map_err(|e| e.message)?;
+            let adj = ParametricAdjustments { masks: read.groups.clone(), ..current };
+            develop::history::commit(conn, row.id, &adj, develop::history::LABEL_READ_XMP).map_err(|e| e.message)?;
+            if !was_dirty {
+                // The masks came from the sidecar: nothing new to write back.
+                store::clear_dirty(conn, row.id).map_err(|e| e.message)?;
+            }
+        }
+        let mut warnings = store::develop_warnings(conn, row.id).map_err(|e| e.message)?;
+        warnings.retain(|w| w.code != crate::ipc::types::DevelopWarningCode::MasksUnsupported);
+        warnings.extend(read.warnings.iter().cloned());
+        store::set_develop_warnings(conn, row.id, &warnings).map_err(|e| e.message)?;
+        store::clear_masks_pending(conn, row.id).map_err(|e| e.message)?;
+        Ok(changed)
+    }
+
     /// Syncs one image. `Err` carries a per-file reason (catalog errors included).
     fn sync_one(&self, conn: &mut Connection, row: &ImageRow, policy: SyncPolicy) -> Result<Outcome, String> {
         let _io = lock_ignore_poison(&self.io_lock);
