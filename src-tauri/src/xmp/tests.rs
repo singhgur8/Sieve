@@ -524,11 +524,13 @@ fn wait_idle(sync: &XmpSync) {
 fn auto_sync_respects_the_setting() {
     let f = Fixture::new(1);
     let mut conn = f.conn();
+    // On by default since IPC v14; turned off, nothing is written.
+    repo::set_xmp_auto_sync(&conn, false).unwrap();
     repo::set_rating(&mut conn, &f.ids, 2).unwrap();
     let (s, rx) = sink();
     f.sync.notify_with(s);
     wait_idle(&f.sync);
-    assert!(!f.sidecar(0).exists(), "auto-sync is off by default");
+    assert!(!f.sidecar(0).exists(), "auto-sync turned off writes nothing");
     assert!(rx.try_recv().is_err());
     assert!(f.state(f.ids[0]).0);
 }

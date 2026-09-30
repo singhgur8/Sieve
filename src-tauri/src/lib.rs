@@ -163,6 +163,14 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::cancel_style_training,
             commands::predict_style,
             commands::apply_style_prediction,
+            commands::list_projects,
+            commands::get_project,
+            commands::create_project,
+            commands::open_project,
+            commands::rename_project,
+            commands::set_project_cover,
+            commands::set_project_shoot_type,
+            commands::remove_project,
         ])
         .events(collect_events![
             ImportProgress,

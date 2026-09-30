@@ -319,7 +319,11 @@ impl ProfileLibrary {
         let mut camera_profiles: Vec<CameraProfileInfo> = Vec::new();
         for d in dcps {
             if !camera_profiles.iter().any(|p| p.name == d.name) {
-                camera_profiles.push(CameraProfileInfo { name: d.name.clone(), group: d.group.clone(), style_id: None });
+                camera_profiles.push(CameraProfileInfo {
+                    name: d.name.clone(),
+                    group: d.group.clone(),
+                    style_id: None,
+                });
             }
         }
         let order = |g: &str| match g {

@@ -11,6 +11,7 @@ use tauri_specta::Event;
 
 use super::error::{AppError, AppResult, ErrorKind};
 use super::types::*;
+use crate::db::projects::{self, FolderScope, ImportTarget};
 use crate::db::{self, repo};
 use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
@@ -107,8 +108,14 @@ pub async fn set_burst_window(
 /// externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 /// returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 /// (and `analysis*`) events.
+///
+/// Project (v14): `projectId` adds the folder to that project ("Add folder to project"; a
+/// folder already in another project -> `invalid_argument`); `null` = the folder's project
+/// if it (or a folder containing it) is in the catalog, else a new project named after it.
+/// `create_project` is the home page's "New project".
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn import_folder(
     app: AppHandle,
     catalog: State<'_, Catalog>,
@@ -117,21 +124,40 @@ pub async fn import_folder(
     xmp: State<'_, XmpSync>,
     path: String,
     options: ImportOptions,
+    project_id: Option<ProjectId>,
 ) -> AppResult<ImportSummary> {
-    let (mut summary, auto) =
-        catalog.run(move |c| Ok((repo::import_folder(c, Path::new(&path), &options)?, repo::auto_analyze(c)?))).await?;
-    let sync = xmp.inner().clone();
+    let target = project_id.map_or(ImportTarget::Auto, ImportTarget::Existing);
+    Ok(run_import(&app, &catalog, &ingest, &analysis, &xmp, path, options, target).await?.0)
+}
+
+/// `import_folder` / `create_project`: registers the files, reads sidecars, starts ingest (and
+/// analysis). Returns the summary and whether the folder was already in the catalog.
+#[allow(clippy::too_many_arguments)]
+async fn run_import(
+    app: &AppHandle,
+    catalog: &Catalog,
+    ingest: &Ingest,
+    analysis: &Analysis,
+    xmp: &XmpSync,
+    path: String,
+    options: ImportOptions,
+    target: ImportTarget,
+) -> AppResult<(ImportSummary, bool)> {
+    let ((mut summary, existing), auto) = catalog
+        .run(move |c| Ok((repo::import_folder_to(c, Path::new(&path), &options, &target)?, repo::auto_analyze(c)?)))
+        .await?;
+    let sync = xmp.clone();
     let folder_id = summary.folder_id;
     summary.sidecars_read = blocking(move || sync.refresh_folder(folder_id)).await?;
     // Re-registered files may have changed on disk: re-resolve develop sources.
     if let Some(develop) = app.try_state::<DevelopCache>() {
         develop.forget_sources(None);
     }
-    ingest.start(&app)?;
+    ingest.start(app)?;
     if auto {
-        analysis.start(&app, AnalysisScope::Pending)?;
+        analysis.start(app, AnalysisScope::Pending)?;
     }
-    Ok(summary)
+    Ok((summary, existing))
 }
 
 /// Re-extracts thumbnails/previews/EXIF for `ids` (e.g. after a failure). Resets them to
@@ -193,11 +219,16 @@ pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> A
     catalog.run(move |c| repo::list_image_ids(c, &query)).await
 }
 
-/// Filter-bar facet counts for `folderId` (`null` = whole catalog).
+/// Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
+/// inside a project pass its id). Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_filter_counts(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<FilterCounts> {
-    catalog.run(move |c| repo::filter_counts(c, folder_id)).await
+pub async fn get_filter_counts(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<FilterCounts> {
+    catalog.run(move |c| repo::filter_counts(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 // Culling writes. Each marks changed images `xmp.dirty` (DB triggers) and notifies the
@@ -822,11 +853,16 @@ pub async fn get_faces(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<Ve
     catalog.run(move |c| repo::get_faces(c, id)).await
 }
 
-/// Burst groups with members, optionally limited to groups touching `folderId`.
+/// Burst groups with members, optionally limited to groups touching `folderId` AND
+/// `projectId` (v14).
 #[tauri::command]
 #[specta::specta]
-pub async fn list_burst_groups(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<BurstGroup>> {
-    catalog.run(move |c| repo::list_burst_groups(c, folder_id)).await
+pub async fn list_burst_groups(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<BurstGroup>> {
+    catalog.run(move |c| repo::list_burst_groups(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 /// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
@@ -1072,7 +1108,8 @@ pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>
 // Scenes & scene matching (Phase 7)
 // ---------------------------------------------------------------------------
 
-/// Groups the images of `folderId` (all folders for `null`) into scenes by capture-time gaps
+/// Groups the images of `folderId` AND `projectId` (v14; both `null` = all folders; scenes
+/// never span folders) into scenes by capture-time gaps
 /// and appearance similarity (`options` `null` = defaults). Replaces the `auto` scenes in scope
 /// (and `manual` ones if `replaceManual`); members of kept manual scenes are not regrouped;
 /// anchor flags survive regrouping. Blocking until done (first run computes preview features,
@@ -1084,12 +1121,15 @@ pub async fn detect_scenes(
     app: AppHandle,
     catalog: State<'_, Catalog>,
     folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
     options: Option<SceneDetectOptions>,
 ) -> AppResult<Vec<Scene>> {
     let options = options.unwrap_or_default();
     options.validate().map_err(AppError::invalid)?;
     let replace_manual = options.replace_manual;
-    let mut frames = catalog.run(move |c| scene::store::detection_frames(c, folder_id, replace_manual)).await?;
+    let scope = catalog.run(move |c| FolderScope::resolve(c, folder_id, project_id)).await?;
+    let frames_scope = scope.clone();
+    let mut frames = catalog.run(move |c| scene::store::detection_frames(c, &frames_scope, replace_manual)).await?;
     let progress = scene::progress_emitter(app, SceneTask::Detect);
     let (frames, computed) = blocking(move || {
         let computed = scene::features::compute_missing(&mut frames, &progress);
@@ -1100,16 +1140,21 @@ pub async fn detect_scenes(
         .run(move |c| {
             scene::store::save_features(c, &computed)?;
             let groups = scene::detect::group(&frames, &options);
-            scene::store::replace_scenes(c, folder_id, &groups, options.replace_manual)
+            scene::store::replace_scenes(c, &scope, &groups, options.replace_manual)
         })
         .await
 }
 
-/// Scenes with a member in `folderId` (all for `null`), in capture order.
+/// Scenes with a member in `folderId` AND `projectId` (v14; both `null` = all), in capture
+/// order.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_scenes(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<Vec<Scene>> {
-    catalog.run(move |c| scene::store::list_scenes(c, folder_id)).await
+pub async fn list_scenes(
+    catalog: State<'_, Catalog>,
+    folder_id: Option<FolderId>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<Scene>> {
+    catalog.run(move |c| scene::store::list_scenes(c, FolderScope::resolve(c, folder_id, project_id)?)).await
 }
 
 #[tauri::command]
@@ -1639,17 +1684,21 @@ pub async fn auto_white_balance(
     note_if_missing(&catalog, id, r).await
 }
 
-/// Guided-workflow step of folder `folderId` (also in `CatalogState.folders[].workflowStep`).
+/// Guided-workflow step of project `projectId` (also `Project.workflowStep`).
 #[tauri::command]
 #[specta::specta]
-pub async fn get_workflow_step(catalog: State<'_, Catalog>, folder_id: FolderId) -> AppResult<WorkflowStep> {
-    catalog.run(move |c| repo::workflow_step(c, folder_id)).await
+pub async fn get_workflow_step(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<WorkflowStep> {
+    catalog.run(move |c| projects::workflow_step(c, project_id)).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_workflow_step(catalog: State<'_, Catalog>, folder_id: FolderId, step: WorkflowStep) -> AppResult<()> {
-    catalog.run(move |c| repo::set_workflow_step(c, folder_id, step)).await
+pub async fn set_workflow_step(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    step: WorkflowStep,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_workflow_step(c, project_id, step)).await
 }
 
 /// Changes which images count as keepers (`CatalogState.keeperRule`). `minRating` 1..=5.
@@ -1659,13 +1708,13 @@ pub async fn set_keeper_rule(catalog: State<'_, Catalog>, rule: KeeperRule) -> A
     catalog.run(move |c| repo::set_keeper_rule(c, &rule)).await
 }
 
-/// The Edit step of folder `folderId`: keepers, their scenes, one representative per scene and
-/// the checklist status. Proposes (and remembers) representatives for scenes without one.
+/// The Edit step of project `projectId`: keepers, their scenes, one representative per scene
+/// and the checklist status. Proposes (and remembers) representatives for scenes without one.
 /// Keepers outside every scene are listed in `unassignedKeeperIds` (run `detect_scenes`).
 #[tauri::command]
 #[specta::specta]
-pub async fn get_edit_plan(catalog: State<'_, Catalog>, folder_id: FolderId) -> AppResult<EditPlan> {
-    catalog.run(move |c| scene::workflow::edit_plan(c, folder_id)).await
+pub async fn get_edit_plan(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<EditPlan> {
+    catalog.run(move |c| scene::workflow::edit_plan(c, project_id)).await
 }
 
 /// Chooses scene `sceneId`'s representative (`imageId` must be a keeper member) or hands the
@@ -1754,7 +1803,7 @@ async fn apply_scenes(
 
 enum SceneIds {
     One(SceneId),
-    EditedIn(FolderId),
+    EditedIn(ProjectId),
 }
 
 /// "Apply to scene": copies the representative's edit to the scene's other keepers (and
@@ -1777,7 +1826,7 @@ pub async fn apply_scene_edit(
     apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::One(scene_id), options).await
 }
 
-/// `apply_scene_edit` for every scene of `folderId` whose status is `edited` or `outdated`,
+/// `apply_scene_edit` for every scene of `projectId` whose status is `edited` or `outdated`,
 /// as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
 #[tauri::command]
 #[specta::specta]
@@ -1787,10 +1836,10 @@ pub async fn apply_all_edited_scenes(
     develop: State<'_, DevelopCache>,
     luts: State<'_, LutLibrary>,
     xmp: State<'_, XmpSync>,
-    folder_id: FolderId,
+    project_id: ProjectId,
     options: Option<SceneApplyOptions>,
 ) -> AppResult<ApplyScenesResult> {
-    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::EditedIn(folder_id), options).await
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::EditedIn(project_id), options).await
 }
 
 /// Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
@@ -1842,7 +1891,10 @@ pub async fn paste_previous(
 /// State of the personal style model ("Auto edit (my style)").
 #[tauri::command]
 #[specta::specta]
-pub async fn style_model_status(catalog: State<'_, Catalog>, style: State<'_, StyleModel>) -> AppResult<StyleModelStatus> {
+pub async fn style_model_status(
+    catalog: State<'_, Catalog>,
+    style: State<'_, StyleModel>,
+) -> AppResult<StyleModelStatus> {
     let style = style.inner().clone();
     catalog.run(move |c| style.status(c)).await
 }
@@ -1914,4 +1966,132 @@ pub async fn apply_style_prediction(
         xmp.notify(&app);
     }
     Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// IPC v14 (Phase 8b): projects (home page). A project is one shoot: name, source folder(s),
+// cover, shoot type, workflow step. Inside a project the UI passes `projectId` to
+// `ImageQuery`, `get_filter_counts`, `list_burst_groups`, `list_scenes`, `detect_scenes`,
+// `get_edit_plan`, `apply_all_edited_scenes` and `AnalysisScope::Project`. "Reveal in Finder"
+// = `reveal_in_finder(project.folders[i].path)`; "Locate folder..." = `relocate_folder`.
+// ---------------------------------------------------------------------------
+
+/// Every project, most recently opened first, then newest (the home page sorts/searches
+/// client-side).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_projects(catalog: State<'_, Catalog>) -> AppResult<Vec<Project>> {
+    catalog.run(|c| projects::list_projects(c)).await
+}
+
+/// One project. Unknown id -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_project(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<Project> {
+    catalog.run(move |c| projects::get_project(c, project_id)).await
+}
+
+/// Home page "New project": imports `path` (like `import_folder`) as a new project named
+/// `name` (`null` = the folder's name) with `shootType` (`null` = `CatalogState.shootType`).
+/// If the folder (or a folder containing it) is already in the catalog, its project is
+/// re-scanned and returned with `existing: true` instead. Errors as `import_folder`; bad name
+/// -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_project(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    analysis: State<'_, Analysis>,
+    xmp: State<'_, XmpSync>,
+    path: String,
+    name: Option<String>,
+    shoot_type: Option<ShootType>,
+    options: ImportOptions,
+) -> AppResult<CreateProjectResult> {
+    if let Some(n) = &name {
+        Project::validate_name(n).map_err(AppError::invalid)?;
+    }
+    let target = ImportTarget::New { name, shoot_type };
+    let (import, existing) = run_import(&app, &catalog, &ingest, &analysis, &xmp, path, options, target).await?;
+    let id = import.project_id;
+    let project = catalog.run(move |c| projects::get_project(c, id)).await?;
+    Ok(CreateProjectResult { project, import, existing })
+}
+
+/// Entering a project: stamps `lastOpenedAtMs` and returns it. The app always starts on the
+/// home page (the last project is not reopened automatically).
+#[tauri::command]
+#[specta::specta]
+pub async fn open_project(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<Project> {
+    catalog.run(move |c| projects::open_project(c, project_id)).await
+}
+
+/// Renames a project (trimmed, 1..=200 characters; the folder on disk is not renamed).
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_project(catalog: State<'_, Catalog>, project_id: ProjectId, name: String) -> AppResult<Project> {
+    catalog.run(move |c| projects::rename_project(c, project_id, &name)).await
+}
+
+/// Sets the cover photo (`imageId` must be in the project) or returns to the automatic
+/// cover (`null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_cover(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    image_id: Option<ImageId>,
+) -> AppResult<Project> {
+    catalog.run(move |c| projects::set_project_cover(c, project_id, image_id)).await
+}
+
+/// Sets the project's shoot type and rescores (tags/scores/suggestions of its photos follow
+/// the new type's thresholds).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_shoot_type(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    project_id: ProjectId,
+    shoot_type: ShootType,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_project_shoot_type(c, project_id, shoot_type)).await?;
+    // vision-ml-dev: the rescore must score each image with its project's shoot type
+    // (`db::projects::shoot_type_of_image`), not the catalog default.
+    analysis.start(&app, AnalysisScope::Rescore)
+}
+
+/// Removes a project from the catalog: its folders, photos and everything Sieve stored about
+/// them (ratings, tags, edits, scenes, history) and their cached thumbnails/previews. Never
+/// deletes or modifies originals, sidecars or exports; re-importing the folder brings the
+/// photos back with what the sidecars hold. Unknown id -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_project(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    project_id: ProjectId,
+) -> AppResult<RemoveProjectResult> {
+    let (result, removed) = catalog.run(move |c| projects::remove_project(c, project_id)).await?;
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(Some(&removed));
+    }
+    // Image ids can be reused by the next import: drop their cached files now.
+    // TODO(rust-engine-dev): also evict other per-image in-memory caches (mask cache, render
+    // cache) and skip removed ids still queued in ingest / analysis / XMP sync.
+    let config = ingest.config().clone();
+    blocking(move || {
+        for id in removed {
+            for p in [config.thumb_path(id), config.preview_path(id)] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(result)
 }

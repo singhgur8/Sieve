@@ -34,6 +34,8 @@ pub type StyleGroupId = i64;
 pub type StyleProfileId = i64;
 /// Catalog row id of an undoable multi-image edit (IPC v14).
 pub type EditBatchId = i64;
+/// Catalog row id of a project (one shoot: its source folder(s), IPC v14).
+pub type ProjectId = i64;
 
 /// Declares a fieldless enum that round-trips through the same snake_case string
 /// on the wire (serde) and in SQLite (`as_str` / `parse`).
@@ -445,6 +447,8 @@ pub enum AnalysisScope {
     Images { ids: Vec<ImageId> },
     /// Re-measure every image in this folder.
     Folder { folder_id: FolderId },
+    /// Re-measure every image of this project (v14).
+    Project { project_id: ProjectId },
     /// Re-measure the whole catalog.
     All,
     /// No ML: recompute tags, scores, suggestions and burst groups from stored
@@ -2210,6 +2214,10 @@ pub struct ImageQuery {
     #[serde(default)]
     pub missing_only: bool,
     pub folder_id: Option<FolderId>,
+    /// Only images of this project (v14). Inside a project the UI always sets it; combined
+    /// with `folderId` (AND) a folder of another project matches nothing.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2237,6 +2245,7 @@ impl Default for ImageQuery {
             collapse_bursts: false,
             missing_only: false,
             folder_id: None,
+            project_id: None,
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
@@ -2285,6 +2294,9 @@ impl ImportOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ImportSummary {
     pub folder_id: FolderId,
+    /// Project the folder belongs to (v14; a new folder gets a new project unless
+    /// `import_folder` was given one).
+    pub project_id: ProjectId,
     /// New images added to the catalog.
     pub added: u32,
     /// Supported files already in the catalog.
@@ -2305,8 +2317,8 @@ pub struct FolderEntry {
     pub id: FolderId,
     pub path: String,
     pub image_count: u32,
-    /// Guided-workflow step of this folder ("project") (v14; `set_workflow_step`).
-    pub workflow_step: WorkflowStep,
+    /// Project this folder belongs to (v14; every folder belongs to exactly one).
+    pub project_id: ProjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -2340,6 +2352,8 @@ pub struct FilterCounts {
 pub struct CatalogState {
     pub catalog_path: String,
     pub image_count: u32,
+    /// Catalog default shoot type: new projects start with it (v14; each project has its own,
+    /// `Project.shootType`, which is what culling scores with).
     pub shoot_type: ShootType,
     /// Max gap between consecutive frames in one burst.
     pub burst_window_ms: u32,
@@ -2357,7 +2371,8 @@ pub struct CatalogState {
     pub xmp_auto_sync: bool,
     /// Integrity of the catalog as found at launch, and its backups (IPC v13).
     pub health: CatalogHealth,
-    /// Which images count as keepers (edit plan, export step) (v14; `set_keeper_rule`).
+    /// Which images count as keepers (edit plan, export step, project counts) (v14;
+    /// `set_keeper_rule`).
     pub keeper_rule: KeeperRule,
 }
 
@@ -3061,6 +3076,9 @@ pub struct ExportJob {
     pub skipped: u32,
     /// Resolved destination incl. subfolder; `null` for `source_folder`.
     pub output_dir: Option<String>,
+    /// The project every image of the job belongs to (v14; `null` = images of several
+    /// projects, or a job from before v14). Drives the Export step's "Exported N".
+    pub project_id: Option<ProjectId>,
     pub failures: Vec<ExportFailure>,
     pub created_at_ms: i64,
     pub finished_at_ms: Option<i64>,
@@ -3699,7 +3717,7 @@ impl AutoToneValues {
 }
 
 string_enum! {
-    /// Guided-workflow step of a folder ("project"): the step bar Cull -> Edit -> Export.
+    /// Guided-workflow step of a project: the step bar Cull -> Edit -> Export (v14).
     pub enum WorkflowStep {
         Cull => "cull",
         Edit => "edit",
@@ -3803,18 +3821,18 @@ pub struct SceneEditEntry {
     pub status: SceneEditStatus,
 }
 
-/// `get_edit_plan(folderId)`: the Edit step of one folder.
+/// `get_edit_plan(projectId)`: the Edit step of one project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EditPlan {
-    pub folder_id: FolderId,
+    pub project_id: ProjectId,
     pub keeper_rule: KeeperRule,
-    /// Every keeper of the folder, capture order (the Export step's default selection).
+    /// Every keeper of the project, capture order (the Export step's default selection).
     pub keeper_ids: Vec<ImageId>,
-    /// Keepers that belong to no scene. Non-empty = run `detect_scenes(folderId, null)` (or
-    /// create scenes) and fetch the plan again.
+    /// Keepers that belong to no scene. Non-empty = run `detect_scenes(null, projectId, null)`
+    /// (or create scenes) and fetch the plan again.
     pub unassigned_keeper_ids: Vec<ImageId>,
-    /// Scenes with at least one keeper, capture order.
+    /// Scenes with at least one keeper in the project, capture order.
     pub scenes: Vec<SceneEditEntry>,
 }
 
@@ -3964,6 +3982,101 @@ pub struct StylePrediction {
     pub notes: Vec<String>,
 }
 
+/// One source folder of a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolder {
+    pub id: FolderId,
+    /// Absolute path on disk.
+    pub path: String,
+    pub image_count: u32,
+    /// The folder is on disk now. `false` = moved, renamed or on an unmounted drive: offer
+    /// "Locate folder..." (`relocate_folder(id, newPath)`).
+    pub exists: bool,
+}
+
+/// A project (one shoot): what the Projects home page card and the TopBar switcher show.
+/// Counts are over all images of the project's folders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: ProjectId,
+    /// Defaults to the (first) folder's name; `rename_project`.
+    pub name: String,
+    /// Source folders, by path. Non-empty.
+    pub folders: Vec<ProjectFolder>,
+    /// Cover photo: the user's choice (`coverChosen`, `set_project_cover`), else automatic
+    /// (best non-rejected photo: picked first, then most stars, then earliest capture);
+    /// `null` for an empty project.
+    pub cover_image_id: Option<ImageId>,
+    /// `coverImageId` was chosen by the user.
+    pub cover_chosen: bool,
+    /// Ready grid thumbnail (512 px) of the cover, absolute path (asset protocol, like
+    /// `ThumbnailState.ready.path`); `null` while pending / failed / no cover.
+    pub cover_thumbnail_path: Option<String>,
+    /// Culling profile of this shoot (`set_project_shoot_type`).
+    pub shoot_type: ShootType,
+    /// Guided-workflow step (`set_workflow_step`).
+    pub workflow_step: WorkflowStep,
+    pub created_at_ms: i64,
+    /// Last `open_project` (`null` = never opened).
+    pub last_opened_at_ms: Option<i64>,
+    pub photo_count: u32,
+    /// Keepers by `CatalogState.keeperRule` (same rule as the Edit step).
+    pub keeper_count: u32,
+    /// Photos with edits (`RawImageEntry.hasEdits`).
+    pub edited_count: u32,
+    pub picked_count: u32,
+    pub rejected_count: u32,
+    /// Photos whose original is missing (`RawImageEntry.missingSinceMs` set).
+    pub missing_count: u32,
+    /// Earliest / latest capture time of the project's photos (`null` = none known).
+    pub captured_from_ms: Option<i64>,
+    pub captured_to_ms: Option<i64>,
+}
+
+impl Project {
+    /// Max length of a project name (characters, after trimming).
+    pub const MAX_NAME_LEN: usize = 200;
+
+    /// Trimmed name, or `invalid_argument`-style message when empty / too long / with
+    /// control characters.
+    pub fn validate_name(name: &str) -> Result<String, String> {
+        let n = name.trim();
+        if n.is_empty() {
+            return Err("project name must not be empty".into());
+        }
+        if n.chars().count() > Self::MAX_NAME_LEN {
+            return Err(format!("project name is longer than {} characters", Self::MAX_NAME_LEN));
+        }
+        if n.chars().any(char::is_control) {
+            return Err("project name must not contain control characters".into());
+        }
+        Ok(n.to_owned())
+    }
+}
+
+/// Result of `create_project`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectResult {
+    pub project: Project,
+    /// The import that ran (new photos are `pending` until the ingest pipeline extracts them).
+    pub import: ImportSummary,
+    /// The folder was already in the catalog: its existing project was returned (and the folder
+    /// re-scanned) instead of creating a new one; `name` / `shootType` were not applied.
+    pub existing: bool,
+}
+
+/// Result of `remove_project`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveProjectResult {
+    /// Catalog images removed (their files, sidecars and exports are untouched).
+    pub removed_images: u32,
+    pub removed_folders: u32,
+}
+
 /// One item of Lightroom's Copy Settings dialog (a checkbox).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -4062,11 +4175,7 @@ pub fn copy_settings_groups() -> Vec<CopySettingsGroup> {
             ],
         ),
         group("transform", "Transform", vec![unsupported("Upright & Transform")]),
-        group(
-            "effects",
-            "Effects",
-            vec![item("Post-Crop Vignetting", &[F::Vignette]), item("Grain", &[F::Grain])],
-        ),
+        group("effects", "Effects", vec![item("Post-Crop Vignetting", &[F::Vignette]), item("Grain", &[F::Grain])]),
         group("calibration", "Calibration", vec![item("Calibration", &[F::Calibration])]),
         group("masking", "Masking", vec![item("Masks", &[F::Masks])]),
         group("spot_removal", "Spot Removal", vec![unsupported("Spot Removal")]),
@@ -4368,8 +4477,9 @@ mod tests {
         assert_eq!(t.crop, CropSettings::default(), "DEFAULT_SYNC leaves the crop alone");
         t.copy_fields(&e, &[AdjustmentField::Crop]);
         assert_eq!(t, e, "ALL groups together cover every field");
-        // v10: DEFAULT_SYNC = ALL minus crop and masks.
-        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 2, AdjustmentField::ALL.len());
+        // v10: DEFAULT_SYNC = ALL minus crop and masks (v14: and the two noise-reduction
+        // subsets, covered by the `noise_reduction` umbrella).
+        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 4, AdjustmentField::ALL.len());
         assert!(!AdjustmentField::DEFAULT_SYNC.contains(&AdjustmentField::Masks));
 
         // Out-of-range / malformed values.

@@ -709,3 +709,132 @@ Who updates what
   finds everything unless the path contains `empty` (error) or `partial` (first missing image stays missing);
   `?health=read_only|replaced` (read_only refuses rating/pick/label/adjustment writes with `catalog_read_only`);
   three mock backups; `restoreCatalogBackup` sets `restorePending`.
+
+## v14 — 2026-09-30 (Phase 8b: projects, style library, auto tone/WB, guided workflow, style model)
+Schema v12 (`migrations/0012_workflow_styles.sql`). **Breaking** for TS callers (new required arguments / fields,
+listed below); Rust is the source of truth, `src/ipc/bindings.ts` regenerated, `src/ipc/index.ts` mirrors updated.
+
+Projects (home page)
+- A project is one shoot: `Project { id, name, folders: ProjectFolder[] ({id, path, imageCount, exists}),
+  coverImageId, coverChosen, coverThumbnailPath, shootType, workflowStep, createdAtMs, lastOpenedAtMs, photoCount,
+  keeperCount, editedCount, pickedCount, rejectedCount, missingCount, capturedFromMs, capturedToMs }`.
+  Every folder belongs to exactly one project (`FolderEntry.projectId`). Cover = user's choice, else automatic
+  (best non-rejected: picked, most stars, earliest). Keeper count uses `CatalogState.keeperRule`.
+- Commands: `list_projects()` (last opened first, then newest), `get_project(projectId)`,
+  `create_project(path, name | null, shootType | null, options) -> CreateProjectResult {project, import, existing}`
+  (name defaults to the folder name; a folder already in the catalog, or inside a catalog folder, returns its
+  project with `existing: true`), `open_project(projectId)` (stamps `lastOpenedAtMs`; the app always starts on
+  the home page), `rename_project(projectId, name)` (trimmed, 1..=200), `set_project_cover(projectId, imageId | null)`,
+  `set_project_shoot_type(projectId, shootType)` (kicks a rescore),
+  `remove_project(projectId) -> RemoveProjectResult {removedImages, removedFolders}` (catalog rows + cached
+  thumbnails only; originals, sidecars, exports untouched). Reveal in Finder = existing
+  `reveal_in_finder(folder.path)`; Locate moved folder = existing `relocate_folder(folderId, newPath)` driven by
+  `ProjectFolder.exists == false`.
+- `import_folder(path, options, projectId | null)` — **new required argument**: `projectId` adds the folder to
+  that project (`invalid_argument` if it is in another one); `null` = the folder's project, or a new project named
+  after the folder. A path inside an already imported folder now reuses that folder row (was: a second folder row).
+  `ImportSummary.projectId` added.
+- Project scoping (**new required arguments**, pass `null` for "no constraint"): `ImageQuery.projectId?`
+  (optional on the wire, default `null`), `get_filter_counts(folderId, projectId)`,
+  `list_burst_groups(folderId, projectId)`, `list_scenes(folderId, projectId)`,
+  `detect_scenes(folderId, projectId, options)`; `AnalysisScope::project {projectId}`. Folder and project AND
+  together (a folder of another project matches nothing); unknown project -> `not_found`.
+- `ExportJob.projectId: number | null` — the project all of the job's images belong to (derived; drives the
+  Export step's "Exported N").
+- `CatalogState.shootType` is now the default for new projects; culling scores each image with its project's
+  shoot type (see vision-ml-dev below).
+
+Guided workflow (step per **project**, moved from the folder)
+- `WorkflowStep = "cull" | "edit" | "export"`; `get_workflow_step(projectId)`, `set_workflow_step(projectId, step)`,
+  `Project.workflowStep`. (The v14 draft had `FolderEntry.workflowStep` / folder ids; removed before release.)
+- Keepers: `KeeperRule {minRating, useSuggestions}` (`CatalogState.keeperRule`, `set_keeper_rule`,
+  `DEFAULT_KEEPER_RULE`; TS mirrors `isKeeper` / `isKeeperValues`).
+- Edit step: `get_edit_plan(projectId) -> EditPlan {projectId, keeperRule, keeperIds, unassignedKeeperIds,
+  scenes: SceneEditEntry[]}`; `SceneEditEntry {sceneId, imageIds, memberCount, representativeId,
+  representativeSource ("auto" | "user"), representativeReason, edited, editedAtMs, appliedAtMs, status
+  ("to_edit" | "edited" | "applied" | "outdated")}`; `set_scene_representative(sceneId, imageId | null)`;
+  `apply_scene_edit(sceneId, options | null)` / `apply_all_edited_scenes(projectId, options | null)` ->
+  `ApplyScenesResult {batch: EditBatchResult, scenes: SceneApplyOutcome[]}` with `SceneApplyOptions
+  {matchOptions, includeNonKeepers, skipUserEdited}` (`DEFAULT_SCENE_APPLY_OPTIONS`); `sceneProgress` task
+  `"apply"`. `undo_edit_batch(batchId) -> UndoBatchResult {restoredIds, skippedIds}`.
+- `paste_previous(targetIds, previousId, fields | null)` (Lightroom "Previous", `PASTE_PREVIOUS_FIELDS`).
+
+Style library (presets + profiles, catalog-wide, grouped by source folder)
+- `import_style_folder(path) -> ImportStyleReport {root, groupIds, presets, profiles, skipped}` (recursive:
+  `.xmp` develop presets, `.lrtemplate`, `.xmp` creative profiles, `.dcp`, `.cube`; one group per folder,
+  re-import replaces), `list_styles() -> StyleLibrary {groups: StyleGroup[]}` ("User Presets", imported groups,
+  "LUTs"; `USER_PRESETS_GROUP_ID` / `LUT_LIBRARY_GROUP_ID`), `remove_style_group(groupId)`,
+  `resolve_preset(id, presetId, adjustments | null)` (hover preview; applying = existing `apply_preset`, Lightroom
+  semantics: only the preset's keys). `StylePreset`, `StyleProfile` (+ `applyStyleProfile` TS mirror),
+  `StyleGroupKind`, `StyleProfileKind`, `StyleSourceFormat`.
+- `Preset` += `groupId`, `sourceFormat`, `settingKeys`; preset names unique per group. `CameraProfileInfo` /
+  `LookProfileInfo` += `styleId`; `ProfileCatalog.luts: LutProfileInfo[]` (LUTs are shown as profiles).
+  `LutRef.amount` range 0..=200 (was 0..=100).
+- `RenderSlot` += `"navigator"` (Navigator + hover previews; never supersedes `main`).
+
+Auto tone / white balance
+- `auto_tone(id, adjustments | null, keys | null) -> AutoToneValues` (keys ⊆ `AUTO_TONE_FIELDS`; Shift-double-click
+  = one key; TS `applyAutoTone`), `auto_white_balance(id, adjustments | null) -> WhiteBalanceValues`. Nothing is
+  saved; the UI commits one history entry ("Auto Tone" / "Auto White Balance").
+
+Style model ("Auto edit (my style)")
+- `style_model_status()`, `train_style_model()` (background; events `styleModelProgress {phase, done, total}` and
+  exactly one `styleModelFinished {ok, cancelled, error, status}`), `cancel_style_training()`,
+  `predict_style(imageIds) -> StylePrediction[]` (nothing saved), `apply_style_prediction(imageIds) ->
+  EditBatchResult` (undoable batch). `StyleModelStatus`, `StyleModelState`, `StyleTrainPhase`, `StyleValidation`.
+
+Copy Settings / misc
+- `AdjustmentField` += `noise_reduction_luminance`, `noise_reduction_color` (subsets of `noise_reduction`),
+  `process_version`; `COPY_SETTINGS_GROUPS` (Lightroom's Copy dialog layout). `UiPrefs` += `copyFields`,
+  `xmpExplainerSeen`, `sceneStripVisible`.
+- XMP auto-sync is **on by default**: new catalogs start on; migration 0012 flips existing catalogs whose
+  setting was never chosen by the user (`set_xmp_auto_sync` now records `xmp_auto_sync_user_set`).
+
+Schema v12
+- New: `projects`, `folders.project_id` (one project per existing folder, same id, named after the folder,
+  catalog shoot type, created = folder `added_at`), `export_jobs.project_id`, `style_groups`, `style_profiles`,
+  `presets` rebuilt with `group_id` / `source_format` / `settings_json` / `setting_keys_json` /
+  `supports_amount` / `warnings_json` (existing rows -> User Presets, same ids), `edit_batches` +
+  `edit_batch_items`, `scenes.representative_*` / `applied_*`, `style_models`, `style_features`,
+  `catalog_meta.keeper_rule`.
+
+Who updates what
+- architect (done): types, schema, commands + registration, catalog-side bodies (`db::projects` incl.
+  `FolderScope` scoping of queries/counts/bursts/scenes/edit plan/analysis, import targets, project CRUD and
+  removal, export job project, workflow step, keeper rule, edit plan + apply bookkeeping, edit batches, style
+  library listing/removal, XMP auto-sync default), Rust tests (migration v12, project scoping, removal), bindings,
+  `src/ipc/index.ts` mirrors, mock backend (2 mock projects, v14 commands), minimal compile fixes in `src/` (pass
+  `null` for the new scope arguments; `navigator` slot entries), docs.
+- rust-engine-dev:
+  1. `styles::import_folder` (preset/profile/DCP/cube import, per-folder groups, skips with reasons),
+     `styles::resolve_preset` / `apply_preset` for imported presets (key by key, Lightroom semantics), refresh
+     `ProfileLibrary` with imported looks/DCPs; `LutRef.amount` > 100 extrapolation in the render.
+  2. `develop::auto::auto_tone` / `auto_white_balance` (acceptance: near the user's edits, never clip skin).
+  3. Projects: `remove_project` should also evict per-image in-memory caches (mask cache, render cache) and skip
+     removed ids still queued in ingest / analysis / XMP sync (TODO in `ipc::commands::remove_project`); optional:
+     a new project for a folder that *contains* existing catalog folders could absorb them (today they stay in
+     their own projects).
+  4. XMP auto-save status + debounce already exist; verify defaults on a fresh catalog.
+- vision-ml-dev:
+  1. Culling scores each image with its project's shoot type: use `db::projects::shoot_type_of_image` (or a
+     per-project grouping) in `ml::worker` (lines using `repo::shoot_type`) for analysis and `Rescore`.
+  2. `scene::workflow::propose_representative` (best keeper with the most typical light) and carrying
+     `representative_*` / `applied_*` over in `store::replace_scenes`.
+  3. `ml::style` (train / status / predict; acceptance: ΔE vs user renders better than Auto tone and no edit).
+- frontend-dev:
+  1. Projects home page (cards, sort, search, New project via `createProject`, open via `openProject`, rename,
+     remove with confirmation, reveal, "Locate folder…" when `folders[i].exists` is false, set cover) and a TopBar
+     project switcher; the app starts on the home page.
+  2. Inside a project pass `projectId` everywhere: `ImageQuery.projectId`, `getFilterCounts(null, projectId)`,
+     `listBurstGroups(null, projectId)`, `listScenes(null, projectId)`, `detectScenes(null, projectId, options)`,
+     `importFolder(path, options, projectId)` for "Add folder", `getEditPlan(projectId)`,
+     `applyAllEditedScenes(projectId, …)`, step bar via `get/setWorkflowStep(projectId)`; Export step shows jobs
+     whose `projectId` matches. The `null` scope arguments added to `App.tsx`, `FilterBar.tsx`, `useScenes.ts` by
+     the architect are placeholders.
+  3. Style library UI, Auto buttons, Copy dialog (`COPY_SETTINGS_GROUPS`), Previous / paste previous, plan view,
+     style-model UI per `docs/ux-spec-8b.md`.
+  Mock: two projects (`ceremony` = folder 1, `reception` = folder 2; `?projects=0` for none); `createProject`
+  adds an empty project (existing path -> `existing: true`); `removeProject` drops its photos; `?autosync=1` gives
+  the v14 default auto-sync on (off otherwise for the existing suites); style library, auto tone/WB, edit plan,
+  style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
+  not emulated yet.

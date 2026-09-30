@@ -300,16 +300,18 @@ impl Exporter {
             ensure_writable_dir(dir)?;
         }
         let created = now_ms();
+        let project_id = job_project(&conn, &ids)?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO export_jobs (state, preset_name, settings_json, output_dir, total, created_at)
-             VALUES ('queued', ?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO export_jobs (state, preset_name, settings_json, output_dir, total, created_at, project_id)
+             VALUES ('queued', ?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 preset_name,
                 serde_json::to_string(&settings)?,
                 output_dir.as_ref().map(|d| d.to_string_lossy().into_owned()),
                 ids.len() as i64,
-                created
+                created,
+                project_id
             ],
         )?;
         let job_id = tx.last_insert_rowid();
@@ -331,6 +333,7 @@ impl Exporter {
             failed: 0,
             skipped: 0,
             output_dir: output_dir.as_ref().map(|d| d.to_string_lossy().into_owned()),
+            project_id,
             failures: Vec::new(),
             created_at_ms: created,
             finished_at_ms: None,
@@ -972,10 +975,27 @@ fn resolve_paths(
         .collect()
 }
 
+/// The project every image of `ids` belongs to (`None` if they span projects) (IPC v14).
+fn job_project(conn: &Connection, ids: &[ImageId]) -> AppResult<Option<crate::ipc::types::ProjectId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT f.project_id FROM images i JOIN folders f ON f.id = i.folder_id WHERE i.id = ?1")?;
+    let mut project = None;
+    for &id in ids {
+        let p: Option<crate::ipc::types::ProjectId> = stmt.query_row([id], |r| r.get(0)).optional()?.flatten();
+        match (project, p) {
+            (_, None) => return Ok(None),
+            (None, Some(p)) => project = Some(p),
+            (Some(a), Some(b)) if a != b => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(project)
+}
+
 fn query_jobs(conn: &Connection, tail: &str) -> AppResult<Vec<ExportJob>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT id, state, preset_name, settings_json, output_dir, total, succeeded, failed, skipped,
-                created_at, finished_at FROM export_jobs {tail}"
+                created_at, finished_at, project_id FROM export_jobs {tail}"
     ))?;
     let rows = stmt.query_map([], |r| {
         let settings: String = r.get(3)?;
@@ -991,6 +1011,7 @@ fn query_jobs(conn: &Connection, tail: &str) -> AppResult<Vec<ExportJob>> {
             preset_name: r.get(2)?,
             format,
             output_dir: r.get(4)?,
+            project_id: r.get(11)?,
             total: r.get(5)?,
             done: succeeded + failed + skipped,
             succeeded,

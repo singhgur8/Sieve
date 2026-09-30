@@ -1,4 +1,4 @@
-//! Guided workflow, Edit step (IPC v14): per-folder edit plan over scenes, representative
+//! Guided workflow, Edit step (IPC v14): per-project edit plan over scenes, representative
 //! choice, and "Apply to scene" (relative matching from the representative, recorded as one
 //! undoable edit batch).
 //!
@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::MatchImage;
+use crate::db::projects::FolderScope;
 use crate::db::{now_ms, repo};
 use crate::develop::batches::{self, BatchItem, BatchKind};
 use crate::ipc::error::{AppError, AppResult};
@@ -27,7 +28,7 @@ use crate::ipc::types::*;
 /// Reason shown for a user-chosen representative.
 pub const REASON_USER: &str = "Chosen by you";
 
-/// What the plan knows about one image of the folder.
+/// What the plan knows about one image of the project.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanImage {
     pub id: ImageId,
@@ -40,16 +41,17 @@ pub struct PlanImage {
     pub has_edits: bool,
 }
 
-/// Images of `folder_id` in capture order (images without a capture time last, by file name).
-pub fn folder_images(conn: &Connection, folder_id: FolderId) -> AppResult<Vec<PlanImage>> {
-    let mut stmt = conn.prepare_cached(
+/// Images of `scope` in capture order (images without a capture time last, by file name).
+pub fn scope_images(conn: &Connection, scope: &FolderScope) -> AppResult<Vec<PlanImage>> {
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT i.id, i.scene_id, i.pick, i.rating, q.suggested_pick, q.overall,
                 EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = i.id AND a.neutral = 0)
          FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id
-         WHERE i.folder_id = ?1
+         WHERE {}
          ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-    )?;
-    let rows = stmt.query_map([folder_id], |r| {
+        scope.predicate("i.folder_id")
+    ))?;
+    let rows = stmt.query_map([], |r| {
         Ok(PlanImage {
             id: r.get(0)?,
             scene_id: r.get(1)?,
@@ -66,7 +68,11 @@ pub fn folder_images(conn: &Connection, folder_id: FolderId) -> AppResult<Vec<Pl
 /// Proposes the representative of a scene among its `keepers` (non-empty, capture order):
 /// `(image, user-facing reason)`. Contract: vision-ml-dev (placeholder: highest
 /// `QualityScore.overall`, then higher rating, then earlier).
-pub fn propose_representative(conn: &Connection, scene_id: SceneId, keepers: &[PlanImage]) -> AppResult<(ImageId, String)> {
+pub fn propose_representative(
+    conn: &Connection,
+    scene_id: SceneId,
+    keepers: &[PlanImage],
+) -> AppResult<(ImageId, String)> {
     let _ = (conn, scene_id);
     let best = keepers
         .iter()
@@ -161,12 +167,13 @@ fn entry_for(conn: &Connection, scene_id: SceneId, keepers: &[PlanImage]) -> App
     })
 }
 
-/// `get_edit_plan(folderId)`. Stores proposed representatives (source `auto`) so the plan is
-/// stable between calls. Unknown folder -> `not_found`.
-pub fn edit_plan(conn: &Connection, folder_id: FolderId) -> AppResult<EditPlan> {
-    repo::workflow_step(conn, folder_id)?; // not_found for unknown folders
+/// `get_edit_plan(projectId)`. Stores proposed representatives (source `auto`) so the plan is
+/// stable between calls. Unknown project -> `not_found`. A scene's keepers are its members in
+/// the project (scenes never span projects: detection runs per folder).
+pub fn edit_plan(conn: &Connection, project_id: ProjectId) -> AppResult<EditPlan> {
+    let scope = FolderScope::resolve(conn, None, Some(project_id))?; // not_found for unknown projects
     let rule = repo::keeper_rule(conn)?;
-    let images = folder_images(conn, folder_id)?;
+    let images = scope_images(conn, &scope)?;
     let keepers: Vec<&PlanImage> =
         images.iter().filter(|i| rule.is_keeper_values(i.pick, i.rating, i.suggested_pick)).collect();
     let mut by_scene: HashMap<SceneId, Vec<PlanImage>> = HashMap::new();
@@ -181,13 +188,13 @@ pub fn edit_plan(conn: &Connection, folder_id: FolderId) -> AppResult<EditPlan> 
     for &s in by_scene.keys() {
         order.push((scene_row(conn, s)?.started_at_ms, s));
     }
-    order.sort_by(|a, b| (a.0.is_none(), a.0, a.1).cmp(&(b.0.is_none(), b.0, b.1)));
+    order.sort_by_key(|a| (a.0.is_none(), a.0, a.1));
     let mut scenes = Vec::with_capacity(order.len());
     for (_, s) in order {
         scenes.push(entry_for(conn, s, &by_scene[&s])?);
     }
     Ok(EditPlan {
-        folder_id,
+        project_id,
         keeper_rule: rule,
         keeper_ids: keepers.iter().map(|k| k.id).collect(),
         unassigned_keeper_ids: unassigned,
@@ -205,7 +212,7 @@ fn scene_keepers(conn: &Connection, scene_id: SceneId) -> AppResult<(Vec<PlanIma
     let mut keepers = Vec::new();
     let mut members = Vec::new();
     for f in folders {
-        for i in folder_images(conn, f)? {
+        for i in scope_images(conn, &FolderScope::from(Some(f)))? {
             if i.scene_id == Some(scene_id) {
                 members.push(i.id);
                 if rule.is_keeper_values(i.pick, i.rating, i.suggested_pick) {
@@ -219,7 +226,11 @@ fn scene_keepers(conn: &Connection, scene_id: SceneId) -> AppResult<(Vec<PlanIma
 
 /// `set_scene_representative`: `Some(image)` must be a keeper member of the scene
 /// (`invalid_argument` otherwise); `None` returns the choice to Sieve (re-proposed).
-pub fn set_representative(conn: &Connection, scene_id: SceneId, image_id: Option<ImageId>) -> AppResult<SceneEditEntry> {
+pub fn set_representative(
+    conn: &Connection,
+    scene_id: SceneId,
+    image_id: Option<ImageId>,
+) -> AppResult<SceneEditEntry> {
     scene_row(conn, scene_id)?;
     let (keepers, _) = scene_keepers(conn, scene_id)?;
     if keepers.is_empty() {
@@ -259,9 +270,9 @@ pub struct SceneApplyJob {
     pub skipped: Vec<ImageId>,
 }
 
-/// Scenes of `folder_id` that `apply_all_edited_scenes` applies (status edited / outdated).
-pub fn edited_scenes(conn: &Connection, folder_id: FolderId) -> AppResult<Vec<SceneId>> {
-    Ok(edit_plan(conn, folder_id)?
+/// Scenes of `project_id` that `apply_all_edited_scenes` applies (status edited / outdated).
+pub fn edited_scenes(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<SceneId>> {
+    Ok(edit_plan(conn, project_id)?
         .scenes
         .into_iter()
         .filter(|s| matches!(s.status, SceneEditStatus::Edited | SceneEditStatus::Outdated))
@@ -272,7 +283,11 @@ pub fn edited_scenes(conn: &Connection, folder_id: FolderId) -> AppResult<Vec<Sc
 /// Resolves what to match for each scene. A scene whose representative has no edits ->
 /// `invalid_argument` ("Edit the representative first"); unknown scene -> `not_found`.
 /// Scenes with no targets left are returned with empty `targets`.
-pub fn apply_inputs(conn: &Connection, scene_ids: &[SceneId], options: &SceneApplyOptions) -> AppResult<Vec<SceneApplyJob>> {
+pub fn apply_inputs(
+    conn: &Connection,
+    scene_ids: &[SceneId],
+    options: &SceneApplyOptions,
+) -> AppResult<Vec<SceneApplyJob>> {
     let mut jobs = Vec::with_capacity(scene_ids.len());
     for &scene_id in scene_ids {
         let (keepers, members) = scene_keepers(conn, scene_id)?;
@@ -325,7 +340,11 @@ pub fn commit_apply(
     let mut items = Vec::new();
     for (job, pv) in jobs.iter().zip(previews) {
         for p in pv {
-            items.push(BatchItem { image_id: p.target_id, adjustments: p.adjustments.clone(), scene_id: Some(job.scene_id) });
+            items.push(BatchItem {
+                image_id: p.target_id,
+                adjustments: p.adjustments.clone(),
+                scene_id: Some(job.scene_id),
+            });
         }
     }
     let batch = batches::commit_recorded(conn, &items, batches::LABEL_APPLY_SCENE, BatchKind::SceneApply)?;
@@ -365,9 +384,9 @@ mod tests {
     use crate::develop::history;
     use crate::ipc::error::ErrorKind;
 
-    /// Folder with 4 images in one scene: 1 picked, 2 rated 2, 3 rejected, 4 untouched
-    /// (suggested pick when `suggest`).
-    fn fixture() -> (Connection, FolderId, SceneId, Vec<ImageId>) {
+    /// Project (one folder) with 4 images in one scene: 1 picked, 2 rated 2, 3 rejected, 4
+    /// untouched (suggested pick when `suggest`).
+    fn fixture() -> (Connection, ProjectId, SceneId, Vec<ImageId>) {
         let mut conn = open_in_memory();
         let dir = tempfile::tempdir().unwrap();
         for n in ["A.ARW", "B.ARW", "C.ARW", "D.ARW"] {
@@ -397,7 +416,7 @@ mod tests {
             .unwrap();
         }
         let scene = super::super::store::create_scene(&mut conn, &ids).unwrap();
-        (conn, s.folder_id, scene.id, ids)
+        (conn, s.project_id, scene.id, ids)
     }
 
     #[test]

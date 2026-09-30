@@ -1,6 +1,6 @@
--- Sieve catalog schema v12 (Phase 8b, IPC v14): style library (presets + profiles), guided
--- workflow (per-folder step, per-scene edit plan), undoable edit batches, style model,
--- keeper rule, XMP auto-sync on by default.
+-- Sieve catalog schema v12 (Phase 8b, IPC v14): projects (one shoot = source folder(s)),
+-- style library (presets + profiles), guided workflow (per-project step, per-scene edit
+-- plan), undoable edit batches, style model, keeper rule, XMP auto-sync on by default.
 
 -- 1. Style library. Groups = source folders of `import_style_folder` (+ two built-ins with
 --    fixed ids, `ipc::types::USER_PRESETS_GROUP_ID` / `LUT_LIBRARY_GROUP_ID`).
@@ -68,9 +68,40 @@ CREATE TABLE style_profiles (
 CREATE INDEX idx_style_profiles_group ON style_profiles(group_id);
 CREATE INDEX idx_style_profiles_look ON style_profiles(look_uuid) WHERE look_uuid IS NOT NULL;
 
--- 2. Guided workflow: step bar per folder ("project").
-ALTER TABLE folders ADD COLUMN workflow_step TEXT NOT NULL DEFAULT 'cull'
-    CHECK (workflow_step IN ('cull', 'edit', 'export'));
+-- 2. Projects (home page) + guided workflow step per project. A project is one shoot: a
+--    name, its source folder(s) (`folders.project_id`), cover, shoot type, workflow step.
+--    Every folder belongs to exactly one project (enforced by `db::projects`: SQLite cannot
+--    add a NOT NULL column without a default). Removing a project deletes its catalog rows
+--    (folders -> images -> everything per image cascades); files on disk are never touched.
+CREATE TABLE projects (
+    id             INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    -- User-chosen cover (`set_project_cover`); NULL = automatic (`db::projects` docs).
+    cover_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
+    shoot_type     TEXT NOT NULL DEFAULT 'general'
+                   CHECK (shoot_type IN ('wedding', 'portrait', 'sports', 'event', 'landscape', 'general')),
+    workflow_step  TEXT NOT NULL DEFAULT 'cull' CHECK (workflow_step IN ('cull', 'edit', 'export')),
+    created_at     INTEGER NOT NULL,
+    last_opened_at INTEGER
+);
+ALTER TABLE folders ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE;
+CREATE INDEX idx_folders_project ON folders(project_id);
+
+-- Existing catalogs: one project per imported root folder (= `folders` row), same id, named
+-- after the folder's last path component, with the catalog's shoot type; created when the
+-- folder was added. `rtrim(path, <path without '/'>)` is the path up to its last '/'.
+INSERT INTO projects (id, name, shoot_type, created_at)
+    SELECT f.id,
+           COALESCE(NULLIF(substr(f.path, length(rtrim(f.path, replace(f.path, '/', ''))) + 1), ''), f.path),
+           COALESCE((SELECT value FROM catalog_meta WHERE key = 'shoot_type'
+                      AND value IN ('wedding', 'portrait', 'sports', 'event', 'landscape', 'general')), 'general'),
+           f.added_at
+      FROM folders f;
+UPDATE folders SET project_id = id;
+
+-- Export jobs remember the project all their images belong to (NULL = mixed / pre-v12), so
+-- the Export step can show "Exported N" per project.
+ALTER TABLE export_jobs ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL;
 
 -- 3. Undoable multi-image edits (apply scene edit, apply style prediction). One row per
 --    changed image with its settings before and after; undo restores `before_json` for images

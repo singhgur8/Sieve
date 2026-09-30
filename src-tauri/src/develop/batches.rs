@@ -97,7 +97,11 @@ pub fn commit_recorded(
 }
 
 /// The settings batch `batch_id` wrote for `image_id`, if it changed that image.
-pub fn written_by(conn: &Connection, batch_id: EditBatchId, image_id: ImageId) -> AppResult<Option<ParametricAdjustments>> {
+pub fn written_by(
+    conn: &Connection,
+    batch_id: EditBatchId,
+    image_id: ImageId,
+) -> AppResult<Option<ParametricAdjustments>> {
     let json: Option<String> = conn
         .query_row(
             "SELECT after_json FROM edit_batch_items WHERE batch_id = ?1 AND image_id = ?2",
@@ -112,7 +116,9 @@ pub fn written_by(conn: &Connection, batch_id: EditBatchId, image_id: ImageId) -
 /// -> `invalid_argument`. Atomic.
 pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatchResult> {
     let row: Option<(String, Option<i64>)> = conn
-        .query_row("SELECT label, undone_at FROM edit_batches WHERE id = ?1", [batch_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row("SELECT label, undone_at FROM edit_batches WHERE id = ?1", [batch_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()?;
     let (label, undone) = row.ok_or_else(|| AppError::not_found(format!("edit batch {batch_id}")))?;
     if undone.is_some() {
@@ -176,7 +182,11 @@ mod tests {
         history::commit(&mut conn, ids[2], &adj(0.3), "Exposure").unwrap();
         let items: Vec<BatchItem> = ids
             .iter()
-            .map(|&id| BatchItem { image_id: id, adjustments: adj(if id == ids[2] { 0.3 } else { 1.0 }), scene_id: None })
+            .map(|&id| BatchItem {
+                image_id: id,
+                adjustments: adj(if id == ids[2] { 0.3 } else { 1.0 }),
+                scene_id: None,
+            })
             .collect();
         let r = commit_recorded(&mut conn, &items, LABEL_APPLY_SCENE, BatchKind::SceneApply).unwrap();
         assert_eq!(r.changed_ids, vec![ids[0], ids[1]]);

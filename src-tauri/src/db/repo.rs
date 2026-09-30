@@ -9,6 +9,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use walkdir::WalkDir;
 
 use super::now_ms;
+use super::projects::{self, FolderScope, ImportTarget};
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::*;
 use crate::raw;
@@ -48,7 +49,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
 
     let folders = conn
         .prepare(
-            "SELECT f.id, f.path, COUNT(i.id), f.workflow_step FROM folders f
+            "SELECT f.id, f.path, COUNT(i.id), f.project_id FROM folders f
              LEFT JOIN images i ON i.folder_id = f.id
              GROUP BY f.id ORDER BY f.path",
         )?
@@ -57,7 +58,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
                 id: r.get(0)?,
                 path: r.get(1)?,
                 image_count: r.get(2)?,
-                workflow_step: WorkflowStep::parse(&r.get::<_, String>(3)?).unwrap_or(WorkflowStep::Cull),
+                project_id: r.get::<_, Option<ProjectId>>(3)?.unwrap_or_default(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -121,21 +122,6 @@ pub fn set_keeper_rule(conn: &Connection, rule: &KeeperRule) -> AppResult<()> {
     set_meta(conn, "keeper_rule", &serde_json::to_string(rule)?)
 }
 
-/// Guided-workflow step of a folder (IPC v14). Unknown folder -> `not_found`.
-pub fn workflow_step(conn: &Connection, folder_id: FolderId) -> AppResult<WorkflowStep> {
-    let v: Option<String> =
-        conn.query_row("SELECT workflow_step FROM folders WHERE id = ?1", [folder_id], |r| r.get(0)).optional()?;
-    let v = v.ok_or_else(|| AppError::not_found(format!("folder {folder_id}")))?;
-    Ok(WorkflowStep::parse(&v).unwrap_or(WorkflowStep::Cull))
-}
-
-pub fn set_workflow_step(conn: &Connection, folder_id: FolderId, step: WorkflowStep) -> AppResult<()> {
-    if conn.execute("UPDATE folders SET workflow_step = ?2 WHERE id = ?1", params![folder_id, step.as_str()])? == 0 {
-        return Err(AppError::not_found(format!("folder {folder_id}")));
-    }
-    Ok(())
-}
-
 pub fn xmp_status(conn: &Connection, running: bool) -> AppResult<XmpStatus> {
     let (dirty, failed) = conn.query_row(
         "SELECT COALESCE(SUM(xmp_dirty = 1), 0), COALESCE(SUM(xmp_error IS NOT NULL), 0) FROM images",
@@ -192,7 +178,20 @@ pub fn set_cull_thresholds(
 
 /// Registers every supported RAW under `folder` with a `pending` thumbnail.
 /// No decoding happens here; metadata is filled in by the Phase 2 extractor.
+/// Project: [`ImportTarget::Auto`] (see [`import_folder_to`]).
 pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions) -> AppResult<ImportSummary> {
+    Ok(import_folder_to(conn, folder, opts, &ImportTarget::Auto)?.0)
+}
+
+/// [`import_folder`] into the project chosen by `target` (IPC v14). Returns the summary and
+/// whether the folder (or a folder containing it, whose row and project are reused) was
+/// already in the catalog.
+pub fn import_folder_to(
+    conn: &mut Connection,
+    folder: &Path,
+    opts: &ImportOptions,
+    target: &ImportTarget,
+) -> AppResult<(ImportSummary, bool)> {
     let folder = folder.canonicalize().map_err(|e| AppError::invalid(format!("{}: {e}", folder.display())))?;
     if !folder.is_dir() {
         return Err(AppError::invalid(format!("{} is not a directory", folder.display())));
@@ -201,13 +200,10 @@ pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions)
     let now = now_ms();
 
     let tx = conn.savepoint()?;
-    tx.execute(
-        "INSERT INTO folders (path, added_at) VALUES (?1, ?2) ON CONFLICT(path) DO NOTHING",
-        params![folder_str, now],
-    )?;
-    let folder_id: FolderId = tx.query_row("SELECT id FROM folders WHERE path = ?1", [&folder_str], |r| r.get(0))?;
+    let row = projects::import_folder_row(&tx, &folder_str, target)?;
+    let folder_id = row.folder_id;
 
-    let mut summary = ImportSummary { folder_id, ..Default::default() };
+    let mut summary = ImportSummary { folder_id, project_id: row.project_id, ..Default::default() };
     {
         let mut insert_image = tx.prepare(
             "INSERT INTO images (folder_id, path, file_name, format, camera_make, sensor_layout,
@@ -327,7 +323,7 @@ pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions)
         };
     }
     tx.commit()?;
-    Ok(summary)
+    Ok((summary, row.existing))
 }
 
 fn path_str(p: &Path) -> AppResult<String> {
@@ -602,6 +598,10 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
         clauses.push("i.folder_id = ?".into());
         args.push(Value::Integer(folder));
     }
+    if let Some(project) = q.project_id {
+        clauses.push("i.folder_id IN (SELECT id FROM folders WHERE project_id = ?)".into());
+        args.push(Value::Integer(project));
+    }
 
     let where_sql = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
     Ok((where_sql, args))
@@ -705,12 +705,15 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
     Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
-/// Facet counts over `folder` (or the whole catalog). Separate statements per case so
-/// SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1` predicate cannot).
-pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<FilterCounts> {
+/// Facet counts over `scope` (a folder, a project's folders, or the whole catalog). Separate
+/// statements per case so SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1`
+/// predicate cannot).
+pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
+    let scope: FolderScope = scope.into();
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
-    let (pick_sql, tag_sql, burst_sql, missing_sql) = match folder {
-        None => (
+    let scoped;
+    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() {
+        true => (
             // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
             // without a temp B-tree; the per-folder rows are summed below.
             "SELECT pick, rating, COUNT(*) FROM images GROUP BY folder_id, pick, rating",
@@ -722,18 +725,27 @@ pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<F
             // Partial `idx_images_missing` (0011): only missing rows are visited.
             "SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL",
         ),
-        Some(_) => (
-            "SELECT pick, rating, COUNT(*) FROM images WHERE folder_id = ?1 GROUP BY pick, rating",
-            "SELECT tag, COUNT(*) FROM image_tags
-             WHERE suppressed = 0 AND image_id IN (SELECT id FROM images WHERE folder_id = ?1)
-             GROUP BY tag ORDER BY tag",
-            "SELECT COUNT(DISTINCT i.burst_group_id),
-                    COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
-             FROM images i JOIN burst_groups b ON b.id = i.burst_group_id WHERE i.folder_id = ?1",
-            "SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL AND folder_id = ?1",
-        ),
+        false => {
+            let f = scope.predicate("folder_id");
+            let fi = scope.predicate("i.folder_id");
+            scoped = [
+                format!("SELECT pick, rating, COUNT(*) FROM images WHERE {f} GROUP BY pick, rating"),
+                format!(
+                    "SELECT tag, COUNT(*) FROM image_tags
+                     WHERE suppressed = 0 AND image_id IN (SELECT id FROM images WHERE {f})
+                     GROUP BY tag ORDER BY tag"
+                ),
+                format!(
+                    "SELECT COUNT(DISTINCT i.burst_group_id),
+                            COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
+                     FROM images i JOIN burst_groups b ON b.id = i.burst_group_id WHERE {fi}"
+                ),
+                format!("SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL AND {f}"),
+            ];
+            (scoped[0].as_str(), scoped[1].as_str(), scoped[2].as_str(), scoped[3].as_str())
+        }
     };
-    let args: Vec<FolderId> = folder.into_iter().collect();
+    let args: [FolderId; 0] = [];
     {
         let mut stmt = conn.prepare_cached(pick_sql)?;
         let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
@@ -1220,14 +1232,23 @@ pub fn get_faces(conn: &Connection, id: ImageId) -> AppResult<Vec<FaceInfo>> {
 }
 
 /// Burst groups (optionally only those with a member in `folder`), in capture order.
-pub fn list_burst_groups(conn: &Connection, folder: Option<FolderId>) -> AppResult<Vec<BurstGroup>> {
-    let mut stmt = conn.prepare(
+/// Burst groups with a member in `scope` (all members listed), start order.
+pub fn list_burst_groups(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<Vec<BurstGroup>> {
+    let scope: FolderScope = scope.into();
+    let filter = match scope.is_all() {
+        true => String::new(),
+        false => format!(
+            "WHERE b.id IN (SELECT burst_group_id FROM images WHERE {} AND burst_group_id IS NOT NULL)",
+            scope.predicate("folder_id")
+        ),
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT b.id, b.started_at_ms, b.ended_at_ms, b.keeper_image_id, i.id
          FROM burst_groups b JOIN images i ON i.burst_group_id = b.id
-         WHERE ?1 IS NULL OR b.id IN (SELECT burst_group_id FROM images WHERE folder_id = ?1)
-         ORDER BY b.started_at_ms, b.id, i.captured_at_ms, i.file_name, i.id",
-    )?;
-    let rows = stmt.query_map([folder], |r| {
+         {filter}
+         ORDER BY b.started_at_ms, b.id, i.captured_at_ms, i.file_name, i.id"
+    ))?;
+    let rows = stmt.query_map([], |r| {
         Ok((
             BurstGroup {
                 id: r.get(0)?,

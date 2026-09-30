@@ -54,16 +54,18 @@ use crate::profiles::CameraKey;
 /// rust-engine-dev.
 pub fn import_folder(conn: &mut Connection, luts: &LutLibrary, root: &Path) -> AppResult<ImportStyleReport> {
     let _ = (conn, luts, root);
-    Err(AppError::internal(
-        "Importing presets and profiles is not implemented yet (IPC v14 stub, rust-engine-dev).",
-    ))
+    Err(AppError::internal("Importing presets and profiles is not implemented yet (IPC v14 stub, rust-engine-dev)."))
 }
 
 /// What applying preset `preset_id` to an image whose adjustments are `base` gives.
 /// Sieve presets: `base` with the preset's `fields` copied. Imported presets: exactly the
 /// preset's `crs:` settings applied onto `base` (rust-engine-dev: `xmp::crs`; until then the
 /// `fields` approximation below).
-pub fn resolve_preset(conn: &Connection, preset_id: PresetId, base: &ParametricAdjustments) -> AppResult<ParametricAdjustments> {
+pub fn resolve_preset(
+    conn: &Connection,
+    preset_id: PresetId,
+    base: &ParametricAdjustments,
+) -> AppResult<ParametricAdjustments> {
     let preset = presets::get(conn, preset_id)?;
     let mut out = base.clone();
     // TODO(rust-engine-dev): imported presets (settings_json NOT NULL) apply key by key.
@@ -216,7 +218,8 @@ pub fn remove_group(conn: &mut Connection, id: StyleGroupId) -> AppResult<()> {
 /// `ProfileLibrary` must resolve these (look by UUID, DCP by camera + name) in addition to the
 /// Adobe directories, and pick up changes after `import_style_folder` / `remove_style_group`.
 pub fn imported_profile_paths(conn: &Connection) -> AppResult<Vec<(StyleProfileKind, PathBuf)>> {
-    let mut stmt = conn.prepare("SELECT kind, source_path FROM style_profiles WHERE kind IN ('look', 'camera_profile')")?;
+    let mut stmt =
+        conn.prepare("SELECT kind, source_path FROM style_profiles WHERE kind IN ('look', 'camera_profile')")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {
@@ -347,7 +350,7 @@ mod tests {
     fn lut_library_sync_is_idempotent() {
         let conn = open_in_memory();
         let dir = tempfile::tempdir().unwrap();
-        let luts = LutLibrary::new(dir.path().to_path_buf());
+        let luts = LutLibrary::new(dir.path().join("luts"));
         let src = dir.path().join("src.cube");
         std::fs::write(&src, "TITLE \"Warm\"\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n")
             .unwrap();
@@ -399,16 +402,14 @@ mod tests {
         assert_eq!(a.profile.look.as_ref().unwrap().amount, 1.5);
         assert!(a.lut.is_none());
         a.validate().unwrap();
-        let lut = StyleProfile { kind: StyleProfileKind::Lut, lut_id: Some("warm".into()), look_uuid: None, ..look.clone() };
+        let lut =
+            StyleProfile { kind: StyleProfileKind::Lut, lut_id: Some("warm".into()), look_uuid: None, ..look.clone() };
         let b = lut.apply_to(&base, 250.0);
         assert_eq!(b.lut, Some(LutRef { id: "warm".into(), amount: 200.0 }));
         assert_eq!(b.profile, base.profile);
         b.validate().unwrap();
-        let dcp = StyleProfile {
-            kind: StyleProfileKind::CameraProfile,
-            camera_profile: Some("Camera ST".into()),
-            ..look
-        };
+        let dcp =
+            StyleProfile { kind: StyleProfileKind::CameraProfile, camera_profile: Some("Camera ST".into()), ..look };
         let c = dcp.apply_to(&base, 100.0);
         assert_eq!(c.profile.camera_profile.as_deref(), Some("Camera ST"));
         assert!(c.profile.look.is_none() && c.lut.is_none());
