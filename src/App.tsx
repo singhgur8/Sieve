@@ -1,8 +1,8 @@
 // Phase 4 culling UI: virtualized grid, filter bar, loupe / compare, Lightroom-style keyboard.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { X } from "lucide-react";
-import { commands, unwrap, type ColorLabel, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
+import { Undo2, X } from "lucide-react";
+import { commands, unwrap, type ColorLabel, type Scene, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
 import { BASE_QUERY, useLibrary, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -17,6 +17,9 @@ import { AnalysisBar, ImportBar } from "./components/ProgressBars";
 import { ExportDialog } from "./components/export/ExportDialog";
 import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
 import { useExportJobs } from "./hooks/useExportJobs";
+import { useScenes } from "./hooks/useScenes";
+import { SceneStrip } from "./components/scenes/SceneStrip";
+import { MatchPanel } from "./components/scenes/MatchPanel";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
 
@@ -29,6 +32,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
+  const [matchOpen, setMatchOpen] = useState<number | null>(null);
+  const [matchUndo, setMatchUndo] = useState<number[] | null>(null);
+  const [devEpoch, setDevEpoch] = useState(0);
   const colsRef = useRef(1);
   const loupe = useRef<LoupeHandle>(null);
   const develop = useRef<DevelopHandle>(null);
@@ -42,6 +48,8 @@ export default function App() {
   const { ids } = lib;
   const exportJobs = useExportJobs(reportError);
   const sel = useSelection(ids);
+  const scenes = useScenes(query.folderId, query.sceneId ?? null, lib, reportError, setNotice);
+  const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
@@ -65,6 +73,12 @@ export default function App() {
       else selClear();
     }
   }, [ids, lib.loaded, selActive, selSet, selClear]);
+
+  // A scene filter that no longer exists (deleted, merged away, other folder) is dropped.
+  const { scenes: sceneList } = scenes;
+  useEffect(() => {
+    if (query.sceneId != null && !sceneList.some((s) => s.id === query.sceneId)) setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
+  }, [sceneList, query.sceneId]);
 
   const targets = useCallback((): number[] => {
     if (mode === "compare" && cmp) return [cmp[cmp.focus]];
@@ -262,7 +276,7 @@ export default function App() {
   useKeyboard((e) => {
     const k = e.key;
     const lower = k.toLowerCase();
-    if (exportOpen) return;
+    if (exportOpen || matchOpen != null) return;
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && lower === "e") {
       e.preventDefault();
       openExport();
@@ -297,6 +311,11 @@ export default function App() {
       return;
     }
     if (e.altKey) return;
+    if (e.shiftKey && lower === "a") {
+      e.preventDefault();
+      void scenes.toggleAnchor(active ?? null);
+      return;
+    }
     const used = () => e.preventDefault();
     if (mode === "develop") {
       if (k === "\\") { used(); develop.current?.toggleBefore(); return; }
@@ -508,6 +527,39 @@ export default function App() {
         onMode={changeMode}
       />
 
+      <SceneStrip
+        api={scenes}
+        filterId={query.sceneId ?? null}
+        onFilter={(id) => setQuery((q) => ({ ...q, sceneId: id }))}
+        targets={targets()}
+        activeId={active ?? null}
+        onMatch={(s) => setMatchOpen(s.id)}
+      />
+      {matchUndo && (
+        <p className="flex items-center gap-3 bg-emerald-950 px-4 py-1 text-xs text-emerald-200" data-testid="match-undo-bar">
+          Matched {matchUndo.length} photo{matchUndo.length === 1 ? "" : "s"} (history: Match Scene)
+          <button
+            className="flex items-center gap-1 rounded bg-emerald-900 px-2 py-0.5 hover:bg-emerald-800"
+            data-testid="match-undo"
+            onClick={() =>
+              void run(async () => {
+                const done = matchUndo;
+                setMatchUndo(null);
+                for (const id of done) await unwrap(commands.undoAdjustments(id));
+                await lib.refresh(done.filter((id) => lib.getEntry(id)));
+                setDevEpoch((n) => n + 1);
+                setNotice(`Undid Match Scene on ${done.length} photo${done.length === 1 ? "" : "s"}`);
+              })
+            }
+          >
+            <Undo2 className="size-3" /> Undo
+          </button>
+          <button className="ml-auto" onClick={() => setMatchUndo(null)} aria-label="Dismiss">
+            <X className="size-3.5" />
+          </button>
+        </p>
+      )}
+
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <PhotoGrid
           lib={lib}
@@ -519,7 +571,7 @@ export default function App() {
           onCellDoubleClick={openLoupe}
         />
         {mode === "develop" && (
-          <DevelopView ref={develop} lib={lib} sel={sel} onError={reportError} onNotice={setNotice} onBack={() => changeMode("grid")} />
+          <DevelopView key={devEpoch} ref={develop} lib={lib} sel={sel} onError={reportError} onNotice={setNotice} onBack={() => changeMode("grid")} />
         )}
         {(mode === "loupe" || mode === "compare") && (
           <LoupeLayer
@@ -537,6 +589,22 @@ export default function App() {
           />
         )}
       </div>
+      {matchScene && (
+        <MatchPanel
+          scene={matchScene}
+          sceneNumber={scenes.number(matchScene.id)}
+          progress={scenes.progress}
+          fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
+          onClose={() => setMatchOpen(null)}
+          onApplied={(changed, attempted) => {
+            setMatchOpen(null);
+            setNotice(`Applied Match Scene to ${changed.length} of ${attempted.length} photo${attempted.length === 1 ? "" : "s"}`);
+            setMatchUndo(changed.length ? changed : null);
+            void lib.refresh(attempted.filter((id) => lib.getEntry(id))).catch(reportError);
+            setDevEpoch((n) => n + 1);
+          }}
+        />
+      )}
     </main>
   );
 }

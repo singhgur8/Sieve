@@ -7,6 +7,7 @@ import { commands, convertFileSrc, unwrap, type AdjustmentField, type LutInfo, t
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
+import { SceneBadge } from "../Cell";
 import { AdjustPanel } from "./AdjustPanel";
 import { LeftPanel } from "./LeftPanel";
 import { FieldsDialog } from "./FieldsDialog";
@@ -298,6 +299,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                 style={{ left: v.start, width: FILM, height: FILM }}
               >
                 {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(fid)}`} alt="" draggable={false} className="size-full object-cover" />}
+                {e && e.sceneId != null && (
+                  <span className="absolute bottom-0.5 left-0.5">
+                    <SceneBadge entry={e} testPrefix="film-scene" />
+                  </span>
+                )}
                 {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited" data-testid={`film-edited-${fid}`} />}
               </button>
             );
