@@ -43,6 +43,16 @@ export function useBackendStatus(onLibraryChanged: () => void) {
       reportError(e);
     }
   }, [reportError]);
+  /** Sidecar write failures seen this session (events and reports), keyed by image id. Cleared when the image is written. */
+  const [xmpFailures, setXmpFailures] = useState<Map<number, string>>(new Map());
+  const noteXmpFailures = useCallback((failed: { imageId: number; reason: string }[], written: number[] = [], replace = false) => {
+    setXmpFailures((m) => {
+      const n = new Map(replace ? [] : m);
+      written.forEach((id) => n.delete(id));
+      failed.forEach((f) => n.set(f.imageId, f.reason));
+      return n;
+    });
+  }, []);
   const refreshXmp = useCallback(() => {
     unwrap(commands.getXmpStatus())
       .then(setXmp)
@@ -83,13 +93,19 @@ export function useBackendStatus(onLibraryChanged: () => void) {
       }),
       events.analysisFailed.listen((ev) => setAnalysis((a) => (a ? { ...a, lastReason: ev.payload.reason } : a))),
       events.thumbnailFailed.listen((ev) => noteFailure(ev.payload.reason)),
-      events.xmpSynced.listen(refreshXmp),
-      events.xmpWriteFailed.listen(refreshXmp),
+      events.xmpSynced.listen((ev) => {
+        noteXmpFailures([], ev.payload.written);
+        refreshXmp();
+      }),
+      events.xmpWriteFailed.listen((ev) => {
+        noteXmpFailures([ev.payload]);
+        refreshXmp();
+      }),
     ];
     return () => {
       unlisten.forEach((u) => void u.then((f) => f()));
     };
-  }, [refreshCatalog, refreshXmp, onLibraryChanged]);
+  }, [refreshCatalog, refreshXmp, onLibraryChanged, noteXmpFailures]);
 
-  return { catalog, setCatalog, refreshCatalog, progress, analysis, setAnalysis, xmp, refreshXmp, error, setError, reportError, catalogIssue, setCatalogIssue };
+  return { catalog, setCatalog, refreshCatalog, progress, analysis, setAnalysis, xmp, refreshXmp, xmpFailures, noteXmpFailures, error, setError, reportError, catalogIssue, setCatalogIssue };
 }

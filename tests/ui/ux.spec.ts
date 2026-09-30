@@ -537,19 +537,18 @@ test.describe("P1-2 toasts and job pill", () => {
 });
 
 test.describe("P1-8 XMP pill", () => {
-  test("amber pill appears only when dirty and saves everything on click", async ({ page }) => {
+  test("auto-sync off: pill shows unsaved count and Save now writes everything", async ({ page }) => {
     await openApp(page, 200);
     const pill = page.getByTestId("xmp-status");
-    await expect(pill).toContainText("5 photos not saved to XMP");
-    await shot(page, "5x-ux-xmp-pill");
+    await expect(pill).toContainText("5 unsaved");
+    await page.getByTestId("xmp-status-button").click();
     await clearCalls(page);
-    await pill.click();
+    await page.getByTestId("xmp-save-all").click();
     await expect.poll(async () => (await calls(page, "write_xmp_all_dirty")).length).toBe(1);
     expect((await calls(page, "write_xmp_all_dirty"))[0].args).toEqual({ folderId: null });
-    await expect(pill).toHaveCount(0);
     await expect(page.getByTestId("notice")).toContainText("Saved XMP for 5 photos");
-    // Editing a rating makes it dirty again (mock marks photo dirty on undo/apply paths only), so just re-check hidden state.
-    await expect(page.getByTestId("top-bar")).not.toContainText("not saved");
+    await expect(pill).toHaveAttribute("data-state", "off");
+    await expect(pill).toContainText("Auto-save off");
   });
 });
 

@@ -5,6 +5,7 @@ import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from 
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
 import { Menu, menuItem } from "./Menu";
+import { XmpStatusPill, type XmpFailureRow } from "./XmpStatus";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { AnalyzeSplit, ShootSelect } from "./AnalyzeControls";
 import type { ReactNode } from "react";
@@ -22,6 +23,9 @@ interface Props {
   onSetCover?: (() => void) | null;
   analysis: AnalysisView | null;
   xmp: XmpStatus | null;
+  xmpFailures: XmpFailureRow[];
+  onOpenXmpErrors: () => void;
+  onXmpExplain: () => void;
   busy: boolean;
   mode: Mode | "plan";
   onMode: (m: Mode) => void;
@@ -75,7 +79,6 @@ function Ring({ pct }: { pct: number }) {
 export function TopBar(p: Props) {
   const c = p.catalog;
   const xmp = p.xmp;
-  const dirty = xmp?.dirty ?? 0;
   const modes: { m: Mode; label: string; icon: typeof Grid3x3; title: string; testid: string }[] = [
     { m: "grid", label: "Grid", icon: Grid3x3, title: `Grid${hint("toGrid")}`, testid: "mode-grid" },
     { m: "loupe", label: "Loupe", icon: Maximize, title: `Loupe${hint("toggleLoupe")}`, testid: "mode-loupe" },
@@ -146,22 +149,7 @@ export function TopBar(p: Props) {
         </button>
       )}
 
-      {dirty > 0 && (
-        <button
-          onClick={p.onSaveAllDirty}
-          className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-full bg-amber-900/70 px-3 text-xs font-medium text-amber-100 ring-1 ring-amber-600 hover:bg-amber-800"
-          data-testid="xmp-status"
-          title="Write XMP sidecars for every photo with unsaved changes"
-        >
-          <CloudUpload className="size-3.5" />
-          {dirty} photo{dirty === 1 ? "" : "s"}<span className="max-[1400px]:hidden"> not saved to XMP</span>{xmp && xmp.failed > 0 ? ` · ${xmp.failed} failed` : ""}
-        </button>
-      )}
-      {dirty === 0 && xmp && xmp.failed > 0 && (
-        <span className="rounded-full bg-red-950 px-3 py-1 text-xs text-red-200" data-testid="xmp-status">
-          {xmp.failed} XMP failed
-        </span>
-      )}
+      <XmpStatusPill xmp={xmp} failures={p.xmpFailures} onOpenErrors={p.onOpenXmpErrors} onRetry={p.onSaveAllDirty} onSaveAll={p.onSaveAllDirty} onAutoSync={p.onAutoXmp} onExplain={p.onXmpExplain} />
       <button onClick={p.onWriteXmp} disabled={!p.hasSelection} className={btn} data-testid="save-metadata" title={`Write XMP sidecars for the selection${hint("saveXmp")}`}>
         <CloudUpload className="size-4" />
         Save

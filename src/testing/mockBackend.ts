@@ -217,6 +217,10 @@ declare global {
     __mockExportManual?: boolean;
     /** Advances the running mock export job by n files (default 1); finishes it when done. */
     __mockExportStep?: (n?: number) => void;
+    /** Test hook: the mock auto-sync writer reports `running` in `get_xmp_status`. */
+    __mockXmpRunning?: boolean;
+    /** Test hook: emulates an auto-sync pass (writes every dirty photo it can, emits `xmp-synced` / `xmp-write-failed`). */
+    __mockXmpFlush?: () => void;
     /** Test hook: ms per progress step of mock `detect_scenes` / `match_scene` (default 30). */
     __mockSceneDelay?: number;
     /** Makes get_edit_plan fail (plan error state). */
@@ -773,6 +777,21 @@ export function installMockBackend(count: number) {
   window.__mockExportStep = (n = 1) => {
     if (activeRun) stepRun(activeRun, n);
   };
+  window.__mockXmpFlush = () => {
+    const written: number[] = [];
+    for (const r of rows) {
+      if (!r.xmp.dirty) continue;
+      if (mockReadOnly(r.id) || mockMissing(r.id)) {
+        const reason = mockMissing(r.id) ? missingMessage(r) : READ_ONLY(r.id);
+        r.xmp = { dirty: true, syncedAtMs: null, error: reason };
+        void emit("xmp-write-failed", { imageId: r.id, reason });
+      } else {
+        r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
+        written.push(r.id);
+      }
+    }
+    void emit("xmp-synced", { written, read: [] });
+  };
 
 
 
@@ -1057,7 +1076,7 @@ export function installMockBackend(count: number) {
         case "get_analysis_status":
           return { total: count, analyzed: count, failed: 0, pending: 0, waiting: 0, running: false };
         case "get_xmp_status":
-          return { dirty: rows.filter((r) => r.xmp.dirty).length, failed: 0, running: false, autoSync: catalog.xmpAutoSync };
+          return { dirty: rows.filter((r) => r.xmp.dirty).length, failed: rows.filter((r) => r.xmp.error).length, running: !!window.__mockXmpRunning, autoSync: catalog.xmpAutoSync };
         case "set_pick":
           guardWrite();
           ids.forEach((i) => {
@@ -1150,8 +1169,13 @@ export function installMockBackend(count: number) {
         case "write_xmp_all_dirty": {
           const folderId = args.folderId as number | null;
           const dirty = rows.filter((r) => r.xmp.dirty && (folderId == null || r.folderId === folderId));
-          dirty.forEach((r) => (r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null }));
-          return { ...ok, succeeded: dirty.length };
+          const bad = dirty.filter((r) => mockReadOnly(r.id) || mockMissing(r.id));
+          dirty.filter((r) => !bad.includes(r)).forEach((r) => (r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null }));
+          return {
+            ...ok,
+            succeeded: dirty.length - bad.length,
+            failed: bad.map((r) => ({ imageId: r.id, reason: mockMissing(r.id) ? missingMessage(r) : READ_ONLY(r.id) })),
+          };
         }
         case "set_xmp_auto_sync":
           catalog = { ...catalog, xmpAutoSync: args.enabled as boolean };

@@ -1,13 +1,14 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type WorkflowStep } from "./ipc";
+import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useCullUndo } from "./hooks/useCullUndo";
 import { TopBar } from "./components/TopBar";
+import { XmpExplainer } from "./components/XmpStatus";
 import { FilterBar, FilterExtras, filterSummaryText, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
@@ -444,13 +445,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   /** Success summary, or a persistent error toast (read-only folder, moved originals...) when some sidecars failed. */
   const xmpToast = useCallback(
     (prefix: string, r: { succeeded: number; failed: { imageId: number; reason: string }[] }) => {
+      status.noteXmpFailures(r.failed);
       if (r.failed.length === 0) return setNotice(`${prefix} ${plural(r.succeeded, "photo")}`);
       r.failed.forEach((f) => noteFailure(f.reason));
       const why = describeReason(r.failed[0].reason);
       const lead = r.succeeded > 0 ? `${prefix} ${plural(r.succeeded, "photo")}; ` : "";
       push(`${lead}${plural(r.failed.length, "sidecar")} could not be written. ${why.message}`, { kind: "error" });
     },
-    [push, setNotice],
+    [push, setNotice, status.noteXmpFailures],
   );
 
   const writeXmp = useCallback(async () => {
@@ -458,6 +460,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (t.length === 0) return;
     try {
       const r = await unwrap(commands.writeXmp(t));
+      status.noteXmpFailures([], t.filter((i) => !r.failed.some((f) => f.imageId === i)));
       xmpToast("Saved metadata for", r);
       await lib.refresh(t);
       status.refreshXmp();
@@ -476,6 +479,51 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       reportError(e);
     }
   }, [lib, status, reportError, setNotice]);
+
+  // One-time explanation of how Sieve reads and merges XMP sidecars (shown when a project is opened with auto-sync on).
+  const [uiPrefs, setUiPrefs] = useState<UiPrefs | null>(null);
+  const [explainOpen, setExplainOpen] = useState(false);
+  useEffect(() => {
+    unwrap(commands.getUiPrefs())
+      .then(setUiPrefs)
+      .catch(() => setUiPrefs({}));
+  }, []);
+  const explainerDue = project != null && uiPrefs != null && !uiPrefs.xmpExplainerSeen && status.catalog?.xmpAutoSync === true;
+  const closeExplainer = useCallback(() => {
+    setExplainOpen(false);
+    if (uiPrefs?.xmpExplainerSeen) return;
+    const next = { ...uiPrefs, xmpExplainerSeen: true };
+    setUiPrefs(next);
+    unwrap(commands.setUiPrefs(next)).catch(reportError);
+  }, [uiPrefs, reportError]);
+
+  // Failure list for the status popover: session failures plus, when the catalog knows of more, a scan for entries with an error.
+  const [xmpNames, setXmpNames] = useState<Map<number, string>>(new Map());
+  const xmpFailureRows = useMemo(
+    () => [...status.xmpFailures].map(([imageId, reason]) => ({ imageId, reason, fileName: rawLib.getEntry(imageId)?.fileName ?? xmpNames.get(imageId) ?? `Photo #${imageId}` })),
+    [status.xmpFailures, xmpNames, rawLib],
+  );
+  const { noteXmpFailures } = status;
+  const openXmpErrors = useCallback(async () => {
+    try {
+      const found: { imageId: number; reason: string }[] = [];
+      const names = new Map<number, string>();
+      for (let offset = 0; ; offset += 1000) {
+        const page = await unwrap(commands.listImages({ ...BASE_QUERY, offset, limit: 1000 }));
+        for (const e of page.items) {
+          if (e.xmp.error) {
+            found.push({ imageId: e.id, reason: e.xmp.error });
+            names.set(e.id, e.fileName);
+          }
+        }
+        if (offset + 1000 >= page.total) break;
+      }
+      setXmpNames(names);
+      noteXmpFailures(found, [], true);
+    } catch {
+      /* the session failures stay listed */
+    }
+  }, [noteXmpFailures]);
 
   const readXmp = useCallback(async () => {
     const t = targets();
@@ -1100,6 +1148,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         onSetCover={active != null && project ? () => void setCover(active) : null}
         analysis={status.analysis}
         xmp={status.xmp}
+        xmpFailures={xmpFailureRows}
+        onOpenXmpErrors={openXmpErrors}
+        onXmpExplain={() => setExplainOpen(true)}
         busy={busy}
         mode={planOpen ? "plan" : mode}
         onMode={changeMode}
@@ -1204,6 +1255,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         />
       )}
       {project && <StyleDialogs wf={wf} fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`} />}
+      {(explainOpen || explainerDue) && <XmpExplainer autoSync={status.catalog?.xmpAutoSync ?? false} onClose={closeExplainer} />}
       {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
