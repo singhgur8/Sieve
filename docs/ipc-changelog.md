@@ -311,3 +311,80 @@ Who updates what
   `planExport` warning for existing files, `exportImages(selectedIds, settings, preset.name)`, a jobs panel
   (`getExportJobs`, `exportProgress` / `exportFinished`, `cancelExport`). Add mock cases for the new commands in
   `src/testing/mockBackend.ts` (the build does not need them; UI tests will).
+
+## v7 — 2026-09-29 (Phase 7: scenes + scene matching)
+Types
+- `SceneId`; `SceneMethod` (`auto | manual`); `SceneTask` (`detect | match`).
+- `Scene { id, folderId | null, startedAtMs | null, endedAtMs | null, imageIds (capture order), anchorIds (0..=2,
+  subset), method, createdAtMs, updatedAtMs }` (`Scene::MAX_ANCHORS = 2`).
+- `SceneDetectOptions { maxGapMs (1000..=86400000, default 120000), similarity (0..=1, default 0.7), replaceManual
+  (default false) }` (+ `validate()`, `Default`).
+- `MatchOptions { matchExposure (true), matchWhiteBalance (true), matchTone (false), strength 0..=1 (1), copyFields
+  (all) }` (+ `validate()`, `matched_fields()`, `MAX_TARGETS = 2000`). TS mirror: `DEFAULT_MATCH_OPTIONS`.
+- `ImageStats { imageId, region, width, height, meanLuma, logMeanLuma, percentiles: LumaPercentiles {p1,p10,p50,p90,p99},
+  clippedHighlights, clippedShadows, meanOklab: OklabColor {l,a,b}, neutral: NeutralEstimate {x, y, a, b, coverage},
+  whiteBalance | null (effective), asShot | null, lutMissing }` — measured on the rendered 8-bit output at 640 px.
+- `MatchDelta { exposure, temperatureK, tint, contrast, whites, blacks }`.
+- `MatchPreview { targetId, anchorIds, anchorWeight, base, full, adjustments, delta, reference, before, predicted,
+  converged, notes }`; `MatchApplication { imageId, adjustments }`.
+- `ParametricAdjustments::lerp(a, b, t)` (numeric linear, temperature in mireds when both custom, otherwise nearer side;
+  LUT amount when same id). TS mirror `lerpAdjustments` in `src/ipc/index.ts` (keep in sync).
+- `RawImageEntry` gains `sceneId: number | null`, `isSceneAnchor: boolean`.
+- `ImageQuery` gains `sceneId: number | null` (members of that scene; `#[serde(default)]`, so omitting it still
+  deserializes). `DEFAULT_QUERY` updated.
+- TS constants: `SCENE_MATCH_TOLERANCE = { ev: 0.15, ab: 0.012 }` (Rust `scene::TOLERANCE_EV/AB`), `MAX_SCENE_ANCHORS`.
+
+Commands (new)
+- `detect_scenes(folderId | null, options | null) -> Scene[]` (blocking; replaces auto scenes in scope, keeps manual
+  ones unless `replaceManual`, anchors survive; progress `sceneProgress {task: "detect"}`).
+- `list_scenes(folderId | null) -> Scene[]`, `get_scene(id) -> Scene`.
+- `create_scene(imageIds) -> Scene`, `set_scene_members(id, imageIds) -> Scene`, `set_scene_anchors(id, anchorIds) ->
+  Scene`, `merge_scenes(ids) -> Scene`, `split_scene(id, firstImageId) -> Scene[2]`, `delete_scene(id)`. Membership
+  edits make a scene `manual`; anchors are members (<= 2); an image leaving a scene loses its anchor flag; emptied
+  scenes are deleted.
+- `match_scene(anchorIds (1..=2), targetIds, options) -> MatchPreview[]` (nothing saved; anchors dropped from targets;
+  progress `sceneProgress {task: "match"}`).
+- `apply_scene_match(applications: MatchApplication[], label | null) -> number[]` (changed ids; atomic; one history
+  entry per changed image, default label "Match Scene"; XMP notify).
+- `get_render_stats(id, adjustments | null, region | null) -> ImageStats` (acceptance helper; `null` = stored
+  adjustments).
+
+Events (new)
+- `sceneProgress { task, done, total }` (throttled).
+
+Schema (migration `0007_scenes.sql`, user_version 7)
+- `scenes` (folder_id nullable, started/ended ms, method CHECK, timestamps) + `idx_scenes_folder`.
+- `images.scene_id` (FK ON DELETE SET NULL) + `idx_images_scene`, `images.scene_anchor`.
+- `scene_features` (image_id PK cascade, version, features_json, computed_at).
+- Scene columns are not XMP-mapped (no dirty triggers).
+
+Who updates what
+- architect (done): types + tests, commands, event, registration, migration + test, `scene/` module surface with
+  `scene::store` (all scene SQL, implemented + tested), pure semantic helpers `matching::{base_adjustments,
+  choose_anchors, delta, touched_fields}` + tests, `stats::render_stats` glue, additive seams
+  `DevelopCache::render_image` (+ `RenderedPixels`) and `develop::history::commit_batch`, `repo` ENTRY_SELECT cols
+  46-47 + `sceneId` filter, TS helpers, mock backend fields.
+- vision-ml-dev: fill every `todo!()` in `src-tauri/src/scene/`: `features::{compute, compute_missing}`,
+  `detect::group` (rules in its doc), `stats::measure`, `matching::{blend_stats, solve, match_images}`; tune
+  `SceneDetectOptions::default()` values if data demands (contract change -> architect). Acceptance (roadmap Phase 7):
+  on sample scenes from `test-data/`, every matched target at strength 1 has |logMeanLuma - reference| <=
+  `TOLERANCE_EV` and |neutral.ab - reference| <= `TOLERANCE_AB` (`get_render_stats` with `MatchPreview.full`);
+  plus unit tests for `detect::group` rules and `solve` on synthetic renders.
+- rust-engine-dev: nothing required; review `DevelopCache::render_image` / `history::commit_batch` (may move them).
+- frontend-dev: see "Frontend API summary" below; add mock cases for the new commands in `src/testing/mockBackend.ts`.
+
+Frontend API summary
+- Scene strip (library/develop): `listScenes(folderId)` on folder change; "Detect scenes" button ->
+  `detectScenes(folderId, null)` with a progress bar from `events.sceneProgress` (`task === "detect"`); clicking a
+  scene filters the grid with `ImageQuery.sceneId`; badges from `RawImageEntry.sceneId` / `isSceneAnchor`.
+- Scene editing: select frames -> "New scene" (`createScene`), "Merge" (`mergeScenes`), "Split here" (`splitScene`),
+  "Remove from scene" (`setSceneMembers` with the rest), delete (`deleteScene`).
+- Anchors: "Mark as anchor" in grid/develop toggles `setSceneAnchors(sceneId, [...])` (max `MAX_SCENE_ANCHORS`;
+  replace the oldest or refuse with a toast).
+- Match: "Match scene" -> `matchScene(scene.anchorIds, scene.imageIds, options)` (options panel: exposure / white
+  balance / tone toggles, copy-fields picker reusing the Sync dialog, strength slider; progress from
+  `sceneProgress` `task === "match"`). Show per-target before/after (render `before` = stored adjustments,
+  `after` = `lerpAdjustments(p.base, p.full, strength)` via `renderPreview`), `delta` values, `converged` / `notes`
+  warnings. Strength slider recomputes locally with `lerpAdjustments` (no new `matchScene` call).
+- Apply: `applySceneMatch(selected.map(p => ({ imageId: p.targetId, adjustments: lerpAdjustments(p.base, p.full,
+  strength) })), null)`; then refresh rows (`getImages`) and history; undo per image via the existing history.

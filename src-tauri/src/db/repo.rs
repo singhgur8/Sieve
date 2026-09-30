@@ -246,7 +246,8 @@ const ENTRY_SELECT: &str = "
            t.preview_path,
            q.suggested_rating, q.suggested_pick,
            EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id),
-           i.xmp_dirty, i.xmp_synced_at, i.xmp_error
+           i.xmp_dirty, i.xmp_synced_at, i.xmp_error,
+           i.scene_id, i.scene_anchor
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -330,6 +331,8 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         quality,
         has_edits: r.get(38)?,
         xmp: XmpSyncState { dirty: r.get(43)?, synced_at_ms: r.get(44)?, error: r.get(45)? },
+        scene_id: r.get(46)?,
+        is_scene_anchor: r.get(47)?,
     })
 }
 
@@ -450,6 +453,10 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
     if let Some(burst) = q.burst_group_id {
         clauses.push("i.burst_group_id = ?".into());
         args.push(Value::Integer(burst));
+    }
+    if let Some(scene) = q.scene_id {
+        clauses.push("i.scene_id = ?".into());
+        args.push(Value::Integer(scene));
     }
     if q.collapse_bursts {
         clauses.push(
