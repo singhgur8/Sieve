@@ -16,6 +16,7 @@ pub mod libraw;
 pub mod meta;
 pub mod preview;
 pub mod raf;
+pub mod raster;
 pub mod source;
 pub mod tiff;
 pub mod turbo;
@@ -30,15 +31,10 @@ use preview::PREVIEW_EDGE;
 use source::{ByteSource, FileSource};
 use tiff::JpegRef;
 
-/// Maps a file extension (case-insensitive) to a supported format.
+/// Maps a file extension (case-insensitive) to a supported format (RAW or, since v9,
+/// non-RAW: callers decide whether to accept `!format.is_raw()`).
 pub fn format_from_extension(path: &Path) -> Option<RawFormat> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "arw" => Some(RawFormat::Arw),
-        "raf" => Some(RawFormat::Raf),
-        "cr3" => Some(RawFormat::Cr3),
-        _ => None,
-    }
+    RawFormat::from_extension(path.extension()?.to_str()?)
 }
 
 /// Checks the file header matches the container the extension claims.
@@ -49,11 +45,22 @@ pub fn header_matches(format: RawFormat, header: &[u8]) -> bool {
         RawFormat::Raf => header.starts_with(b"FUJIFILMCCD-RAW"),
         // Canon CR3 is ISO-BMFF: 4-byte box size, then `ftyp` with brand `crx `.
         RawFormat::Cr3 => header.get(4..12) == Some(b"ftypcrx ".as_slice()),
+        RawFormat::Jpeg => header.starts_with(&[0xFF, 0xD8, 0xFF]),
+        RawFormat::Png => header.starts_with(b"\x89PNG\r\n\x1a\n"),
+        RawFormat::Tiff => header.starts_with(b"II*\0") || header.starts_with(b"MM\0*"),
+        // ISO-BMFF `ftyp` with a HEIF brand.
+        RawFormat::Heic => {
+            header.get(4..8) == Some(b"ftyp".as_slice())
+                && matches!(
+                    header.get(8..12),
+                    Some(b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"mif1" | b"msf1")
+                )
+        }
     }
 }
 
 /// Returns the format if `path` has a supported extension *and* a valid header.
-/// `Ok(None)` = not a RAW we handle; `Err` = RAW extension but bad/unreadable header.
+/// `Ok(None)` = not a format we handle; `Err` = supported extension but bad/unreadable header.
 pub fn identify(path: &Path) -> Result<Option<RawFormat>, String> {
     let Some(format) = format_from_extension(path) else {
         return Ok(None);
@@ -74,6 +81,7 @@ pub fn default_make(format: RawFormat) -> CameraMake {
         RawFormat::Arw => CameraMake::Sony,
         RawFormat::Raf => CameraMake::Fujifilm,
         RawFormat::Cr3 => CameraMake::Canon,
+        RawFormat::Jpeg | RawFormat::Heic | RawFormat::Tiff | RawFormat::Png => CameraMake::Other,
     }
 }
 
@@ -83,6 +91,7 @@ pub fn default_sensor_layout(format: RawFormat) -> SensorLayout {
     match format {
         RawFormat::Arw | RawFormat::Cr3 => SensorLayout::Bayer,
         RawFormat::Raf => SensorLayout::Unknown,
+        RawFormat::Jpeg | RawFormat::Heic | RawFormat::Tiff | RawFormat::Png => SensorLayout::Unknown,
     }
 }
 
@@ -102,6 +111,9 @@ pub fn parse_container(src: &(impl ByteSource + ?Sized), format: RawFormat) -> R
         }
         RawFormat::Raf => raf::parse(src),
         RawFormat::Cr3 => cr3::parse(src),
+        RawFormat::Jpeg | RawFormat::Heic | RawFormat::Tiff | RawFormat::Png => {
+            Err(format!("{} is not a RAW container (use raw::raster)", format.as_str()))
+        }
     }
 }
 
@@ -179,6 +191,9 @@ pub struct Extracted {
 /// `Err` only if the file cannot be opened at all; parse problems degrade to
 /// empty metadata and/or the LibRaw fallback for the preview.
 pub fn extract(path: &Path, format: RawFormat, jpeg_buf: &mut Vec<u8>) -> Result<Extracted, String> {
+    if !format.is_raw() {
+        return raster::extract(path, format, jpeg_buf);
+    }
     let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let (builder, parse_err, jpeg) = match parse_container(&src, format) {
         Ok(c) => {
@@ -218,6 +233,10 @@ pub(crate) mod test_fixtures {
             RawFormat::Arw => b"II*\0\x08\0\0\0".to_vec(),
             RawFormat::Raf => b"FUJIFILMCCD-RAW 0201".to_vec(),
             RawFormat::Cr3 => b"\0\0\0\x18ftypcrx \0\0\0\x01".to_vec(),
+            RawFormat::Jpeg => b"\xFF\xD8\xFF\xE1\0\x10Exif\0\0".to_vec(),
+            RawFormat::Heic => b"\0\0\0\x18ftypheic\0\0\0\0".to_vec(),
+            RawFormat::Tiff => b"MM\0*\0\0\0\x08".to_vec(),
+            RawFormat::Png => b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec(),
         }
     }
 }
@@ -232,7 +251,11 @@ mod tests {
         assert_eq!(format_from_extension(Path::new("a/DSC0001.ARW")), Some(RawFormat::Arw));
         assert_eq!(format_from_extension(Path::new("DSCF1.raf")), Some(RawFormat::Raf));
         assert_eq!(format_from_extension(Path::new("IMG_1.Cr3")), Some(RawFormat::Cr3));
-        assert_eq!(format_from_extension(Path::new("IMG_1.jpg")), None);
+        assert_eq!(format_from_extension(Path::new("IMG_1.jpg")), Some(RawFormat::Jpeg));
+        assert_eq!(format_from_extension(Path::new("IMG_1.HIF")), Some(RawFormat::Heic));
+        assert_eq!(format_from_extension(Path::new("x.TIFF")), Some(RawFormat::Tiff));
+        assert_eq!(format_from_extension(Path::new("x.png")), Some(RawFormat::Png));
+        assert_eq!(format_from_extension(Path::new("x.dng")), None);
         assert_eq!(format_from_extension(Path::new("noext")), None);
     }
 
@@ -245,6 +268,9 @@ mod tests {
         assert!(!header_matches(RawFormat::Raf, &stub_header(RawFormat::Arw)));
         assert!(!header_matches(RawFormat::Cr3, b"\0\0\0\x18ftypheic"));
         assert!(!header_matches(RawFormat::Cr3, b"short"));
+        assert!(!header_matches(RawFormat::Heic, &stub_header(RawFormat::Cr3)));
+        assert!(!header_matches(RawFormat::Jpeg, &stub_header(RawFormat::Png)));
+        assert!(header_matches(RawFormat::Tiff, &stub_header(RawFormat::Arw)));
     }
 
     #[test]

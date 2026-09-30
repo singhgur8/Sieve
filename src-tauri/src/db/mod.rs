@@ -156,4 +156,74 @@ mod tests {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM scene_features", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn v9_relaxes_format_check_in_place_and_keeps_children() {
+        // A v8 catalog with an image and child rows in several FK tables.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, sql) in schema::MIGRATIONS[..8].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                     file_size, file_mtime_ms, imported_at)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 'bayer', 1, 0, 0);
+                 INSERT INTO thumbnails (image_id, status) VALUES (1, 'pending');
+                 INSERT INTO adjustments (image_id, params_json, process_version, updated_at) VALUES (1, '{}', 1, 0);",
+            )
+            .unwrap();
+            let jpeg = "INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                            file_size, file_mtime_ms, imported_at)
+                        VALUES (2, 1, '/f/b.jpg', 'b.jpg', 'jpeg', 'other', 'unknown', 1, 0, 0)";
+            assert!(conn.execute(jpeg, []).is_err(), "v8 rejects non-RAW formats");
+        }
+        // Upgrade on the same connection that then writes (schema must be reloaded).
+        let conn = open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                 file_size, file_mtime_ms, imported_at, companion_path)
+             VALUES (2, 1, '/f/b.jpg', 'b.jpg', 'jpeg', 'other', 'unknown', 1, 0, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        for f in ["heic", "tiff", "png"] {
+            conn.execute(
+                "INSERT INTO images (folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms, imported_at)
+                 VALUES (1, ?1, 'x', ?2, 'other', 1, 0, 0)",
+                [format!("/f/x.{f}"), f.to_owned()],
+            )
+            .unwrap();
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO images (folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms, imported_at)
+                 VALUES (1, '/f/y.gif', 'y', 'gif', 'other', 1, 0, 0)",
+                [],
+            )
+            .is_err());
+        // Children survived; the constraint text is updated; integrity holds.
+        let kids: (i64, i64) = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM thumbnails), (SELECT COUNT(*) FROM adjustments)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kids, (1, 1));
+        let sql: String =
+            conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'images'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("'jpeg', 'heic', 'tiff', 'png'") && sql.contains("develop_warnings"), "{sql}");
+        let ok: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok");
+        // A fresh connection sees the relaxed constraint too.
+        drop(conn);
+        let conn = open(&path).unwrap();
+        conn.execute("UPDATE images SET format = 'png' WHERE id = 2", []).unwrap();
+    }
 }

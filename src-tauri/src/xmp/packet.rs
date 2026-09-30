@@ -18,7 +18,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use super::crs::{self, PropertyEdit};
-use crate::ipc::types::ParametricAdjustments;
+use crate::ipc::types::{DevelopWarning, LookSettings, ParametricAdjustments};
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
@@ -68,6 +68,9 @@ pub struct SidecarValues {
     pub develop: Option<ParametricAdjustments>,
     /// Why the develop settings could not be read (malformed value), if so.
     pub develop_error: Option<String>,
+    /// `crs:` features preserved but not rendered (`crs::unsupported_warnings`), stored as
+    /// `RawImageEntry.developWarnings` by the read path (v9).
+    pub warnings: Vec<DevelopWarning>,
 }
 
 /// The XMP-mapped state Sieve wants in the sidecar.
@@ -98,11 +101,12 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     let list = |ns: &str, local: &str| -> Vec<String> {
         doc.list(ns, local).map(|p| p.items.iter().map(|i| i.value.clone()).collect()).unwrap_or_default()
     };
-    let get = |ns: &str, local: &str| doc.scalars(ns, local).into_iter().next().map(|s| s.value.to_owned());
-    let (develop, develop_error) = match crs::decode(&get) {
+    let source = DocSource(&doc);
+    let (develop, develop_error) = match crs::decode_source(&source) {
         Ok(d) => (d, None),
         Err(e) => (None, Some(e)),
     };
+    let warnings = crs::unsupported_warnings(&source);
     Ok(SidecarValues {
         rating,
         label,
@@ -110,7 +114,35 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
         subjects: list(NS_DC, "subject"),
         develop,
         develop_error,
+        warnings,
     })
+}
+
+/// Top-level properties of a parsed packet, for `crs::decode_source`.
+struct DocSource<'a>(&'a Doc);
+
+impl crs::CrsSource for DocSource<'_> {
+    fn scalar(&self, ns: &str, name: &str) -> Option<String> {
+        self.0.scalars(ns, name).into_iter().next().map(|s| s.value.to_owned())
+    }
+
+    fn seq(&self, ns: &str, name: &str) -> Option<Vec<String>> {
+        let p = self.0.list(ns, name)?;
+        p.container.as_ref()?;
+        Some(p.items.iter().map(|i| i.value.clone()).collect())
+    }
+
+    fn has(&self, ns: &str, name: &str) -> bool {
+        self.0.attr_props.iter().any(|a| a.uri == ns && a.local == name)
+            || self.0.elem_props.iter().any(|p| p.uri == ns && p.local == name)
+    }
+
+    fn look(&self) -> Option<LookSettings> {
+        // rust-engine-dev (Phase 7b): index nested structs (`<crs:Look><rdf:Description
+        // crs:Name crs:Amount crs:UUID ...>`) and return them here. Until then the caller
+        // keeps the default look when `<crs:Look>` is present.
+        None
+    }
 }
 
 /// Applies `want` to `existing` (or to a new minimal packet), touching only the fields

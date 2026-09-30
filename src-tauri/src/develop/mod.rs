@@ -24,6 +24,7 @@
 //!   queue); concurrent decodes of the same image are coalesced.
 
 pub mod history;
+pub mod parity;
 pub mod pipeline;
 pub mod presets;
 pub mod source;
@@ -357,7 +358,15 @@ impl DevelopCache {
         let (source_width, source_height) = source::oriented_size(img.width, img.height, o);
         let (full_width, full_height) = source::oriented_size(img.full_width, img.full_height, o);
         let as_shot = img.color.as_shot_mul.map(|m| wb::values_for(m, &img.color.xyz_to_cam));
-        Ok(DevelopInfo { image_id: src.id, as_shot, source_width, source_height, full_width, full_height })
+        Ok(DevelopInfo {
+            image_id: src.id,
+            as_shot,
+            source_width,
+            source_height,
+            full_width,
+            full_height,
+            warnings: Vec::new(),
+        })
     }
 
     /// Warms the cache for `sources` in the background (e.g. filmstrip neighbours) and

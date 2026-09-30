@@ -1,5 +1,6 @@
 // Slider definitions, neutral adjustments and helpers for the Develop module.
 import type { AdjustmentField, HslChannels, ParametricAdjustments } from "../ipc";
+import { ADJUSTMENT_FIELD_LABELS, copyAdjustmentFields } from "../ipc";
 
 export type Band = keyof HslChannels;
 export const BANDS: Band[] = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"];
@@ -75,24 +76,8 @@ export const TEMP_MAX = 50000;
 export const tempToPos = (k: number) => (Math.log(k) - Math.log(TEMP_MIN)) / (Math.log(TEMP_MAX) - Math.log(TEMP_MIN));
 export const posToTemp = (t: number) => Math.round(Math.exp(Math.log(TEMP_MIN) + t * (Math.log(TEMP_MAX) - Math.log(TEMP_MIN))) / 10) * 10;
 
-export const FIELD_LABEL: Record<AdjustmentField, string> = {
-  white_balance: "White balance",
-  exposure: "Exposure",
-  contrast: "Contrast",
-  highlights: "Highlights",
-  shadows: "Shadows",
-  whites: "Whites",
-  blacks: "Blacks",
-  texture: "Texture",
-  clarity: "Clarity",
-  dehaze: "Dehaze",
-  vibrance: "Vibrance",
-  saturation: "Saturation",
-  hsl_hue: "HSL hue",
-  hsl_saturation: "HSL saturation",
-  hsl_luminance: "HSL luminance",
-  lut: "LUT",
-};
+// IPC v9 (architect): labels + copy semantics live next to the contract in `src/ipc`.
+export const FIELD_LABEL: Record<AdjustmentField, string> = ADJUSTMENT_FIELD_LABELS;
 
 /** Field groups per panel section (section resets). */
 export const BASIC_FIELDS: AdjustmentField[] = ["white_balance", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
@@ -101,29 +86,7 @@ export const HSL_FIELDS: AdjustmentField[] = ["hsl_hue", "hsl_saturation", "hsl_
 
 /** Copies the `fields` groups of `src` over `dst` (mirrors `ParametricAdjustments::copy_fields`). */
 export function copyFields(dst: ParametricAdjustments, src: ParametricAdjustments, fields: AdjustmentField[]): ParametricAdjustments {
-  const out: ParametricAdjustments = structuredClone(dst);
-  for (const f of fields) {
-    switch (f) {
-      case "white_balance":
-        out.whiteBalance = structuredClone(src.whiteBalance);
-        break;
-      case "hsl_hue":
-        out.hsl.hue = { ...src.hsl.hue };
-        break;
-      case "hsl_saturation":
-        out.hsl.saturation = { ...src.hsl.saturation };
-        break;
-      case "hsl_luminance":
-        out.hsl.luminance = { ...src.hsl.luminance };
-        break;
-      case "lut":
-        out.lut = src.lut ? { ...src.lut } : null;
-        break;
-      default:
-        out[f] = src[f];
-    }
-  }
-  return out;
+  return copyAdjustmentFields(dst, src, fields);
 }
 
 export const sameAdjustments = (a: ParametricAdjustments, b: ParametricAdjustments) => JSON.stringify(a) === JSON.stringify(b);

@@ -99,20 +99,30 @@ pub enum SyncPolicy {
     NewerWins,
 }
 
-/// Lightroom convention: `DSC0001.ARW` -> `DSC0001.xmp` in the same directory.
+/// RAW (Lightroom convention): `DSC0001.ARW` -> `DSC0001.xmp` in the same directory.
+/// Non-RAW sources (v9): `IMG_1.JPG` -> `IMG_1.JPG.xmp`. Lightroom embeds XMP into JPEG/TIFF
+/// (and ignores sidecars for them), which Sieve never does to originals; appending keeps a
+/// JPEG's sidecar from colliding with (and clobbering) the same-stem RAW's `DSCF1234.xmp`.
 /// (An existing sidecar whose extension differs only in case, e.g. `.XMP`, should be
 /// reused by the implementation; on APFS it is the same file anyway.)
-pub fn sidecar_path(raw_path: &Path) -> PathBuf {
-    raw_path.with_extension("xmp")
+pub fn sidecar_path(image_path: &Path) -> PathBuf {
+    let raw = crate::raw::format_from_extension(image_path).is_none_or(|f| f.is_raw());
+    if raw {
+        image_path.with_extension("xmp")
+    } else {
+        let mut name = image_path.as_os_str().to_owned();
+        name.push(".xmp");
+        PathBuf::from(name)
+    }
 }
 
-/// The sidecar to use for `raw_path`: an existing `.xmp` / `.XMP`, else [`sidecar_path`].
-pub fn resolve_sidecar(raw_path: &Path) -> PathBuf {
-    let lower = sidecar_path(raw_path);
+/// The sidecar to use for `image_path`: an existing `.xmp` / `.XMP`, else [`sidecar_path`].
+pub fn resolve_sidecar(image_path: &Path) -> PathBuf {
+    let lower = sidecar_path(image_path);
     if lower.exists() {
         return lower;
     }
-    let upper = raw_path.with_extension("XMP");
+    let upper = lower.with_extension("XMP");
     if upper.exists() {
         return upper;
     }
@@ -382,6 +392,7 @@ impl XmpSync {
                         develop_changed = true;
                     }
                 }
+                store::set_develop_warnings(conn, row.id, &values.warnings).map_err(|e| e.message)?;
                 let (rating, pick, label) = catalog_values(&values, row.rating);
                 let changed = store::apply_read(conn, row.id, rating, pick, label, file_mtime_ms(&path))
                     .map_err(|e| e.message)?;

@@ -5,6 +5,7 @@ pub mod ingest;
 pub mod ipc;
 pub mod lut;
 pub mod ml;
+pub mod profiles;
 pub mod raw;
 pub mod scene;
 pub mod xmp;
@@ -122,6 +123,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::set_ui_prefs,
             commands::reveal_in_finder,
             commands::write_xmp_all_dirty,
+            commands::list_profiles,
         ])
         .events(collect_events![
             ImportProgress,
@@ -137,6 +139,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             ExportFinished,
             SceneProgress
         ])
+        // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
+        .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
+        .constant(
+            "DEFAULT_ADJUSTMENTS_NON_RAW",
+            ipc::types::ParametricAdjustments::defaults_for(ipc::types::ImageFormat::Jpeg),
+        )
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -206,6 +214,8 @@ pub fn run() {
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }));
             app.manage(DevelopCache::new(DevelopConfig { cache_bytes: develop_cache_mb * 1024 * 1024 }));
+            // Adobe DCPs / looks installed on this Mac, read in place (never copied).
+            app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
             let luts = LutLibrary::new(luts_dir);
             let exporter =
                 Exporter::new(ExportConfig { catalog_path: path, memory_budget_mb: export_memory_mb }, luts.clone());

@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut conn = db::open(&config.catalog_path)?;
     let t_import = Instant::now();
-    let summary = repo::import_folder(&mut conn, &folder_path, &ImportOptions { recursive: false })?;
+    let summary = repo::import_folder(&mut conn, &folder_path, &ImportOptions::raw_only(false))?;
     if let Some(n) = limit {
         conn.execute("DELETE FROM images WHERE id NOT IN (SELECT id FROM images ORDER BY file_name LIMIT ?1)", [n])?;
     }

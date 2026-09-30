@@ -15,6 +15,7 @@ src-tauri/
   migrations/0006_export.sql   v6: export_presets, export_jobs, export_items
   migrations/0007_scenes.sql   v7: scenes, images.scene_id/scene_anchor, scene_features
   migrations/0008_ux.sql       v8: burst_keeper_pins (user-chosen burst keepers)
+  migrations/0009_parity_sources.sql v9: images.format CHECK += jpeg/heic/tiff/png (in place), companion_path, develop_warnings
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -38,6 +39,7 @@ src-tauri/
       meta.rs                  EXIF -> CaptureMeta (sub-second time, Fuji sensor layout)
       preview.rs turbo.rs      TurboJPEG n/8 scaled decode, resize, orientation, encode
       libraw.rs                minimal FFI to Homebrew libraw_r (build.rs locates it)
+      raster.rs                non-RAW sources (JPEG/HEIC/TIFF/PNG): ingest extract, linear decode, embedded XMP (v9)
   examples/ingest_bench.rs     release benchmark: files/s, ready/failed, peak RSS/footprint
     ingest/mod.rs              background pipeline (Ingest state, start/regenerate, import_status)
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
@@ -48,6 +50,9 @@ src-tauri/
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
+      parity.rs                Lightroom-parity stages: curves, color grading, calibration, detail, effects, crop (v9)
+    profiles/mod.rs            installed Adobe DCPs + looks (read in place), ProfileLibrary (v9)
+      dcp.rs look.rs table.rs  DCP parser; look profiles; Adobe crs:Table_ big-table decoder
     lut/mod.rs                 .cube LUT library (directory) + parse/apply
     export/mod.rs              Exporter (job queue + worker, memory-bounded concurrency), plan, memory policy
       develop.rs               full-res LibRaw decode + render_full (shared pipeline, resize, sharpen, quantize)
@@ -74,7 +79,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
 | `src-tauri/src/scene/` (surface in `scene/mod.rs` + `store.rs` fixed by the architect) | vision-ml-dev |
-| `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/` | rust-engine-dev |
+| `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/`, `src-tauri/src/profiles/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
 | everything, read-only | qa-engineer |
 
@@ -418,6 +423,98 @@ repo functions in `db/repo.rs` (rust-engine-dev), `ml::store::set_burst_keeper` 
 - `revealInFinder(path)`: `/usr/bin/open -R` with the path as a single argument (no shell, no plugin).
 - `writeXmpAllDirty(folderId | null)`: explicit "Save all metadata" regardless of auto-sync.
 
+## Lightroom parity + non-RAW sources (Phase 7b, IPC v9)
+
+Goal (user requirement): Sieve replaces Lightroom for the user's edits. Every develop setting in the user's
+394 sample sidecars round-trips through `crs:` and renders like Lightroom; what cannot be rendered yet is
+preserved byte-for-byte and reported (`DevelopWarning`).
+
+### Adjustment model
+`ParametricAdjustments` gained groups (all `#[serde(default)]`; TS sees them optional, the backend always sends
+them; `completeAdjustments` / `defaultAdjustments(format)` in `src/ipc/index.ts` fill them):
+`toneCurve {parametric, point {master, red, green, blue}}`, `colorGrading {shadows, midtones, highlights, global:
+{hue, saturation, luminance}, blending, balance}`, `calibration {red/green/blue {hue, saturation}, shadowTint}`,
+`detail {sharpening {amount, radius, detail, masking}, noiseReduction {...6}}`, `effects {vignette {amount, midpoint,
+roundness, feather, highlights, style}, grain {amount, size, roughness}}`, `blackAndWhite {enabled, mixer}`,
+`crop {enabled, top, left, bottom, right, angle}`, `profile {cameraProfile, look {name, uuid, amount}}`.
+
+Defaults are Lightroom's defaults for the source (`ParametricAdjustments::defaults_for(format)`; generated TS
+constants `DEFAULT_ADJUSTMENTS`, `DEFAULT_ADJUSTMENTS_NON_RAW`): RAW = profile "Adobe Color" (DCP Adobe Standard +
+look Adobe Color), sharpening 40/1.0/25/0, color NR 25/50/50, splits 25/50/75, blending 50; non-RAW = no profile,
+sharpening 0, color NR 0. `neutral`/`hasEdits` compare against the image's format default. Stored JSON is overlaid on
+the format default when read (`repo::get_adjustments`, history, presets), so pre-v9 rows load unchanged.
+
+Fields masks: new `AdjustmentField`s `tone_curve, color_grading, calibration, sharpening, noise_reduction, vignette,
+grain, black_and_white, crop, profile`. `AdjustmentField::DEFAULT_SYNC` / TS `DEFAULT_SYNC_FIELDS` = all but `crop`
+(default of `MatchOptions.copyFields`; the Sync dialog's default selection). `reset_adjustments` resets every
+group (incl. profile) to the image's format default.
+
+Phase 7c (masks) plugs in as `ParametricAdjustments.masks` (+ field `masks`) with per-mask *local* parameter sets
+mirroring `crs:Local*`; pipeline stages must be able to take per-pixel parameter overrides (`develop/parity.rs` docs).
+
+### crs mapping (`xmp/crs.rs` is the source of truth)
+| Group | crs properties | Format |
+|---|---|---|
+| parametric curve | `ParametricShadows/Darks/Lights/Highlights` (-100..100); `ParametricShadowSplit/MidtoneSplit/HighlightSplit` | signed; splits plain |
+| point curves | `ToneCurvePV2012`, `...Red/Green/Blue` (`rdf:Seq` of `"x, y"`), `ToneCurveName2012` (`Linear` if master identity else `Custom`) | Seq items |
+| color grading | shadows = `SplitToningShadowHue/Saturation` + `ColorGradeShadowLum`; highlights = `SplitToningHighlightHue/Saturation` + `ColorGradeHighlightLum`; `ColorGradeMidtoneHue/Sat/Lum`; `ColorGradeGlobalHue/Sat/Lum`; `ColorGradeBlending`; balance = `SplitToningBalance` | hue/sat/blending plain, lum/balance signed |
+| legacy split toning | `SplitToning*` without `ColorGradeBlending` -> blending 100 | read only |
+| calibration | `RedHue RedSaturation GreenHue GreenSaturation BlueHue BlueSaturation ShadowTint` | signed |
+| sharpening | `Sharpness` (0..150), `SharpenRadius` (0.5..3, `+1.0`), `SharpenDetail`, `SharpenEdgeMasking` | plain; radius signed decimal |
+| noise reduction | `LuminanceSmoothing`, `LuminanceNoiseReductionDetail`, `LuminanceNoiseReductionContrast`, `ColorNoiseReduction`, `ColorNoiseReductionDetail`, `ColorNoiseReductionSmoothness` | plain |
+| vignette | `PostCropVignetteAmount` (signed), `...Midpoint`, `...Roundness` (signed), `...Feather`, `...HighlightContrast`, `...Style` (1/2/3) | |
+| grain | `GrainAmount`, `GrainSize`, `GrainFrequency` (= roughness) | plain |
+| B&W | `ConvertToGrayscale` (True/False), `GrayMixerRed..Magenta` | signed |
+| crop | `HasCrop` (True/False), `CropTop/Left/Bottom/Right` (0..1, un-oriented frame), `CropAngle` | plain |
+| profile | `CameraProfile` + `<crs:Look>` struct (`Name, Amount, UUID, Parameters`) | see `crs::CAMERA_PROFILE` |
+
+Write rules: every owned scalar is written on every develop write (Lightroom accepts the full set); curves need
+`rdf:Seq` create/replace in `packet` (rust-engine-dev: `crs::encode_curves` is ready); the profile is written only
+when it differs from the sidecar's (`crs::encode_profile`), `crs:CameraProfileDigest` removed then; `crs:Look`
+struct copied from the installed look profile. Never written: `crs:Table_*`, `CameraProfileDigest`, masks,
+retouch, lens, transform, `PointColors`, `CurveRefineSaturation`, `crd:*` -- preserved byte-for-byte.
+Read rules: top-level properties only (the look's `crs:Parameters` never leak into the user's settings); missing
+properties read as RAW defaults; out-of-range values clamp; unordered splits / inverted crop fall back to defaults;
+malformed numbers/curves fail the develop import (ratings still sync). `crs::unsupported_warnings` fills
+`RawImageEntry.developWarnings` at every read (masks incl. legacy gradient/brush corrections, retouch, lens
+corrections, Upright/perspective, pre-2012 process version).
+
+### Profiles and looks (`profiles/`)
+Adobe DCPs (`/Library/Application Support/Adobe/CameraRaw/CameraProfiles`, `Adobe Standard/*.dcp`,
+`Camera/<model>/*.dcp`) and look profiles (`.../CameraRaw/Settings/**/*.xmp`, `crs:PresetType="Look"`) are read
+in place at runtime (never bundled, copied or redistributed; `SIEVE_CAMERA_PROFILES` / `SIEVE_LOOK_PROFILES`
+override). On the dev Mac: Adobe Standard DCPs for all three sample cameras (Sony ILCE-7M4, Canon EOS M6 Mark II,
+Fujifilm X-M5) + Camera Matching for the Sony/Canon; Adobe Raw looks incl. Adobe Color
+(UUID B952C231111CD8E0ECCF14B86BAA7077, LookTable E1095149...) and Adobe Monochrome. The sample sidecars reference
+looks by UUID/table MD5 only (their `crs:Table_*` attributes belong to masks), so looks resolve from the installed
+Settings; a look embedded in a sidecar (`crs:Table_<md5>` at top level) is the fallback. Missing DCP/look ->
+LibRaw-matrix base / no look + `profile_unavailable` / `look_unavailable` in `DevelopInfo.warnings`.
+Pipeline order and DCP/table formats: `profiles/mod.rs`, `profiles/dcp.rs`, `profiles/table.rs` docs.
+`list_profiles(id)` feeds the profile browser.
+
+### Pipeline (preview + export; `develop/parity.rs`)
+crop geometry -> camera RGB -> WB -> (calibration folded into) ForwardMatrix/DCP HueSatMap -> exposure (+ baseline)
+-> noise reduction -> PV2012 tone (existing) -> DCP LookTable -> DCP tone curve -> look (table + parameters, at
+amount) -> parametric curve -> point curves -> HSL / vibrance / saturation -> color grading -> B&W mix -> post-crop
+vignette -> grain -> capture sharpening -> LUT -> output. Radii in full-res pixels scaled by the working scale.
+Crop enabled: renders, `RenderOptions.region`, histograms, scene stats and exports cover the cropped frame;
+`DevelopInfo` sizes stay uncropped.
+
+### Non-RAW sources
+- Formats: `ImageFormat` (was `RawFormat`) += `jpeg, heic, tiff, png` (extensions jpg/jpeg/jpe, heic/heif/hif,
+  tif/tiff, png; magic bytes checked). Imported only with `ImportOptions.includeNonRaw` (default false).
+- Companions: with `pairJpegWithRaw` (default true) a same-stem JPEG/HEIC next to a RAW (case-insensitive, same
+  directory; JPEG preferred over HEIC) becomes the RAW's `companionPath` instead of an image (Lightroom's default).
+  An already-imported sibling stays an image. TIFF/PNG never pair.
+- Sidecars: `<file name>.xmp` (`IMG_1.JPG.xmp`) via `xmp::sidecar_path`; originals are never modified.
+  Lightroom embeds XMP in JPEG/TIFF and ignores sidecars for them, so `<stem>.xmp` would buy no interop and would
+  collide with the RAW sibling's sidecar. Embedded XMP (Lightroom-edited JPEGs) is read-only input when no sidecar
+  exists (`raw::raster::embedded_xmp`).
+- Develop: `raw::raster::decode_linear` (ICC-aware; sRGB / Display P3 / Adobe RGB / ProPhoto; unknown -> sRGB +
+  `source_color_assumed`) -> `to_linear_image` (display-referred flag: no baseline exposure / base curve, so
+  neutral = the original). As-shot WB reported as 6500 K / 0. Export uses the same decode at full size.
+
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -427,7 +524,7 @@ migrations tracked by `PRAGMA user_version`.
 |---|---|
 | `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `folders` | imported roots |
-| `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor` |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
