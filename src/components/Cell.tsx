@@ -54,6 +54,17 @@ export function SceneBadge({ entry, testPrefix = "scene-badge" }: { entry: RawIm
   );
 }
 
+/** RAW with a camera JPEG sibling paired at import (`ImportOptions.pairJpegWithRaw`). */
+export function CompanionBadge({ entry, testPrefix = "companion" }: { entry: RawImageEntry; testPrefix?: string }) {
+  if (!entry.companionPath) return null;
+  const name = entry.companionPath.split("/").pop();
+  return (
+    <span title={`Paired with ${name}`} data-testid={`${testPrefix}-${entry.id}`} className="rounded bg-neutral-800/90 px-1 text-[10px] font-semibold text-neutral-200">
+      +JPG
+    </span>
+  );
+}
+
 export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick }: Props) {
   const t = entry?.thumbnail;
   const compact = size < 150;
@@ -98,6 +109,7 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
           </div>
           <div className="pointer-events-none absolute right-1 top-1 flex items-center gap-1">
             <XmpBadge entry={entry} />
+            <CompanionBadge entry={entry} />
             <SceneBadge entry={entry} />
             {entry.burstGroupId != null && (
               <span

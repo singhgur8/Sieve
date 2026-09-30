@@ -1,5 +1,5 @@
-import { useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, FileUp, RotateCcw } from "lucide-react";
+import { useState } from "react";
+import { FileUp } from "lucide-react";
 import type { AdjustmentField, LutInfo, ParametricAdjustments } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
 import {
@@ -8,9 +8,8 @@ import {
   BASIC,
   BASIC_FIELDS,
   copyFields,
+  HSL_BW_FIELDS,
   HSL_FIELD,
-  HSL_FIELDS,
-  neutralAdjustments,
   posToTemp,
   PRESENCE,
   PRESENCE_FIELDS,
@@ -20,39 +19,26 @@ import {
 } from "../../lib/adjust";
 import { Slider } from "./Slider";
 import { HistogramView } from "./Histogram";
-
-function Section({ id, title, onReset, children, defaultOpen = true }: { id: string; title: string; onReset?: () => void; children: ReactNode; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <section className="border-b border-neutral-800 py-2" data-testid={`section-${id}`}>
-      <div className="mb-1 flex items-center justify-between">
-        <button className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-neutral-300" onClick={() => setOpen(!open)}>
-          {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-          {title}
-        </button>
-        {onReset && (
-          <button className="text-neutral-400 hover:text-neutral-200" title={`Reset ${title}`} onClick={onReset} data-testid={`reset-${id}`}>
-            <RotateCcw className="size-3.5" />
-          </button>
-        )}
-      </div>
-      {open && children}
-    </section>
-  );
-}
-
-const seg = (on: boolean) => `flex-1 rounded px-2 py-0.5 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
+import { Section, seg } from "./fields";
+import { ProfilePanel } from "./ProfilePanel";
+import { ToneCurvePanel } from "./ToneCurvePanel";
+import { ColorGradingPanel } from "./ColorGradingPanel";
+import { CalibrationPanel, DetailPanel, EffectsPanel } from "./DetailPanels";
+import { CropPanel, type CropApi } from "./CropPanel";
 
 interface Props {
   editor: Editor;
   luts: LutInfo[];
   onImportLut: () => void;
+  imageId: number | null;
+  onError: (e: unknown) => void;
+  crop: CropApi;
 }
 
-export function AdjustPanel({ editor, luts, onImportLut }: Props) {
+export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop }: Props) {
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
-  const resetFields = (fields: AdjustmentField[], label: string) => change((a) => copyFields(a, neutralAdjustments(), fields), label);
+  const resetFields = (fields: AdjustmentField[], label: string) => change((a) => copyFields(a, editor.defaults, fields), label);
 
   const simple = (d: SliderDef) => (
     <Slider
@@ -66,7 +52,7 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
       digits={d.digits}
       onInput={(v) => edit((a) => ({ ...a, [d.key]: v }), d.label)}
       onCommit={commit}
-      onReset={() => change((a) => ({ ...a, [d.key]: 0 }), d.label)}
+      onReset={() => change((a) => ({ ...a, [d.key]: editor.defaults[d.key] }), d.label)}
     />
   );
 
@@ -89,6 +75,14 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
       <div className="py-2">
         <HistogramView h={editor.histogram} />
       </div>
+
+      <Section id="crop" title="Crop" onReset={() => resetFields(["crop"], "Reset Crop")}>
+        <CropPanel editor={editor} crop={crop} />
+      </Section>
+
+      <Section id="profile" title="Profile" onReset={() => resetFields(["profile"], "Reset Profile")}>
+        <ProfilePanel editor={editor} imageId={imageId} onError={onError} />
+      </Section>
 
       <Section id="basic" title="Basic" onReset={() => resetFields(BASIC_FIELDS, "Reset Basic")}>
         <div className="mb-2 flex gap-1" data-testid="wb-mode">
@@ -141,36 +135,82 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
         {PRESENCE.map(simple)}
       </Section>
 
-      <Section id="hsl" title="Color Mixer" onReset={() => resetFields(HSL_FIELDS, "Reset Color Mixer")}>
-        <div className="mb-2 flex gap-1" data-testid="hsl-tabs">
-          {(["hue", "saturation", "luminance"] as const).map((k) => (
-            <button key={k} className={seg(hslTab === k)} onClick={() => setHslTab(k)} data-testid={`hsl-tab-${k}`}>
-              {k === "hue" ? "Hue" : k === "saturation" ? "Sat" : "Lum"}
-            </button>
-          ))}
+      <Section id="tone-curve" title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
+        <ToneCurvePanel editor={editor} />
+      </Section>
+
+      <Section id="hsl" title={adj.blackAndWhite.enabled ? "Black & White" : "Color Mixer"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
+        <div className="mb-2 flex gap-1" data-testid="bw-mode">
+          <button className={seg(!adj.blackAndWhite.enabled)} onClick={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, enabled: false } }), "Color")} data-testid="bw-off">
+            Color
+          </button>
+          <button className={seg(adj.blackAndWhite.enabled)} onClick={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, enabled: true } }), "Black & White")} data-testid="bw-on">
+            Black &amp; White
+          </button>
         </div>
-        <button
-          className="mb-1 text-[11px] text-neutral-400 hover:text-neutral-200"
-          onClick={() => resetFields([HSL_FIELD[hslTab]], `Reset ${hslTab}`)}
-          data-testid="hsl-reset-tab"
-        >
-          Reset {hslTab}
-        </button>
-        {BANDS.map((b) => (
-          <Slider
-            key={b}
-            id={`hsl-${hslTab}-${b}`}
-            label={b[0].toUpperCase() + b.slice(1)}
-            value={adj.hsl[hslTab][b]}
-            min={-100}
-            max={100}
-            step={1}
-            accent={BAND_COLOR[b]}
-            onInput={(v) => edit((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: v } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
-            onCommit={commit}
-            onReset={() => change((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: 0 } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
-          />
-        ))}
+        {adj.blackAndWhite.enabled ? (
+          <div data-testid="bw-mixer">
+            {BANDS.map((b) => (
+              <Slider
+                key={b}
+                id={`bw-${b}`}
+                label={b[0].toUpperCase() + b.slice(1)}
+                value={adj.blackAndWhite.mixer[b]}
+                min={-100}
+                max={100}
+                step={1}
+                accent={BAND_COLOR[b]}
+                onInput={(v) => edit((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [b]: v } } }), `B&W: ${b}`)}
+                onCommit={commit}
+                onReset={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [b]: editor.defaults.blackAndWhite.mixer[b] } } }), `B&W: ${b}`)}
+              />
+            ))}
+          </div>
+        ) : (
+          <>
+            <div className="mb-2 flex gap-1" data-testid="hsl-tabs">
+              {(["hue", "saturation", "luminance"] as const).map((k) => (
+                <button key={k} className={seg(hslTab === k)} onClick={() => setHslTab(k)} data-testid={`hsl-tab-${k}`}>
+                  {k === "hue" ? "Hue" : k === "saturation" ? "Sat" : "Lum"}
+                </button>
+              ))}
+            </div>
+            <button
+              className="mb-1 text-[11px] text-neutral-400 hover:text-neutral-200"
+              onClick={() => resetFields([HSL_FIELD[hslTab]], `Reset ${hslTab}`)}
+              data-testid="hsl-reset-tab"
+            >
+              Reset {hslTab}
+            </button>
+            {BANDS.map((b) => (
+              <Slider
+                key={b}
+                id={`hsl-${hslTab}-${b}`}
+                label={b[0].toUpperCase() + b.slice(1)}
+                value={adj.hsl[hslTab][b]}
+                min={-100}
+                max={100}
+                step={1}
+                accent={BAND_COLOR[b]}
+                onInput={(v) => edit((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: v } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
+                onCommit={commit}
+                onReset={() => change((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: 0 } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
+              />
+            ))}
+          </>
+        )}
+      </Section>
+
+      <Section id="color-grading" title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
+        <ColorGradingPanel editor={editor} />
+      </Section>
+
+      <Section id="detail" title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
+        <DetailPanel editor={editor} />
+      </Section>
+
+      <Section id="effects" title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
+        <EffectsPanel editor={editor} />
       </Section>
 
       <Section id="lut" title="LUT" onReset={() => resetFields(["lut"], "Reset LUT")}>
@@ -211,6 +251,10 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
             onReset={() => change((a) => ({ ...a, lut: a.lut ? { ...a.lut, amount: 100 } : null }), "LUT")}
           />
         )}
+      </Section>
+
+      <Section id="calibration" title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
+        <CalibrationPanel editor={editor} />
       </Section>
     </div>
   );

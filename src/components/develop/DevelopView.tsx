@@ -14,6 +14,11 @@ import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
 import { AdjustPanel } from "./AdjustPanel";
 import { LeftPanel } from "./LeftPanel";
 import { FieldsDialog } from "./FieldsDialog";
+import { CropOverlay, type CropTool } from "./CropOverlay";
+import type { CropApi } from "./CropPanel";
+import { WarningsChip } from "./WarningsChip";
+import { FULL, fromStored, isFull, toStored } from "../../lib/crop";
+import { setSectionOpen } from "../../lib/sections";
 import { Viewer, visibleRegion, type Size, type Zoom } from "./Viewer";
 
 export interface DevelopHandle {
@@ -24,6 +29,12 @@ export interface DevelopHandle {
   sync: () => void;
   reset: () => void;
   toggleSplit: () => void;
+  /** R: start the crop tool, or apply it when already active. */
+  toggleCrop: () => void;
+  /** Enter: apply the crop (no-op when the tool is inactive). */
+  commitCrop: () => void;
+  /** Esc: discard the crop tool; true when it was active (so the caller does not also leave Develop). */
+  cancelCrop: () => boolean;
   undo: () => void;
   redo: () => void;
 }
@@ -51,12 +62,18 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [luts, setLuts] = useState<LutInfo[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [cropTool, setCropTool] = useState<CropTool | null>(null);
+  const cropRef = useRef<CropTool | null>(null);
+  cropRef.current = cropTool;
   const copied = useClipboard();
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
 
   const { refresh } = lib;
   const onChanged = useCallback((changed: number) => void refresh([changed]).catch(() => {}), [refresh]);
+  const entry = id != null ? lib.getEntry(id) : undefined;
   const editor = useEditor(id, {
+    format: entry?.format,
+    uncropped: cropTool !== null,
     maxEdge: Math.ceil(Math.max(size.w, size.h) * dpr),
     region,
     wantBefore: showBefore || split,
@@ -86,7 +103,35 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   // New image: back to fit.
   useEffect(() => setZoom({ on: false, cx: 0.5, cy: 0.5 }), [id]);
 
-  const toggleZoom = useCallback((at?: { x: number; y: number }) => setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
+  // ---- crop tool ----
+  useEffect(() => setCropTool(null), [id]);
+  const orientation = entry?.orientation ?? 1;
+  const imageAspect = editor.main && editor.main.uncropped && editor.main.height > 0 ? editor.main.width / editor.main.height : 0;
+  const startCrop = useCallback(() => {
+    if (id == null) return;
+    const c = editor.adj.crop;
+    setZoom({ on: false, cx: 0.5, cy: 0.5 });
+    setShowBefore(false);
+    setSplit(false);
+    setSectionOpen("crop", true);
+    setCropTool({ rect: c.enabled ? fromStored(c, orientation) : FULL, angle: c.angle, aspect: "free", flip: false });
+  }, [id, editor.adj.crop, orientation]);
+  const commitCrop = useCallback(() => {
+    const t = cropRef.current;
+    if (!t) return;
+    setCropTool(null);
+    const next = isFull(t.rect) && t.angle === 0 ? { ...editor.defaults.crop } : toStored(t.rect, orientation, t.angle);
+    if (JSON.stringify(next) === JSON.stringify(editor.adj.crop)) return; // nothing changed: no history entry
+    editor.change((a) => ({ ...a, crop: next }), "Crop");
+  }, [editor, orientation]);
+  const cancelCrop = useCallback(() => {
+    if (!cropRef.current) return false;
+    setCropTool(null);
+    return true;
+  }, []);
+  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: setCropTool, commit: commitCrop, cancel: cancelCrop };
+
+  const toggleZoom = useCallback((at?: { x: number; y: number }) => cropRef.current || setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
 
   // Presets and LUTs.
   const loadPresets = useCallback(() => unwrap(commands.listPresets()).then(setPresets).catch(onError), [onError]);
@@ -181,10 +226,13 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       sync: () => (syncTargets.length > 0 ? setDialog({ kind: "sync" }) : onNotice("Cmd/Shift-click other photos in the filmstrip to sync to them")),
       reset: doReset,
       toggleSplit: () => setSplit((v) => !v),
+      toggleCrop: () => (cropRef.current ? commitCrop() : startCrop()),
+      commitCrop,
+      cancelCrop,
       undo: editor.undo,
       redo: editor.redo,
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo],
+    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo, commitCrop, cancelCrop, startCrop],
   );
 
   // ---- filmstrip ----
@@ -200,7 +248,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     if (activeIndex >= 0) virt.scrollToIndex(activeIndex, { align: "auto" });
   }, [activeIndex, virt]);
 
-  const entry = id != null ? lib.getEntry(id) : undefined;
   const btn = (on = false) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40`;
 
   return (
@@ -247,6 +294,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             <RotateCcw className="size-3.5" /> Reset
           </button>
         </div>
+        <WarningsChip warnings={info?.warnings ?? []} />
         <span className="ml-auto text-[11px] tabular-nums text-neutral-400" data-testid="render-ms">
           {editor.main ? `${editor.main.width}x${editor.main.height} · ${Math.round(editor.main.renderMs)} ms` : ""}
         </span>
@@ -270,7 +318,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onGoto={editor.goto}
           />
         </aside>
-        <div className="min-w-0 flex-1">
+        <div className="relative min-w-0 flex-1">
           <Viewer
             main={editor.main}
             before={editor.before}
@@ -290,9 +338,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             onPanEnd={onPanEnd}
             onToggleZoom={toggleZoom}
           />
+          {cropTool && imageAspect > 0 && <CropOverlay tool={cropTool} size={size} imageAspect={imageAspect} onChange={setCropTool} />}
+          {cropTool && (
+            <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="crop-badge">
+              Crop: Enter applies, Esc cancels
+            </span>
+          )}
         </div>
         <aside className="w-72 shrink-0 border-l border-neutral-800">
-          <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} />
+          <AdjustPanel editor={editor} luts={luts} onImportLut={importLut} imageId={id} onError={onError} crop={cropApi} />
         </aside>
       </div>
 

@@ -11,10 +11,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
   unwrap,
+  completeAdjustments,
+  defaultAdjustments,
   type AdjustmentHistory,
+  type CompleteAdjustments,
   type DevelopInfo,
   type EditState,
   type Histogram,
+  type ImageFormat,
   type NormRect,
   type ParametricAdjustments,
   type RenderSlot,
@@ -29,6 +33,8 @@ export interface RenderView {
   seq: number;
   renderMs: number;
   lutMissing: boolean;
+  /** Rendered with the crop disabled (the crop tool shows the whole frame). */
+  uncropped: boolean;
 }
 
 export interface EditorOptions {
@@ -40,10 +46,16 @@ export interface EditorOptions {
   onError: (e: unknown) => void;
   /** Called after a history entry was saved / changed, so the library can refresh `hasEdits`. */
   onChanged: (id: number) => void;
+  /** Source format of the image (selects the neutral defaults); RAW when unknown. */
+  format?: ImageFormat;
+  /** Render the full, uncropped frame (crop tool active). */
+  uncropped?: boolean;
 }
 
 export interface Editor {
-  adj: ParametricAdjustments;
+  adj: CompleteAdjustments;
+  /** Neutral settings for this image's format ("reset" values). */
+  defaults: CompleteAdjustments;
   history: AdjustmentHistory | null;
   info: DevelopInfo | null;
   main: RenderView | null;
@@ -52,13 +64,13 @@ export interface Editor {
   histogram: Histogram | null;
   loading: boolean;
   /** Live edit (slider input): updates state and schedules a render. `label` names the history entry. */
-  edit: (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => void;
+  edit: (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string) => void;
   /** Persist the pending live edit (slider release). */
   commit: () => void;
   /** Persist any pending edit and wait for all queued saves/undos to finish (call before batch commands). */
   flush: () => Promise<void>;
   /** edit + commit in one go (buttons, dropdowns, resets). */
-  change: (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => void;
+  change: (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string) => void;
   undo: () => void;
   redo: () => void;
   goto: (entryId: number) => void;
@@ -67,7 +79,7 @@ export interface Editor {
 }
 
 export function useEditor(id: number | null, opts: EditorOptions): Editor {
-  const [adj, setAdj] = useState<ParametricAdjustments>(neutralAdjustments);
+  const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
   const [info, setInfo] = useState<DevelopInfo | null>(null);
   const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null });
@@ -79,6 +91,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const idRef = useRef(id);
   idRef.current = id;
   const adjRef = useRef(adj);
+  const lastProfile = useRef("");
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
   const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false });
@@ -104,7 +117,9 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (inflight.current.has(key)) return; // its completion pumps again with the latest adjustments
     want.current[slot] = false;
     inflight.current.add(key);
-    const a = slot === "before" ? neutralAdjustments() : adjRef.current;
+    const cropOff = !!o.uncropped && slot !== "before";
+    const base = slot === "before" ? neutralAdjustments(o.format) : adjRef.current;
+    const a: ParametricAdjustments = cropOff ? { ...base, crop: { ...base.crop, enabled: false } } : base;
     const full = Math.min(2048, Math.max(64, Math.round(o.maxEdge)));
     const edge = draft.current && slot === "main" ? Math.max(256, Math.min(1024, Math.round(o.maxEdge / 2))) : full;
     const options = { maxEdge: Math.min(edge, full), slot, region: slot === "detail" ? o.region : null };
@@ -122,7 +137,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
         const k = `${r.imageId}:${r.slot}`;
         if (r.seq <= (lastSeq.current.get(k) ?? -1)) return; // older than what is shown
         lastSeq.current.set(k, r.seq);
-        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing };
+        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing, uncropped: cropOff || !base.crop.enabled };
         setViews((prev) => ({ ...prev, [r.slot]: v }));
         if (r.slot === "main") setHistogram(r.histogram);
       })
@@ -149,8 +164,10 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     schedule("main");
   }, [schedule]);
 
-  const setAdjBoth = useCallback((a: ParametricAdjustments) => {
+  const setAdjBoth = useCallback((a0: ParametricAdjustments) => {
+    const a = completeAdjustments(a0, optsRef.current.format);
     adjRef.current = a;
+    lastProfile.current ||= JSON.stringify(a.profile);
     setAdj(a);
   }, []);
 
@@ -164,6 +181,12 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       const h = await unwrap(commands.saveAdjustments(p.id, snapshot, p.label));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
+      // Profile / look availability warnings depend on the saved settings.
+      const pk = JSON.stringify(snapshot.profile);
+      if (pk !== lastProfile.current && idRef.current === p.id) {
+        lastProfile.current = pk;
+        setInfo(await unwrap(commands.getDevelopInfo(p.id)));
+      }
     });
   }, [enqueue, endDraft]);
 
@@ -176,6 +199,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     setHistogram(null);
     setInfo(null);
     setHistory(null);
+    lastProfile.current = "";
     Promise.all([unwrap(commands.getAdjustments(id)), unwrap(commands.getHistory(id)), unwrap(commands.getDevelopInfo(id))])
       .then(([a, h, i]) => {
         if (stale) return;
@@ -201,6 +225,10 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   useEffect(() => {
     if (id != null && opts.wantBefore) schedule("before");
   }, [id, opts.wantBefore, schedule]);
+  const uncropped = !!opts.uncropped;
+  useEffect(() => {
+    if (id != null) schedule("main");
+  }, [id, uncropped, schedule]);
   const regionKey = opts.region ? JSON.stringify(opts.region) : "";
   useEffect(() => {
     if (id != null && regionKey) schedule("detail");
@@ -210,7 +238,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   useEffect(() => () => clearTimeout(draftTimer.current), []);
 
   const applyEdit = useCallback(
-    (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string, isDraft: boolean) => {
+    (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string, isDraft: boolean) => {
       const cur = idRef.current;
       if (cur == null) return;
       if (pending.current && pending.current.label !== label) commitPending();
@@ -226,10 +254,10 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     [commitPending, setAdjBoth, schedule, endDraft],
   );
 
-  const edit = useCallback((mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => applyEdit(mutate, label, true), [applyEdit]);
+  const edit = useCallback((mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string) => applyEdit(mutate, label, true), [applyEdit]);
 
   const change = useCallback(
-    (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => {
+    (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string) => {
       applyEdit(mutate, label, false);
       commitPending();
     },
@@ -280,7 +308,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   }, [commitPending, setAdjBoth, schedule]);
 
   return useMemo(
-    () => ({ adj, history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload }),
-    [adj, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload],
+    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload }),
+    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload],
   );
 }

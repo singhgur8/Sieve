@@ -1,6 +1,6 @@
 // Slider definitions, neutral adjustments and helpers for the Develop module.
-import type { AdjustmentField, HslChannels, ParametricAdjustments } from "../ipc";
-import { ADJUSTMENT_FIELD_LABELS, copyAdjustmentFields } from "../ipc";
+import type { AdjustmentField, HslChannels, ImageFormat, ParametricAdjustments } from "../ipc";
+import { ADJUSTMENT_FIELD_LABELS, copyAdjustmentFields, defaultAdjustments, type CompleteAdjustments } from "../ipc";
 
 export type Band = keyof HslChannels;
 export const BANDS: Band[] = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"];
@@ -17,28 +17,9 @@ export const BAND_COLOR: Record<Band, string> = {
 export type HslKind = "hue" | "saturation" | "luminance";
 export const HSL_FIELD: Record<HslKind, AdjustmentField> = { hue: "hsl_hue", saturation: "hsl_saturation", luminance: "hsl_luminance" };
 
-const zeroBands = (): HslChannels => ({ red: 0, orange: 0, yellow: 0, green: 0, aqua: 0, blue: 0, purple: 0, magenta: 0 });
-
-export const PROCESS_VERSION = 1;
-
-export function neutralAdjustments(): ParametricAdjustments {
-  return {
-    processVersion: PROCESS_VERSION,
-    whiteBalance: { mode: "as_shot" },
-    exposure: 0,
-    contrast: 0,
-    highlights: 0,
-    shadows: 0,
-    whites: 0,
-    blacks: 0,
-    texture: 0,
-    clarity: 0,
-    dehaze: 0,
-    vibrance: 0,
-    saturation: 0,
-    hsl: { hue: zeroBands(), saturation: zeroBands(), luminance: zeroBands() },
-    lut: null,
-  };
+/** Neutral (Lightroom default) settings for a source format; RAW when unknown. */
+export function neutralAdjustments(format?: ImageFormat): CompleteAdjustments {
+  return defaultAdjustments(format);
 }
 
 export type SimpleKey = "exposure" | "contrast" | "highlights" | "shadows" | "whites" | "blacks" | "texture" | "clarity" | "dehaze" | "vibrance" | "saturation";
@@ -83,6 +64,7 @@ export const FIELD_LABEL: Record<AdjustmentField, string> = ADJUSTMENT_FIELD_LAB
 export const BASIC_FIELDS: AdjustmentField[] = ["white_balance", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"];
 export const PRESENCE_FIELDS: AdjustmentField[] = ["texture", "clarity", "dehaze", "vibrance", "saturation"];
 export const HSL_FIELDS: AdjustmentField[] = ["hsl_hue", "hsl_saturation", "hsl_luminance"];
+export const HSL_BW_FIELDS: AdjustmentField[] = [...HSL_FIELDS, "black_and_white"];
 
 /** Copies the `fields` groups of `src` over `dst` (mirrors `ParametricAdjustments::copy_fields`). */
 export function copyFields(dst: ParametricAdjustments, src: ParametricAdjustments, fields: AdjustmentField[]): ParametricAdjustments {
