@@ -19,6 +19,8 @@ export interface Library {
   pin: (ids: number[]) => void;
   patch: (ids: number[], fn: (e: RawImageEntry) => RawImageEntry) => void;
   refresh: (ids: number[]) => Promise<void>;
+  /** Re-fetches every entry currently cached (after bulk changes such as scene edits). */
+  refreshAll: () => Promise<void>;
   reload: () => Promise<void>;
   touch: () => void;
 }
@@ -125,6 +127,11 @@ export function useLibrary(query: Query, onError: (e: unknown) => void): Library
     [merge, touch],
   );
 
+  const refreshAll = useCallback(async () => {
+    const all = [...entries.current.keys()];
+    for (let i = 0; i < all.length; i += CHUNK * 4) await refresh(all.slice(i, i + CHUNK * 4));
+  }, [refresh]);
+
   const refreshLoaded = useCallback(
     (list: number[]) => {
       const have = list.filter((id) => entries.current.has(id));
@@ -166,5 +173,5 @@ export function useLibrary(query: Query, onError: (e: unknown) => void): Library
   const getEntry = useCallback((id: number) => entries.current.get(id), []);
   const version = useCallback((id: number) => versions.current.get(id) ?? 0, []);
 
-  return { ids, epoch, loaded, getEntry, version, ensure, pin, patch, refresh, reload, touch };
+  return { ids, epoch, loaded, getEntry, version, ensure, pin, patch, refresh, refreshAll, reload, touch };
 }

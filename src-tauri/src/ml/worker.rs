@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_specta::Event;
 
-use super::bursts::{demote, group_bursts};
+use super::bursts::{apply_pins, demote, group_bursts};
 use super::store::{self, BurstRow};
 use super::{score, AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
 use crate::db::{self, now_ms, repo};
@@ -299,13 +299,15 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
             by_folder.entry(a.folder_id).or_default().push((frame, i));
         }
     }
+    let pins = store::pinned_keepers(conn)?;
     let mut rows = Vec::new();
     for frames in by_folder.values() {
         let index: std::collections::HashMap<ImageId, usize> = frames.iter().map(|(f, i)| (f.id, *i)).collect();
         let times: std::collections::HashMap<ImageId, i64> =
             frames.iter().map(|(f, _)| (f.id, f.captured_at_ms)).collect();
         let plain: Vec<BurstFrame> = frames.iter().map(|(f, _)| *f).collect();
-        for b in group_bursts(&plain, window, thresholds.burst_hash_distance) {
+        for mut b in group_bursts(&plain, window, thresholds.burst_hash_distance) {
+            apply_pins(&mut b, &pins, |m| scored[index[&m]].quality.overall);
             for &m in &b.members {
                 if m != b.keeper {
                     demote(&mut scored[index[&m]].quality);
@@ -496,6 +498,17 @@ mod tests {
         assert_eq!(untouched, 4);
         let faces = repo::get_faces(&conn, 4).unwrap();
         assert!(faces[0].blink && faces[0].primary);
+
+        // A user-chosen keeper survives regrouping, and suggestions follow it.
+        store::set_burst_keeper(&mut db::open(&config.catalog_path).unwrap(), groups[0].id, 1).unwrap();
+        rescore_all(&mut db::open(&config.catalog_path).unwrap()).unwrap();
+        let groups = repo::list_burst_groups(&conn, None).unwrap();
+        assert_eq!(groups[0].keeper_image_id, Some(1));
+        assert!(tags_of(&conn, 1).is_empty());
+        assert_eq!(tags_of(&conn, 2), vec!["duplicate_burst", "motion_blur"]);
+        let pick2: String =
+            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(pick2, "reject");
 
         // Narrower burst window (rescore) dissolves the group and its duplicate tag.
         repo::set_burst_window(&conn, 400).unwrap();

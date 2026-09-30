@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
 
-use super::types::{ExportFailure, ExportJobId, ImageId};
+use super::types::{ExportFailure, ExportJobId, ImageId, SceneTask};
 
 /// Progress of the ingest pipeline (thumbnail + EXIF extraction).
 /// Counts cover the current pipeline run: images queued since the pipeline was last
@@ -135,4 +135,15 @@ pub struct ExportFinished {
     pub output_dir: Option<String>,
     /// Wall time since the job started running (excludes time queued); 0 if it never ran.
     pub elapsed_ms: u32,
+}
+
+/// Progress of a running `detect_scenes` (feature extraction over previews) or `match_scene`
+/// (renders per target). Throttled (~10/s, always ending with `done == total`). Only drives a
+/// progress bar; the command's result arrives when it resolves.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneProgress {
+    pub task: SceneTask,
+    pub done: u32,
+    pub total: u32,
 }

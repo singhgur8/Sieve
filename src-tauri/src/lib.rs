@@ -6,6 +6,7 @@ pub mod ipc;
 pub mod lut;
 pub mod ml;
 pub mod raw;
+pub mod scene;
 pub mod xmp;
 
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
     AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress, ImportProgress,
-    ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    SceneProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -102,6 +103,25 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::export_images,
             commands::cancel_export,
             commands::get_export_jobs,
+            commands::detect_scenes,
+            commands::list_scenes,
+            commands::get_scene,
+            commands::create_scene,
+            commands::set_scene_members,
+            commands::set_scene_anchors,
+            commands::merge_scenes,
+            commands::split_scene,
+            commands::delete_scene,
+            commands::match_scene,
+            commands::apply_scene_match,
+            commands::get_render_stats,
+            commands::set_burst_keeper,
+            commands::get_cull_snapshot,
+            commands::restore_cull_snapshot,
+            commands::get_ui_prefs,
+            commands::set_ui_prefs,
+            commands::reveal_in_finder,
+            commands::write_xmp_all_dirty,
         ])
         .events(collect_events![
             ImportProgress,
@@ -114,7 +134,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             XmpSynced,
             XmpWriteFailed,
             ExportProgress,
-            ExportFinished
+            ExportFinished,
+            SceneProgress
         ])
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()

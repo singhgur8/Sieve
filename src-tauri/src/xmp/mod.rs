@@ -278,6 +278,16 @@ impl XmpSync {
         self.run_explicit(ids, SyncPolicy::CatalogWins)
     }
 
+    /// `write_xmp_all_dirty`: [`Self::write_images`] over every `xmp_dirty` image of `folder`
+    /// (all folders for `None`). Works whether or not auto-sync is on. Blocking.
+    pub fn write_dirty(&self, folder: Option<FolderId>) -> AppResult<XmpSyncReport> {
+        let ids = store::dirty_ids_in(&db::open(&self.config.catalog_path)?, folder)?;
+        if ids.is_empty() {
+            return Ok(XmpSyncReport::default());
+        }
+        self.write_images(&ids)
+    }
+
     /// `read_xmp`: reads sidecars for `ids` into the catalog ([`SyncPolicy::SidecarWins`]);
     /// images without a sidecar count as `skipped`. Unknown ids -> `not_found`.
     /// Blocking (call from `spawn_blocking`).
