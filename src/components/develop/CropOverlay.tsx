@@ -1,7 +1,7 @@
 // Crop tool overlay: dimmed outside, rule-of-thirds grid, 8 resize handles and a movable body over the fitted frame.
 // Straightening (Lightroom parity): dragging outside the rectangle rotates the photo about the crop centre, Cmd/Ctrl-drag
 // draws a line that is levelled, and the rectangle stays axis-aligned and inside the rotated image.
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   HANDLES,
   ASPECTS,
@@ -126,6 +126,19 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
   const spin = useRef<{ mode: "rotate" | "line"; a0: number; rot0: number; start: P } | null>(null);
   const [line, setLine] = useState<{ a: P; b: P } | null>(null);
   const [meta, setMeta] = useState(false);
+  // While Cmd / Ctrl is held the hit layer moves above the crop rectangle, so a straighten line can start anywhere.
+  useEffect(() => {
+    const sync = (e: KeyboardEvent) => setMeta(e.metaKey || e.ctrlKey);
+    const off = () => setMeta(false);
+    window.addEventListener("keydown", sync);
+    window.addEventListener("keyup", sync);
+    window.addEventListener("blur", off);
+    return () => {
+      window.removeEventListener("keydown", sync);
+      window.removeEventListener("keyup", sync);
+      window.removeEventListener("blur", off);
+    };
+  }, []);
   if (size.w <= 0 || size.h <= 0 || !(imageAspect > 0)) return null;
   const iw = Math.min(size.w, size.h * imageAspect);
   const ih = iw / imageAspect;
@@ -194,7 +207,6 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     return rot0 - al;
   };
   const spinMove = (e: React.PointerEvent) => {
-    setMeta(e.metaKey || e.ctrlKey);
     const s = spin.current;
     if (!s) return;
     const p = lp(e);
@@ -223,7 +235,8 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
       <div
         ref={layer}
         className="pointer-events-auto absolute -inset-6 touch-none"
-        style={{ cursor: meta ? "crosshair" : ROTATE_CURSOR }}
+        style={{ cursor: meta ? "crosshair" : ROTATE_CURSOR, zIndex: meta ? 30 : 0 }}
+        data-cmd={meta}
         data-testid="crop-rotate-layer"
         onPointerDown={spinDown}
         onPointerMove={spinMove}

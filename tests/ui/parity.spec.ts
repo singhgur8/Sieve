@@ -344,9 +344,11 @@ test.describe("crop tool", () => {
     await expect.poll(async () => (await saved(page)).length).toBe(1);
     const s = await lastSave(page);
     expect(s.label).toBe("Crop");
-    expect(s.adjustments.crop).toMatchObject({ enabled: true, top: 0, left: 0, angle: 3.5 });
-    expect(s.adjustments.crop.right).toBeCloseTo(rect.r, 2);
-    expect(s.adjustments.crop.bottom).toBeCloseTo(rect.b, 2);
+    // Straightened: the stored corners are those of the rotated frame in the source (see polish.spec for the round trip).
+    expect(s.adjustments.crop).toMatchObject({ enabled: true, angle: 3.5 });
+    expect(s.adjustments.crop.right).toBeGreaterThan(s.adjustments.crop.left);
+    expect(s.adjustments.crop.bottom).toBeGreaterThan(s.adjustments.crop.top);
+    expect(s.adjustments.crop.right).toBeLessThanOrEqual(1);
     // The render of the cropped frame follows (mock: aspect changes).
     await expect.poll(async () => (await calls(page, "render_preview")).filter((c) => c.args.options.slot === "main").pop()!.args.adjustments.crop.enabled).toBe(true);
     await expect(page.getByTestId("crop-status")).toContainText("Cropped");
