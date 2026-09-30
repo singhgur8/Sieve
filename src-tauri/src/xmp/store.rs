@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::{ColorLabel, FolderId, ImageId, PickFlag};
+use crate::ipc::types::{ColorLabel, FolderId, ImageId, ParametricAdjustments, PickFlag};
 
 /// XMP-relevant catalog state of one image.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +116,17 @@ pub fn apply_read(
     )?;
     tx.commit()?;
     Ok(changed)
+}
+
+/// Stored develop settings, only for images that have an `adjustments` row (images never
+/// edited in Sieve get no `crs:` written).
+pub fn develop_settings(conn: &Connection, id: ImageId) -> AppResult<Option<ParametricAdjustments>> {
+    let has_row: bool =
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM adjustments WHERE image_id = ?1)", [id], |r| r.get(0))?;
+    if !has_row {
+        return Ok(None);
+    }
+    Ok(Some(crate::db::repo::get_adjustments(conn, id)?))
 }
 
 pub fn mark_failed(conn: &Connection, id: ImageId, reason: &str) -> AppResult<()> {

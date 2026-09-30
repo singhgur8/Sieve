@@ -13,7 +13,13 @@ const DARKTABLE: &str = include_str!("fixtures/darktable.xmp");
 const DATE: &str = "2026-09-29T12:00:00Z";
 
 fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
-    Desired { rating, label, tags: tags.iter().map(|t| t.to_string()).collect(), metadata_date: DATE.into() }
+    Desired {
+        rating,
+        label,
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        metadata_date: DATE.into(),
+        develop: Vec::new(),
+    }
 }
 
 /// Every line of `orig` not mentioning a field we own must appear in `out`, in order.
@@ -231,11 +237,11 @@ fn row(rating: u8, pick: PickFlag, label: Option<ColorLabel>) -> ImageRow {
 
 #[test]
 fn catalog_to_sidecar_mapping() {
-    let d = desired(&row(4, PickFlag::Reject, Some(ColorLabel::Blue)), &[]);
+    let d = desired(&row(4, PickFlag::Reject, Some(ColorLabel::Blue)), &[], None);
     assert_eq!((d.rating, d.label), (-1, Some("Blue")));
-    let d = desired(&row(2, PickFlag::Pick, Some(ColorLabel::Blue)), &[]);
+    let d = desired(&row(2, PickFlag::Pick, Some(ColorLabel::Blue)), &[], None);
     assert_eq!((d.rating, d.label), (2, Some("Pick")));
-    let d = desired(&row(0, PickFlag::Unflagged, None), &["blink".into()]);
+    let d = desired(&row(0, PickFlag::Unflagged, None), &["blink".into()], None);
     assert_eq!((d.rating, d.label, d.tags), (0, None, vec!["blink".to_string()]));
 }
 
@@ -684,4 +690,195 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
             fs::copy(s, keep.join(s.file_name().unwrap())).unwrap();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Develop settings (crs:)
+// ---------------------------------------------------------------------------
+
+fn edited() -> ParametricAdjustments {
+    use crate::ipc::types::{HslAdjustments, HslChannels, LutRef, WhiteBalance};
+    ParametricAdjustments {
+        white_balance: WhiteBalance::Custom { temperature_k: 4350.0, tint: -7.5 },
+        exposure: -0.65,
+        contrast: 18.0,
+        highlights: -55.0,
+        shadows: 32.0,
+        whites: 5.0,
+        blacks: -12.0,
+        texture: 10.0,
+        clarity: 15.0,
+        dehaze: 7.0,
+        vibrance: 22.0,
+        saturation: -4.0,
+        hsl: HslAdjustments {
+            hue: HslChannels { orange: -6.0, blue: 12.0, ..Default::default() },
+            saturation: HslChannels { aqua: -30.0, ..Default::default() },
+            luminance: HslChannels { orange: 8.5, ..Default::default() },
+        },
+        lut: Some(LutRef { id: "film-a1b2c3d4".into(), amount: 65.0 }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn develop_settings_written_only_for_edited_images_and_merged() {
+    let f = Fixture::new(2);
+    fs::write(f.sidecar(0), LIGHTROOM).unwrap();
+    fs::write(f.sidecar(1), LIGHTROOM).unwrap();
+    let mut conn = f.conn();
+    develop::history::commit(&mut conn, f.ids[0], &edited(), "Exposure").unwrap();
+    // Image 1 is only rated: its Lightroom crs: settings must not be touched.
+    repo::set_rating(&mut conn, &f.ids[1..], 5).unwrap();
+    let report = f.sync.write_images(&f.ids).unwrap();
+    assert_eq!(report.succeeded, 2);
+
+    let out1 = fs::read_to_string(f.sidecar(1)).unwrap();
+    for line in LIGHTROOM.lines().filter(|l| l.contains("crs:")) {
+        assert!(out1.contains(line), "untouched crs: line lost: {line}");
+    }
+
+    let out0 = fs::read_to_string(f.sidecar(0)).unwrap();
+    assert!(out0.contains("crs:Exposure2012=\"-0.65\""), "{out0}");
+    assert!(out0.contains("crs:WhiteBalance=\"Custom\""));
+    assert!(out0.contains("crs:Temperature=\"4350\"") && out0.contains("crs:Tint=\"-7.5\""));
+    assert!(out0.contains("crs:ProcessVersion=\"11.0\""));
+    assert!(out0.contains("crs:LuminanceAdjustmentOrange=\"+8.5\""));
+    assert!(
+        out0.contains("sieve:LutId=\"film-a1b2c3d4\"") && out0.contains("xmlns:sieve=\"http://sieve.app/ns/1.0/\"")
+    );
+    // Unowned crs: properties survive byte-for-byte.
+    for keep in [
+        "crs:Version=\"16.4\"",
+        "crs:CameraProfile=\"Adobe Color\"",
+        "<crs:ToneCurvePV2012>",
+        "<rdf:li>255, 255</rdf:li>",
+    ] {
+        assert!(out0.contains(keep), "{keep}");
+    }
+    let owned: Vec<&str> = OWNED
+        .iter()
+        .copied()
+        .chain([
+            "crs:ProcessVersion",
+            "crs:Exposure2012",
+            "crs:Contrast2012",
+            "crs:Highlights2012",
+            "crs:Shadows2012",
+            "crs:WhiteBalance",
+        ])
+        .collect();
+    assert_unrelated_preserved(LIGHTROOM, &out0, &owned);
+    // Reads back identically, and the catalog -> XMP -> catalog trip is lossless.
+    assert_eq!(parse(&out0).unwrap().develop, Some(edited()));
+
+    // As-shot removes Temperature/Tint; LUT removal removes the sieve: fields.
+    let as_shot =
+        ParametricAdjustments { lut: None, white_balance: crate::ipc::types::WhiteBalance::AsShot, ..edited() };
+    develop::history::commit(&mut conn, f.ids[0], &as_shot, "White Balance").unwrap();
+    f.sync.write_images(&f.ids[..1]).unwrap();
+    let out0 = fs::read_to_string(f.sidecar(0)).unwrap();
+    assert!(out0.contains("crs:WhiteBalance=\"As Shot\""));
+    assert!(!out0.contains("crs:Temperature") && !out0.contains("crs:Tint") && !out0.contains("sieve:Lut"), "{out0}");
+    assert_eq!(parse(&out0).unwrap().develop, Some(as_shot));
+}
+
+#[test]
+fn develop_settings_read_from_lightroom_sidecar() {
+    let f = Fixture::new(3);
+    fs::write(f.sidecar(0), LIGHTROOM).unwrap();
+    // PV2010-only sidecar: rating read, develop not imported.
+    fs::write(
+        f.sidecar(1),
+        LIGHTROOM
+            .replace("crs:ProcessVersion=\"15.4\"", "crs:ProcessVersion=\"5.7\"")
+            .replace("xmp:Rating=\"3\"", "xmp:Rating=\"2\""),
+    )
+    .unwrap();
+    // Malformed develop value: ratings still sync, develop untouched.
+    fs::write(f.sidecar(2), LIGHTROOM.replace("crs:Contrast2012=\"+12\"", "crs:Contrast2012=\"lots\"")).unwrap();
+    let report = f.sync.read_images(&f.ids).unwrap();
+    assert_eq!((report.succeeded, report.failed.len()), (3, 0));
+    assert_eq!(report.changed, f.ids);
+    let conn = f.conn();
+    let a = repo::get_adjustments(&conn, f.ids[0]).unwrap();
+    let want = ParametricAdjustments {
+        exposure: 0.35,
+        contrast: 12.0,
+        highlights: -40.0,
+        shadows: 25.0,
+        ..Default::default()
+    };
+    assert_eq!(a, want);
+    let h = develop::history::history(&conn, f.ids[0]).unwrap();
+    assert_eq!(h.entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Original", "Read from XMP"]);
+    assert!(!f.state(f.ids[0]).0, "reading develop settings leaves the image clean");
+    assert!(repo::get_adjustments(&conn, f.ids[1]).unwrap().is_neutral());
+    assert_eq!(f.values(f.ids[1]).0, 2);
+    assert!(develop::history::history(&conn, f.ids[1]).unwrap().entries.is_empty());
+    assert!(repo::get_adjustments(&conn, f.ids[2]).unwrap().is_neutral());
+    // Unchanged on re-read: no new history entry, no change reported.
+    assert!(f.sync.read_images(&f.ids[..1]).unwrap().changed.is_empty());
+    assert_eq!(develop::history::history(&conn, f.ids[0]).unwrap().entries.len(), 2);
+}
+
+#[test]
+fn develop_catalog_xmp_catalog_round_trip() {
+    let f = Fixture::new(1);
+    let mut conn = f.conn();
+    develop::history::commit(&mut conn, f.ids[0], &edited(), "Edit").unwrap();
+    f.sync.write_images(&f.ids).unwrap();
+    // A second catalog importing the same sidecar gets identical settings.
+    let g = Fixture::new(1);
+    fs::copy(f.sidecar(0), g.sidecar(0)).unwrap();
+    assert_eq!(g.sync.read_images(&g.ids).unwrap().changed, g.ids);
+    assert_eq!(repo::get_adjustments(&g.conn(), g.ids[0]).unwrap(), edited());
+}
+
+/// Writes develop settings into the sidecar of a copy of a real RAW under
+/// `test-data/xmp-crs/` (the original is only read) and checks it with exiftool.
+#[test]
+#[ignore = "needs exiftool and sample RAWs"]
+fn develop_exiftool_check() {
+    let samples = std::env::var("SIEVE_XMP_SAMPLES")
+        .unwrap_or_else(|_| format!("{}/Pictures/test RAWS", std::env::var("HOME").unwrap()));
+    let raw = fs::read_dir(&samples)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| crate::raw::format_from_extension(p).is_some())
+        .min()
+        .unwrap();
+    let out_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data/xmp-crs"));
+    let _ = fs::remove_dir_all(&out_dir);
+    fs::create_dir_all(&out_dir).unwrap();
+    let copy = out_dir.join(raw.file_name().unwrap());
+    fs::copy(&raw, &copy).unwrap();
+    let catalog = out_dir.join("cat.sqlite");
+    let mut conn = db::open(&catalog).unwrap();
+    repo::import_folder(&mut conn, &out_dir, &ImportOptions { recursive: false }).unwrap();
+    let id: ImageId = conn.query_row("SELECT id FROM images", [], |r| r.get(0)).unwrap();
+    develop::history::commit(&mut conn, id, &edited(), "Edit").unwrap();
+    let sync = XmpSync::new(XmpSyncConfig { catalog_path: catalog });
+    assert_eq!(sync.write_images(&[id]).unwrap().succeeded, 1);
+    let sidecar = sidecar_path(&copy);
+    let out = std::process::Command::new("exiftool")
+        .args(["-XMP-crs:all", "-XMP-sieve:all", "-j"])
+        .arg(&sidecar)
+        .output()
+        .expect("exiftool on PATH");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    println!("{text}");
+    let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+    // exiftool prints signed positives as strings ("+18"), negatives as numbers.
+    assert_eq!(j[0]["Exposure2012"], -0.65);
+    assert_eq!(j[0]["ColorTemperature"], 4350);
+    assert_eq!(j[0]["Tint"], -7.5);
+    assert_eq!(j[0]["WhiteBalance"], "Custom");
+    assert_eq!(j[0]["Contrast2012"], "+18");
+    assert_eq!(j[0]["Highlights2012"], -55);
+    assert_eq!(j[0]["LuminanceAdjustmentOrange"], "+8.5");
+    assert_eq!(j[0]["ProcessVersion"], 11.0);
+    assert_eq!(j[0]["HasSettings"], true);
+    assert_eq!(j[0]["LutId"], "film-a1b2c3d4");
 }

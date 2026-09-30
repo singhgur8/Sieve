@@ -3,7 +3,17 @@ use std::process::Command;
 
 fn main() {
     // LibRaw (thread-safe build) for RAW decoding / thumbnail fallback.
-    link_system_lib("raw_r", "LIBRAW_DIR", "libraw_r", &["/opt/homebrew/opt/libraw", "/usr/local/opt/libraw"]);
+    let libraw =
+        link_system_lib("raw_r", "LIBRAW_DIR", "libraw_r", &["/opt/homebrew/opt/libraw", "/usr/local/opt/libraw"]);
+    // Tiny C shim for LibRaw fields without C-API accessors (develop source settings,
+    // colour matrices), compiled against the same install's headers.
+    println!("cargo:rerun-if-changed=native/libraw_shim.c");
+    let mut shim = cc::Build::new();
+    shim.file("native/libraw_shim.c").warnings(false);
+    if let Some(include) = libraw.as_ref().and_then(|lib| lib.parent()).map(|p| p.join("include")) {
+        shim.include(include);
+    }
+    shim.compile("sieve_libraw_shim");
     // TurboJPEG 3 API from libjpeg-turbo (a dependency of Homebrew's libraw).
     link_system_lib(
         "turbojpeg",
@@ -17,18 +27,19 @@ fn main() {
 /// Links `lib<name>` dynamically, searching `$<env_dir>/lib`, `pkg-config <pc>`, then
 /// the given Homebrew prefixes. Install with `brew install libraw` (brings jpeg-turbo).
 /// Homebrew dylibs carry absolute install names, so no rpath is needed at runtime.
-fn link_system_lib(name: &str, env_dir: &str, pc: &str, prefixes: &[&str]) {
+fn link_system_lib(name: &str, env_dir: &str, pc: &str, prefixes: &[&str]) -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed={env_dir}");
     let has_lib =
         |lib: &Path| lib.join(format!("lib{name}.dylib")).exists() || lib.join(format!("lib{name}.so")).exists();
     let from_env = std::env::var_os(env_dir).map(|p| PathBuf::from(p).join("lib"));
     let from_brew = || prefixes.iter().map(|p| Path::new(p).join("lib")).find(|lib| has_lib(lib));
     let dir = from_env.or_else(|| pkg_config_libdir(pc)).or_else(from_brew);
-    match dir {
+    match &dir {
         Some(dir) => println!("cargo:rustc-link-search=native={}", dir.display()),
         None => println!("cargo:warning=lib{name} not found (set {env_dir} or `brew install libraw`)"),
     }
     println!("cargo:rustc-link-lib=dylib={name}");
+    dir
 }
 
 fn pkg_config_libdir(name: &str) -> Option<PathBuf> {

@@ -6,19 +6,60 @@
 //!   a clash with another preset). Unknown id -> `not_found`.
 //! - Listed by name (case-insensitive).
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::ipc::error::AppResult;
+use crate::db::now_ms;
+use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{AdjustmentField, ParametricAdjustments, Preset, PresetId};
 
+const SELECT: &str = "SELECT id, name, params_json, fields_json, created_at, updated_at FROM presets";
+
+fn overlay(json: &str) -> AppResult<ParametricAdjustments> {
+    fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
+        match (base, overlay) {
+            (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+                for (k, v) in o {
+                    match b.get_mut(&k) {
+                        Some(slot) => merge(slot, v),
+                        None => {
+                            b.insert(k, v);
+                        }
+                    }
+                }
+            }
+            (slot, v) => *slot = v,
+        }
+    }
+    let mut value = serde_json::to_value(ParametricAdjustments::default())?;
+    merge(&mut value, serde_json::from_str(json)?);
+    Ok(serde_json::from_value(value)?)
+}
+
+type RawRow = (PresetId, String, String, String, i64, i64);
+
+fn raw(r: &Row) -> rusqlite::Result<RawRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+}
+
+fn to_preset((id, name, params_json, fields_json, created_at_ms, updated_at_ms): RawRow) -> AppResult<Preset> {
+    let names: Vec<String> = serde_json::from_str(&fields_json)?;
+    // Unknown (future) field names are skipped rather than failing the whole list.
+    let fields = names.iter().filter_map(|n| AdjustmentField::parse(n)).collect();
+    Ok(Preset { id, name, adjustments: overlay(&params_json)?, fields, created_at_ms, updated_at_ms })
+}
+
 pub fn list(conn: &Connection) -> AppResult<Vec<Preset>> {
-    let _ = conn;
-    todo!("rust-engine-dev: develop::presets::list")
+    let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY name COLLATE NOCASE, id"))?;
+    let rows = stmt.query_map([], raw)?.collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(to_preset).collect()
 }
 
 pub fn get(conn: &Connection, id: PresetId) -> AppResult<Preset> {
-    let _ = (conn, id);
-    todo!("rust-engine-dev: develop::presets::get")
+    let row = conn
+        .query_row(&format!("{SELECT} WHERE id = ?1"), [id], raw)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("preset {id}")))?;
+    to_preset(row)
 }
 
 /// Creates (`id = None`) or overwrites (`Some`) a preset; validates `adjustments`.
@@ -29,11 +70,110 @@ pub fn save(
     adjustments: &ParametricAdjustments,
     fields: &[AdjustmentField],
 ) -> AppResult<Preset> {
-    let _ = (conn, id, name, adjustments, fields);
-    todo!("rust-engine-dev: develop::presets::save")
+    let name = name.trim();
+    let n = name.chars().count();
+    if n == 0 || n > 100 {
+        return Err(AppError::invalid("preset name must be 1..=100 characters"));
+    }
+    adjustments.validate().map_err(AppError::invalid)?;
+    let mut uniq: Vec<AdjustmentField> = Vec::new();
+    for f in fields {
+        if !uniq.contains(f) {
+            uniq.push(*f);
+        }
+    }
+    if uniq.is_empty() {
+        return Err(AppError::invalid("fields must not be empty"));
+    }
+    let clash: Option<PresetId> = conn
+        .query_row("SELECT id FROM presets WHERE name = ?1 COLLATE NOCASE AND id IS NOT ?2", params![name, id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if clash.is_some() {
+        return Err(AppError::invalid(format!("a preset named {name:?} already exists")));
+    }
+    let params_json = serde_json::to_string(adjustments)?;
+    let fields_json = serde_json::to_string(&uniq.iter().map(|f| f.as_str()).collect::<Vec<_>>())?;
+    let now = now_ms();
+    let id = match id {
+        Some(id) => {
+            let n = conn.execute(
+                "UPDATE presets SET name = ?2, params_json = ?3, fields_json = ?4, updated_at = ?5 WHERE id = ?1",
+                params![id, name, params_json, fields_json, now],
+            )?;
+            if n == 0 {
+                return Err(AppError::not_found(format!("preset {id}")));
+            }
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO presets (name, params_json, fields_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![name, params_json, fields_json, now],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+    get(conn, id)
 }
 
 pub fn delete(conn: &Connection, id: PresetId) -> AppResult<()> {
-    let _ = (conn, id);
-    todo!("rust-engine-dev: develop::presets::delete")
+    if conn.execute("DELETE FROM presets WHERE id = ?1", [id])? == 0 {
+        return Err(AppError::not_found(format!("preset {id}")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_in_memory;
+    use crate::ipc::error::ErrorKind;
+
+    #[test]
+    fn crud_and_validation() {
+        let conn = open_in_memory();
+        assert!(list(&conn).unwrap().is_empty());
+        let warm = ParametricAdjustments { exposure: 0.3, vibrance: 20.0, ..Default::default() };
+        let fields = [AdjustmentField::Exposure, AdjustmentField::Vibrance, AdjustmentField::Exposure];
+        let p = save(&conn, None, "  Warm  ", &warm, &fields).unwrap();
+        assert_eq!(p.name, "Warm");
+        assert_eq!(p.fields, vec![AdjustmentField::Exposure, AdjustmentField::Vibrance]);
+        assert_eq!(p.adjustments, warm);
+        assert_eq!(get(&conn, p.id).unwrap(), p);
+
+        let b = save(&conn, None, "b&w", &ParametricAdjustments::default(), AdjustmentField::ALL).unwrap();
+        assert_eq!(list(&conn).unwrap().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["b&w", "Warm"]);
+
+        // Name clash (case-insensitive) with another preset; renaming itself is fine.
+        assert_eq!(save(&conn, None, "WARM", &warm, &fields).unwrap_err().kind, ErrorKind::InvalidArgument);
+        let p2 = save(&conn, Some(p.id), "warm", &warm, &[AdjustmentField::Exposure]).unwrap();
+        assert_eq!((p2.id, p2.name.as_str(), p2.fields.len()), (p.id, "warm", 1));
+        assert_eq!(p2.created_at_ms, p.created_at_ms);
+        assert_eq!(save(&conn, Some(b.id), "Warm", &warm, &fields).unwrap_err().kind, ErrorKind::InvalidArgument);
+
+        assert_eq!(save(&conn, None, " ", &warm, &fields).unwrap_err().kind, ErrorKind::InvalidArgument);
+        assert_eq!(save(&conn, None, &"x".repeat(101), &warm, &fields).unwrap_err().kind, ErrorKind::InvalidArgument);
+        assert_eq!(save(&conn, None, "x", &warm, &[]).unwrap_err().kind, ErrorKind::InvalidArgument);
+        let bad = ParametricAdjustments { exposure: 7.0, ..Default::default() };
+        assert_eq!(save(&conn, None, "x", &bad, &fields).unwrap_err().kind, ErrorKind::InvalidArgument);
+        assert_eq!(save(&conn, Some(999), "x", &warm, &fields).unwrap_err().kind, ErrorKind::NotFound);
+
+        delete(&conn, b.id).unwrap();
+        assert_eq!(delete(&conn, b.id).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(get(&conn, b.id).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(list(&conn).unwrap().len(), 1);
+
+        // Stored JSON missing newer fields loads as neutral for them.
+        conn.execute(
+            "INSERT INTO presets (name, params_json, fields_json, created_at, updated_at)
+             VALUES ('old', '{\"exposure\":1.5}', '[\"exposure\",\"future_field\"]', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let old = list(&conn).unwrap().into_iter().find(|p| p.name == "old").unwrap();
+        assert_eq!(old.adjustments, ParametricAdjustments { exposure: 1.5, ..Default::default() });
+        assert_eq!(old.fields, vec![AdjustmentField::Exposure]);
+    }
 }
