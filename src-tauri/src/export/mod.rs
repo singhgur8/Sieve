@@ -67,6 +67,7 @@ use crate::ipc::types::{
     RawImageEntry,
 };
 use crate::lut::LutLibrary;
+use crate::raw::access;
 use naming::{Claims, Resolved};
 
 /// Most images developed at once within a job. LibRaw's demosaic is largely single-threaded,
@@ -500,6 +501,24 @@ impl Exporter {
                 }
             }
         };
+        // Several statements as one transaction (an item's status and the job counters never
+        // disagree after a crash).
+        let db_all = |stmts: &[(&str, &[&dyn rusqlite::ToSql])]| {
+            if let Some(c) = conn {
+                let run = || -> rusqlite::Result<()> {
+                    let tx = c.unchecked_transaction()?;
+                    for (sql, p) in stmts {
+                        tx.execute(sql, *p)?;
+                    }
+                    tx.commit()
+                };
+                if let Err(e) = run() {
+                    eprintln!("export job {}: {e}", job.id);
+                }
+            }
+        };
+        // First fatal destination error (disk full): the remaining items fail fast with it.
+        let abort: Mutex<Option<String>> = Mutex::new(None);
         db("UPDATE export_jobs SET state = 'running', started_at = ?2 WHERE id = ?1", &[&job.id, &now_ms()]);
         let total = job.items.len() as u32;
         let settings = &job.settings;
@@ -558,7 +577,7 @@ impl Exporter {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let tx = tx.clone();
-                let (work, next, budget) = (&work, &next, &budget);
+                let (work, next, budget, abort) = (&work, &next, &budget, &abort);
                 let job = &job;
                 scope.spawn(move || loop {
                     let n = next.fetch_add(1, Ordering::SeqCst);
@@ -567,6 +586,10 @@ impl Exporter {
                     let cancelled = || self.is_cancelled(job.id);
                     if cancelled() {
                         break;
+                    }
+                    if let Some(reason) = lock(abort).clone() {
+                        let _ = tx.send(Msg::Done(*i, Err(Failure::Error(format!("Not exported: {reason}")))));
+                        continue;
                     }
                     let need = item_estimate(&item.entry, settings).min(self.inner.budget);
                     if !budget.acquire(need, &cancelled) {
@@ -594,22 +617,33 @@ impl Exporter {
                         if let Some(pos) = in_flight.iter().position(|n| *n == item.entry.file_name) {
                             in_flight.remove(pos);
                         }
+                        const COUNTERS: &str =
+                            "UPDATE export_jobs SET succeeded = ?2, failed = ?3, skipped = ?4 WHERE id = ?1";
                         match outcome {
                             Ok(path) => {
                                 live.succeeded += 1;
-                                db(
-                                    "UPDATE export_items SET status = 'done', output_path = ?3, error = NULL
-                                     WHERE job_id = ?1 AND seq = ?2",
-                                    &[&job.id, &item.seq, &path.to_string_lossy().into_owned()],
-                                );
+                                db_all(&[
+                                    (
+                                        "UPDATE export_items SET status = 'done', output_path = ?3, error = NULL
+                                         WHERE job_id = ?1 AND seq = ?2",
+                                        &[&job.id, &item.seq, &path.to_string_lossy().into_owned()],
+                                    ),
+                                    (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
+                                ]);
                             }
                             Err(Failure::Cancelled) => continue,
                             Err(Failure::Error(reason)) => {
                                 live.failed += 1;
-                                db(
-                                    "UPDATE export_items SET status = 'failed', error = ?3 WHERE job_id = ?1 AND seq = ?2",
-                                    &[&job.id, &item.seq, &reason],
-                                );
+                                if access::is_disk_full_message(&reason) {
+                                    lock(&abort).get_or_insert_with(|| reason.clone());
+                                }
+                                db_all(&[
+                                    (
+                                        "UPDATE export_items SET status = 'failed', error = ?3 WHERE job_id = ?1 AND seq = ?2",
+                                        &[&job.id, &item.seq, &reason],
+                                    ),
+                                    (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
+                                ]);
                                 failures.push(ExportFailure {
                                     image_id: item.entry.id,
                                     file_name: item.entry.file_name.clone(),
@@ -617,10 +651,6 @@ impl Exporter {
                                 });
                             }
                         }
-                        db(
-                            "UPDATE export_jobs SET succeeded = ?2, failed = ?3, skipped = ?4 WHERE id = ?1",
-                            &[&job.id, &live.succeeded, &live.failed, &live.skipped],
-                        );
                         set_live(&live);
                         emit(&live, in_flight.last().cloned(), &mut last_emit, false);
                     }
@@ -727,8 +757,9 @@ fn export_one(
     use crate::develop::masks::{self as dmasks, render as mrender};
     let check = || if cancelled() { Err(Failure::Cancelled) } else { Ok(()) };
     let raw = Path::new(&item.entry.path);
+    access::require_original(raw)?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
+        std::fs::create_dir_all(dir).map_err(|e| Failure::Error(access::io_message(dir, "write", &e)))?;
     }
     // Masks (Phase 7c): AI mattes the image does not have yet are computed first.
     let masked = mrender::any_rendered(&item.adjustments.masks);
@@ -744,7 +775,13 @@ fn export_one(
         }
         check()?;
     }
-    let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
+    let (src, meta) = crate::develop::source::decode_full_meta(raw).map_err(|e| match e.kind {
+        ErrorKind::Internal => {
+            let prefix = format!("{}: ", raw.display());
+            access::decode_failed(raw, e.message.strip_prefix(&prefix).unwrap_or(&e.message))
+        }
+        _ => e,
+    })?;
     check()?;
     let orientation = item.entry.orientation;
     let crop = &item.adjustments.crop;
@@ -822,6 +859,9 @@ fn export_one(
     let image = develop::finish(encoded, size, settings);
     let meta = metadata::collect(raw, &settings.metadata)?;
     check()?;
+    if let Some(dir) = path.parent() {
+        access::ensure_space(dir, output_bytes_estimate(&image, settings))?;
+    }
     let tmp = temp_path(path);
     let written = encode::write_file(&image, settings, &meta, &tmp);
     drop(image);
@@ -835,9 +875,24 @@ fn export_one(
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Failure::Error(format!("{}: {e}", path.display())));
+        return Err(Failure::Error(access::io_message(path, "write", &e)));
     }
     Ok(path.to_path_buf())
+}
+
+/// Upper-bound-ish file size of `image` in `settings.format` (+ 4 MiB for metadata and
+/// slack), for the free-space check before writing: uncompressed for TIFF/PNG, a quarter
+/// of that for the lossy formats.
+fn output_bytes_estimate(image: &develop::ExportImage, settings: &ExportSettings) -> u64 {
+    let raw = match &image.pixels {
+        develop::ExportPixels::Rgb8(p) => p.len() as u64,
+        develop::ExportPixels::Rgb16(p) => p.len() as u64 * 2,
+    };
+    let body = match settings.format.kind() {
+        ExportFormatKind::Tiff | ExportFormatKind::Png => raw,
+        _ => raw / 4,
+    };
+    body + (4 << 20)
 }
 
 /// `folder` + subfolder; `None` for `source_folder`. `choose` -> `invalid_argument`.
@@ -855,7 +910,7 @@ fn output_dir(settings: &ExportSettings) -> AppResult<Option<PathBuf>> {
 
 /// Creates `dir` and checks it is writable.
 fn ensure_writable_dir(dir: &Path) -> AppResult<()> {
-    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, format!("{}: {e}", dir.display()));
+    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, access::io_message(dir, "write", &e));
     std::fs::create_dir_all(dir).map_err(io)?;
     let probe = dir.join(format!(".sieve-write-test-{}", std::process::id()));
     std::fs::write(&probe, b"").map_err(io)?;

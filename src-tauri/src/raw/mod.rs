@@ -10,6 +10,7 @@
 //! never from the embedded JPEG itself (Sony previews carry no usable Orientation).
 //! If no usable embedded JPEG is found, LibRaw's `unpack_thumb` is the fallback.
 
+pub mod access;
 pub mod cr3;
 pub mod heif;
 pub mod icc;

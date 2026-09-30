@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use super::error::{AppError, AppResult};
 use super::types::*;
@@ -48,13 +48,36 @@ impl Catalog {
         F: FnOnce(&mut Connection) -> AppResult<T> + Send + 'static,
     {
         let conn = self.conn.clone();
+        let path = self.path.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut conn = conn.lock().map_err(|_| AppError::internal("catalog lock poisoned"))?;
-            f(&mut conn)
+            f(&mut conn).map_err(|e| explain_catalog_error(&path, e))
         })
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
     }
+}
+
+/// Database errors get an actionable message: a damaged catalog (opened read-only, see
+/// `db::health`) says how to restore a backup; a full disk says so.
+fn explain_catalog_error(path: &Path, e: AppError) -> AppError {
+    if e.kind != super::error::ErrorKind::Database {
+        return e;
+    }
+    if let db::CatalogHealth::ReadOnly { reason } = db::health(path) {
+        return AppError::new(e.kind, db::read_only_message(path, &reason));
+    }
+    let m = e.message.to_ascii_lowercase();
+    if m.contains("database or disk is full") {
+        return AppError::new(
+            e.kind,
+            format!(
+                "The catalog could not be saved: the disk holding {} is full. Free up space and try again.",
+                path.display()
+            ),
+        );
+    }
+    e
 }
 
 #[tauri::command]
@@ -112,6 +135,10 @@ pub async fn import_folder(
     let sync = xmp.inner().clone();
     let folder_id = summary.folder_id;
     summary.sidecars_read = blocking(move || sync.refresh_folder(folder_id)).await?;
+    // Re-registered files may have changed on disk: re-resolve develop sources.
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(None);
+    }
     ingest.start(&app)?;
     if auto {
         analysis.start(&app, AnalysisScope::Pending)?;
@@ -131,6 +158,10 @@ pub async fn regenerate_thumbnails(
     analysis: State<'_, Analysis>,
     ids: Vec<ImageId>,
 ) -> AppResult<()> {
+    // Re-extraction may change the orientation: re-resolve develop sources.
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(Some(&ids));
+    }
     ingest.regenerate(&app, ids)?;
     if catalog.run(|c| repo::auto_analyze(c)).await? {
         analysis.start(&app, AnalysisScope::Pending)?;
@@ -280,6 +311,22 @@ async fn source_images(catalog: &Catalog, ids: Vec<ImageId>) -> AppResult<Vec<So
         .collect())
 }
 
+/// The develop source of `id` for per-frame commands (slider renders, overlays, WB
+/// picker): remembered in the `DevelopCache` after the first lookup, so a slider drag never
+/// touches the catalog (or waits for its lock). Images still pending thumbnail extraction
+/// are not remembered (their orientation may still change).
+async fn develop_source(catalog: &Catalog, develop: &DevelopCache, id: ImageId) -> AppResult<SourceImage> {
+    if let Some(src) = develop.source(id) {
+        return Ok(src);
+    }
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let src = source_of(&entry);
+    if !matches!(entry.thumbnail, ThumbnailState::Pending) {
+        develop.remember_source(src.clone());
+    }
+    Ok(src)
+}
+
 fn require_fields(fields: &[AdjustmentField]) -> AppResult<()> {
     if fields.is_empty() {
         return Err(AppError::invalid("fields must not be empty"));
@@ -303,7 +350,7 @@ pub async fn render_preview(
     adjustments.validate().map_err(AppError::invalid)?;
     options.validate().map_err(AppError::invalid)?;
     let ticket = develop.ticket(id, options.slot);
-    let src = source_images(&catalog, vec![id]).await?.remove(0);
+    let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
     let luts = luts.inner().clone();
     blocking(move || {
@@ -326,7 +373,10 @@ pub async fn get_develop_info(
     id: ImageId,
 ) -> AppResult<DevelopInfo> {
     let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
-    let src = SourceImage { id: entry.id, path: PathBuf::from(&entry.path), orientation: entry.orientation };
+    let src = source_of(&entry);
+    if !matches!(entry.thumbnail, ThumbnailState::Pending) {
+        develop.remember_source(src.clone());
+    }
     let cache = develop.inner().clone();
     let mut info = blocking(move || cache.info(&src)).await?;
     let mut warnings = entry.develop_warnings;
@@ -354,7 +404,7 @@ pub async fn sample_white_balance(
     adjustments: ParametricAdjustments,
 ) -> AppResult<WhiteBalanceValues> {
     adjustments.validate().map_err(AppError::invalid)?;
-    let src = source_images(&catalog, vec![id]).await?.pop().ok_or_else(|| AppError::not_found("image not found"))?;
+    let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
     blocking(move || cache.sample_white_balance(&src, point, &adjustments)).await
 }
@@ -1330,7 +1380,7 @@ pub async fn render_mask_overlay(
         return Err(AppError::invalid("target does not name a mask group/component of adjustments.masks"));
     }
     let ticket = develop.ticket(id, RenderSlot::Mask);
-    let src = source_images(&catalog, vec![id]).await?.remove(0);
+    let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
     let masks = masks.inner().clone();
     blocking(move || {

@@ -54,7 +54,9 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind (not abort): the export, prefetch, XMP and masking workers isolate panics with
+# `catch_unwind` so one bad file fails its item instead of killing the app (Phase 8).
+panic = "unwind"
 strip = true
 
 [dev-dependencies]
