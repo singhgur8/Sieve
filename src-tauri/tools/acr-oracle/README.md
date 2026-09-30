@@ -21,3 +21,25 @@ tables); no Adobe code or data is copied. Real frames are converted in place (re
 | `bt.py`, `lt.py` | Adobe big-table (`crs:Table_*`) decoding experiments |
 
 End-to-end parity: `cargo run --release --example parity_eval` (see its docs).
+
+## Real-frame oracle (fix round 1, 2026-09-30)
+
+Settings *variants* of the user's edited frames, rendered by Camera Raw from DNG copies and
+by Sieve from the identical XMP, so each stage can be measured on real images. Work dir
+`$P2` (default `<repo>/test-data/p2`): `dng/` (DNG copies, `-p0`, delete when done),
+`var/<variant>/<stem>.{ref.jpg,xmp}`, `out/<variant>/` (Sieve renders, `SIEVE_DUMP` PPMs).
+Sources are only read (never write under `~/Pictures`).
+
+| Script | Does |
+|---|---|
+| `variant.sh`, `variants.py <list> <v,...>` | Camera Raw renders of settings variants (`neutral`, `tone`, `notone`, `nocolor`, single-slider sweeps `nS+100` ..., `z*` isolations, `name=set:neutral\|Tag=v;...`) |
+| `eval.sh <list> <v\|-\|hold>`, `table.py`, `dump_variants.py`, `diag_variants.py` | Sieve vs Camera Raw dE2000 per image/variant (`-` = fit-set refs `$P2/ref`, `hold` = held-out `$P2/hold-ref`) |
+| `diff.py <out-dir> [stems]` | dL / da / db and dE binned by L* |
+| `tonefit.py`, `scale_probe.py`, `adapt_probe.py`, `local_probe.py` | slider delta in scene EV per pixel (inverting Camera Raw's neutral tone mapping); spatial / image-adaptivity probes |
+| `fit_local.py`, `gen_local.py`, `fit_ref.py` | first local-operator fits (Python features) |
+| `fit2.py [--write] [--loo]` | final fit on features computed by Sieve (`parity_eval` with `SIEVE_DUMP_EV=1` on `neutral`): references + tables -> `src/develop/local_tone_data.rs` |
+| `check_local.py`, `halo_probe.py`, `align_probe.py`, `cc_probe.py`, `montage.py`, `settings.py` | per-image bias, Camera Raw step-edge halos, frame alignment, CameraCalibration derivation, visual montages, sidecar settings dump |
+
+Refit after changing the adaptation filter: build `parity_eval`, run
+`SIEVE_DUMP_EV=1 SIEVE_DUMP=1 ./eval.sh $P2/fit-list.txt neutral`, re-dump the sweep variants
+(`dump_variants.py ... nS+50,...,nH-100`), then `python3 fit2.py --write`.

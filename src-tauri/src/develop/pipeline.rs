@@ -7,18 +7,20 @@
 //!    linear ProPhoto through the camera profile's matrices for this white balance
 //!    (`ForwardMatrix` / `ColorMatrix` interpolated by temperature, DNG model) with the
 //!    Calibration panel folded in (`develop::camera`).
-//! B. Noise reduction on that scene-linear image (`parity::denoise`).
-//! C. Local operators on log-luminance fields: Shadows/Highlights evaluated at an
-//!    edge-aware local luminance (guided filter), clarity/texture (local contrast), dehaze.
-//!    They act as luminance gains (hue/saturation preserving).
+//! B. Noise reduction on that scene-linear image (`parity::denoise`; banded for exports).
+//! C. Local operators on log-luminance fields, as luminance gains (hue/saturation
+//!    preserving): Shadows/Highlights = fitted response tables ([`LocalTone`]) at an
+//!    adaptation luminance from the whole uncropped source ([`ToneContext`]: two guided-filter
+//!    bases on a ~512 px grid + image-adaptive references), clarity/texture, dehaze.
 //! D. A pointwise chain evaluated through a shaped 3D LUT built per render (tetrahedral
 //!    interpolation; 33^3 drafts, 65^3 previews and exports): profile HueSatMap ->
-//!    Whites/Exposure(+baseline)/Contrast/Blacks as a luminance gain -> profile LookTable ->
-//!    look HSV table -> HSL/vibrance/saturation or the B&W mix -> shadow tint -> base tone
-//!    curve composed with the look's and the user's parametric + master curves, applied
-//!    hue-preservingly ("RGB tone": max/min channels through the curve, the middle one
-//!    interpolated) -> look RGB table -> per-channel point curves -> colour grading ->
-//!    output colour space (+ `.cube` LUT on sRGB-encoded values).
+//!    exposure (+baseline) gain -> profile LookTable -> look HSV table ->
+//!    HSL/vibrance/saturation or the B&W mix -> shadow tint -> the global tone sliders
+//!    (Whites/Contrast/Blacks, exposure shoulder) composed with the base tone curve and the
+//!    look's and the user's parametric + master curves, applied hue-preservingly ("RGB
+//!    tone": max/min channels through the curve, the middle one interpolated; so Contrast
+//!    and Blacks change saturation like Camera Raw) -> look RGB table -> per-channel point
+//!    curves -> colour grading -> output colour space (+ `.cube` LUT on sRGB values).
 //! E. On the encoded output: post-crop vignette and grain (fused with D), then capture
 //!    sharpening on luminance.
 //!

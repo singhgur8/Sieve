@@ -49,6 +49,15 @@ VARIANTS = {
     "nolocal": args_for(["local"]),
     "notone": args_for(["tone"]),
 }
+# Colour-op isolation (the rest as edited).
+VARIANTS["zHue"] = ["-XMP-crs:HueAdjustment%s=0" % c for c in COLORS]
+VARIANTS["zSatLum"] = ["-XMP-crs:%sAdjustment%s=0" % (k, c) for k in ("Saturation", "Luminance") for c in COLORS]
+VARIANTS["zVib"] = ["-XMP-crs:Vibrance=0", "-XMP-crs:Saturation=0"]
+VARIANTS["zGrade"] = ["-XMP-crs:%s=0" % t for t in ("ColorGradeMidtoneSat", "ColorGradeGlobalSat",
+                                                   "SplitToningShadowSaturation", "SplitToningHighlightSaturation")]
+for k, tag in [("S", "Shadows2012"), ("H", "Highlights2012"), ("W", "Whites2012"), ("B", "Blacks2012"),
+               ("C", "Contrast2012")]:
+    VARIANTS["z" + k] = ["-XMP-crs:%s=0" % tag]
 # Single-slider sweeps on the neutral base.
 for k, tag in [("S", "Shadows2012"), ("H", "Highlights2012"), ("W", "Whites2012"), ("B", "Blacks2012"),
                ("C", "Contrast2012"), ("Cl", "Clarity2012"), ("Tx", "Texture"), ("Dh", "Dehaze")]:

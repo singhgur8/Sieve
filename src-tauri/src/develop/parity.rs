@@ -879,19 +879,30 @@ pub fn denoise(img: &mut Working, nr: &NoiseReduction, scale: f32) {
     denoise_opts(img, nr, scale, true);
 }
 
-/// As [`denoise`]; `luminance = false` skips luminance NR (drafts).
+/// As [`denoise`]; `luminance = false` skips luminance NR (drafts). Large images (exports)
+/// are processed in bands of rows (flat memory: ~0.1 GB of planes instead of ~1 GB for 24 MP).
 pub fn denoise_opts(img: &mut Working, nr: &NoiseReduction, scale: f32, luminance: bool) {
-    let (w, h) = (img.width, img.height);
-    let lum_amt = if luminance { (nr.luminance / 100.0).clamp(0.0, 1.0) } else { 0.0 };
-    let col_amt = (nr.color / 100.0).clamp(0.0, 1.0);
-    if (lum_amt == 0.0 && col_amt == 0.0) || w < 4 || h < 4 {
-        return;
-    }
-    let n = w * h;
-    let mut yq = vec![0.0f32; n];
-    let mut c1 = vec![0.0f32; n];
-    let mut c2 = vec![0.0f32; n];
-    img.rgb.par_chunks(3).zip(yq.par_iter_mut().zip(c1.par_iter_mut().zip(c2.par_iter_mut()))).for_each(
+    let band = if img.width * img.height > NR_BAND_MIN_PIXELS { NR_BAND_ROWS } else { img.height };
+    denoise_banded(img, nr, scale, luminance, band);
+}
+
+/// Images above this many pixels are denoised in bands of [`NR_BAND_ROWS`] rows.
+pub const NR_BAND_MIN_PIXELS: usize = 4 << 20;
+pub const NR_BAND_ROWS: usize = 512;
+
+/// Parameters of one denoise run (shared by all bands).
+struct NrParams {
+    lum: Option<(usize, f32, f32, f32, f32)>,
+    col: Option<(usize, f32)>,
+    /// Rows of context each side of a band (the filters' support).
+    overlap: usize,
+}
+
+/// Square-root opponent planes (luminance, R - L, B - L) of `rgb` rows.
+fn nr_planes(rgb: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = rgb.len() / 3;
+    let (mut yq, mut c1, mut c2) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    rgb.par_chunks(3).zip(yq.par_iter_mut().zip(c1.par_iter_mut().zip(c2.par_iter_mut()))).for_each(
         |(p, (y, (a, b)))| {
             let q = [p[0].max(0.0).sqrt(), p[1].max(0.0).sqrt(), p[2].max(0.0).sqrt()];
             let l = 0.3 * q[0] + 0.6 * q[1] + 0.1 * q[2];
@@ -900,46 +911,130 @@ pub fn denoise_opts(img: &mut Working, nr: &NoiseReduction, scale: f32, luminanc
             *b = q[2] - l;
         },
     );
-    let scale = scale.clamp(0.05, 4.0);
-    if lum_amt > 0.0 {
-        let sigma = noise_sigma(&yq, w, h);
-        if sigma > 0.0 {
-            let r = ((1.5 * scale.sqrt()).round() as usize).clamp(1, 3);
-            let k = 0.6 + 3.4 * lum_amt;
-            let eps = (k * sigma) * (k * sigma);
-            let smooth = guided(&yq, &yq, w, h, r, eps);
-            let keep = (nr.luminance_detail / 100.0).clamp(0.0, 1.0);
-            let keep = 0.35 * keep * keep;
-            let contrast = (nr.luminance_contrast / 100.0).clamp(0.0, 1.0);
-            let base = if contrast > 0.0 { Some(blur(&smooth, w, h, 6.0 * scale.max(0.3))) } else { None };
-            yq.par_iter_mut().enumerate().for_each(|(k2, y)| {
-                let s = smooth[k2];
-                let mut v = s + (*y - s) * keep;
-                if let Some(b) = &base {
-                    v += (s - b[k2]) * contrast * 0.3;
-                }
-                *y = v;
-            });
-        }
+    (yq, c1, c2)
+}
+
+/// [`noise_sigma`] of the three planes of the whole image, computed from sampled row
+/// triplets (no full-size planes).
+fn nr_sigmas(rgb: &[f32], w: usize, h: usize) -> [f32; 3] {
+    if w < 3 || h < 3 {
+        return [0.0; 3];
     }
-    if col_amt > 0.0 {
-        let sig = noise_sigma(&c1, w, h).max(noise_sigma(&c2, w, h)).max(1e-4);
-        let smooth = (nr.color_smoothness / 100.0).clamp(0.0, 1.0);
-        let r = ((2.0 + 10.0 * col_amt + 6.0 * smooth) * scale).round().clamp(1.0, 24.0) as usize;
-        let detail = (nr.color_detail / 100.0).clamp(0.0, 1.0);
-        let eps = (sig * (2.0 + 6.0 * col_amt) * (1.2 - detail)).powi(2).max(1e-8);
+    let step = (h / 256).max(1);
+    let rows: Vec<usize> = (1..h - 1).step_by(step).collect();
+    let per_row: Vec<[Vec<f32>; 3]> = rows
+        .par_iter()
+        .map(|&y| {
+            let (yq, c1, c2) = nr_planes(&rgb[(y - 1) * w * 3..(y + 2) * w * 3]);
+            [&yq, &c1, &c2].map(|p| {
+                let (u, m, d) = (&p[..w], &p[w..2 * w], &p[2 * w..]);
+                (1..w - 1)
+                    .step_by(2)
+                    .map(|x| {
+                        let lap = m[x - 1] + m[x + 1] + u[x] + d[x]
+                            - 4.0 * m[x]
+                            - 0.5 * (u[x - 1] + u[x + 1] + d[x - 1] + d[x + 1] - 4.0 * m[x]);
+                        lap.abs()
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    [0, 1, 2].map(|k| {
+        let mut vals: Vec<f32> = per_row.iter().flat_map(|r| r[k].iter().copied()).collect();
+        if vals.is_empty() {
+            return 0.0;
+        }
+        let mid = vals.len() / 2;
+        let (_, med, _) = vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        *med / (0.6745 * 3.0)
+    })
+}
+
+/// Denoises rows of `rgb` (w wide) and returns the processed rows.
+fn nr_region(rgb: &[f32], w: usize, p: &NrParams) -> Vec<f32> {
+    let h = rgb.len() / 3 / w;
+    let (mut yq, mut c1, mut c2) = nr_planes(rgb);
+    if let Some((r, eps, keep, contrast, blur_sigma)) = p.lum {
+        let smooth = guided(&yq, &yq, w, h, r, eps);
+        let base = if contrast > 0.0 { Some(blur(&smooth, w, h, blur_sigma)) } else { None };
+        yq.par_iter_mut().enumerate().for_each(|(k2, y)| {
+            let s = smooth[k2];
+            let mut v = s + (*y - s) * keep;
+            if let Some(b) = &base {
+                v += (s - b[k2]) * contrast * 0.3;
+            }
+            *y = v;
+        });
+    }
+    if let Some((r, eps)) = p.col {
         c1 = guided(&yq, &c1, w, h, r, eps);
         c2 = guided(&yq, &c2, w, h, r, eps);
     }
-    img.rgb.par_chunks_mut(3).enumerate().for_each(|(k, p)| {
+    let mut out = vec![0.0f32; rgb.len()];
+    out.par_chunks_mut(3).enumerate().for_each(|(k, o)| {
         let l = yq[k];
         let r = (c1[k] + l).max(0.0);
         let b = (c2[k] + l).max(0.0);
         let g = ((l - 0.3 * r - 0.1 * b) / 0.6).max(0.0);
-        p[0] = r * r;
-        p[1] = g * g;
-        p[2] = b * b;
+        o[0] = r * r;
+        o[1] = g * g;
+        o[2] = b * b;
     });
+    out
+}
+
+/// [`denoise_opts`] with an explicit band height (`band_rows >= height` = whole image).
+pub fn denoise_banded(img: &mut Working, nr: &NoiseReduction, scale: f32, luminance: bool, band_rows: usize) {
+    let (w, h) = (img.width, img.height);
+    let lum_amt = if luminance { (nr.luminance / 100.0).clamp(0.0, 1.0) } else { 0.0 };
+    let col_amt = (nr.color / 100.0).clamp(0.0, 1.0);
+    if (lum_amt == 0.0 && col_amt == 0.0) || w < 4 || h < 4 {
+        return;
+    }
+    let scale = scale.clamp(0.05, 4.0);
+    let sig = nr_sigmas(img.rgb, w, h);
+    let lum = (lum_amt > 0.0 && sig[0] > 0.0).then(|| {
+        let r = ((1.5 * scale.sqrt()).round() as usize).clamp(1, 3);
+        let k = 0.6 + 3.4 * lum_amt;
+        let eps = (k * sig[0]) * (k * sig[0]);
+        let keep = (nr.luminance_detail / 100.0).clamp(0.0, 1.0);
+        let contrast = (nr.luminance_contrast / 100.0).clamp(0.0, 1.0);
+        (r, eps, 0.35 * keep * keep, contrast, 6.0 * scale.max(0.3))
+    });
+    let col = (col_amt > 0.0).then(|| {
+        let s = sig[1].max(sig[2]).max(1e-4);
+        let smooth = (nr.color_smoothness / 100.0).clamp(0.0, 1.0);
+        let r = ((2.0 + 10.0 * col_amt + 6.0 * smooth) * scale).round().clamp(1.0, 24.0) as usize;
+        let detail = (nr.color_detail / 100.0).clamp(0.0, 1.0);
+        (r, (s * (2.0 + 6.0 * col_amt) * (1.2 - detail)).powi(2).max(1e-8))
+    });
+    // Support: guided = 2 boxes of r; blur = 3 boxes of ~sigma.
+    let lum_support = lum.map_or(0, |(r, _, _, c, bs)| 2 * r + if c > 0.0 { 3 * (bs.ceil() as usize + 1) } else { 0 });
+    let col_support = col.map_or(0, |(r, _)| 2 * r);
+    let p = NrParams { lum, col, overlap: lum_support + col_support + 2 };
+    if band_rows >= h {
+        let out = nr_region(img.rgb, w, &p);
+        img.rgb.copy_from_slice(&out);
+        return;
+    }
+    // Bands: each band's output is written back only after the next band has read its
+    // (unprocessed) upper context.
+    let mut pending: Option<(usize, Vec<f32>)> = None;
+    let mut y0 = 0;
+    while y0 < h {
+        let y1 = (y0 + band_rows).min(h);
+        let (a, b) = (y0.saturating_sub(p.overlap), (y1 + p.overlap).min(h));
+        let out = nr_region(&img.rgb[a * w * 3..b * w * 3], w, &p);
+        if let Some((py, rows)) = pending.take() {
+            img.rgb[py * w * 3..py * w * 3 + rows.len()].copy_from_slice(&rows);
+        }
+        pending = Some((y0, out[(y0 - a) * w * 3..(y1 - a) * w * 3].to_vec()));
+        y0 = y1;
+    }
+    if let Some((py, rows)) = pending {
+        img.rgb[py * w * 3..py * w * 3 + rows.len()].copy_from_slice(&rows);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,6 +1380,41 @@ pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u
 mod tests {
     use super::*;
     use crate::ipc::types::PrimaryCalibration;
+
+    /// Banded noise reduction (exports) equals the whole-image result.
+    #[test]
+    fn banded_denoise_matches_whole_image() {
+        let (w, h) = (160usize, 700usize);
+        let mut s = 11u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / (1 << 24) as f32
+        };
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                let base = if (x / 40 + y / 90) % 2 == 0 { 0.05 } else { 0.3 };
+                for c in 0..3 {
+                    rgb.push(base * (1.0 + 0.2 * c as f32) + 0.02 * (rnd() - 0.5));
+                }
+            }
+        }
+        let nr = NoiseReduction {
+            luminance: 60.0,
+            luminance_detail: 50.0,
+            luminance_contrast: 40.0,
+            color: 50.0,
+            color_detail: 50.0,
+            color_smoothness: 50.0,
+        };
+        let mut whole = rgb.clone();
+        denoise_banded(&mut Working { width: w, height: h, rgb: &mut whole }, &nr, 1.0, true, h);
+        let mut banded = rgb.clone();
+        denoise_banded(&mut Working { width: w, height: h, rgb: &mut banded }, &nr, 1.0, true, 64);
+        let worst = whole.iter().zip(&banded).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "banded differs by {worst}");
+        assert!(whole.iter().zip(&rgb).any(|(a, b)| (a - b).abs() > 1e-3), "NR had an effect");
+    }
 
     fn is_monotone(l: &[f32]) -> bool {
         l.windows(2).all(|w| w[1] >= w[0] - 1e-6)
