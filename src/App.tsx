@@ -491,7 +491,7 @@ export default function App() {
       case "toGrid":
         return changeMode("grid");
       case "escape":
-        if (mode === "develop" && develop.current?.cancelCrop()) return;
+        if (mode === "develop" && (develop.current?.cancelCrop() || develop.current?.cancelMaskTool())) return;
         if (mode !== "grid") changeMode("grid");
         else sel.clear();
         return;
@@ -551,6 +551,20 @@ export default function App() {
         return develop.current?.sync();
       case "reset":
         return develop.current?.reset();
+      case "maskPanel":
+      case "maskBrush":
+      case "maskLinear":
+      case "maskRadial":
+      case "maskColor":
+      case "maskLuminance":
+      case "maskOverlay":
+      case "maskOverlayStyle":
+      case "maskPins":
+      case "maskSize":
+      case "maskFeather":
+      case "maskAuto":
+      case "maskDelete":
+        return develop.current?.maskKey(def.id, e);
       case "saveXmp":
         return void writeXmp();
       case "export":

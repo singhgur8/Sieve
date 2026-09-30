@@ -11,10 +11,12 @@ use tauri::{AppHandle, State};
 use super::error::{AppError, AppResult};
 use super::types::*;
 use crate::db::{self, repo};
+use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
 use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
+use crate::ml::masking::Segmenter;
 use crate::ml::{self, Analysis};
 use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
@@ -1181,4 +1183,145 @@ pub async fn list_profiles(
         model: entry.camera.model.clone(),
     };
     Ok(profiles.catalog(entry.id, &camera))
+}
+
+// ---------------------------------------------------------------------------
+// Masks / local adjustments (Phase 7c, IPC v10)
+// ---------------------------------------------------------------------------
+
+fn preview_path(entry: &RawImageEntry) -> Option<PathBuf> {
+    match &entry.thumbnail {
+        ThumbnailState::Ready { preview_path: Some(p), .. } => Some(PathBuf::from(p)),
+        _ => None,
+    }
+}
+
+fn source_of(entry: &RawImageEntry) -> SourceImage {
+    SourceImage { id: entry.id, path: PathBuf::from(&entry.path), orientation: entry.orientation }
+}
+
+/// The image's stored mask groups (`getAdjustments(id).masks`) + the render status of each
+/// AI component (`MaskCache::status`, rust-engine-dev).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_masks(
+    catalog: State<'_, Catalog>,
+    masks: State<'_, MaskCache>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+) -> AppResult<MaskList> {
+    let masks = masks.inner().clone();
+    let segmenter = segmenter.inner().clone();
+    catalog
+        .run(move |c| {
+            let groups = repo::get_adjustments(c, id)?.masks;
+            let ai = masks.status(c, id, &groups, &segmenter)?;
+            Ok(MaskList { image_id: id, groups, ai })
+        })
+        .await
+}
+
+/// Replaces the image's mask groups (everything else in its adjustments is kept) with one
+/// history entry labelled `label` (e.g. "Mask: Brush", "Mask: Exposure"; same-label saves
+/// within 1.5 s coalesce, so saving on every stroke / slider release is fine). XMP dirty.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_masks(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    id: ImageId,
+    masks: Vec<MaskGroup>,
+    label: String,
+) -> AppResult<AdjustmentHistory> {
+    validate_masks(&masks).map_err(AppError::invalid)?;
+    let history = catalog
+        .run(move |c| {
+            let mut adj = repo::get_adjustments(c, id)?;
+            adj.masks = masks;
+            develop::history::commit(c, id, &adj, &label)
+        })
+        .await?;
+    xmp.notify(&app);
+    Ok(history)
+}
+
+/// Computes (or returns the cached) AI matte for `request` on image `id`; resolves when
+/// done (first run per image and kind: model load + inference; cached: instant). Put
+/// `digest` into the component's `AiMask.digest` and save. `invalid` when the family is
+/// unavailable (`getMaskCapabilities`).
+#[tauri::command]
+#[specta::specta]
+pub async fn compute_ai_mask(
+    catalog: State<'_, Catalog>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+    request: AiMaskRequest,
+) -> AppResult<AiMaskInfo> {
+    if let Some(p) = &request.reference_point {
+        if ![p.x, p.y].iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            return Err(AppError::invalid("referencePoint must lie within 0..=1"));
+        }
+    }
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let segmenter = segmenter.inner().clone();
+    blocking(move || segmenter.compute(&source_of(&entry), preview_path(&entry).as_deref(), &request)).await
+}
+
+/// People in image `id` for the People mask picker (left to right).
+#[tauri::command]
+#[specta::specta]
+pub async fn detect_people(
+    catalog: State<'_, Catalog>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+) -> AppResult<Vec<DetectedPerson>> {
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let segmenter = segmenter.inner().clone();
+    blocking(move || segmenter.detect_people(&source_of(&entry), preview_path(&entry).as_deref())).await
+}
+
+/// Renders the mask of `target` (a group, or one component, of `adjustments.masks`: live
+/// and unsaved) as a grayscale JPEG matching `render_preview`'s frame for the same
+/// `maxEdge` / `region`. Latest-wins per image on the `mask` slot: `null` = superseded.
+#[tauri::command]
+#[specta::specta]
+pub async fn render_mask_overlay(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    masks: State<'_, MaskCache>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+    target: MaskOverlayTarget,
+    options: MaskOverlayOptions,
+) -> AppResult<Option<RenderedMaskOverlay>> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    options.validate().map_err(AppError::invalid)?;
+    let known =
+        adjustments.masks.iter().find(|g| g.id == target.group_id).is_some_and(|g| match &target.component_id {
+            None => true,
+            Some(c) => g.components.iter().any(|x| &x.id == c),
+        });
+    if !known {
+        return Err(AppError::invalid("target does not name a mask group/component of adjustments.masks"));
+    }
+    let ticket = develop.ticket(id, RenderSlot::Mask);
+    let src = source_images(&catalog, vec![id]).await?.remove(0);
+    let cache = develop.inner().clone();
+    let masks = masks.inner().clone();
+    blocking(move || {
+        if !cache.is_current(ticket) {
+            return Ok(None);
+        }
+        develop::masks::render_overlay(&cache, &masks, ticket, &src, &adjustments, &target, &options)
+    })
+    .await
+}
+
+/// Which AI mask families can be computed on this Mac (model files present).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mask_capabilities(segmenter: State<'_, Segmenter>) -> AppResult<MaskCapabilities> {
+    let segmenter = segmenter.inner().clone();
+    blocking(move || Ok(segmenter.capabilities())).await
 }
