@@ -67,9 +67,9 @@ Conventions
   - Acceptance: 50-file batch per format from `test-data/`; output dimensions, JPEG quality, ICC profile and metadata verified with `exiftool`; memory flat during batch.
 
 ## Phase 7 — Anchor-photo scene matching
-- [ ] **Contract** (architect): scenes table + `match_scene(anchor_ids, target_ids)`.
-- [ ] **Matching** (vision-ml-dev): group frames by scene (time + histogram/embedding similarity); normalize histogram + white point delta from 1–2 graded anchors; apply relative adjustments.
-- [ ] **UI** (frontend-dev): mark anchors, preview and apply to scene.
+- [x] **Contract** (architect): scenes table + `match_scene(anchor_ids, target_ids)`.
+- [x] **Matching** (vision-ml-dev): group frames by scene (time + histogram/embedding similarity); normalize histogram + white point delta from 1–2 graded anchors; apply relative adjustments.
+- [x] **UI** (frontend-dev): mark anchors, preview and apply to scene.
 - [ ] **QA gate**.
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
