@@ -199,7 +199,7 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
 
 /// Test helper: the same decode through `dcraw_make_mem_image` (the pre-Phase 6 path).
 #[cfg(test)]
-fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, String> {
+fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<LinearRgb16, String> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| "path contains NUL".to_owned())?;
     let h = Handle::new()?;
     // SAFETY: as in `decode_linear`.
@@ -207,8 +207,16 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
         if libraw_open_file(h.0, c_path.as_ptr()) != 0 {
             return Err("open".into());
         }
+        let mut c = ShimColor::default();
+        sieve_lr_get_color(h.0, &mut c);
         sieve_lr_set_linear(h.0, c_int::from(half_size));
-        if libraw_unpack(h.0) != 0 || libraw_dcraw_process(h.0) != 0 {
+        if libraw_unpack(h.0) != 0 {
+            return Err("unpack".into());
+        }
+        if let Some(white) = adobe_white_level(&c) {
+            sieve_lr_set_white(h.0, white);
+        }
+        if libraw_dcraw_process(h.0) != 0 {
             return Err("process".into());
         }
         let mut code: c_int = 0;
@@ -217,11 +225,12 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
             return Err(err(code));
         }
         let r = &*img;
-        let n = r.width as usize * r.height as usize * 3;
+        let (w, hgt) = (r.width as u32, r.height as u32);
+        let n = w as usize * hgt as usize * 3;
         let mut pixels = vec![0u16; n];
         std::ptr::copy_nonoverlapping(std::ptr::addr_of!(r.data).cast::<u8>(), pixels.as_mut_ptr().cast::<u8>(), n * 2);
         libraw_dcraw_clear_mem(img);
-        Ok(pixels)
+        Ok(default_crop(LinearRgb16 { width: w, height: hgt, pixels, color: color_data(&c) }, &c, half_size))
     }
 }
 
@@ -250,7 +259,10 @@ fn default_crop(img: LinearRgb16, c: &ShimColor, half: bool) -> LinearRgb16 {
     if fx + fw > c.width.max(0) as usize || fy + fh > c.height.max(0) as usize {
         return img;
     }
-    let s = if half { 2 } else { 1 };
+    // Scale of the decode from its actual size: LibRaw only shrinks CFA layouts for
+    // `half_size` (Sony's lossless M/S raws and other non-CFA files decode at full size).
+    let full_w = c.width.max(0) as usize;
+    let s = if half && (img.width as usize) * 2 <= full_w + 2 { 2 } else { 1 };
     let (x0, y0) = (fx / s, fy / s);
     let (w, h) = ((fw / s).min(img.width as usize - x0), (fh / s).min(img.height as usize - y0));
     if (w, h) == (img.width as usize, img.height as usize) {
@@ -402,6 +414,31 @@ mod tests {
         assert!(e.starts_with("LibRaw:"), "{e}");
     }
 
+    /// The default crop follows the decode's real scale: a `half_size` request that LibRaw
+    /// decodes at full size (Sony lossless M/S raws) is cropped in full-size units.
+    #[test]
+    fn default_crop_uses_the_decoded_scale() {
+        let mut c = ShimColor::default();
+        for (d, s) in c.make.iter_mut().zip(b"Sony") {
+            *d = *s as c_char;
+        }
+        (c.width, c.height) = (4624, 3080);
+        c.inset = [8, 4, 4608, 3072];
+        let img = |w: u32, h: u32| {
+            let pixels = (0..w * h * 3).map(|i| (i / 3 % w) as u16).collect();
+            LinearRgb16 { width: w, height: h, pixels, color: color_data(&c) }
+        };
+        // Full-size decode despite `half`: crop at scale 1.
+        let full = default_crop(img(4624, 3080), &c, true);
+        assert_eq!((full.width, full.height), (4608, 3072));
+        assert_eq!(full.pixels[0], 8);
+        // A real half-size decode: scale 2.
+        let half = default_crop(img(2312, 1540), &c, true);
+        assert_eq!((half.width, half.height), (2304, 1536));
+        assert_eq!(half.pixels[0], 4);
+        assert_eq!((half.color.width, half.color.height), (4608, 3072));
+    }
+
     /// The direct image copy equals `dcraw_make_mem_image`'s output (identity curve).
     #[test]
     #[ignore = "needs sample RAWs ($SIEVE_SAMPLES)"]
@@ -415,8 +452,8 @@ mod tests {
             .expect("no RAW in sample folder");
         let a = decode_linear(&raw, true).unwrap();
         let b = decode_linear_mem_image(&raw, true).unwrap();
-        assert_eq!(a.pixels.len(), b.len());
-        let max = a.pixels.iter().zip(&b).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap();
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let max = a.pixels.iter().zip(&b.pixels).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap();
         assert!(max <= 1, "max diff {max}");
     }
 
