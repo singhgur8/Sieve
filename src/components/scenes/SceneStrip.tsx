@@ -1,6 +1,6 @@
 // Scene strip (Library and Develop): one 32 px non-wrapping row, shown once scenes exist (or are being detected).
 // Scene chips filter the grid; the "Scene" menu holds the editing actions; Match scene is the primary action.
-import { Anchor, ChevronDown, Combine, Loader2, Scissors, ScanSearch, SquarePlus, Trash2, Unlink, Wand2 } from "lucide-react";
+import { Anchor, ChevronDown, Combine, EyeOff, Loader2, Scissors, ScanSearch, SquarePlus, Trash2, Unlink, Wand2 } from "lucide-react";
 import { MAX_SCENE_ANCHORS, type Scene } from "../../ipc";
 import type { ScenesApi } from "../../hooks/useScenes";
 import { hint } from "../../lib/keymap";
@@ -15,11 +15,13 @@ interface Props {
   targets: number[];
   activeId: number | null;
   onMatch: (scene: Scene) => void;
+  /** Hide the strip and clear the scene filter. */
+  onHide?: () => void;
 }
 
 const btn = "flex h-6 items-center gap-1 whitespace-nowrap rounded bg-neutral-800 px-2 text-xs hover:bg-neutral-700 disabled:opacity-40 disabled:hover:bg-neutral-800";
 
-export function SceneStrip({ api, filterId, onFilter, targets, activeId, onMatch }: Props) {
+export function SceneStrip({ api, filterId, onFilter, targets, activeId, onMatch, onHide }: Props) {
   const { scenes, progress, detecting } = api;
   if (scenes.length === 0 && !detecting) return null;
   const activeScene = api.sceneOfImage(activeId);
@@ -117,6 +119,11 @@ export function SceneStrip({ api, filterId, onFilter, targets, activeId, onMatch
       >
         <Wand2 className="size-3.5" /> Match scene
       </button>
+      {onHide && (
+        <button className={btn} onClick={onHide} title={`Hide the scene strip and clear the scene filter${hint("scenesToggle")}`} data-testid="scene-strip-hide">
+          <EyeOff className="size-3.5" /> Hide
+        </button>
+      )}
     </div>
   );
 }

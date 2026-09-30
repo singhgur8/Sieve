@@ -18,6 +18,12 @@ interface Props {
   busy: boolean;
   mode: Mode;
   onMode: (m: Mode) => void;
+  /** Compare view is open (also inside Develop): highlights the Compare button. */
+  compareOn?: boolean;
+  /** Scene strip toggle: shown once scenes exist (or are being detected). */
+  scenesCount: number;
+  scenesOpen: boolean;
+  onToggleScenes: () => void;
   hasSelection: boolean;
   hasImages: boolean;
   detecting: boolean;
@@ -154,11 +160,17 @@ export function TopBar(p: Props) {
 
       <div className="mx-auto flex gap-1" data-testid="mode-switcher">
         {modes.map(({ m, label, icon: Icon, title, testid }) => (
-          <button key={m} className={seg(p.mode === m)} onClick={() => p.onMode(m)} title={title} data-testid={testid}>
+          <button key={m} className={seg(p.mode === m || (m === "compare" && !!p.compareOn))} aria-pressed={m === "compare" ? !!p.compareOn || p.mode === m : p.mode === m} onClick={() => p.onMode(m)} title={title} data-testid={testid}>
             <Icon className="size-3.5" /> {label}
           </button>
         ))}
       </div>
+
+      {(p.scenesCount > 0 || p.detecting) && (
+        <button className={seg(p.scenesOpen)} onClick={p.onToggleScenes} aria-pressed={p.scenesOpen} title={`${p.scenesOpen ? "Hide" : "Show"} the scene strip (hiding clears the scene filter)${hint("scenesToggle")}`} data-testid="scenes-toggle">
+          <Layers3 className="size-3.5" /> Scenes
+        </button>
+      )}
 
       {dirty > 0 && (
         <button

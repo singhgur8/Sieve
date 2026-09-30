@@ -16,6 +16,7 @@ interface Props {
   onColsChange: (cols: number, page: number) => void;
   onCellClick: (id: number, e: React.MouseEvent) => void;
   onCellDoubleClick: (id: number) => void;
+  onRate?: (id: number, rating: number) => void;
   /** True when the catalog holds no photos at all (first run). */
   catalogEmpty: boolean;
   filtered: boolean;
@@ -23,7 +24,7 @@ interface Props {
   onClearFilters: () => void;
 }
 
-export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
+export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, onRate, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const { ids } = lib;
@@ -136,6 +137,7 @@ export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onC
                   active={active === id}
                   onClick={onCellClick}
                   onDoubleClick={onCellDoubleClick}
+                  onRate={onRate}
                 />
               ))}
             </div>

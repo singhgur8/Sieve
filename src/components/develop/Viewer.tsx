@@ -61,11 +61,13 @@ export function Viewer(p: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const drag = useRef<{ sx: number; sy: number; cx: number; cy: number } | null>(null);
   const splitDrag = useRef(false);
+  const onSizeRef = useRef(p.onSize);
+  onSizeRef.current = p.onSize;
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = () => p.onSize({ w: el.clientWidth, h: el.clientHeight });
+    const report = () => onSizeRef.current({ w: el.clientWidth, h: el.clientHeight });
     report();
     const ro = new ResizeObserver(report);
     ro.observe(el);

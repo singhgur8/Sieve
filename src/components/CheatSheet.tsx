@@ -37,7 +37,7 @@ export function CheatSheet({ onClose, mode = "grid" }: { onClose: () => void; mo
         {ordered(mode).map((g) => (
           <section key={g.group} className="mb-4 break-inside-avoid" data-testid={`cheat-group-${g.group}`}>
             <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-neutral-400">{g.group}</h3>
-            <ul className="space-y-1">
+            <ul className="space-y-0.5">
               {g.items.map((d) => (
                 <li key={d.id} className="flex items-baseline gap-3" data-testid={`cheat-${d.id}`}>
                   <span className="flex w-28 shrink-0 flex-wrap gap-1">

@@ -1,14 +1,16 @@
 // Develop module: filmstrip + viewer (before/after, split, 100% detail) + presets/history + adjustment sliders.
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, ChevronLeft, ChevronRight, ClipboardCopy, ClipboardPaste, Columns2, Flag, RefreshCw, RotateCcw, SplitSquareHorizontal, X, ZoomIn } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, ClipboardCopy, ClipboardPaste, Columns2, Columns3, Flag, RefreshCw, RotateCcw, SplitSquareHorizontal, X, ZoomIn } from "lucide-react";
 import { commands, convertFileSrc, unwrap, type FaceInfo, type LutInfo, type NormRect, type ParametricAdjustments, type Preset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
-import { useEditor } from "../../hooks/useEditor";
+import { useEditor, type Editor } from "../../hooks/useEditor";
 import { clearFileHealth, useEntryHealth } from "../../lib/errors";
 import { OriginalUnavailable } from "./OriginalUnavailable";
 import { Stars } from "../Cell";
+import { CompareBar, CompareTag } from "../CompareBar";
+import type { CompareState } from "../LoupeLayer";
 import { Filmstrip } from "../Filmstrip";
 import { setPanelHidden, usePanels } from "../../lib/panels";
 import { dispToSensor, screenToDisp } from "../../lib/maskGeom";
@@ -81,6 +83,16 @@ interface Props {
   onBack: () => void;
   /** "Locate folder…" for the folder of image `imageId` (IPC v13 relocate_folder). */
   onLocate: (imageId: number) => void;
+  /** Compare view (two panes side by side). `focus` is the active pane: the sliders, crop and masks edit it. */
+  compare?: CompareState | null;
+  onFocusPane?: (k: "a" | "b") => void;
+  /** Filmstrip click in Compare: choose the Candidate. */
+  onCandidate?: (id: number) => void;
+  onSwap?: () => void;
+  onMakeSelect?: () => void;
+  onToggleCompare?: () => void;
+  /** Click on a star: rate that photo (0 clears). */
+  onRate?: (id: number, rating: number) => void;
 }
 
 const FILM = 72;
@@ -96,8 +108,8 @@ const TOOL_HELP: Record<string, string> = {
   object: "Objects: drag a rectangle around the object",
 };
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onBack, onLocate }, ref) {
-  const id = sel.active;
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onBack, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate }, ref) {
+  const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
   const [region, setRegion] = useState<NormRect | null>(null);
@@ -120,15 +132,31 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const { refresh } = lib;
   const onChanged = useCallback((changed: number) => void refresh([changed]).catch(() => {}), [refresh]);
   const entry = id != null ? lib.getEntry(id) : undefined;
-  const editor = useEditor(id, {
-    format: entry?.format,
-    uncropped: cropTool !== null,
-    maxEdge: Math.ceil(Math.max(size.w, size.h) * dpr),
+  // Compare: one editor per pane (A = Select, B = Candidate); `editor` is the active pane's, so every panel edits it.
+  const focusB = !!compare && compare.focus === "b";
+  const idA = compare ? compare.a : id;
+  const idB = compare ? compare.b : null;
+  const maxEdge = Math.ceil(Math.max(size.w, size.h) * dpr);
+  const beforeOn = (showBefore || split) && !compare;
+  const editorA = useEditor(idA, {
+    format: (idA != null ? lib.getEntry(idA) : undefined)?.format,
+    uncropped: cropTool !== null && !focusB,
+    maxEdge,
     region,
-    wantBefore: showBefore || split,
+    wantBefore: beforeOn && !focusB,
     onError,
     onChanged,
   });
+  const editorB = useEditor(idB, {
+    format: (idB != null ? lib.getEntry(idB) : undefined)?.format,
+    uncropped: cropTool !== null && focusB,
+    maxEdge,
+    region,
+    wantBefore: false,
+    onError,
+    onChanged,
+  });
+  const editor = focusB ? editorB : editorA;
   const { info } = editor;
   const health = useEntryHealth(entry);
   // The original became reachable again (relocated folder): load the image that failed to open.
@@ -163,7 +191,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [commitRegion]);
   useEffect(() => () => clearTimeout(panTimer.current), []);
   // New image: back to fit.
-  useEffect(() => setZoom({ on: false, cx: 0.5, cy: 0.5 }), [id]);
+  // (Compare keeps the shared zoom while the Candidate changes.)
+  useEffect(() => setZoom({ on: false, cx: 0.5, cy: 0.5 }), [idA]);
 
   // ---- crop tool ----
   useEffect(() => setCropTool(null), [id]);
@@ -503,6 +532,68 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const thumb = entry?.thumbnail;
   const thumbUrl = thumb?.status === "ready" ? `${convertFileSrc(thumb.path)}?v=${id != null ? lib.version(id) : 0}` : null;
 
+  const mkViewer = (ed: Editor, active: boolean) => (
+    <Viewer
+      main={ed.main}
+      before={active ? ed.before : null}
+      detail={ed.detail}
+      detailRegion={region}
+      showBefore={active && showBefore && !compare}
+      split={active && split && !compare}
+      splitPos={splitPos}
+      onSplitPos={setSplitPos}
+      zoom={zoom}
+      size={size}
+      fw={ed.info?.fullWidth ?? 0}
+      fh={ed.info?.fullHeight ?? 0}
+      loading={ed.loading}
+      onSize={setSize}
+      onPan={setZoom}
+      onPanEnd={onPanEnd}
+      onToggleZoom={toggleZoom}
+      inset={active && cropTool ? CROP_INSET : 0}
+      rotate={active && cropTool ? previewRotation(cropTool.angle, orientation) : 0}
+    />
+  );
+  const activeLayers = (
+    <>
+          {health && !editor.main && entry && (
+        <OriginalUnavailable
+          health={health}
+          fileName={entry.fileName}
+          onLocate={() => onLocate(entry.id)}
+          onRetry={() => {
+            clearFileHealth(entry.path);
+            void editor.reload().catch(onError);
+          }}
+        />
+      )}
+      {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} region={zoom.on ? region : null} onError={onError} />}
+      {masks.open && masks.tool && !cropTool && (
+        <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>
+          {TOOL_HELP[masks.tool.kind]}
+        </span>
+      )}
+      {cropTool && imageAspect > 0 && (
+        <div className="absolute" style={{ inset: CROP_INSET }} data-testid="crop-inset">
+          <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} />
+        </div>
+      )}
+      {cropTool && <CropBar crop={cropApi} />}
+      {picking && (
+        <div
+          className="absolute inset-0 z-20 cursor-crosshair"
+          data-testid="wb-picker-overlay"
+          onClick={(e) => pickWb(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
+        >
+          <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="wb-picker-badge">
+            Click a neutral grey or white. Esc cancels
+          </span>
+        </div>
+      )}
+    </>
+  );
+
   const btn = (on = false) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"} disabled:opacity-40`;
 
   return (
@@ -519,19 +610,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           <span className="flex items-center gap-1.5" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
             {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" aria-label="Picked" />}
             {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} aria-label="Rejected" />}
-            <Stars n={entry.rating} />
+            <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId="develop-stars" />
             {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={entry.colorLabel} />}
           </span>
         )}
         <div className="ml-4 flex gap-1">
-          <button className={btn(showBefore)} onClick={() => setShowBefore((v) => !v)} title={`Before / after${hint("before")}`} data-testid="before-toggle">
+          <button className={btn(showBefore)} disabled={!!compare} onClick={() => setShowBefore((v) => !v)} title={`Before / after${hint("before")}`} data-testid="before-toggle">
             <Columns2 className="size-3.5" /> Before
           </button>
-          <button className={btn(split)} onClick={() => setSplit((v) => !v)} title={`Split view${hint("split")}`} data-testid="split-toggle">
+          <button className={btn(split)} disabled={!!compare} onClick={() => setSplit((v) => !v)} title={`Split view${hint("split")}`} data-testid="split-toggle">
             <SplitSquareHorizontal className="size-3.5" /> Split
           </button>
           <button className={btn(zoom.on)} onClick={() => toggleZoom()} title={`Zoom to 100%${hint("zoomDevelop")}`} data-testid="zoom-toggle">
             <ZoomIn className="size-3.5" /> 100%
+          </button>
+          <button className={btn(!!compare)} onClick={() => onToggleCompare?.()} title={`Compare two photos side by side${hint("compare")}`} aria-pressed={!!compare} data-testid="develop-compare">
+            <Columns3 className="size-3.5" /> Compare
           </button>
         </div>
         <div className="flex gap-1">
@@ -562,6 +656,17 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         </span>
       </div>
       )}
+      {compare && !panels.chrome && (
+        <CompareBar
+          focus={compare.focus}
+          aName={lib.getEntry(compare.a)?.fileName ?? ""}
+          bName={lib.getEntry(compare.b)?.fileName ?? ""}
+          onSwap={() => onSwap?.()}
+          onMakeSelect={() => onMakeSelect?.()}
+          onFocus={(k) => onFocusPane?.(k)}
+          onExit={onToggleCompare}
+        />
+      )}
 
       <div className="flex min-h-0 flex-1">
         {!panels.left && (
@@ -584,67 +689,50 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           />
         </aside>
         )}
-        <div className="relative min-w-0 flex-1">
-          <Viewer
-            main={editor.main}
-            before={editor.before}
-            detail={editor.detail}
-            detailRegion={region}
-            showBefore={showBefore}
-            split={split}
-            splitPos={splitPos}
-            onSplitPos={setSplitPos}
-            zoom={zoom}
-            size={size}
-            fw={fw}
-            fh={fh}
-            loading={editor.loading}
-            onSize={setSize}
-            onPan={setZoom}
-            onPanEnd={onPanEnd}
-            onToggleZoom={toggleZoom}
-            inset={cropTool ? CROP_INSET : 0}
-            rotate={cropTool ? previewRotation(cropTool.angle, orientation) : 0}
-          />
-          {health && !editor.main && entry && (
-            <OriginalUnavailable
-              health={health}
-              fileName={entry.fileName}
-              onLocate={() => onLocate(entry.id)}
-              onRetry={() => {
-                clearFileHealth(entry.path);
-                void editor.reload().catch(onError);
-              }}
-            />
-          )}
-          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} region={zoom.on ? region : null} onError={onError} />}
-          {masks.open && masks.tool && !cropTool && (
-            <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>
-              {TOOL_HELP[masks.tool.kind]}
-            </span>
-          )}
-          {cropTool && imageAspect > 0 && (
-            <div className="absolute" style={{ inset: CROP_INSET }} data-testid="crop-inset">
-              <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} />
-            </div>
-          )}
-          {cropTool && <CropBar crop={cropApi} />}
-          {picking && (
-            <div
-              className="absolute inset-0 z-20 cursor-crosshair"
-              data-testid="wb-picker-overlay"
-              onClick={(e) => pickWb(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
-            >
-              <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="wb-picker-badge">
-                Click a neutral grey or white. Esc cancels
-              </span>
-            </div>
-          )}
-          <PanelChevron side="left" hidden={panels.left} />
-          <PanelChevron side="right" hidden={panels.right} />
-        </div>
+        {compare ? (
+          <div className="relative flex min-w-0 flex-1 gap-1" data-testid="dev-compare">
+            {(["a", "b"] as const).map((k) => {
+              const active = compare.focus === k;
+              const pid = compare[k];
+              const pe = lib.getEntry(pid);
+              return (
+                <div
+                  key={k}
+                  className={`relative min-w-0 flex-1 border-2 ${active ? "border-sky-500" : "border-transparent"}`}
+                  data-testid={`dev-compare-pane-${k}`}
+                  data-active={active}
+                  data-image-id={pid}
+                  onPointerDown={() => !active && onFocusPane?.(k)}
+                >
+                  {mkViewer(k === "a" ? editorA : editorB, active)}
+                  {active && activeLayers}
+                  <div className="absolute bottom-2 left-2 flex items-center gap-2 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-100" data-testid={`dev-compare-label-${k}`}>
+                    <span className={`rounded px-1 font-semibold ${k === "a" ? "bg-sky-700" : "bg-amber-400 text-black"}`}>{k === "a" ? "Select" : "Candidate"}</span>
+                    {pe?.fileName}
+                    {pe && <Stars n={pe.rating} className="size-3" onRate={onRate && ((r) => onRate(pid, r))} testId={`dev-compare-stars-${k}`} />}
+                    {active && <span className="text-sky-300">editing</span>}
+                  </div>
+                </div>
+              );
+            })}
+            <PanelChevron side="left" hidden={panels.left} />
+            <PanelChevron side="right" hidden={panels.right} />
+          </div>
+        ) : (
+          <div className="relative min-w-0 flex-1">
+            {mkViewer(editor, true)}
+            {activeLayers}
+            <PanelChevron side="left" hidden={panels.left} />
+            <PanelChevron side="right" hidden={panels.right} />
+          </div>
+        )}
         {!panels.right && (
         <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside">
+          {compare && (
+            <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
+              Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}
+            </div>
+          )}
           <div className="flex gap-1 border-b border-neutral-800 px-3 py-1.5" role="tablist" aria-label="Develop panels">
             <button role="tab" aria-selected={!masks.open} className={`flex-1 rounded px-2 py-1 text-xs ${!masks.open ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`} onClick={() => { masks.endTool(); masks.setOpen(false); }} data-testid="panel-tab-adjust">
               Adjust
@@ -661,7 +749,19 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       </div>
 
       {!panels.chrome && (
-        <Filmstrip lib={lib} activeId={id} selected={sel.selected} onPick={(fid, ev) => sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey })} cellW={FILM} cellH={FILM} height={88} scenePrefix="film-scene" />
+        <Filmstrip
+          lib={lib}
+          activeId={compare ? compare.b : id}
+          selected={compare ? new Set([compare.a]) : sel.selected}
+          marked={compare ? new Set([compare.b]) : undefined}
+          onPick={(fid, ev) => (compare ? onCandidate?.(fid) : sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey }))}
+          onRate={onRate}
+          badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : undefined}
+          cellW={FILM}
+          cellH={FILM}
+          height={88}
+          scenePrefix="film-scene"
+        />
       )}
 
       {masks.picker && id != null && (

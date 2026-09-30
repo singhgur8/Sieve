@@ -309,11 +309,11 @@ test.describe("compare", () => {
     await expect.poll(async () => (await calls(page, "set_pick")).length).toBe(1);
     expect((await calls(page, "set_pick"))[0].args).toEqual({ ids: [2], pick: "reject" });
 
-    // Arrows step the focused pane through the burst, skipping the other pane's image.
+    // Arrows step the Candidate through the filtered gallery, skipping the Select.
     await page.keyboard.press("ArrowRight");
     await expect(page.getByTestId("compare-pane-b")).toHaveAttribute("data-image-id", "4");
     await page.keyboard.press("ArrowRight");
-    await expect(page.getByTestId("compare-pane-b")).toHaveAttribute("data-image-id", "4");
+    await expect(page.getByTestId("compare-pane-b")).toHaveAttribute("data-image-id", "5");
 
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("compare")).toHaveCount(0);

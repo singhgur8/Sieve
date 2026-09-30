@@ -176,7 +176,7 @@ export interface OverlayStyle {
 }
 
 export const OVERLAY_STYLES: OverlayStyle[] = [
-  { id: "red", label: "Red overlay", mode: "color", color: "#ff2d2d" },
+  { id: "red", label: "Red overlay", mode: "color", color: "#c00000" },
   { id: "green", label: "Green overlay", mode: "color", color: "#22e05a" },
   { id: "blue", label: "Blue overlay", mode: "color", color: "#3b82f6" },
   { id: "yellow", label: "Yellow overlay", mode: "color", color: "#facc15" },

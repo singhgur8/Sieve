@@ -51,6 +51,7 @@ export default function App() {
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
+  const [scenesOpen, setScenesOpen] = useState(true);
   const [cheatOpen, setCheatOpen] = useState(false);
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [healthDismissed, setHealthDismissed] = useState(false);
@@ -140,16 +141,61 @@ export default function App() {
     [ids, sel],
   );
 
+  /** Compare: move the Candidate through the filtered gallery (the Select never changes; it is skipped). */
   const stepCompare = useCallback(
     (dir: 1 | -1) => {
+      if (!cmp || ids.length === 0) return;
+      let i = ids.indexOf(cmp.b);
+      if (i < 0) i = ids.indexOf(cmp.a);
+      i += dir;
+      while (i >= 0 && i < ids.length && ids[i] === cmp.a) i += dir;
+      if (i < 0 || i >= ids.length) return;
+      const id = ids[i];
+      setCmp({ ...cmp, b: id });
+      if (cmp.focus === "b") sel.set([id], id);
+    },
+    [cmp, ids, sel],
+  );
+
+  /** Pick the Candidate (filmstrip click). Clicking the Select swaps the two. */
+  const setCandidate = useCallback(
+    (id: number) => {
+      if (!cmp || id === cmp.b) return;
+      if (id === cmp.a) return swapCompareRef.current();
+      setCmp({ ...cmp, b: id });
+      if (cmp.focus === "b") sel.set([id], id);
+    },
+    [cmp, sel],
+  );
+
+  /** Swap the panes. The active photo stays active (so the focus flips with it). */
+  const swapCompare = useCallback(() => {
+    if (!cmp) return;
+    const next: CompareState = { a: cmp.b, b: cmp.a, focus: cmp.focus === "a" ? "b" : "a" };
+    setCmp(next);
+    sel.set([next[next.focus]], next[next.focus]);
+  }, [cmp, sel]);
+  const swapCompareRef = useRef(swapCompare);
+  swapCompareRef.current = swapCompare;
+
+  /** Candidate becomes the Select; the next photo after it becomes the new Candidate. */
+  const makeSelect = useCallback(() => {
+    if (!cmp) return;
+    let i = ids.indexOf(cmp.b) + 1;
+    if (ids[i] === cmp.b) i++;
+    let next = ids[i];
+    if (next == null || next === cmp.b) next = ids[ids.indexOf(cmp.b) - 1];
+    if (next == null || next === cmp.b) return;
+    const n: CompareState = { a: cmp.b, b: next, focus: cmp.focus };
+    setCmp(n);
+    sel.set([n[n.focus]], n[n.focus]);
+  }, [cmp, ids, sel]);
+
+  const focusPane = useCallback(
+    (k: "a" | "b") => {
       if (!cmp) return;
-      const other = cmp.focus === "a" ? cmp.b : cmp.a;
-      let i = cmp.pool.indexOf(cmp[cmp.focus]) + dir;
-      while (i >= 0 && i < cmp.pool.length && cmp.pool[i] === other) i += dir;
-      if (i < 0 || i >= cmp.pool.length) return;
-      const id = cmp.pool[i];
-      setCmp({ ...cmp, [cmp.focus]: id });
-      sel.set([id], id);
+      setCmp({ ...cmp, focus: k });
+      sel.set([cmp[k]], cmp[k]);
     },
     [cmp, sel],
   );
@@ -169,8 +215,7 @@ export default function App() {
     try {
       let a: number | undefined;
       let b: number | undefined;
-      let pool = ids;
-      if (mode === "grid" && sel.selected.size === 2) {
+      if ((mode === "grid" || mode === "develop") && sel.selected.size === 2) {
         [a, b] = [...sel.selected];
       } else {
         a = sel.active ?? ids[0];
@@ -180,7 +225,6 @@ export default function App() {
           const groups = await unwrap(commands.listBurstGroups(query.folderId));
           const g = groups.find((x) => x.id === entry.burstGroupId);
           if (g) {
-            pool = g.imageIds;
             b = g.keeperImageId != null && g.keeperImageId !== a ? g.keeperImageId : g.imageIds.find((x) => x !== a);
           }
         }
@@ -193,9 +237,9 @@ export default function App() {
         setNotice("Select two photos (or a burst member) to compare");
         return;
       }
-      setCmp({ pool, a, b, focus: "a" });
+      setCmp({ a, b, focus: "a" });
       sel.set([a], a);
-      setMode("compare");
+      if (mode !== "develop") setMode("compare"); // inside Develop, Compare is a view of Develop (editing stays available)
     } catch (e) {
       reportError(e);
     }
@@ -205,10 +249,10 @@ export default function App() {
     const target = sel.active ?? ids[0];
     if (target == null) return;
     // Keep a multi-selection (for sync / paste); otherwise select just the image.
-    if (!sel.selected.has(target)) sel.set([target], target);
-    setCmp(null);
-    setMode("develop");
-  }, [sel, ids]);
+    if (!cmp && !sel.selected.has(target)) sel.set([target], target);
+    setMode("develop"); // a Compare pair stays open: Develop Compare edits the active pane
+    if (!cmp) setCmp(null);
+  }, [sel, ids, cmp]);
 
   const changeMode = useCallback(
     (m: Mode) => {
@@ -217,9 +261,10 @@ export default function App() {
         setCmp(null);
       } else if (m === "develop") openDevelop();
       else if (m === "loupe") openLoupe();
+      else if (mode === "compare" || (mode === "develop" && cmp)) return;
       else void enterCompare();
     },
-    [openLoupe, openDevelop, enterCompare],
+    [openLoupe, openDevelop, enterCompare, mode, cmp],
   );
 
   // ---- culling actions (batch over targets), all undoable ----
@@ -296,6 +341,14 @@ export default function App() {
       advanceIf(t, false);
     },
     [targets, mutate, advanceIf, what],
+  );
+
+  /** Star click in the grid, loupe, Develop or a filmstrip: rates that photo only; clicking its current rating clears it. */
+  const ratePhoto = useCallback(
+    (id: number, rating: number) => {
+      void mutate(`Rate ${what([id])} ${rating}★`, [id], (e) => ({ ...e, rating }), () => unwrap(commands.setRating([id], rating)));
+    },
+    [mutate, what],
   );
 
   const doLabel = useCallback(
@@ -512,10 +565,17 @@ export default function App() {
     }
   }, [active, lib, query.folderId, ids, sel, reportError, setNotice]);
 
+  const toggleScenes = useCallback(() => {
+    if (scenesOpen) {
+      setScenesOpen(false);
+      setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
+    } else setScenesOpen(true);
+  }, [scenesOpen]);
+
   // ---- keyboard: one handler driven by the shared keymap ----
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
-    const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping() });
+    const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
     e.preventDefault();
     const k = e.key;
@@ -544,7 +604,7 @@ export default function App() {
         return void selectBurst();
       case "navH": {
         const dir = k === "ArrowRight" ? 1 : -1;
-        if (mode === "compare") stepCompare(dir);
+        if (cmp) stepCompare(dir);
         else step(dir, e.shiftKey && mode === "grid");
         return;
       }
@@ -591,15 +651,17 @@ export default function App() {
         return openDevelop();
       case "compare":
         if (mode === "compare") openLoupe(cmp ? cmp[cmp.focus] : undefined);
+        else if (mode === "develop" && cmp) setCmp(null);
         else void enterCompare();
         return;
-      case "tab":
-        if (cmp) {
-          const focus = cmp.focus === "a" ? "b" : "a";
-          setCmp({ ...cmp, focus });
-          sel.set([cmp[focus]], cmp[focus]);
-        }
-        return;
+      case "compareSwap":
+        return swapCompare();
+      case "compareMakeSelect":
+        return makeSelect();
+      case "compareFocus":
+        return cmp ? focusPane(cmp.focus === "a" ? "b" : "a") : undefined;
+      case "scenesToggle":
+        return toggleScenes();
       case "selectAll":
         return sel.selectAll();
       case "selectNone":
@@ -701,6 +763,10 @@ export default function App() {
         busy={busy}
         mode={mode}
         onMode={changeMode}
+        compareOn={cmp != null}
+        scenesCount={scenes.scenes.length}
+        scenesOpen={scenesOpen}
+        onToggleScenes={toggleScenes}
         hasSelection={targets().length > 0}
         hasImages={ids.length > 0}
         detecting={scenes.detecting}
@@ -720,7 +786,10 @@ export default function App() {
             status.setCatalog((c) => (c ? { ...c, autoAnalyze: v } : c));
           })
         }
-        onDetectScenes={() => void scenes.detect()}
+        onDetectScenes={() => {
+          setScenesOpen(true);
+          void scenes.detect();
+        }}
         onAutoXmp={(v) =>
           void run(async () => {
             await unwrap(commands.setXmpAutoSync(v));
@@ -812,6 +881,7 @@ export default function App() {
         />
       )}
 
+      {scenesOpen && (
       <SceneStrip
         api={scenes}
         filterId={query.sceneId ?? null}
@@ -819,7 +889,9 @@ export default function App() {
         targets={targets()}
         activeId={active ?? null}
         onMatch={(s) => setMatchOpen(s.id)}
+        onHide={toggleScenes}
       />
+      )}
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
@@ -831,6 +903,7 @@ export default function App() {
           onColsChange={(cols, page) => (colsRef.current = { cols, page })}
           onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
           onCellDoubleClick={openLoupe}
+          onRate={ratePhoto}
           catalogEmpty={catalog != null && catalog.imageCount === 0}
           filtered={filtered}
           onImport={importFolder}
@@ -849,6 +922,13 @@ export default function App() {
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBack={() => changeMode("grid")}
             onLocate={locateFolder}
+            compare={cmp}
+            onFocusPane={focusPane}
+            onCandidate={setCandidate}
+            onSwap={swapCompare}
+            onMakeSelect={makeSelect}
+            onToggleCompare={() => (cmp ? setCmp(null) : void enterCompare())}
+            onRate={ratePhoto}
           />
           </ErrorBoundary>
         )}
@@ -860,12 +940,14 @@ export default function App() {
             lib={lib}
             activeId={active}
             compare={cmp}
-            onFocusPane={(k) => {
-              if (!cmp) return;
-              setCmp({ ...cmp, focus: k });
-              sel.set([cmp[k]], cmp[k]);
-            }}
+            onFocusPane={focusPane}
             onOpen={(id) => sel.set([id], id)}
+            onCandidate={setCandidate}
+            onSwap={swapCompare}
+            onMakeSelect={makeSelect}
+            onEditCompare={openDevelop}
+            onExitCompare={() => openLoupe(cmp ? cmp[cmp.focus] : undefined)}
+            onRate={ratePhoto}
             onLocate={locateFolder}
           />
           </ErrorBoundary>
