@@ -535,6 +535,8 @@ mod tests {
             let half = source::decode_half_size(raw).unwrap();
             let prep = source::prepare(&half, 1, &CropSettings::default(), None, 1024);
             let p = prof();
+            // As the app: the whole-source local tone context (`DevelopCache`).
+            let tone = crate::develop::pipeline::tone_context(&half, 1, &adj, &p);
             let input = RenderInput {
                 width: prep.width,
                 height: prep.height,
@@ -545,7 +547,7 @@ mod tests {
                 profile: &p,
                 seed: 1,
                 quality: crate::develop::pipeline::Quality::Preview,
-                tone: None,
+                tone: Some(&tone),
             };
             let preview = render(&input, &adj, None);
             let full = decode_full(raw).unwrap();

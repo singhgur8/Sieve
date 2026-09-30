@@ -73,7 +73,7 @@ Conventions
 - [x] **QA gate**.
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
-## Phase 7b — Real-world parity (user request 2026-09-29)
+## Phase 7b — Real-world parity (user request 2026-09-29) ✅
 Sample set: `/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal` (45 GB; 537 ARW, 231 CR3, 79 RAF, 39 JPG, 394 user-edited
 Lightroom XMPs). **Read-only** — never write sidecars there (auto-sync stays off; verify no file changes before/after);
 copy subsets into `test-data/` for anything that writes.
@@ -100,7 +100,7 @@ copy subsets into `test-data/` for anything that writes.
   throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
   side-by-side of Sieve renders of the user's edits for visual parity review.
 - [x] **Culling calibration to user picks** (vision-ml-dev): QA found 31% of the user's keepers suggested reject (burst duplicates, overexposed on 40% of frames). Acceptance on held-out part of the shoot: keeper false-reject ≤ 5%, overexposed < 10% unless truly clipped, no blink/missed_focus precision regression.
-- [ ] **QA gate**.
+- [x] **QA gate**.
 
 ## Phase 7c — Local adjustments & masking (moved from Phase 11: user requires an all-in-one Lightroom replacement)
 - [x] **Contract** (architect): mask groups with per-mask adjustment sets (Lightroom `crs:MaskGroupBasedCorrections`
@@ -171,3 +171,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-30 — Phase 7b culling calibration: keeper_eval on the user's proposal shoot (keeper = edited or ≥2★), time split 60/40. Held-out keepers suggested reject 37.4% → 0%; overexposed 27.7% → 0% (now blown skin / >60% blown frame); remaining 7 rejects all non-keepers; wedding-label tag precision unchanged. Gap: stars/picks barely predict this user's keepers (AUC ~0.57) — content/preference model needed (Phase 10).
 - 2026-09-30 — Phase 7b QA (final): non-RAW end to end PASS (neutral ≤ 2 levels, <name>.JPG.xmp sidecars, exports, originals byte-identical); parity PASS at 3.0 bar (held-out 2.88; ARW 2.97 / CR3 2.81 / RAF 2.87; 4 frames > 3 → Phase 8 round 2); culling calibration PASS (held-out keeper false-reject 0/115, wedding-label precision unchanged); scale PASS (orchestrator-run: 847/847 ready, 108 files/s, 330 MB footprint, 394 sidecars 0 errors, source listing of 1281 files identical). Open: M-size ARW half-size preview crop regression (fix in progress) blocks the QA gate.
 - 2026-09-30 — Phase 7c implemented (pending QA): v10 masks contract; segmentation models (BiRefNet subject, U²-Net sky, YOLOX + EfficientSAM people, MediaPipe parts; all MIT/Apache, SCRFD caveat); Lightroom mask XMP I/O (50/50 user mattes decoded, byte-identical round trip); mask evaluation + local planes merged with parity round 1 (full-frame mask == global slider; outside-mask change ≤ 0.011 ΔE); user's 10 masked frames vs Camera Raw 3.42 (in-mask 3.78); masked 2048 p95 78 ms; masking UI + UX review 2 fixes + polish (140 Playwright). Phase 8 UX review done (reviews 1 and 2, all P0/P1 implemented); crop straighten live preview done.
+- 2026-09-30 — Phase 7b complete: M-size ARW half-size crop regression fixed (158d475; crop scale from decoded vs full size); direct_copy_matches_mem_image + real_raw_export_matches_preview pass; 259 tests green. Parity round 2 continues in Phase 8.
