@@ -186,6 +186,36 @@ export const commands = {
 	 *  `invalid_argument` unless `force` (they then render without it, `lutMissing`).
 	 */
 	deleteLut: (id: string, force: boolean) => typedError<null, AppError>(__TAURI_INVOKE("delete_lut", { id, force })),
+	/**  Which formats can be written here (WebP/HEIC depend on encoders), plus concurrency limits. */
+	getExportCapabilities: () => typedError<ExportCapabilities, AppError>(__TAURI_INVOKE("get_export_capabilities")),
+	/**  Built-in presets (read-only, negative ids) first, then user presets by name. */
+	listExportPresets: () => typedError<ExportPreset[], AppError>(__TAURI_INVOKE("list_export_presets")),
+	/**
+	 *  Creates (`id = null`) or overwrites a user preset. Built-ins cannot be overwritten
+	 *  (`invalid_argument`; save under a new name instead). Names are unique (case-insensitive).
+	 */
+	saveExportPreset: (id: number | null, name: string, settings: ExportSettings) => typedError<ExportPreset, AppError>(__TAURI_INVOKE("save_export_preset", { id, name, settings })),
+	/**  Deletes a user preset (built-ins -> `invalid_argument`). */
+	deleteExportPreset: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("delete_export_preset", { id })),
+	/**
+	 *  Dry run: resolved output paths and which already exist (for the export dialog's
+	 *  "N files exist" warning). No pixels are developed.
+	 */
+	planExport: (ids: number[], settings: ExportSettings) => typedError<ExportPlan, AppError>(__TAURI_INVOKE("plan_export", { ids, settings })),
+	/**
+	 *  Queues an export of `ids` (in this order; `{seq}` follows it; duplicates dropped) with
+	 *  `settings` and returns the `queued` job immediately. Adjustments are snapshotted now.
+	 *  `presetName` labels the job. Progress: `exportProgress`; end: `exportFinished`.
+	 *  `settings.destination` must not be `choose`. Unknown ids -> `not_found`, nothing queued.
+	 */
+	exportImages: (ids: number[], settings: ExportSettings, presetName: string | null) => typedError<ExportJob, AppError>(__TAURI_INVOKE("export_images", { ids, settings, presetName })),
+	/**
+	 *  Cancels a queued or running job (files already written are kept). No-op for finished
+	 *  jobs; unknown id -> `not_found`. The job ends with `exportFinished { cancelled: true }`.
+	 */
+	cancelExport: (jobId: number) => typedError<null, AppError>(__TAURI_INVOKE("cancel_export", { jobId })),
+	/**  Queued/running jobs first, then recent finished jobs (newest first, max 50). */
+	getExportJobs: () => typedError<ExportJob[], AppError>(__TAURI_INVOKE("get_export_jobs")),
 };
 
 /** Events */
@@ -194,6 +224,8 @@ export const events = {
 	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
 	analysisReady: makeEvent<AnalysisReady>("analysis-ready"),
+	exportFinished: makeEvent<ExportFinished>("export-finished"),
+	exportProgress: makeEvent<ExportProgress>("export-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
@@ -316,6 +348,9 @@ export type AppError = {
 	message: string,
 };
 
+/**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
+export type BitDepth = "8" | "16";
+
 /**  A cluster of near-identical frames shot in quick succession. */
 export type BurstGroup = {
 	id: number,
@@ -376,6 +411,19 @@ export type CatalogState = {
 	 */
 	xmpAutoSync: boolean,
 };
+
+/**  JPEG chroma subsampling. `444` keeps full colour resolution (larger files). */
+export type ChromaSubsampling = "444" | "422" | "420";
+
+/**
+ *  What to do when a target file already exists on disk. Two images of one job that
+ *  expand to the same name always get unique suffixes (never overwrite each other).
+ */
+export type CollisionPolicy = 
+/**  Append `-2`, `-3`, ... before the extension. */
+"unique_suffix" | "overwrite" | 
+/**  Leave the existing file; the image counts as `skipped`. */
+"skip";
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
 export type ColorLabel = "red" | "yellow" | "green" | "blue" | "purple";
@@ -453,6 +501,176 @@ export type EditState = {
 
 export type ErrorKind = "not_found" | "invalid_argument" | "io" | "database" | "internal";
 
+/**  What the export engine can do here (`get_export_capabilities`). */
+export type ExportCapabilities = {
+	/**  One entry per `ExportFormatKind`, in enum order. */
+	formats: ExportFormatInfo[],
+	/**  Upper bound of images developed concurrently (see `docs/architecture.md`, "Export"). */
+	maxParallel: number,
+	/**  Memory budget shared by concurrently developed images, MiB. */
+	memoryBudgetMb: number,
+};
+
+/**
+ *  Output colour space; its ICC profile is always embedded (sRGB IEC61966-2.1,
+ *  Display P3, Adobe RGB (1998)).
+ */
+export type ExportColorSpace = "srgb" | "display_p3" | "adobe_rgb";
+
+/**  Where exported files go (`ExportSettings.subfolder` is appended in every case). */
+export type ExportDestination = 
+/**
+ *  Ask at export time. Allowed in presets; the export dialog must replace it with
+ *  `folder` before calling `export_images` / `plan_export` (they reject it).
+ */
+{ kind: "choose" } | 
+/**  Absolute folder path; created (with the subfolder) if missing. */
+{ kind: "folder"; path: string } | 
+/**  Next to each RAW (its own folder). */
+{ kind: "source_folder" };
+
+/**  An image that could not be exported. */
+export type ExportFailure = {
+	imageId: number,
+	/**  Source RAW file name (for display). */
+	fileName: string,
+	reason: string,
+};
+
+/**
+ *  An export job ended (completed or cancelled). Emitted exactly once per job, also for a
+ *  job cancelled while still queued. `get_export_jobs()` then shows its final state.
+ */
+export type ExportFinished = {
+	jobId: number,
+	succeeded: number,
+	skipped: number,
+	failed: ExportFailure[],
+	/**  Stopped by `cancel_export`; images not yet started were not exported. */
+	cancelled: boolean,
+	/**  Resolved destination incl. subfolder; `null` for `source_folder`. */
+	outputDir: string | null,
+	/**  Wall time since the job started running (excludes time queued); 0 if it never ran. */
+	elapsedMs: number,
+};
+
+/**
+ *  File format and its encoder options. Quality values are 0..=100 (Lightroom scale,
+ *  passed to the encoder as-is).
+ */
+export type ExportFormat = { kind: "jpeg"; quality: number; chromaSubsampling: ChromaSubsampling } | { kind: "tiff"; bitDepth: BitDepth; compression: TiffCompression } | { kind: "png"; bitDepth: BitDepth } | 
+/**  `quality` is ignored when `lossless`. */
+{ kind: "webp"; quality: number; lossless: boolean } | 
+/**  8-bit HEVC in a HEIF container (macOS ImageIO). */
+{ kind: "heic"; quality: number };
+
+/**  Encoder availability for one format in this build / on this machine. */
+export type ExportFormatInfo = {
+	kind: ExportFormatKind,
+	available: boolean,
+	/**  Why it is unavailable (e.g. "HEIC encoder not available"); `null` when available. */
+	reason: string | null,
+	/**  Bit depths the encoder writes (JPEG/WebP/HEIC `["8"]`, TIFF/PNG `["8", "16"]`). */
+	bitDepths: BitDepth[],
+	/**  EXIF/XMP metadata can be embedded. ICC profiles are embedded for every available format. */
+	supportsMetadata: boolean,
+};
+
+/**
+ *  Output file formats. `webp` / `heic` depend on encoders: check
+ *  `get_export_capabilities()` before offering them.
+ */
+export type ExportFormatKind = "jpeg" | "tiff" | "png" | "webp" | "heic";
+
+/**  An export job (live or from history). */
+export type ExportJob = {
+	id: number,
+	state: ExportJobState,
+	/**  Label passed to `export_images` (usually the preset name). */
+	presetName: string | null,
+	format: ExportFormatKind,
+	total: number,
+	/**  `succeeded + failed + skipped`. */
+	done: number,
+	succeeded: number,
+	failed: number,
+	/**  Existing files left alone (`collision = skip`). */
+	skipped: number,
+	/**  Resolved destination incl. subfolder; `null` for `source_folder`. */
+	outputDir: string | null,
+	failures: ExportFailure[],
+	createdAtMs: number,
+	finishedAtMs: number | null,
+};
+
+export type ExportJobState = 
+/**  Waiting for an earlier job (jobs run one at a time, in order). */
+"queued" | "running" | 
+/**  Every image was processed (some may have failed or been skipped). */
+"completed" | 
+/**  Stopped by `cancel_export`; files already written are kept. */
+"cancelled" | 
+/**  The app quit while the job was queued/running (not resumed). */
+"interrupted";
+
+/**  Dry run of an export: resolved paths, no pixels. Disk state may change before it runs. */
+export type ExportPlan = {
+	/**  Resolved destination incl. subfolder; `null` for `source_folder` (one per RAW folder). */
+	outputDir: string | null,
+	/**  In `ids` order. */
+	files: PlannedFile[],
+	/**  How many `files` have `exists`. */
+	existing: number,
+};
+
+/**
+ *  A named export configuration. Built-in presets (`builtIn`, negative ids) are read-only:
+ *  "save as" creates a user preset.
+ */
+export type ExportPreset = {
+	id: number,
+	/**  Unique case-insensitively across built-in and user presets, 1..=100 chars (trimmed). */
+	name: string,
+	builtIn: boolean,
+	settings: ExportSettings,
+	/**  0 for built-ins. */
+	createdAtMs: number,
+	updatedAtMs: number,
+};
+
+/**
+ *  Progress of the running export job. Throttled like `ImportProgress`. `done` includes
+ *  failures and skips.
+ */
+export type ExportProgress = {
+	jobId: number,
+	done: number,
+	total: number,
+	/**  Of `done`, how many failed. */
+	failed: number,
+	/**  Of `done`, how many were skipped (`collision = skip`). */
+	skipped: number,
+	/**  Source RAW file name most recently started; `null` when none is in flight. */
+	currentFile: string | null,
+};
+
+/**  Everything that defines an export (the body of an `ExportPreset`). */
+export type ExportSettings = {
+	format: ExportFormat,
+	colorSpace: ExportColorSpace,
+	resize: ResizeOptions,
+	/**  `null` = no output sharpening. */
+	sharpening: OutputSharpening | null,
+	naming: FileNaming,
+	destination: ExportDestination,
+	/**
+	 *  Relative path appended to the destination (e.g. `"Smith Wedding/Web"`); `null` = none.
+	 *  `/`-separated; no `..`, `.`, empty components, `\` or `:`.
+	 */
+	subfolder: string | null,
+	metadata: MetadataOptions,
+};
+
 export type ExposureStats = {
 	/**  Share of pixels at the highlight clip point, 0..=1. */
 	clippedHighlightsPct: number,
@@ -491,6 +709,18 @@ export type FaceInfo = {
 	 *  are reported but ignored for tags and scores.
 	 */
 	considered: boolean,
+};
+
+/**
+ *  Output file names. `template` grammar: literal text plus tokens in braces (see
+ *  [`parse_filename_template`]); the format's extension is appended.
+ */
+export type FileNaming = {
+	/**  e.g. `"{filename}"`, `"Smith-Wedding-{seq:4}"`, `"{date:YYYYMMDD}_{filename}"`. */
+	template: string,
+	/**  First value of `{seq}` (0..=999999999). */
+	startNumber: number,
+	collision: CollisionPolicy,
 };
 
 /**  Facet counts for the filter bar over one folder (or the whole catalog). */
@@ -682,6 +912,40 @@ export type LutRef = {
 	amount: number,
 };
 
+/**
+ *  Which metadata is copied into exported files. Develop settings (`crs:`) and Sieve's
+ *  culling tags (`Sieve|*`) are never exported. Orientation is always written as 1
+ *  (pixels are rotated); the ICC profile and resolution are always present.
+ */
+export type MetadataInclude = 
+/**
+ *  EXIF of the RAW (camera, lens, exposure, capture time) + sidecar XMP/IPTC
+ *  (creator, rights, title, description, rating, label; keywords per `includeKeywords`).
+ */
+"all" | 
+/**  Copyright notice only (EXIF `Copyright` + `dc:rights`). */
+"copyright_only" | 
+/**
+ *  Copyright + creator and IPTC creator contact info (`dc:creator`, EXIF `Artist`,
+ *  `Iptc4xmpCore:CreatorContactInfo`).
+ */
+"copyright_and_contact" | "none";
+
+export type MetadataOptions = {
+	include: MetadataInclude,
+	/**  Strip GPS EXIF and IPTC location fields (only matters for `all`). */
+	removeLocation: boolean,
+	/**
+	 *  Copy the sidecar's keywords (`dc:subject` / `lr:hierarchicalSubject`, minus `Sieve|*`).
+	 *  Only matters for `all`.
+	 */
+	includeKeywords: boolean,
+	/**  Overrides the copyright notice from the RAW/sidecar (ignored for `none`), <= 500 chars. */
+	copyright: string | null,
+	/**  Overrides the creator/artist (used by `all` and `copyright_and_contact`), <= 500 chars. */
+	creator: string | null,
+};
+
 /**  Point in normalized preview coordinates (see [`NormRect`]). */
 export type NormPoint = {
 	x: number,
@@ -697,6 +961,12 @@ export type NormRect = {
 	y: number,
 	width: number,
 	height: number,
+};
+
+/**  Output sharpening, applied after resizing to the output-encoded pixels. */
+export type OutputSharpening = {
+	media: SharpenMedia,
+	amount: SharpenAmount,
 };
 
 /**
@@ -725,6 +995,15 @@ export type ParametricAdjustments = {
 };
 
 export type PickFlag = "pick" | "reject" | "unflagged";
+
+/**  One file an export would write (`plan_export`). */
+export type PlannedFile = {
+	imageId: number,
+	/**  Final absolute path after the collision policy; `null` when it would be skipped. */
+	path: string | null,
+	/**  The template's path already exists on disk (before the collision policy). */
+	exists: boolean,
+};
 
 /**  A saved develop preset: applies `adjustments` restricted to `fields`. */
 export type Preset = {
@@ -853,6 +1132,33 @@ export type RenderedPreview = {
 };
 
 /**
+ *  Output size. Sizes refer to the orientation-corrected image; the aspect ratio is always
+ *  preserved (no cropping). Rounding: the constrained edge is exact, the other rounds to nearest.
+ */
+export type ResizeMode = 
+/**  Full resolution (`DevelopInfo.fullWidth x fullHeight`). */
+{ kind: "none" } | 
+/**  Longer side = `px`. */
+{ kind: "long_edge"; px: number } | 
+/**  Shorter side = `px`. */
+{ kind: "short_edge"; px: number } | 
+/**  Total pixels ~= `mp` x 1,000,000 (0.1..=200). */
+{ kind: "megapixels"; mp: number } | 
+/**  Fit within a `width` x `height` box (literal: not rotated for portrait frames). */
+{ kind: "width_height"; width: number; height: number };
+
+export type ResizeOptions = {
+	mode: ResizeMode,
+	/**  Never upscale: if the target is larger than full resolution, export full resolution. */
+	dontEnlarge: boolean,
+	/**
+	 *  Pixels per inch written to the file (EXIF/TIFF resolution, JFIF density, PNG `pHYs`),
+	 *  1..=4800. Does not change pixel dimensions.
+	 */
+	resolutionPpi: number,
+};
+
+/**
  *  Relative weights of the score components in `QualityScore.overall`.
  *  Non-negative; normalized by their sum (all-zero is invalid).
  */
@@ -869,6 +1175,11 @@ export type ScoreWeights = {
  *  Fuji bodies can be either, so this is `unknown` until metadata is read.
  */
 export type SensorLayout = "bayer" | "x_trans" | "unknown";
+
+export type SharpenAmount = "low" | "standard" | "high";
+
+/**  Lightroom output-sharpening target. */
+export type SharpenMedia = "screen" | "matte" | "glossy";
 
 /**  Shoot context; biases subject prioritization and tag thresholds. */
 export type ShootType = "wedding" | "portrait" | "sports" | "event" | "landscape" | "general";
@@ -929,6 +1240,10 @@ previewPath: string | null;
 width: number; height: number } | 
 /**  Extraction failed; `reason` is a human-readable message. */
 { status: "failed"; reason: string };
+
+export type TiffCompression = "none" | "lzw" | 
+/**  Deflate (Adobe "ZIP"). */
+"zip";
 
 /**  White balance. `AsShot` uses the camera's recorded multipliers. */
 export type WhiteBalance = { mode: "as_shot" } | 

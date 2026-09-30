@@ -12,9 +12,10 @@ src-tauri/
   migrations/0003_analysis.sql v3: image_analysis, quality_scores.suggested_*, auto_analyze
   migrations/0004_xmp.sql      v4: images.xmp_* sync columns + dirty triggers, xmp_auto_sync
   migrations/0005_editor.sql   v5: adjustment_history, presets, adjustments.neutral/history_entry_id, develop dirty triggers
+  migrations/0006_export.sql   v6: export_presets, export_jobs, export_items
   src/
     main.rs                    -> sieve_lib::run()
-    lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary,
+    lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
                                cache/models/luts-dir resolution, asset scope, `sieve` render URI scheme,
                                specta_builder() (single registration point for commands + events),
                                debug-build export of src/ipc/bindings.ts
@@ -46,6 +47,10 @@ src-tauri/
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
     lut/mod.rs                 .cube LUT library (directory) + parse/apply
+    export/mod.rs              Exporter (job queue + worker, memory-bounded concurrency), plan, memory policy
+      develop.rs               full-res LibRaw decode + render_full (shared pipeline, resize, sharpen, quantize)
+      encode.rs metadata.rs    encoders + ICC; EXIF/XMP selection for exported files
+      naming.rs presets.rs     file-name template expansion; export presets (built-ins + catalog SQL)
 src/
   ipc/bindings.ts              GENERATED from Rust. Do not edit.
   ipc/index.ts                 re-exports bindings + unwrap() + DEFAULT_QUERY + ALL_ADJUSTMENT_FIELDS
@@ -61,7 +66,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
 | rest of `src-tauri/` (incl. `db/repo.rs`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
-| `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/` | rust-engine-dev |
+| `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
 | everything, read-only | qa-engineer |
 
@@ -121,6 +126,14 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `list_luts` / `listLuts` | – | `LutInfo[]` |
 | `import_lut` / `importLut` | `path: string` | `LutInfo` |
 | `delete_lut` / `deleteLut` | `id: string, force: boolean` | `null` |
+| `get_export_capabilities` / `getExportCapabilities` | – | `ExportCapabilities` |
+| `list_export_presets` / `listExportPresets` | – | `ExportPreset[]` (built-ins first) |
+| `save_export_preset` / `saveExportPreset` | `id: number \| null, name: string, settings: ExportSettings` | `ExportPreset` |
+| `delete_export_preset` / `deleteExportPreset` | `id: number` | `null` |
+| `plan_export` / `planExport` | `ids: number[], settings: ExportSettings` | `ExportPlan` (dry run) |
+| `export_images` / `exportImages` | `ids: number[], settings: ExportSettings, presetName: string \| null` | `ExportJob` (queued; background) |
+| `cancel_export` / `cancelExport` | `jobId: number` | `null` |
+| `get_export_jobs` / `getExportJobs` | – | `ExportJob[]` |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -131,6 +144,8 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `analysisProgress {done,total,failed}`, `analysisReady {imageId}`, `analysisFailed {imageId,reason}`,
 `analysisFinished {analyzed,failed,cancelled,burstGroups}` (Phase 3),
 `xmpSynced {written,read}`, `xmpWriteFailed {imageId,reason}` (Phase 4). Rendered previews use the `sieve` URI scheme (Phase 5).
+`exportProgress {jobId,done,total,failed,skipped,currentFile}`,
+`exportFinished {jobId,succeeded,skipped,failed,cancelled,outputDir,elapsedMs}` (Phase 6).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -272,6 +287,52 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
   Rendering of imported settings approximates Adobe's, not pixel-identical.
 - Dirty tracking: triggers on `adjustments` (0005) join the 0004 triggers, so one `xmp_dirty` flag covers both.
 
+## Export (Phase 6)
+
+### Flow
+1. Export dialog: pick a preset (`listExportPresets`; built-ins are read-only, destination `choose`), edit settings,
+   choose the folder (dialog plugin) -> `destination = {kind: "folder", path}`. Optional `planExport` shows final
+   names and "N files already exist". Formats with `available = false` in `getExportCapabilities()` are disabled.
+2. `exportImages(ids, settings, presetName)` validates, resolves/creates `<destination>/<subfolder>`, snapshots
+   each image's stored adjustments, writes `export_jobs` + `export_items` (`pending`, `seq` = position in `ids`) and
+   returns the `queued` job. Later edits do not affect a queued job.
+3. One `export` worker thread (own SQLite connection) runs jobs one at a time in id order. Within a job, images are
+   developed concurrently (below); `exportProgress` is throttled; each job ends with exactly one `exportFinished`.
+4. `cancelExport(jobId)`: in-flight images stop at a checkpoint (temp file removed) or finish; unstarted images
+   stay `pending`; state `cancelled`. Written files are kept. On launch, jobs left queued/running are `interrupted`.
+
+### Per image (same pipeline as the preview)
+`export::develop::decode_full` (LibRaw full demosaic: preview decode settings with `half_size = 0`, `user_qual = 3`
+= AHD for Bayer, 3-pass Markesteijn for X-Trans; `highlight = 0`, no WB, linear 16-bit camera RGB)
+-> resample in linear light to `output_size` (orientation applied)
+-> `develop::pipeline` stages up to the display-referred linear Rec.2020 working image (resolution-independent)
+-> output colour space: no LUT = linear Rec.2020 -> target primaries + transfer curve (keeps P3 / Adobe RGB gamut);
+   with a LUT = sRGB-encode -> LUT (as in the preview) -> target space
+-> output sharpening (media x amount; on encoded luminance, radius scaled to output size)
+-> quantize (8/16-bit) -> encode with the target ICC profile, resolution (ppi) and filtered metadata
+-> `<name>.<ext>.sieve-tmp` in the target dir, fsync, rename. A missing LUT exports without it.
+Resizing *before* the pipeline makes web exports cheap and matches the preview (which renders a downsampled
+source); full-size exports run the pipeline at full resolution. WYSIWYG check: an sRGB 8-bit export at the preview's
+size without sharpening matches `render_preview` within 2 levels.
+
+### Memory bound
+- Budget `B` = `SIEVE_EXPORT_MEMORY_MB`, else 25% of physical RAM clamped to 2..=8 GiB (`export::memory_budget_bytes`).
+- Per-image estimate (`export::estimate_image_bytes`) = 16 B x source px (LibRaw decode) + 24 B x output px (f32
+  working set + quantized output) + 64 MiB: 24 MP full-res ~1.0 GB, 61 MP full-res ~2.4 GB, any -> 2048 px ~0.5 GB.
+- A weighted semaphore over `B` (an estimate larger than `B` is capped at `B`, so it runs alone) plus a hard cap of
+  `MAX_PARALLEL = 4` images; each image parallelizes internally with rayon. 16 GB Mac: 4 GiB budget = 4 x 24 MP or
+  1 x 61 MP full-res at a time. The develop preview cache (`DevelopCache`) is neither used nor evicted by exports.
+
+### Naming, collisions, metadata
+- Template grammar: literal text + `{filename}`, `{seq}`/`{seq:N}` (`ids` position + `startNumber`), `{date}`/
+  `{date:FMT}` (capture wall-clock, else file mtime), `{rating}`, `{camera}`, `{folder}`, `{id}`
+  (`ipc::types::parse_filename_template`). Token values are sanitized; the format's lower-case extension is appended.
+- Collisions with files on disk follow `collision` (`unique_suffix` -> `-2`, `-3`...; `overwrite`; `skip` counts as
+  `skipped`); names repeated within one job always get unique suffixes.
+- Metadata: `all` = RAW EXIF + sidecar XMP/IPTC (keywords optional, location optionally stripped);
+  `copyright_only`; `copyright_and_contact`; `none`. Never exported: `crs:` develop settings, `Sieve|*` tags.
+  Orientation is written as 1; ICC and resolution are always embedded. `copyright` / `creator` override the source.
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -290,6 +351,9 @@ migrations tracked by `PRAGMA user_version`.
 | `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated) |
 | `presets` | name (unique, NOCASE), params JSON, fields JSON |
+| `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
+| `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps |
+| `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
 
 Deferred: `scenes` (Phase 7).
 
