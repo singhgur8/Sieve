@@ -112,7 +112,7 @@ pub fn apply_read(
     label: Option<ColorLabel>,
     sidecar_mtime: Option<i64>,
 ) -> AppResult<bool> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     let changed = tx.execute(
         "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4
          WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4)",
@@ -142,6 +142,43 @@ pub fn develop_settings(conn: &Connection, id: ImageId) -> AppResult<Option<Para
 pub fn set_develop_warnings(conn: &Connection, id: ImageId, warnings: &[DevelopWarning]) -> AppResult<()> {
     let json = if warnings.is_empty() { None } else { Some(serde_json::to_string(warnings)?) };
     conn.execute("UPDATE images SET develop_warnings = ?2 WHERE id = ?1", params![id, json])?;
+    Ok(())
+}
+
+/// `images.masks_pending_import` (migration 0010): sidecar masks not imported yet.
+pub fn masks_pending(conn: &Connection, id: ImageId) -> AppResult<bool> {
+    let v: i64 = conn.query_row("SELECT masks_pending_import FROM images WHERE id = ?1", [id], |r| r.get(0))?;
+    Ok(v != 0)
+}
+
+/// Images whose sidecar masks still await import (launch catch-up), by id.
+pub fn masks_pending_ids(conn: &Connection) -> AppResult<Vec<ImageId>> {
+    let mut stmt = conn.prepare("SELECT id FROM images WHERE masks_pending_import <> 0 ORDER BY id")?;
+    let ids = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<ImageId>, _>>()?;
+    Ok(ids)
+}
+
+/// `images.develop_warnings` (sidecar feature warnings).
+pub fn develop_warnings(conn: &Connection, id: ImageId) -> AppResult<Vec<DevelopWarning>> {
+    let json: Option<String> =
+        conn.query_row("SELECT develop_warnings FROM images WHERE id = ?1", [id], |r| r.get(0))?;
+    Ok(json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+/// `images.xmp_dirty`.
+pub fn is_dirty(conn: &Connection, id: ImageId) -> AppResult<bool> {
+    Ok(conn.query_row("SELECT xmp_dirty FROM images WHERE id = ?1", [id], |r| r.get::<_, i64>(0))? != 0)
+}
+
+/// Clears `xmp_dirty` (the catalog equals the sidecar again).
+pub fn clear_dirty(conn: &Connection, id: ImageId) -> AppResult<()> {
+    conn.execute("UPDATE images SET xmp_dirty = 0 WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// The sidecar's masks were imported.
+pub fn clear_masks_pending(conn: &Connection, id: ImageId) -> AppResult<()> {
+    conn.execute("UPDATE images SET masks_pending_import = 0 WHERE id = ?1 AND masks_pending_import <> 0", [id])?;
     Ok(())
 }
 

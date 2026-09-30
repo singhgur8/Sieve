@@ -67,6 +67,7 @@ use crate::ipc::types::{
     RawImageEntry,
 };
 use crate::lut::LutLibrary;
+use crate::raw::access;
 use naming::{Claims, Resolved};
 
 /// Most images developed at once within a job. LibRaw's demosaic is largely single-threaded,
@@ -184,6 +185,16 @@ pub struct Exporter {
     config: ExportConfig,
     luts: LutLibrary,
     inner: Arc<Inner>,
+    /// Matte cache + segmenter for masked exports (Phase 7c); `None` = AI mask components
+    /// render empty.
+    masks: Option<ExportMasks>,
+}
+
+/// What an export needs for AI masks: computes missing mattes, then renders them.
+#[derive(Clone)]
+pub struct ExportMasks {
+    pub cache: crate::develop::masks::MaskCache,
+    pub segmenter: crate::ml::masking::Segmenter,
 }
 
 impl Exporter {
@@ -193,7 +204,18 @@ impl Exporter {
             config,
             luts,
             inner: Arc::new(Inner { state: Mutex::new(State::default()), idle: Condvar::new(), budget }),
+            masks: None,
         }
+    }
+
+    /// Enables AI masks in exports: missing mattes are computed with `segmenter` first.
+    pub fn with_masks(
+        mut self,
+        cache: crate::develop::masks::MaskCache,
+        segmenter: crate::ml::masking::Segmenter,
+    ) -> Self {
+        self.masks = Some(ExportMasks { cache, segmenter });
+        self
     }
 
     pub fn config(&self) -> &ExportConfig {
@@ -225,6 +247,11 @@ impl Exporter {
     /// Blocking; called once at startup. Marks jobs left `queued`/`running` by a previous
     /// session as `interrupted` (finished_at = now). Must not fail startup on a fresh catalog.
     pub fn recover_interrupted(&self) -> AppResult<()> {
+        // A damaged catalog is read-only (`db::health`): nothing to recover, and failing
+        // here would stop the app from starting at all.
+        if matches!(db::health(&self.config.catalog_path), db::CatalogHealth::ReadOnly { .. }) {
+            return Ok(());
+        }
         let conn = self.open()?;
         conn.execute(
             "UPDATE export_jobs SET state = 'interrupted', finished_at = ?1 WHERE state IN ('queued', 'running')",
@@ -479,6 +506,24 @@ impl Exporter {
                 }
             }
         };
+        // Several statements as one transaction (an item's status and the job counters never
+        // disagree after a crash).
+        let db_all = |stmts: &[(&str, &[&dyn rusqlite::ToSql])]| {
+            if let Some(c) = conn {
+                let run = || -> rusqlite::Result<()> {
+                    let tx = c.unchecked_transaction()?;
+                    for (sql, p) in stmts {
+                        tx.execute(sql, *p)?;
+                    }
+                    tx.commit()
+                };
+                if let Err(e) = run() {
+                    eprintln!("export job {}: {e}", job.id);
+                }
+            }
+        };
+        // First fatal destination error (disk full): the remaining items fail fast with it.
+        let abort: Mutex<Option<String>> = Mutex::new(None);
         db("UPDATE export_jobs SET state = 'running', started_at = ?2 WHERE id = ?1", &[&job.id, &now_ms()]);
         let total = job.items.len() as u32;
         let settings = &job.settings;
@@ -537,7 +582,7 @@ impl Exporter {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let tx = tx.clone();
-                let (work, next, budget) = (&work, &next, &budget);
+                let (work, next, budget, abort) = (&work, &next, &budget, &abort);
                 let job = &job;
                 scope.spawn(move || loop {
                     let n = next.fetch_add(1, Ordering::SeqCst);
@@ -547,14 +592,19 @@ impl Exporter {
                     if cancelled() {
                         break;
                     }
+                    if let Some(reason) = lock(abort).clone() {
+                        let _ = tx.send(Msg::Done(*i, Err(Failure::Error(format!("Not exported: {reason}")))));
+                        continue;
+                    }
                     let need = item_estimate(&item.entry, settings).min(self.inner.budget);
                     if !budget.acquire(need, &cancelled) {
                         break;
                     }
                     let _ = tx.send(Msg::Started(item.entry.file_name.clone()));
-                    let outcome =
-                        catch_unwind(AssertUnwindSafe(|| export_one(item, settings, path, &self.luts, &cancelled)))
-                            .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        export_one(item, settings, path, &self.luts, self.masks.as_ref(), &cancelled)
+                    }))
+                    .unwrap_or_else(|_| Err(Failure::Error("internal error (panic) while exporting".into())));
                     budget.release(need);
                     let _ = tx.send(Msg::Done(*i, outcome));
                 });
@@ -572,22 +622,33 @@ impl Exporter {
                         if let Some(pos) = in_flight.iter().position(|n| *n == item.entry.file_name) {
                             in_flight.remove(pos);
                         }
+                        const COUNTERS: &str =
+                            "UPDATE export_jobs SET succeeded = ?2, failed = ?3, skipped = ?4 WHERE id = ?1";
                         match outcome {
                             Ok(path) => {
                                 live.succeeded += 1;
-                                db(
-                                    "UPDATE export_items SET status = 'done', output_path = ?3, error = NULL
-                                     WHERE job_id = ?1 AND seq = ?2",
-                                    &[&job.id, &item.seq, &path.to_string_lossy().into_owned()],
-                                );
+                                db_all(&[
+                                    (
+                                        "UPDATE export_items SET status = 'done', output_path = ?3, error = NULL
+                                         WHERE job_id = ?1 AND seq = ?2",
+                                        &[&job.id, &item.seq, &path.to_string_lossy().into_owned()],
+                                    ),
+                                    (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
+                                ]);
                             }
                             Err(Failure::Cancelled) => continue,
                             Err(Failure::Error(reason)) => {
                                 live.failed += 1;
-                                db(
-                                    "UPDATE export_items SET status = 'failed', error = ?3 WHERE job_id = ?1 AND seq = ?2",
-                                    &[&job.id, &item.seq, &reason],
-                                );
+                                if access::is_disk_full_message(&reason) {
+                                    lock(&abort).get_or_insert_with(|| reason.clone());
+                                }
+                                db_all(&[
+                                    (
+                                        "UPDATE export_items SET status = 'failed', error = ?3 WHERE job_id = ?1 AND seq = ?2",
+                                        &[&job.id, &item.seq, &reason],
+                                    ),
+                                    (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
+                                ]);
                                 failures.push(ExportFailure {
                                     image_id: item.entry.id,
                                     file_name: item.entry.file_name.clone(),
@@ -595,10 +656,6 @@ impl Exporter {
                                 });
                             }
                         }
-                        db(
-                            "UPDATE export_jobs SET succeeded = ?2, failed = ?3, skipped = ?4 WHERE id = ?1",
-                            &[&job.id, &live.succeeded, &live.failed, &live.skipped],
-                        );
                         set_live(&live);
                         emit(&live, in_flight.last().cloned(), &mut last_emit, false);
                     }
@@ -699,14 +756,37 @@ fn export_one(
     settings: &ExportSettings,
     path: &Path,
     luts: &LutLibrary,
+    masks: Option<&ExportMasks>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, Failure> {
+    use crate::develop::masks::{self as dmasks, render as mrender};
     let check = || if cancelled() { Err(Failure::Cancelled) } else { Ok(()) };
     let raw = Path::new(&item.entry.path);
+    access::require_original(raw)?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
+        std::fs::create_dir_all(dir).map_err(|e| Failure::Error(access::io_message(dir, "write", &e)))?;
     }
-    let (src, meta) = crate::develop::source::decode_full_meta(raw)?;
+    // Masks (Phase 7c): AI mattes the image does not have yet are computed first.
+    let masked = mrender::any_rendered(&item.adjustments.masks);
+    let source =
+        crate::develop::SourceImage { id: item.entry.id, path: raw.to_path_buf(), orientation: item.entry.orientation };
+    if let (true, Some(m)) = (masked, masks) {
+        let preview = match &item.entry.thumbnail {
+            crate::ipc::types::ThumbnailState::Ready { preview_path: Some(p), .. } => Some(PathBuf::from(p)),
+            _ => None,
+        };
+        for e in mrender::compute_missing(&m.segmenter, &source, preview.as_deref(), &item.adjustments.masks) {
+            eprintln!("export {}: AI mask not computed: {e}", raw.display());
+        }
+        check()?;
+    }
+    let (src, meta) = crate::develop::source::decode_full_meta(raw).map_err(|e| match e.kind {
+        ErrorKind::Internal => {
+            let prefix = format!("{}: ", raw.display());
+            access::decode_failed(raw, e.message.strip_prefix(&prefix).unwrap_or(&e.message))
+        }
+        _ => e,
+    })?;
     check()?;
     let orientation = item.entry.orientation;
     let crop = &item.adjustments.crop;
@@ -724,6 +804,15 @@ fn export_one(
         &item.adjustments,
         &profile,
     );
+    let mut mattes = if masked {
+        mrender::ResolvedMattes::resolve(masks.map(|m| &m.cache), item.entry.id, &item.adjustments.masks)
+    } else {
+        mrender::ResolvedMattes::none(item.entry.id)
+    };
+    if mattes.needs_guide() {
+        mattes.refine(|| Some(develop::sensor_guide(&src, &profile)));
+    }
+    let (sensor_width, sensor_height) = (src.full_width, src.full_height);
     let prepared = develop::prepare_output(&src, orientation, crop, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
@@ -739,13 +828,45 @@ fn export_one(
         Some(l) => luts.load(&l.id).unwrap_or(None),
         None => None,
     };
-    let ctx = develop::DevelopContext { profile: &profile, scale, seed: item.entry.id as u64, tone: Some(&tone) };
+    let (local, _) = if masked {
+        let geom = dmasks::MaskGeometry {
+            sensor_width,
+            sensor_height,
+            orientation: orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1),
+            crop: *crop,
+            region: None,
+            width: size.0,
+            height: size.1,
+        };
+        mrender::local_planes(
+            &item.adjustments.masks,
+            &geom,
+            item.entry.id,
+            &mattes,
+            || crate::develop::local::range_guide(&pixels, &color, &profile, &item.adjustments),
+            0,
+            None,
+        )
+    } else {
+        (None, Vec::new())
+    };
+    drop(mattes);
+    let ctx = develop::DevelopContext {
+        profile: &profile,
+        scale,
+        seed: item.entry.id as u64,
+        tone: Some(&tone),
+        masks: local.as_ref(),
+    };
     let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
     check()?;
     let image = develop::finish(encoded, size, settings);
     let meta = metadata::collect(raw, &settings.metadata)?;
     check()?;
+    if let Some(dir) = path.parent() {
+        access::ensure_space(dir, output_bytes_estimate(&image, settings))?;
+    }
     let tmp = temp_path(path);
     let written = encode::write_file(&image, settings, &meta, &tmp);
     drop(image);
@@ -759,9 +880,24 @@ fn export_one(
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Failure::Error(format!("{}: {e}", path.display())));
+        return Err(Failure::Error(access::io_message(path, "write", &e)));
     }
     Ok(path.to_path_buf())
+}
+
+/// Upper-bound-ish file size of `image` in `settings.format` (+ 4 MiB for metadata and
+/// slack), for the free-space check before writing: uncompressed for TIFF/PNG, a quarter
+/// of that for the lossy formats.
+fn output_bytes_estimate(image: &develop::ExportImage, settings: &ExportSettings) -> u64 {
+    let raw = match &image.pixels {
+        develop::ExportPixels::Rgb8(p) => p.len() as u64,
+        develop::ExportPixels::Rgb16(p) => p.len() as u64 * 2,
+    };
+    let body = match settings.format.kind() {
+        ExportFormatKind::Tiff | ExportFormatKind::Png => raw,
+        _ => raw / 4,
+    };
+    body + (4 << 20)
 }
 
 /// `folder` + subfolder; `None` for `source_folder`. `choose` -> `invalid_argument`.
@@ -779,7 +915,7 @@ fn output_dir(settings: &ExportSettings) -> AppResult<Option<PathBuf>> {
 
 /// Creates `dir` and checks it is writable.
 fn ensure_writable_dir(dir: &Path) -> AppResult<()> {
-    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, format!("{}: {e}", dir.display()));
+    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, access::io_message(dir, "write", &e));
     std::fs::create_dir_all(dir).map_err(io)?;
     let probe = dir.join(format!(".sieve-write-test-{}", std::process::id()));
     std::fs::write(&probe, b"").map_err(io)?;
@@ -1081,6 +1217,208 @@ mod tests {
         assert_eq!(t.map(|i| (i.width, i.height, i.bit_depth)).unwrap(), (200, 100, 16));
         #[cfg(not(target_os = "macos"))]
         let _ = t;
+    }
+
+    /// Phase 8 error states: a missing original fails its item with an actionable message
+    /// (the rest of the job runs); a full destination fails the item before writing and the
+    /// remaining items fail fast with the same reason; nothing partial is left behind.
+    #[test]
+    fn missing_originals_and_full_disk_fail_cleanly() {
+        use crate::ingest::{run_until_idle, IngestConfig, IngestSink};
+        use crate::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
+        use crate::raw::raster::tests::fixtures;
+        struct Quiet;
+        impl IngestSink for Quiet {
+            fn ready(&self, _: ThumbnailReady) {}
+            fn failed(&self, e: ThumbnailFailed) {
+                panic!("{}", e.reason)
+            }
+            fn progress(&self, _: ImportProgress) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 1..=6 {
+            std::fs::write(src.join(format!("IMG_{i}.JPG")), fixtures::camera_jpeg(320, 240, 1, None)).unwrap();
+        }
+        let catalog = dir.path().join("cat.sqlite");
+        {
+            let mut conn = db::open(&catalog).unwrap();
+            let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+            assert_eq!(repo::import_folder(&mut conn, &src, &opts).unwrap().added, 6);
+        }
+        let cfg = IngestConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") };
+        run_until_idle(&cfg, &Quiet, &std::sync::atomic::AtomicBool::new(true)).unwrap();
+        let ex = Exporter::new(
+            ExportConfig { catalog_path: catalog, memory_budget_mb: Some(1024) },
+            LutLibrary::new(dir.path().join("luts")),
+        );
+        let sink = Arc::new(Sink::default());
+
+        // Missing original: that item fails, the other one exports.
+        std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
+        let out = dir.path().join("out");
+        ex.enqueue_with(sink.clone(), vec![1, 2], settings(&out), None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        let fin = lock(&sink.finished)[0].clone();
+        assert_eq!(fin.succeeded, 1);
+        assert_eq!(fin.failed.len(), 1);
+        assert!(fin.failed[0].reason.starts_with(access::MISSING_PREFIX), "{}", fin.failed[0].reason);
+
+        // Full disk: nothing written, every item fails with the disk message.
+        let full = dir.path().join("full");
+        access::FREE_BYTES_OVERRIDE.lock().unwrap().push((full.clone(), 64 * 1024));
+        ex.enqueue_with(sink.clone(), vec![1, 3, 4, 5, 6], settings(&full), None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        let fin = lock(&sink.finished)[1].clone();
+        assert_eq!((fin.succeeded, fin.failed.len()), (0, 5));
+        for f in &fin.failed {
+            assert!(f.reason.contains("Not enough disk space"), "{}", f.reason);
+        }
+        assert_eq!(std::fs::read_dir(full.join("Web")).unwrap().count(), 0, "no partial files");
+        let jobs = ex.jobs().unwrap();
+        let job = jobs.iter().find(|j| j.failed == 5).unwrap();
+        assert_eq!((job.done, job.state), (5, ExportJobState::Completed), "items and counters agree");
+        access::FREE_BYTES_OVERRIDE.lock().unwrap().clear();
+    }
+
+    /// Phase 7c: an export of an image with an AI mask that has no matte yet computes it with
+    /// the segmenter first, then renders the local adjustment only where the matte selects.
+    #[test]
+    fn masked_export_computes_missing_ai_mattes() {
+        use crate::develop::masks::{AlphaMask, MaskCache, MaskCacheConfig};
+        use crate::ipc::types::{
+            AiMask, AiTarget, AiTargetKind, LocalAdjustments, MaskBlendMode, MaskComponent, MaskGroup, MaskShape,
+            NormRect,
+        };
+        use crate::ml::masking::{
+            CatalogMatteStore, RegisteredModel, SegmentInput, SegmentModel, SegmentRequest, Segmenter, SegmenterConfig,
+            SegmenterParts, SourcePixels,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// "Subject" = the left half of the frame.
+        struct LeftHalf(Arc<AtomicUsize>);
+        impl SegmentModel for LeftHalf {
+            fn id(&self) -> &str {
+                "left-half@1"
+            }
+            fn families(&self) -> &[AiTargetKind] {
+                &[AiTargetKind::Subject]
+            }
+            fn run(&self, _: &SegmentRequest, input: &SegmentInput) -> Result<AlphaMask, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let (w, h) = (input.width, input.height);
+                let data = (0..w * h).map(|i| if i % w < w / 2 { 255 } else { 0 }).collect();
+                Ok(AlphaMask {
+                    width: w,
+                    height: h,
+                    bounds: NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+                    data,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let px: Vec<u16> = (0..200 * 100).flat_map(|_| [16000u16, 16000, 16000]).collect();
+        std::fs::write(
+            src.join("grey.png"),
+            crate::raw::png::test_support::encode(200, 100, Some(&px), None, None, None, None),
+        )
+        .unwrap();
+        let catalog = dir.path().join("cat.sqlite");
+        let id = {
+            let mut conn = db::open(&catalog).unwrap();
+            let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+            assert_eq!(repo::import_folder(&mut conn, &src, &opts).unwrap().added, 1);
+            conn.query_row("SELECT id FROM images", [], |r| r.get::<_, ImageId>(0)).unwrap()
+        };
+        let cache =
+            MaskCache::new(MaskCacheConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parts = SegmenterParts {
+            models: vec![RegisteredModel {
+                model: Arc::new(LeftHalf(calls.clone())),
+                required: vec![],
+                parts: vec![],
+                people: None,
+            }],
+            store: Arc::new(CatalogMatteStore { cache: cache.clone(), catalog_path: catalog.clone() }),
+            loader: Arc::new(|_, _| Ok(SourcePixels { width: 200, height: 100, rgb: vec![128; 200 * 100 * 3] })),
+        };
+        let segmenter = Segmenter::with_parts(
+            SegmenterConfig { models_dir: dir.path().join("models"), catalog_path: catalog.clone() },
+            cache.clone(),
+            parts,
+        );
+        let ex = Exporter::new(
+            ExportConfig { catalog_path: catalog.clone(), memory_budget_mb: Some(1024) },
+            LutLibrary::new(dir.path().join("luts")),
+        )
+        .with_masks(cache, segmenter);
+        let out = dir.path().join("out");
+        let mut s = settings(&out);
+        s.resize.mode = ResizeMode::None;
+        s.format = ExportFormat::Jpeg { quality: 100, chroma_subsampling: ChromaSubsampling::Yuv444 };
+        let sink = Arc::new(Sink::default());
+        let export = |sink: &Arc<Sink>| {
+            let _ = std::fs::remove_dir_all(&out);
+            ex.enqueue_with(sink.clone(), vec![id], s.clone(), None).unwrap();
+            assert!(ex.wait_idle(Duration::from_secs(60)));
+            let fin = lock(&sink.finished).last().cloned().unwrap();
+            assert_eq!(fin.succeeded, 1, "{:?}", fin.failed);
+            let jpeg = std::fs::read(out.join("Web").join("grey.jpg")).unwrap();
+            let d = crate::raw::turbo::decode_rgb(&jpeg, 100_000, 1 << 30).unwrap();
+            let mean = |x0: u32, x1: u32| {
+                let mut sum = 0u64;
+                for y in 0..d.height {
+                    for x in x0..x1 {
+                        sum += u64::from(d.pixels[((y * d.width + x) * 3 + 1) as usize]);
+                    }
+                }
+                sum as f32 / ((x1 - x0) * d.height) as f32
+            };
+            (mean(10, 80), mean(120, 190))
+        };
+        let (base_l, base_r) = export(&sink);
+        assert!((base_l - base_r).abs() < 1.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no masks, no segmentation");
+
+        let group = MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Subject".into(),
+            active: true,
+            amount: 1.0,
+            adjustments: LocalAdjustments { exposure: 1.5, ..Default::default() },
+            components: vec![MaskComponent {
+                id: format!("{:032X}", 2),
+                name: String::new(),
+                active: true,
+                mode: MaskBlendMode::Add,
+                inverted: false,
+                opacity: 1.0,
+                shape: MaskShape::Ai(AiMask { target: AiTarget::Subject, reference_point: None, digest: None }),
+            }],
+        };
+        {
+            let mut conn = db::open(&catalog).unwrap();
+            let adj = ParametricAdjustments { masks: vec![group], ..repo::get_adjustments(&conn, id).unwrap() };
+            crate::develop::history::commit(&mut conn, id, &adj, "Mask").unwrap();
+        }
+        let (l, r) = export(&sink);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "matte computed before rendering");
+        let conn = db::open(&catalog).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mask_cache WHERE image_id = ?1 AND origin = 'sieve'", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(l > base_l + 20.0, "subject brighter: {base_l} -> {l}");
+        assert!((r - base_r).abs() < 1.5, "outside unchanged: {base_r} -> {r}");
+        // Second export reuses the cached matte.
+        export(&sink);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

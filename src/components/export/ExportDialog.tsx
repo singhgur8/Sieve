@@ -104,7 +104,29 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
   const [busy, setBusy] = useState(false);
   const templateRef = useRef<HTMLInputElement>(null);
 
-  const ids = scope === "selection" ? selectionIds : filteredIds;
+  const baseIds = scope === "selection" ? selectionIds : filteredIds;
+  // Rejects in the scope (looked up in chunks; skipped by default so a client delivery never contains them).
+  const [rejected, setRejected] = useState<Set<number>>(new Set());
+  const [skipRejected, setSkipRejected] = useState(true);
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const out = new Set<number>();
+      for (let i = 0; i < baseIds.length; i += 200) {
+        try {
+          for (const r of await unwrap(commands.getImages(baseIds.slice(i, i + 200)))) if (r.pick === "reject") out.add(r.id);
+        } catch {
+          break;
+        }
+        if (!live) return;
+      }
+      if (live) setRejected(out);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [baseIds]);
+  const ids = useMemo(() => (skipRejected && rejected.size > 0 ? baseIds.filter((x) => !rejected.has(x)) : baseIds), [baseIds, rejected, skipRejected]);
   const preset = presets.find((p) => p.id === selectedId) ?? null;
   const fail = useCallback((e: unknown) => setError(formatError(e)), []);
 
@@ -326,6 +348,11 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
           <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 p-3" data-testid="export-presets">
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">Presets</h3>
             <ul className="min-h-0 flex-1 space-y-0.5 overflow-auto">
+              {presets.length === 0 && (
+                <li className="px-2 py-1 text-xs text-neutral-400" data-testid="export-presets-empty">
+                  No presets yet. Adjust the settings and use Save as.
+                </li>
+              )}
               {presets.map((p) => (
                 <li key={p.id}>
                   <button
@@ -658,6 +685,12 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
                   All filtered ({filteredIds.length})
                 </label>
               </>
+            )}
+            {rejected.size > 0 && (
+              <label className="flex items-center gap-1.5" data-testid="export-skip-rejected-label">
+                <input type="checkbox" checked={skipRejected} onChange={(e) => setSkipRejected(e.target.checked)} data-testid="export-skip-rejected" />
+                Skip rejected ({rejected.size})
+              </label>
             )}
             <span className="text-neutral-400" data-testid="export-count">
               {ids.length} photo{ids.length === 1 ? "" : "s"}

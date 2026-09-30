@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && bash scripts/fetch-models.sh --culling",
     "frontendDist": "../dist"
   },
   "app": {
@@ -32,13 +32,49 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "category": "Photography",
+    "copyright": "Copyright © 2026 Gurjot Singh",
+    "shortDescription": "Local RAW culling, editing and export",
+    "resources": {
+      "target/sieve-stage/models/": "models/"
+    },
+    "macOS": {
+      "minimumSystemVersion": "15.0",
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "Entitlements.plist",
+      "frameworks": [
+        "target/sieve-stage/Frameworks/libjpeg.8.dylib",
+        "target/sieve-stage/Frameworks/liblcms2.2.dylib",
+        "target/sieve-stage/Frameworks/libomp.dylib",
+        "target/sieve-stage/Frameworks/libraw_r.dylib",
+        "target/sieve-stage/Frameworks/libturbojpeg.dylib"
+      ],
+      "dmg": {
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        },
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        }
+      }
+    }
   }
 }

@@ -18,6 +18,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 # Compiles native/libraw_shim.c (LibRaw fields without C-API accessors).
 cc = "1"
+# Reads tauri.conf.json to check the staged Frameworks list (build.rs).
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
@@ -44,6 +46,8 @@ weezl = "0.1"
 flate2 = "1"
 libwebp-sys = "0.14"
 libc = "0.2"
+# Packaged-app model downloads (model_fetch.rs): streaming SHA-256 verification.
+sha2 = "0.10"
 # Culling engine (vision-ml-dev): ONNX Runtime 1.28 (prebuilt, statically linked by ort-sys)
 # with the CoreML execution provider; CPU EP is the fallback.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-27", "coreml"] }
@@ -54,7 +58,9 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind (not abort): the export, prefetch, XMP and masking workers isolate panics with
+# `catch_unwind` so one bad file fails its item instead of killing the app (Phase 8).
+panic = "unwind"
 strip = true
 
 [dev-dependencies]

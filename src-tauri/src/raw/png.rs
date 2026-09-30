@@ -114,7 +114,7 @@ pub struct Decoded {
 
 /// Decodes the whole image (alpha dropped; palette/low-bit grey expanded to 8 bits).
 pub fn decode(path: &Path) -> Result<Decoded, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file = std::fs::File::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(|e| format!("PNG: {e}"))?;

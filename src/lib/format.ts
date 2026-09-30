@@ -1,8 +1,9 @@
-import type { AppError, CullTag } from "../ipc";
+import type { CullTag } from "../ipc";
+import { describeError } from "./errors";
 
+/** User-facing text of a backend error (no `kind:` prefix; the backend wording already says what to do). */
 export function formatError(e: unknown): string {
-  const err = e as Partial<AppError>;
-  return err && err.kind ? `${err.kind}: ${err.message}` : String(e);
+  return describeError(e).message;
 }
 
 export const TAG_SHORT: Record<CullTag, string> = {

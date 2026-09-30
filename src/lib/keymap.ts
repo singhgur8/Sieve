@@ -18,6 +18,16 @@ export type ActionId =
   | "devToLoupe"
   | "toGrid"
   | "escape"
+  | "developEscape"
+  | "cropSwap"
+  | "cropLock"
+  | "panelsToggle"
+  | "panelsHide"
+  | "bwToggle"
+  | "faceDevelop"
+  | "wbPicker"
+  | "pastePrev"
+  | "savePreset"
   | "develop"
   | "compare"
   | "tab"
@@ -40,6 +50,21 @@ export type ActionId =
   | "paste"
   | "sync"
   | "reset"
+  | "maskPanel"
+  | "maskBrush"
+  | "maskLinear"
+  | "maskRadial"
+  | "maskColor"
+  | "maskLuminance"
+  | "maskOverlay"
+  | "maskOverlayStyle"
+  | "maskPins"
+  | "maskSize"
+  | "maskFeather"
+  | "maskAuto"
+  | "maskDelete"
+  | "maskMoveUp"
+  | "maskMoveDown"
   | "selectBurst"
   | "selectAll"
   | "selectNone"
@@ -58,6 +83,8 @@ export interface Chord {
   mod?: boolean;
   /** true = required, false/undefined = must not be held, "any" = ignored. */
   shift?: boolean | "any";
+  /** Alt / Option: true = required, otherwise it must not be held. */
+  alt?: boolean;
 }
 
 export interface KeyDef {
@@ -73,12 +100,23 @@ export interface KeyDef {
   where: string;
   /** Handled elsewhere (modal system); documented only. */
   external?: boolean;
+  /** Only active while the crop tool is open (matched before the culling keys, so X / A do not cull or auto-mask). */
+  needs?: "crop";
+}
+
+/** Tool state the matcher needs to pick between chords that share a key. */
+export interface KeyContext {
+  cropping?: boolean;
 }
 
 const c = (key: string, o: Omit<Chord, "key"> = {}): Chord => ({ key, ...o });
 const digits = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => c(String(from + i)));
 
 export const KEYMAP: KeyDef[] = [
+  // ---- crop tool (must come before the culling keys: X swaps the orientation, A locks the aspect, only while cropping) ----
+  { id: "cropSwap", group: "Develop", label: "Swap crop orientation (landscape / portrait)", chords: [c("x")], modes: ["develop"], display: ["X"], where: "While cropping", needs: "crop" },
+  { id: "cropLock", group: "Develop", label: "Lock / unlock the crop aspect ratio", chords: [c("a")], modes: ["develop"], display: ["A"], where: "While cropping", needs: "crop" },
+
   // ---- culling ----
   { id: "pick", group: "Culling", label: "Pick (Shift = and advance)", chords: [c("p", { shift: "any" })], modes: ALL, display: ["P"], where: "Everywhere" },
   { id: "reject", group: "Culling", label: "Reject (Shift = and advance)", chords: [c("x", { shift: "any" })], modes: ALL, display: ["X"], where: "Everywhere" },
@@ -99,7 +137,10 @@ export const KEYMAP: KeyDef[] = [
   { id: "toggleLoupe", group: "Navigate", label: "Grid to Loupe and back", chords: [c(" "), c("Enter"), c("e")], modes: LIB, display: ["Space", "Enter", "E"], where: "Grid, Loupe, Compare" },
   { id: "devToLoupe", group: "Navigate", label: "Open in Loupe", chords: [c("e")], modes: ["develop"], display: ["E"], where: "Develop" },
   { id: "toGrid", group: "Navigate", label: "Back to Grid", chords: [c("g")], modes: ["loupe", "compare", "develop"], display: ["G"], where: "Outside Grid" },
-  { id: "escape", group: "Navigate", label: "Back to Grid (in Grid: clear selection; while cropping: cancel the crop)", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Everywhere (never with a dialog open)" },
+  { id: "escape", group: "Navigate", label: "Back to Grid (Grid: clear selection)", chords: [c("Escape")], modes: LIB, display: ["Esc"], where: "Grid, Loupe, Compare (never with a dialog open)" },
+  { id: "developEscape", group: "Navigate", label: "Cancel tool / deselect mask / close Masks panel (never leaves Develop)", chords: [c("Escape")], modes: ["develop"], display: ["Esc"], where: "Develop" },
+  { id: "panelsToggle", group: "Navigate", label: "Hide / show the side panels", chords: [c("Tab")], modes: ["develop"], display: ["Tab"], where: "Develop" },
+  { id: "panelsHide", group: "Navigate", label: "Hide / show all panels, filmstrip and toolbar", chords: [c("Tab", { shift: true })], modes: ["develop", "loupe"], display: ["Shift+Tab"], where: "Develop, Loupe" },
   { id: "develop", group: "Navigate", label: "Develop", chords: [c("d")], modes: LIB, display: ["D"], where: "Grid, Loupe, Compare" },
   { id: "compare", group: "Navigate", label: "Compare (from Compare: back to Loupe)", chords: [c("c")], modes: LIB, display: ["C"], where: "Grid, Loupe, Compare" },
   { id: "tab", group: "Navigate", label: "Switch the focused Compare pane", chords: [c("Tab")], modes: ["compare"], display: ["Tab"], where: "Compare" },
@@ -109,7 +150,8 @@ export const KEYMAP: KeyDef[] = [
 
   // ---- view ----
   { id: "zoomLoupe", group: "View", label: "Zoom to 1:1", chords: [c("z")], modes: LIB, display: ["Z"], where: "Grid, Loupe, Compare" },
-  { id: "zoomDevelop", group: "View", label: "Zoom to 100%", chords: [c("z")], modes: ["develop"], display: ["Z"], where: "Develop" },
+  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100%", chords: [c("z"), c(" ")], modes: ["develop"], display: ["Z", "Space"], where: "Develop" },
+  { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },
 
@@ -118,12 +160,33 @@ export const KEYMAP: KeyDef[] = [
   { id: "split", group: "Develop", label: "Split view", chords: [c("y")], modes: ["develop"], display: ["Y"], where: "Develop" },
   { id: "crop", group: "Develop", label: "Crop tool (again: apply)", chords: [c("r")], modes: ["develop"], display: ["R"], where: "Develop" },
   { id: "cropCommit", group: "Develop", label: "Apply crop (Esc cancels it)", chords: [c("Enter")], modes: ["develop"], display: ["Enter"], where: "While cropping" },
-  { id: "undoAdj", group: "Develop", label: "Undo adjustment", chords: [c("z", { mod: true })], modes: ["develop"], display: ["Cmd+Z"], where: "Develop" },
-  { id: "redoAdj", group: "Develop", label: "Redo adjustment", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
+  { id: "undoAdj", group: "Develop", label: "Undo (culling or adjustment, newest first)", chords: [c("z", { mod: true })], modes: ["develop"], display: ["Cmd+Z"], where: "Develop" },
+  { id: "redoAdj", group: "Develop", label: "Redo (culling or adjustment)", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
+  { id: "bwToggle", group: "Develop", label: "Toggle Black & White", chords: [c("v")], modes: ["develop"], display: ["V"], where: "Develop" },
+  { id: "wbPicker", group: "Develop", label: "White balance picker (click a neutral grey)", chords: [c("w")], modes: ["develop"], display: ["W"], where: "Develop" },
+  { id: "pastePrev", group: "Develop", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
+  { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
   { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
   { id: "sync", group: "Develop", label: "Sync settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
   { id: "reset", group: "Develop", label: "Reset all adjustments", chords: [c("r", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+R"], where: "Develop" },
+
+  // ---- masks (Develop; the tool keys open the Masks panel themselves, so K never clashes with Compare's keeper) ----
+  { id: "maskPanel", group: "Masks", label: "Show / hide the Masks panel", chords: [c("w", { shift: true })], modes: ["develop"], display: ["Shift+W"], where: "Develop" },
+  { id: "maskBrush", group: "Masks", label: "Brush (Alt = erase, A = auto mask); opens Masks", chords: [c("k")], modes: ["develop"], display: ["K"], where: "Develop" },
+  { id: "maskLinear", group: "Masks", label: "Linear gradient", chords: [c("m")], modes: ["develop"], display: ["M"], where: "Develop" },
+  { id: "maskRadial", group: "Masks", label: "Radial gradient", chords: [c("m", { shift: true })], modes: ["develop"], display: ["Shift+M"], where: "Develop" },
+  { id: "maskColor", group: "Masks", label: "Color range", chords: [c("j", { shift: true })], modes: ["develop"], display: ["Shift+J"], where: "Develop" },
+  { id: "maskLuminance", group: "Masks", label: "Luminance range", chords: [c("q", { shift: true })], modes: ["develop"], display: ["Shift+Q"], where: "Develop" },
+  { id: "maskOverlay", group: "Masks", label: "Show / hide the mask overlay", chords: [c("o")], modes: ["develop"], display: ["O"], where: "Develop (photo has masks)" },
+  { id: "maskOverlayStyle", group: "Masks", label: "Cycle the overlay color / mode", chords: [c("o", { shift: true })], modes: ["develop"], display: ["Shift+O"], where: "Develop (photo has masks)" },
+  { id: "maskPins", group: "Masks", label: "Show / hide mask pins", chords: [c("h")], modes: ["develop"], display: ["H"], where: "Develop (photo has masks)" },
+  { id: "maskSize", group: "Masks", label: "Brush size smaller / larger", chords: [c("["), c("]")], modes: ["develop"], display: ["[ / ]"], where: "Develop, brush active" },
+  { id: "maskFeather", group: "Masks", label: "Brush feather less / more", chords: [c("[", { shift: true }), c("]", { shift: true }), c("{", { shift: "any" }), c("}", { shift: "any" })], modes: ["develop"], display: ["Shift+[ / Shift+]"], where: "Develop, brush active" },
+  { id: "maskAuto", group: "Masks", label: "Toggle brush auto mask", chords: [c("a")], modes: ["develop"], display: ["A"], where: "Develop, brush active" },
+  { id: "maskDelete", group: "Masks", label: "Delete the selected mask component (Enter / Esc: finish the tool)", chords: [c("Delete"), c("Backspace")], modes: ["develop"], display: ["Delete"], where: "Develop, Masks panel open" },
+  { id: "maskMoveUp", group: "Masks", label: "Move the selected mask (or its component) up in the stack", chords: [c("ArrowUp", { alt: true })], modes: ["develop"], display: ["Alt+Up"], where: "Develop, Masks panel open" },
+  { id: "maskMoveDown", group: "Masks", label: "Move the selected mask (or its component) down in the stack", chords: [c("ArrowDown", { alt: true })], modes: ["develop"], display: ["Alt+Down"], where: "Develop, Masks panel open" },
 
   // ---- app ----
   { id: "saveXmp", group: "App", label: "Save metadata (XMP)", chords: [c("s", { mod: true })], modes: ALL, display: ["Cmd+S"], where: "Everywhere" },
@@ -137,15 +200,21 @@ export const KEYMAP: KeyDef[] = [
 function chordMatches(ch: Chord, e: KeyboardEvent): boolean {
   const mod = e.metaKey || e.ctrlKey;
   if (!!ch.mod !== mod) return false;
+  if (!!ch.alt !== e.altKey) return false;
   if (ch.shift !== "any" && !!ch.shift !== e.shiftKey) return false;
-  return ch.key.length === 1 ? e.key.toLowerCase() === ch.key : e.key === ch.key;
+  if (ch.key.length === 1) {
+    // With Option held macOS types a different character; the physical key still identifies letters.
+    if (ch.alt && /^[a-z]$/.test(ch.key)) return e.code === `Key${ch.key.toUpperCase()}`;
+    return e.key.toLowerCase() === ch.key;
+  }
+  return e.key === ch.key;
 }
 
 /** The definition triggered by `e` in `mode`, if any. */
-export function matchKey(e: KeyboardEvent, mode: Mode): KeyDef | null {
-  if (e.altKey) return null;
+export function matchKey(e: KeyboardEvent, mode: Mode, ctx: KeyContext = {}): KeyDef | null {
   for (const d of KEYMAP) {
     if (d.external || !d.modes.includes(mode)) continue;
+    if (d.needs === "crop" && !ctx.cropping) continue;
     if (d.chords.some((ch) => chordMatches(ch, e))) return d;
   }
   return null;

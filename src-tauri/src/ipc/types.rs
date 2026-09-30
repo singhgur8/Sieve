@@ -55,6 +55,10 @@ macro_rules! string_enum {
         }
     };
 }
+pub(crate) use string_enum;
+
+// Masks / local adjustments (Phase 7c, IPC v10) live in `ipc/masks.rs`.
+pub use super::masks::*;
 
 // ---------------------------------------------------------------------------
 // Camera / file identity
@@ -1172,9 +1176,16 @@ string_enum! {
         /// The look `detail` is neither installed nor embedded in the sidecar: rendered
         /// without it.
         LookUnavailable => "look_unavailable",
-        /// `crs:MaskGroupBasedCorrections` (local adjustments / AI masks, Phase 7c):
-        /// preserved in the sidecar, not rendered yet. `detail` = number of mask groups.
+        /// Local corrections Sieve cannot render (v10: `MaskShape::Unsupported` components
+        /// such as depth ranges, legacy pre-2021 `crs:GradientBasedCorrections` /
+        /// `CircularGradientBasedCorrections` / `PaintBasedCorrections`): preserved in the
+        /// sidecar. `detail` = number of affected components / corrections. (Until the v10
+        /// mask reader lands, every `crs:MaskGroupBasedCorrections`; `detail` = group count.)
         MasksUnsupported => "masks_unsupported",
+        /// AI mask components without a matte for this image (pasted/synced masks, or the
+        /// model for that kind is not installed): rendered as empty until `computeAiMask`
+        /// succeeds. `detail` = number of components (v10).
+        AiMaskNeedsUpdate => "ai_mask_needs_update",
         /// `crs:RetouchAreas` (spot heal/clone): preserved, not rendered.
         RetouchUnsupported => "retouch_unsupported",
         /// Lens profile / chromatic aberration / defringe / manual distortion or lens
@@ -1250,11 +1261,8 @@ pub struct ProfileCatalog {
 
 /// Parametric develop settings. Field names and ranges mirror Adobe Camera Raw
 /// Process 2012+ (`crs:` XMP namespace) so XMP export is a 1:1 mapping.
-/// Phase 7c (masking) will add `masks: Vec<MaskGroup>` (`#[serde(default)]`, group `masks`),
-/// each with a *local* parameter set mirroring Lightroom's `crs:Local*` (exposure, contrast,
-/// highlights, shadows, whites, blacks, temperature/tint deltas, texture, clarity, dehaze,
-/// saturation, hue, sharpness, luminance noise, moire, defringe, toning colour, curve
-/// refine saturation); those reuse this struct's ranges and names, not a second model.
+/// Local adjustments (Phase 7c, IPC v10) are `masks`: mask groups with per-mask parameter
+/// sets mirroring Lightroom's `crs:MaskGroupBasedCorrections` (see `ipc/masks.rs`).
 /// Stored JSON missing newer fields loads as neutral (see `db::repo::get_adjustments`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -1309,6 +1317,10 @@ pub struct ParametricAdjustments {
     /// Camera profile + look (see [`ProfileSettings`]).
     #[serde(default)]
     pub profile: ProfileSettings,
+    /// Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+    /// [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+    #[serde(default)]
+    pub masks: Vec<MaskGroup>,
 }
 
 impl ParametricAdjustments {
@@ -1478,6 +1490,7 @@ impl ParametricAdjustments {
                 return Err(format!("profile.look.name must be at most {} chars", ProfileSettings::MAX_NAME));
             }
         }
+        validate_masks(&self.masks)?;
         Ok(())
     }
 
@@ -1512,6 +1525,8 @@ impl ParametricAdjustments {
                 AdjustmentField::BlackAndWhite => self.black_and_white = src.black_and_white,
                 AdjustmentField::Crop => self.crop = src.crop,
                 AdjustmentField::Profile => self.profile = src.profile.clone(),
+                // AI mattes belong to the source image: the target recomputes them.
+                AdjustmentField::Masks => self.masks = src.masks.iter().map(MaskGroup::transferable).collect(),
             }
         }
     }
@@ -1535,6 +1550,7 @@ impl ParametricAdjustments {
     ///   same number of points, else the nearer side's curve; booleans, `vignette.style`,
     ///   `crop` unless both enabled: the nearer side's; `profile`: look amount linear when both
     ///   sides have the same camera profile and look, else the nearer side's.
+    /// - v10 `masks`: the nearer side's (never interpolated).
     pub fn lerp(a: &ParametricAdjustments, b: &ParametricAdjustments, t: f32) -> ParametricAdjustments {
         let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
         let l = |x: f32, y: f32| x + (y - x) * t;
@@ -1685,6 +1701,7 @@ impl ParametricAdjustments {
                 }
             },
             profile: ProfileSettings::lerp(&a.profile, &b.profile, t),
+            masks: if near_b { b.masks.clone() } else { a.masks.clone() },
         }
     }
 }
@@ -1739,11 +1756,15 @@ string_enum! {
         Crop => "crop",
         /// `profile` (camera profile + look) (v9).
         Profile => "profile",
+        /// `masks` (all mask groups; AI mattes are recomputed on the target) (v10). Not in
+        /// [`AdjustmentField::DEFAULT_SYNC`].
+        Masks => "masks",
     }
 }
 
 impl AdjustmentField {
-    /// Every group except `crop` (Lightroom's Sync/Copy default: crops are per-frame).
+    /// Every group except `crop` and `masks` (per-frame geometry; Lightroom's Sync/Copy
+    /// default leaves them unchecked).
     /// Default of `MatchOptions.copyFields`; TS mirror `DEFAULT_SYNC_FIELDS`.
     pub const DEFAULT_SYNC: &'static [AdjustmentField] = &[
         AdjustmentField::WhiteBalance,
@@ -1788,6 +1809,9 @@ string_enum! {
         Before => "before",
         /// A zoomed region (`RenderOptions.region`), e.g. 1:1 loupe detail.
         Detail => "detail",
+        /// Mask overlays (`render_mask_overlay`, v10): grayscale JPEG mattes. Not accepted
+        /// by `render_preview`.
+        Mask => "mask",
     }
 }
 
@@ -1809,10 +1833,18 @@ impl RenderOptions {
     pub const MAX_EDGE: u32 = 8192;
 
     pub fn validate(&self) -> Result<(), String> {
-        if !(Self::MIN_EDGE..=Self::MAX_EDGE).contains(&self.max_edge) {
-            return Err(format!("maxEdge = {} is outside {}..={}", self.max_edge, Self::MIN_EDGE, Self::MAX_EDGE));
+        if self.slot == RenderSlot::Mask {
+            return Err("slot \"mask\" is reserved for render_mask_overlay".into());
         }
-        if let Some(r) = self.region {
+        Self::validate_geometry(self.max_edge, self.region)
+    }
+
+    /// `maxEdge` / `region` rules shared with `MaskOverlayOptions`.
+    pub fn validate_geometry(max_edge: u32, region: Option<NormRect>) -> Result<(), String> {
+        if !(Self::MIN_EDGE..=Self::MAX_EDGE).contains(&max_edge) {
+            return Err(format!("maxEdge = {} is outside {}..={}", max_edge, Self::MIN_EDGE, Self::MAX_EDGE));
+        }
+        if let Some(r) = region {
             let ok = [r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
                 && r.x >= 0.0
                 && r.y >= 0.0
@@ -1999,6 +2031,7 @@ impl Default for ParametricAdjustments {
             black_and_white: BlackAndWhite::default(),
             crop: CropSettings::default(),
             profile: ProfileSettings::default(),
+            masks: Vec::new(),
         }
     }
 }
@@ -3169,9 +3202,112 @@ pub struct UiPrefs {
     pub last_export_folder: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Model downloads (IPC v12)
+// ---------------------------------------------------------------------------
+
+/// Model group id accepted by `download_models`. Currently only `"segmentation"` (the AI-mask
+/// models, ~560 MB); the culling models ship with the app.
+pub const MODEL_GROUP_SEGMENTATION: &str = "segmentation";
+
+/// One model file of a [`ModelGroupStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFileStatus {
+    /// File name in the models directory (e.g. `birefnet_lite.onnx`).
+    pub name: String,
+    /// Present with the expected size (files are checksum-verified before they are moved into place).
+    pub installed: bool,
+    /// Download size in bytes.
+    pub bytes: u64,
+}
+
+/// A downloadable set of models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelGroupStatus {
+    /// Pass to `download_models` (e.g. `"segmentation"`).
+    pub id: String,
+    /// User-facing name (e.g. "AI masking models").
+    pub label: String,
+    /// Every file installed.
+    pub installed: bool,
+    /// Sum of `files[].bytes`.
+    pub bytes_total: u64,
+    pub files: Vec<ModelFileStatus>,
+}
+
+/// `model_downloads_status()`: what is installed and what is downloading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadStatus {
+    pub groups: Vec<ModelGroupStatus>,
+    /// Group id of the download in flight (at most one at a time); `null` when idle.
+    pub downloading: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn masked() -> ParametricAdjustments {
+        let ai = MaskComponent {
+            id: format!("{:032X}", 2),
+            name: "Subject 1".into(),
+            active: true,
+            mode: MaskBlendMode::Add,
+            inverted: false,
+            opacity: 1.0,
+            shape: MaskShape::Ai(AiMask {
+                target: AiTarget::Subject,
+                reference_point: None,
+                digest: Some("E71A59AFC894F4F898F72751E30113DA".into()),
+            }),
+        };
+        let group = MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Cool Soft".into(),
+            active: true,
+            amount: 1.0,
+            adjustments: LocalAdjustments { clarity: -19.5, temperature: -19.8, texture: -14.9, ..Default::default() },
+            components: vec![ai],
+        };
+        ParametricAdjustments { masks: vec![group], ..Default::default() }
+    }
+
+    #[test]
+    fn v10_masks_validate_copy_lerp_and_old_json() {
+        let m = masked();
+        m.validate().unwrap();
+        assert!(!m.is_neutral());
+        // Copy/paste/sync: groups copied, AI digests dropped (target recomputes).
+        let mut t = ParametricAdjustments::default();
+        t.copy_fields(&m, AdjustmentField::DEFAULT_SYNC);
+        assert!(t.masks.is_empty(), "DEFAULT_SYNC leaves masks alone");
+        t.copy_fields(&m, &[AdjustmentField::Masks]);
+        assert_eq!(t.masks.len(), 1);
+        assert_eq!(t.masks[0].adjustments, m.masks[0].adjustments);
+        assert!(matches!(&t.masks[0].components[0].shape, MaskShape::Ai(a) if a.digest.is_none()));
+        // lerp: nearer side's masks.
+        let d = ParametricAdjustments::default();
+        assert!(ParametricAdjustments::lerp(&m, &d, 0.4).masks == m.masks);
+        assert!(ParametricAdjustments::lerp(&m, &d, 0.6).masks.is_empty());
+        // validate() covers masks.
+        let mut bad = m.clone();
+        bad.masks[0].adjustments.contrast = 150.0;
+        assert!(bad.validate().unwrap_err().contains("masks[0].adjustments.contrast"));
+        // JSON without `masks` (pre-v10 rows) reads as no masks; round trip keeps them.
+        let mut v = serde_json::to_value(&d).unwrap();
+        v.as_object_mut().unwrap().remove("masks");
+        assert_eq!(serde_json::from_value::<ParametricAdjustments>(v).unwrap(), d);
+        let back: ParametricAdjustments = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // The mask slot is reserved for overlays.
+        let opts = RenderOptions { max_edge: 1024, slot: RenderSlot::Mask, region: None };
+        assert!(opts.validate().is_err());
+        assert!(MaskOverlayOptions { max_edge: 1024, region: None }.validate().is_ok());
+        assert!(MaskOverlayOptions { max_edge: 10, region: None }.validate().is_err());
+    }
 
     #[test]
     fn copy_fields_copies_only_selected_groups() {
@@ -3403,7 +3539,9 @@ mod tests {
         assert_eq!(t.crop, CropSettings::default(), "DEFAULT_SYNC leaves the crop alone");
         t.copy_fields(&e, &[AdjustmentField::Crop]);
         assert_eq!(t, e, "ALL groups together cover every field");
-        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 1, AdjustmentField::ALL.len());
+        // v10: DEFAULT_SYNC = ALL minus crop and masks.
+        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 2, AdjustmentField::ALL.len());
+        assert!(!AdjustmentField::DEFAULT_SYNC.contains(&AdjustmentField::Masks));
 
         // Out-of-range / malformed values.
         let bad = |f: fn(&mut ParametricAdjustments)| {

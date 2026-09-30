@@ -5,7 +5,7 @@ import type { Editor } from "../../hooks/useEditor";
 import { addPoint, movePoint, removePoint, sampleCurve } from "../../lib/curve";
 import { NumField, seg } from "./fields";
 
-type Channel = keyof PointCurves;
+export type Channel = keyof PointCurves;
 const CHANNELS: { id: Channel; label: string; color: string }[] = [
   { id: "master", label: "RGB", color: "#e5e5e5" },
   { id: "red", label: "R", color: "#f87171" },
@@ -16,19 +16,31 @@ const CHANNELS: { id: Channel; label: string; color: string }[] = [
 const PAD = 8;
 const VIEW = 255 + PAD * 2;
 
-const setCurve = (a: CompleteAdjustments, ch: Channel, pts: CurvePoint[]): CompleteAdjustments => ({
-  ...a,
-  toneCurve: { ...a.toneCurve, point: { ...a.toneCurve.point, [ch]: pts } },
-});
+const setPts = (a: CompleteAdjustments, ch: Channel, fn: (pts: CurvePoint[]) => CurvePoint[]): CompleteAdjustments => {
+  const cur = a.toneCurve.point[ch];
+  const next = fn(cur);
+  return next === cur ? a : { ...a, toneCurve: { ...a.toneCurve, point: { ...a.toneCurve.point, [ch]: next } } };
+};
+
+/** What a point-curve editor edits: the four curves plus live / committed / release callbacks (global or per-mask). */
+export interface CurveHost {
+  curves: PointCurves;
+  /** Live edit (drag): `fn` maps the channel's points to the new points (return the same array for "no change"). */
+  edit: (ch: Channel, fn: (pts: CurvePoint[]) => CurvePoint[]) => void;
+  /** Committed edit (own history entry). */
+  change: (ch: Channel, fn: (pts: CurvePoint[]) => CurvePoint[]) => void;
+  commit: () => void;
+}
 
 const isIdentity = (pts: readonly CurvePoint[]) => pts.length === 2 && pts[0][0] === 0 && pts[0][1] === 0 && pts[1][0] === 255 && pts[1][1] === 255;
 
-function PointCurveEditor({ editor }: { editor: Editor }) {
+/** Master / R / G / B point-curve editor. `tid` prefixes the test ids ("curve" for the Tone Curve panel, "mask-curve" for masks). */
+export function PointCurveEditor({ host, tid = "curve" }: { host: CurveHost; tid?: string }) {
   const [ch, setCh] = useState<Channel>("master");
   const [sel, setSel] = useState<number | null>(null);
   const svg = useRef<SVGSVGElement>(null);
   const drag = useRef<{ index: number } | null>(null);
-  const pts = editor.adj.toneCurve.point[ch];
+  const pts = host.curves[ch];
   const color = CHANNELS.find((c) => c.id === ch)!.color;
 
   const toCurve = (e: { clientX: number; clientY: number }): [number, number] => {
@@ -56,11 +68,11 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
     let index = hit(x, y);
     if (index < 0) {
       let added = -1;
-      editor.edit((a) => {
-        const r = addPoint(a.toneCurve.point[ch], x, y);
+      host.edit(ch, (cur) => {
+        const r = addPoint(cur, x, y);
         added = r.index;
-        return added < 0 ? a : setCurve(a, ch, r.pts);
-      }, "Tone Curve");
+        return added < 0 ? cur : r.pts;
+      });
       if (added < 0) return;
       index = added;
     }
@@ -72,16 +84,16 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
     const d = drag.current;
     if (!d) return;
     const [x, y] = toCurve(e);
-    editor.edit((a) => setCurve(a, ch, movePoint(a.toneCurve.point[ch], d.index, x, y)), "Tone Curve");
+    host.edit(ch, (cur) => movePoint(cur, d.index, x, y));
   };
   const onUp = () => {
     if (!drag.current) return;
     drag.current = null;
-    editor.commit();
+    host.commit();
   };
   const remove = (i: number) => {
     if (pts.length <= 2) return;
-    editor.change((a) => setCurve(a, ch, removePoint(a.toneCurve.point[ch], i)), "Tone Curve");
+    host.change(ch, (cur) => removePoint(cur, i));
     setSel(null);
   };
   const onDouble = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -101,10 +113,7 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
       const s = e.shiftKey ? 10 : 1;
       const dx = e.key === "ArrowRight" ? s : e.key === "ArrowLeft" ? -s : 0;
       const dy = e.key === "ArrowUp" ? s : e.key === "ArrowDown" ? -s : 0;
-      editor.change((a) => {
-        const p = a.toneCurve.point[ch][sel];
-        return setCurve(a, ch, movePoint(a.toneCurve.point[ch], sel, p[0] + dx, p[1] + dy));
-      }, "Tone Curve");
+      host.change(ch, (cur) => movePoint(cur, sel, cur[sel][0] + dx, cur[sel][1] + dy));
     } else if (e.key === "Escape" || e.key === "Tab") {
       setSel(null);
     }
@@ -114,10 +123,10 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
     .map((p) => `${p[0] + PAD},${255 - p[1] + PAD}`)
     .join(" ");
   return (
-    <div data-testid="curve-editor" data-channel={ch}>
-      <div className="mb-1 flex gap-1" data-testid="curve-channels">
+    <div data-testid={`${tid}-editor`} data-channel={ch}>
+      <div className="mb-1 flex gap-1" data-testid={`${tid}-channels`}>
         {CHANNELS.map((c) => (
-          <button key={c.id} className={seg(ch === c.id)} style={{ color: ch === c.id ? undefined : c.color }} onClick={() => (setCh(c.id), setSel(null))} data-testid={`curve-ch-${c.id}`}>
+          <button key={c.id} className={seg(ch === c.id)} style={{ color: ch === c.id ? undefined : c.color }} onClick={() => (setCh(c.id), setSel(null))} data-testid={`${tid}-ch-${c.id}`}>
             {c.label}
           </button>
         ))}
@@ -129,7 +138,7 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
         tabIndex={0}
         role="application"
         aria-label={`${ch} tone curve. Click to add a point, drag to move, double-click or Backspace to delete`}
-        data-testid="curve-svg"
+        data-testid={`${tid}-svg`}
         data-points={JSON.stringify(pts)}
         data-selected={sel ?? ""}
         onPointerDown={onDown}
@@ -156,19 +165,19 @@ function PointCurveEditor({ editor }: { editor: Editor }) {
             fill={sel === i ? color : "#171717"}
             stroke={color}
             strokeWidth="1.5"
-            data-testid={`curve-pt-${i}`}
+            data-testid={`${tid}-pt-${i}`}
           />
         ))}
       </svg>
       <div className="mt-1 flex items-center justify-between text-[11px] text-neutral-400">
-        <span data-testid="curve-info">
+        <span data-testid={`${tid}-info`}>
           {sel != null && pts[sel] ? `In ${pts[sel][0]}  Out ${pts[sel][1]}` : `${pts.length} / ${MAX_CURVE_POINTS} points`}
         </span>
         <button
           className="hover:text-neutral-200 disabled:opacity-40"
           disabled={isIdentity(pts)}
-          onClick={() => (editor.change((a) => setCurve(a, ch, IDENTITY_CURVE.map((p) => [...p] as CurvePoint)), "Tone Curve"), setSel(null))}
-          data-testid="curve-reset"
+          onClick={() => (host.change(ch, () => IDENTITY_CURVE.map((p) => [...p] as CurvePoint)), setSel(null))}
+          data-testid={`${tid}-reset`}
         >
           Reset curve
         </button>
@@ -252,9 +261,15 @@ const PARAMETRIC = [
 ] as const;
 
 export function ToneCurvePanel({ editor }: { editor: Editor }) {
+  const host: CurveHost = {
+    curves: editor.adj.toneCurve.point,
+    edit: (ch, fn) => editor.edit((a) => setPts(a, ch, fn), "Tone Curve"),
+    change: (ch, fn) => editor.change((a) => setPts(a, ch, fn), "Tone Curve"),
+    commit: editor.commit,
+  };
   return (
     <>
-      <PointCurveEditor editor={editor} />
+      <PointCurveEditor host={host} />
       <div className="mt-2 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Region</div>
       <SplitBar editor={editor} />
       {PARAMETRIC.map(([k, label]) => (

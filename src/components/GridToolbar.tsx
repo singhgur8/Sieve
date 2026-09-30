@@ -20,6 +20,9 @@ interface Props {
   onSize: (n: number) => void;
   selectedCount: number;
   total: number;
+  /** Photos in the catalog / folder before filtering (null while loading). */
+  catalogTotal?: number | null;
+  capsLock?: boolean;
   autoAdvance: boolean;
   onAutoAdvance: (v: boolean) => void;
   /** Rating / label / burst / folder filters, shown to the left. */
@@ -66,11 +69,11 @@ export function GridToolbar(p: Props) {
         {p.query.sortDescending ? <ArrowUpAZ className="size-3.5" /> : <ArrowDownAZ className="size-3.5" />}
       </button>
       <label className="flex items-center gap-1.5" title="Advance to the next photo after flagging/rating (Shift+P / Shift+X always advance)">
-        <input type="checkbox" checked={p.autoAdvance} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />
-        <SkipForward className="size-3.5" /> Auto-advance
+        <input type="checkbox" checked={p.autoAdvance || !!p.capsLock} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />
+        <SkipForward className="size-3.5" /> Auto-advance{p.capsLock ? " (Caps Lock)" : ""}
       </label>
       <span className="ml-auto pl-2" data-testid="selection-count">
-        {p.selectedCount} selected · {p.total} photos
+        {p.catalogTotal != null && p.catalogTotal !== p.total ? `${p.total} of ${p.catalogTotal}` : `${p.total} photos`} · {p.selectedCount} selected
       </span>
     </div>
   );

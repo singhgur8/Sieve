@@ -106,13 +106,15 @@ test.describe("P0-1 modals own the keyboard", () => {
     // The X inside the dialog never rejected the photo behind it.
     expect((await calls(page, "set_pick")).length).toBe(0);
 
-    // Enter confirms; a plain Esc afterwards leaves Develop as usual.
+    // Enter confirms; a plain Esc afterwards does nothing in Develop (UX2 P0-1), G leaves.
     await page.keyboard.press("Meta+Shift+c");
     await expect(dlg).toBeVisible();
     await page.keyboard.press("Enter");
     await expect(dlg).toHaveCount(0);
     await expect(page.getByTestId("notice")).toContainText("Copied");
     await page.keyboard.press("Escape");
+    await expect(page.getByTestId("develop-view")).toBeVisible();
+    await page.keyboard.press("g");
     await expect(page.getByTestId("develop-view")).toHaveCount(0);
   });
 
@@ -171,7 +173,9 @@ test.describe("P0-2 apply suggestions", () => {
     const dlg = page.getByTestId("apply-dialog");
     await expect(dlg).toBeVisible();
     expect((await calls(page, "apply_suggestions")).length).toBe(0); // nothing happens before confirming
-    await expect(page.getByTestId("apply-title")).toHaveText("Apply suggestions to 5 photos");
+    await expect(page.getByTestId("apply-title")).toHaveText("Apply suggestions");
+    await expect(page.getByTestId("apply-scope-selected")).toBeChecked();
+    await expect(page.getByTestId("apply-scope")).toContainText("Selected (5)");
     await expect(page.getByTestId("apply-only-unset")).toBeChecked();
     await expect(page.getByTestId("apply-count-skipped")).toHaveText("1");
     await expect(page.getByTestId("apply-count-apply")).toHaveText("4");
@@ -290,7 +294,7 @@ test.describe("P0-3 export reason and defaults", () => {
   test("remembers the last folder, defaults to All filtered for a single photo, Cmd+Enter exports", async ({ page }) => {
     await openExport(page, [5]);
     await expect(page.getByTestId("export-scope-filtered")).toBeChecked();
-    await expect(page.getByTestId("export-count")).toHaveText("200 photos");
+    await expect(page.getByTestId("export-count")).toHaveText("186 photos"); // 14 rejects skipped by default
     await page.getByTestId("export-scope-selection").check();
     await expect(page.getByTestId("export-count")).toHaveText("1 photo");
     await page.getByTestId("export-choose-folder").click();
@@ -473,7 +477,7 @@ test.describe("P1-10 cheat sheet and keymap", () => {
     expect(first).not.toBe("cell-1");
     await page.keyboard.press("Shift+End");
     await expect(page.getByTestId("selection-count")).toContainText("selected");
-    expect(await page.getByTestId("selection-count").textContent()).toMatch(/^(\d+) selected/);
+    expect(await page.getByTestId("selection-count").textContent()).toMatch(/(\d+) selected/);
 
     await page.keyboard.press("Home");
     await page.keyboard.press("Space");

@@ -73,7 +73,7 @@ Conventions
 - [x] **QA gate**.
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
-## Phase 7b — Real-world parity (user request 2026-09-29)
+## Phase 7b — Real-world parity (user request 2026-09-29) ✅
 Sample set: `/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal` (45 GB; 537 ARW, 231 CR3, 79 RAF, 39 JPG, 394 user-edited
 Lightroom XMPs). **Read-only** — never write sidecars there (auto-sync stays off; verify no file changes before/after);
 copy subsets into `test-data/` for anything that writes.
@@ -81,11 +81,11 @@ copy subsets into `test-data/` for anything that writes.
   render in flight per slot, send latest values when it lands; draft-size renders (~1024 px) while dragging, full
   quality on release/idle. Acceptance: preview visibly tracks a continuous drag (Playwright with delayed mock renders
   proves intermediate frames are shown; real bench of drag sequences reports frames shown/sec).
-- [ ] **Non-RAW sources** (architect → rust-engine-dev, frontend-dev): import and edit JPEG/HEIC/TIFF/PNG (and
+- [x] **Non-RAW sources** (architect → rust-engine-dev, frontend-dev): import and edit JPEG/HEIC/TIFF/PNG (and
   camera JPEG siblings of RAWs, grouped or listed per user setting): ingest/thumbnail/EXIF, develop from decoded sRGB→
   linear, XMP sidecars for JPEG edits (Lightroom writes `<name>.xmp` for RAW, embedded/sidecar for JPEG — decide),
   export.
-- [ ] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): **full parity for every develop
+- [x] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): **full parity for every develop
   setting the user's edits use — Sieve must replace Lightroom, not supplement it (user requirement).** Parametric +
   point tone curve (master + RGB), color grading / split toning, camera calibration, sharpening, luminance/color noise
   reduction, vignette, grain, lens-profile-free basics; camera profiles via the Adobe Standard/Camera Matching DCPs
@@ -95,31 +95,32 @@ copy subsets into `test-data/` for anything that writes.
   the user's edited frames, Sieve's render of the imported XMP matches Lightroom's render (ΔE2000 mean ≤ 3 vs a
   Lightroom-exported reference if the user provides one; otherwise orchestrator visual review) and every crs value
   round-trips.
-- [ ] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
+- [x] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
   (X-Trans + Bayer)/CR3/JPG thumbnails + EXIF + develop + export correct; user XMP ratings + develop settings imported;
   throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
   side-by-side of Sieve renders of the user's edits for visual parity review.
 - [x] **Culling calibration to user picks** (vision-ml-dev): QA found 31% of the user's keepers suggested reject (burst duplicates, overexposed on 40% of frames). Acceptance on held-out part of the shoot: keeper false-reject ≤ 5%, overexposed < 10% unless truly clipped, no blink/missed_focus precision regression.
-- [ ] **QA gate**.
+- [x] **QA gate**.
 
-## Phase 7c — Local adjustments & masking (moved from Phase 11: user requires an all-in-one Lightroom replacement)
-- [ ] **Contract** (architect): mask groups with per-mask adjustment sets (Lightroom `crs:MaskGroupBasedCorrections`
+## Phase 7c — Local adjustments & masking ✅ (moved from Phase 11: user requires an all-in-one Lightroom replacement)
+- [x] **Contract** (architect): mask groups with per-mask adjustment sets (Lightroom `crs:MaskGroupBasedCorrections`
   model): brush, linear gradient, radial gradient, luminance/color range, AI masks (subject, sky, background, people
   incl. face/skin/eyes/lips), add/subtract/intersect, invert, feather/density; XMP read/write parity with Lightroom.
-- [ ] **Segmentation models** (vision-ml-dev): permissively licensed ONNX models for subject, sky and people/face
+- [x] **Segmentation models** (vision-ml-dev): permissively licensed ONNX models for subject, sky and people/face
   parts (CoreML where possible), cached per image, resolution-independent mask storage.
-- [ ] **Mask rendering** (rust-engine-dev): masks evaluated at any resolution; local adjustments in the shared pipeline
+- [x] **Mask rendering** (rust-engine-dev): masks evaluated at any resolution; local adjustments in the shared pipeline
   (preview + export), within the slider latency budget.
-- [ ] **Masking UI** (frontend-dev): Lightroom-style masks panel, brush with size/feather/flow/auto-mask, gradient
+- [x] **Masking UI** (frontend-dev): Lightroom-style masks panel, brush with size/feather/flow/auto-mask, gradient
   handles, AI select buttons, overlay visualization, keyboard shortcuts (O overlay, K brush, M linear, Shift+M radial).
-- [ ] **Mask pipeline integration** (rust-engine-dev, after 7b pipeline lands): call the develop/masks seam from develop/pipeline.rs + mod.rs (preview + export; export computes missing AI mattes first); adapt apply_group_blends to the pipeline's working space (linear ProPhoto vs Rec.2020 stub); lib.rs `XmpSync::with_mask_cache(mask_cache)` (architect-approved) so Lightroom mattes are cached on read; DevelopCache::info reports ai_mask_needs_update; launch catch-up for masks_pending_import; render the user's 50 masked frames and compare with/without masks.
-- [ ] **Masking polish** (frontend-dev + rust-engine-dev): per-mask tone curve editor, reorder groups/components, overlay rendered for the visible region at 100% zoom, verify crop-angle sign + gradient geometry against real renders, luminance eyedropper via backend sample (not canvas).
-- [ ] **QA gate**: the user's 50 AI subject masks (Adaptive: Subject presets; mattes embedded as JPEG XL in crs:Table_*) import and render like Lightroom (decoded mattes); new brush/gradient/range/AI masks work end to end; round trip preserves Lightroom mask data byte-for-byte when unchanged.
+- [x] **Mask pipeline integration** (rust-engine-dev, after 7b pipeline lands): call the develop/masks seam from develop/pipeline.rs + mod.rs (preview + export; export computes missing AI mattes first); adapt apply_group_blends to the pipeline's working space (linear ProPhoto vs Rec.2020 stub); lib.rs `XmpSync::with_mask_cache(mask_cache)` (architect-approved) so Lightroom mattes are cached on read; DevelopCache::info reports ai_mask_needs_update; launch catch-up for masks_pending_import; render the user's 50 masked frames and compare with/without masks.
+- [x] **Masking polish** (frontend-dev + rust-engine-dev): per-mask tone curve editor, reorder groups/components, overlay rendered for the visible region at 100% zoom, verify crop-angle sign + gradient geometry against real renders, luminance eyedropper via backend sample (not canvas).
+- [x] **QA gate**: the user's 50 AI subject masks (Adaptive: Subject presets; mattes embedded as JPEG XL in crs:Table_*) import and render like Lightroom (decoded mattes); new brush/gradient/range/AI masks work end to end; round trip preserves Lightroom mask data byte-for-byte when unchanged.
 
 ## Phase 8 — Hardening + packaging
+- [ ] **Mask/XMP polish** (rust-engine-dev, vision-ml-dev): don't write default-valued global crs keys Lightroom omitted (only write keys that differ from defaults or already exist); Sky matte patchy on hazy low-contrast horizons (AZA06714); luminance-range mask blockiness (guide resample in develop/masks/overlay.rs); refit local Clarity/Texture/Temperature on the parity-round-1 pipeline (in-mask ΔE 3.78 → ≤ 3).
 - [ ] **Parity round 2** (rust-engine-dev): halo-free local Shadows at strong edges without losing fit; highlight reconstruction for raw-clipped skies (removes the green/magenta arc, IMG_5698/5674); night/low-key frames (DSCF5919 4.18, DSCF5923 4.56); calibrate Clarity/Texture/Dehaze and Whites+ against Camera Raw. Acceptance: held-out mean ≤ 2.5, no frame > 4, halo ≤ 4/255 on the step probe.
-- [ ] **Crop straighten preview** (frontend-dev + rust-engine-dev): live rotation preview while dragging the crop angle (Lightroom parity); currently applied only on commit.
-- [ ] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
+- [x] **Crop straighten preview** (frontend-dev + rust-engine-dev): live rotation preview while dragging the crop angle (Lightroom parity); currently applied only on commit.
+- [x] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
 - [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
 - [ ] Error states, empty states, crash-safe catalog writes.
 - [ ] `pnpm tauri build` → `.app` / `.dmg`; smoke-test the bundle.
@@ -169,3 +170,8 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 7b slider responsiveness: one render in flight per slot + draft (≤1024 px) while dragging, full on release/idle; Playwright: 24–25 intermediate renders shown during a 1 s drag with 40 ms renders (0 before fix). UX review 1 P0/P1 implemented (69/69 Playwright; Library chrome 108/140 px, Develop viewer 571 px at 1280×800). Real-backend slider feel still to confirm in the app.
 - 2026-09-29 — Phase 7 complete: scene features/detection (time gaps + histogram similarity, bursts never split), render-space ImageStats, Broyden solver for exposure/temp/tint (+tone) with safety caps, time-weighted 2-anchor blending, scene UI (strip, anchors, Match panel with local strength lerp, apply + undo). QA: 189 tests + 10 ignored; scene_eval 142/146 targets (97.3%) within 0.15 EV / 0.012 ab, all 4 misses flagged (dark LED scene, blown close-up); 48 scenes over 396 frames; 7 ms/target warm; app migrates to v8. Also merged here: IPC v8 UX additions + UX review 1 implementation (Playwright 69/69).
 - 2026-09-30 — Phase 7b culling calibration: keeper_eval on the user's proposal shoot (keeper = edited or ≥2★), time split 60/40. Held-out keepers suggested reject 37.4% → 0%; overexposed 27.7% → 0% (now blown skin / >60% blown frame); remaining 7 rejects all non-keepers; wedding-label tag precision unchanged. Gap: stars/picks barely predict this user's keepers (AUC ~0.57) — content/preference model needed (Phase 10).
+- 2026-09-30 — Phase 7b QA (final): non-RAW end to end PASS (neutral ≤ 2 levels, <name>.JPG.xmp sidecars, exports, originals byte-identical); parity PASS at 3.0 bar (held-out 2.88; ARW 2.97 / CR3 2.81 / RAF 2.87; 4 frames > 3 → Phase 8 round 2); culling calibration PASS (held-out keeper false-reject 0/115, wedding-label precision unchanged); scale PASS (orchestrator-run: 847/847 ready, 108 files/s, 330 MB footprint, 394 sidecars 0 errors, source listing of 1281 files identical). Open: M-size ARW half-size preview crop regression (fix in progress) blocks the QA gate.
+- 2026-09-30 — Phase 7c implemented (pending QA): v10 masks contract; segmentation models (BiRefNet subject, U²-Net sky, YOLOX + EfficientSAM people, MediaPipe parts; all MIT/Apache, SCRFD caveat); Lightroom mask XMP I/O (50/50 user mattes decoded, byte-identical round trip); mask evaluation + local planes merged with parity round 1 (full-frame mask == global slider; outside-mask change ≤ 0.011 ΔE); user's 10 masked frames vs Camera Raw 3.42 (in-mask 3.78); masked 2048 p95 78 ms; masking UI + UX review 2 fixes + polish (140 Playwright). Phase 8 UX review done (reviews 1 and 2, all P0/P1 implemented); crop straighten live preview done.
+- 2026-09-30 — Phase 7b complete: M-size ARW half-size crop regression fixed (158d475; crop scale from decoded vs full size); direct_copy_matches_mem_image + real_raw_export_matches_preview pass; 259 tests green. Parity round 2 continues in Phase 8.
+- 2026-09-30 — Phase 7c complete: QA PASS — 329 tests + 140 Playwright; user's 50 Lightroom masks import/render (outside-mask ΔE ≤ 0.011; vs Camera Raw 3.42 with masks / 4.02 without on 10 frames); round trip changes only the edited local value, mattes byte-identical; new Subject/Sky/People/brush/linear/radial/range masks confined to their regions, exported, Lightroom-structured XMP; AI subject 3–5 s cold (cached after), sky 0.25 s; masked 2048 p95 71 ms. Follow-ups → Phase 8 Mask/XMP polish.
+- 2026-09-30 — Phase 8 perf + crash safety merged (add7aec, pending final QA). Slider: source lookup 0.100 → 0.001 ms (SourceImage cached in DevelopCache), draft frame p50 ~28 ms, IPC+protocol ~0.03 ms (protocol copy kept: 3 µs); warm 2048 render p50 72 ms (regressed from 18.6 ms → parity round 2). Ingest 847 RAWs 92.7–99.6 → 99.8–107 files/s, 330 MB peak; analysis 9.1 ms/image. Grid 50k: worst median 231.7 → 25.3 ms (16.5 ms with v13 indexes). Export 50 ARW: JPEG full 2.94/s, JPEG 2048 P3 6.99/s, TIFF16 1.72/s, WebP 6.19/s, HEIC 7.15/s, peak ≤ 942 MiB. Catalog: WAL+NORMAL+fullfsync, quick_check on open, 3 rotating VACUUM INTO backups, read-only fallback, kill test all-or-nothing; panic=unwind. IPC v12 model downloads merged.

@@ -6,16 +6,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_specta::Event;
 
 use super::error::{AppError, AppResult};
 use super::types::*;
 use crate::db::{self, repo};
+use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
 use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
+use crate::ml::masking::Segmenter;
 use crate::ml::{self, Analysis};
+use crate::model_fetch::ModelDownloads;
 use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
 use crate::xmp::XmpSync;
@@ -46,13 +50,20 @@ impl Catalog {
         F: FnOnce(&mut Connection) -> AppResult<T> + Send + 'static,
     {
         let conn = self.conn.clone();
+        let path = self.path.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut conn = conn.lock().map_err(|_| AppError::internal("catalog lock poisoned"))?;
-            f(&mut conn)
+            f(&mut conn).map_err(|e| explain_catalog_error(&path, e))
         })
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
     }
+}
+
+/// Database errors get an actionable message: a damaged catalog (opened read-only, see
+/// `db::health`) says how to restore a backup; a full disk says so.
+fn explain_catalog_error(path: &Path, e: AppError) -> AppError {
+    db::explain_error(path, e)
 }
 
 #[tauri::command]
@@ -110,6 +121,10 @@ pub async fn import_folder(
     let sync = xmp.inner().clone();
     let folder_id = summary.folder_id;
     summary.sidecars_read = blocking(move || sync.refresh_folder(folder_id)).await?;
+    // Re-registered files may have changed on disk: re-resolve develop sources.
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(None);
+    }
     ingest.start(&app)?;
     if auto {
         analysis.start(&app, AnalysisScope::Pending)?;
@@ -129,6 +144,10 @@ pub async fn regenerate_thumbnails(
     analysis: State<'_, Analysis>,
     ids: Vec<ImageId>,
 ) -> AppResult<()> {
+    // Re-extraction may change the orientation: re-resolve develop sources.
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(Some(&ids));
+    }
     ingest.regenerate(&app, ids)?;
     if catalog.run(|c| repo::auto_analyze(c)).await? {
         analysis.start(&app, AnalysisScope::Pending)?;
@@ -278,6 +297,22 @@ async fn source_images(catalog: &Catalog, ids: Vec<ImageId>) -> AppResult<Vec<So
         .collect())
 }
 
+/// The develop source of `id` for per-frame commands (slider renders, overlays, WB
+/// picker): remembered in the `DevelopCache` after the first lookup, so a slider drag never
+/// touches the catalog (or waits for its lock). Images still pending thumbnail extraction
+/// are not remembered (their orientation may still change).
+async fn develop_source(catalog: &Catalog, develop: &DevelopCache, id: ImageId) -> AppResult<SourceImage> {
+    if let Some(src) = develop.source(id) {
+        return Ok(src);
+    }
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let src = source_of(&entry);
+    if !matches!(entry.thumbnail, ThumbnailState::Pending) {
+        develop.remember_source(src.clone());
+    }
+    Ok(src)
+}
+
 fn require_fields(fields: &[AdjustmentField]) -> AppResult<()> {
     if fields.is_empty() {
         return Err(AppError::invalid("fields must not be empty"));
@@ -301,7 +336,7 @@ pub async fn render_preview(
     adjustments.validate().map_err(AppError::invalid)?;
     options.validate().map_err(AppError::invalid)?;
     let ticket = develop.ticket(id, options.slot);
-    let src = source_images(&catalog, vec![id]).await?.remove(0);
+    let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
     let luts = luts.inner().clone();
     blocking(move || {
@@ -324,13 +359,40 @@ pub async fn get_develop_info(
     id: ImageId,
 ) -> AppResult<DevelopInfo> {
     let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
-    let src = SourceImage { id: entry.id, path: PathBuf::from(&entry.path), orientation: entry.orientation };
+    let src = source_of(&entry);
+    if !matches!(entry.thumbnail, ThumbnailState::Pending) {
+        develop.remember_source(src.clone());
+    }
     let cache = develop.inner().clone();
     let mut info = blocking(move || cache.info(&src)).await?;
     let mut warnings = entry.develop_warnings;
     warnings.append(&mut info.warnings);
     info.warnings = warnings;
     Ok(info)
+}
+
+/// White balance picker (IPC v11): the Temp/Tint that neutralizes the 5x5 develop-source
+/// pixel neighbourhood around `point`. `point` is in the **sensor frame** (normalized 0..=1
+/// of the un-oriented, uncropped image; same convention as masks: convert a viewer click with
+/// `unorientPoint` + the crop mapping). `adjustments` = the live (unsaved) edit; only its
+/// `profile` matters (colour matrices, as for `DevelopInfo.asShot`). The result is clamped to
+/// the slider ranges; the caller commits `whiteBalance: custom` itself. Errors:
+/// `invalid_argument` if the point is outside 0..=1 or the sample is clipped / too dark
+/// (message is user-facing). Body: architect (thin wrapper over
+/// `DevelopCache::sample_white_balance`; rust-engine-dev owns it from here).
+#[tauri::command]
+#[specta::specta]
+pub async fn sample_white_balance(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    point: NormPoint,
+    adjustments: ParametricAdjustments,
+) -> AppResult<WhiteBalanceValues> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    blocking(move || cache.sample_white_balance(&src, point, &adjustments)).await
 }
 
 /// Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
@@ -1181,4 +1243,189 @@ pub async fn list_profiles(
         model: entry.camera.model.clone(),
     };
     Ok(profiles.catalog(entry.id, &camera))
+}
+
+// ---------------------------------------------------------------------------
+// Masks / local adjustments (Phase 7c, IPC v10)
+// ---------------------------------------------------------------------------
+
+fn preview_path(entry: &RawImageEntry) -> Option<PathBuf> {
+    match &entry.thumbnail {
+        ThumbnailState::Ready { preview_path: Some(p), .. } => Some(PathBuf::from(p)),
+        _ => None,
+    }
+}
+
+fn source_of(entry: &RawImageEntry) -> SourceImage {
+    SourceImage { id: entry.id, path: PathBuf::from(&entry.path), orientation: entry.orientation }
+}
+
+/// The image's stored mask groups (`getAdjustments(id).masks`) + the render status of each
+/// AI component (`MaskCache::status`, rust-engine-dev).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_masks(
+    catalog: State<'_, Catalog>,
+    masks: State<'_, MaskCache>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+) -> AppResult<MaskList> {
+    let masks = masks.inner().clone();
+    let segmenter = segmenter.inner().clone();
+    catalog
+        .run(move |c| {
+            let groups = repo::get_adjustments(c, id)?.masks;
+            let ai = masks.status(c, id, &groups, &segmenter)?;
+            Ok(MaskList { image_id: id, groups, ai })
+        })
+        .await
+}
+
+/// Replaces the image's mask groups (everything else in its adjustments is kept) with one
+/// history entry labelled `label` (e.g. "Mask: Brush", "Mask: Exposure"; same-label saves
+/// within 1.5 s coalesce, so saving on every stroke / slider release is fine). XMP dirty.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_masks(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    id: ImageId,
+    masks: Vec<MaskGroup>,
+    label: String,
+) -> AppResult<AdjustmentHistory> {
+    validate_masks(&masks).map_err(AppError::invalid)?;
+    let history = catalog
+        .run(move |c| {
+            let mut adj = repo::get_adjustments(c, id)?;
+            adj.masks = masks;
+            develop::history::commit(c, id, &adj, &label)
+        })
+        .await?;
+    xmp.notify(&app);
+    Ok(history)
+}
+
+/// Computes (or returns the cached) AI matte for `request` on image `id`; resolves when
+/// done (first run per image and kind: model load + inference; cached: instant). Put
+/// `digest` into the component's `AiMask.digest` and save. `invalid` when the family is
+/// unavailable (`getMaskCapabilities`).
+#[tauri::command]
+#[specta::specta]
+pub async fn compute_ai_mask(
+    catalog: State<'_, Catalog>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+    request: AiMaskRequest,
+) -> AppResult<AiMaskInfo> {
+    if let Some(p) = &request.reference_point {
+        if ![p.x, p.y].iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            return Err(AppError::invalid("referencePoint must lie within 0..=1"));
+        }
+    }
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let segmenter = segmenter.inner().clone();
+    blocking(move || segmenter.compute(&source_of(&entry), preview_path(&entry).as_deref(), &request)).await
+}
+
+/// People in image `id` for the People mask picker (left to right).
+#[tauri::command]
+#[specta::specta]
+pub async fn detect_people(
+    catalog: State<'_, Catalog>,
+    segmenter: State<'_, Segmenter>,
+    id: ImageId,
+) -> AppResult<Vec<DetectedPerson>> {
+    let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
+    let segmenter = segmenter.inner().clone();
+    blocking(move || segmenter.detect_people(&source_of(&entry), preview_path(&entry).as_deref())).await
+}
+
+/// Renders the mask of `target` (a group, or one component, of `adjustments.masks`: live
+/// and unsaved) as a grayscale JPEG matching `render_preview`'s frame for the same
+/// `maxEdge` / `region`. Latest-wins per image on the `mask` slot: `null` = superseded.
+#[tauri::command]
+#[specta::specta]
+pub async fn render_mask_overlay(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    masks: State<'_, MaskCache>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+    target: MaskOverlayTarget,
+    options: MaskOverlayOptions,
+) -> AppResult<Option<RenderedMaskOverlay>> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    options.validate().map_err(AppError::invalid)?;
+    let known =
+        adjustments.masks.iter().find(|g| g.id == target.group_id).is_some_and(|g| match &target.component_id {
+            None => true,
+            Some(c) => g.components.iter().any(|x| &x.id == c),
+        });
+    if !known {
+        return Err(AppError::invalid("target does not name a mask group/component of adjustments.masks"));
+    }
+    let ticket = develop.ticket(id, RenderSlot::Mask);
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let masks = masks.inner().clone();
+    blocking(move || {
+        if !cache.is_current(ticket) {
+            return Ok(None);
+        }
+        develop::masks::render_overlay(&cache, &masks, ticket, &src, &adjustments, &target, &options)
+    })
+    .await
+}
+
+/// Which AI mask families can be computed on this Mac (model files present).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mask_capabilities(segmenter: State<'_, Segmenter>) -> AppResult<MaskCapabilities> {
+    let segmenter = segmenter.inner().clone();
+    blocking(move || Ok(segmenter.capabilities())).await
+}
+
+// ---------------------------------------------------------------------------
+// Model downloads (IPC v12)
+// ---------------------------------------------------------------------------
+
+/// Downloadable model groups (AI masking), which files are installed, and the download in
+/// flight. Cheap (file sizes only).
+#[tauri::command]
+#[specta::specta]
+pub async fn model_downloads_status(downloads: State<'_, ModelDownloads>) -> AppResult<ModelDownloadStatus> {
+    let downloads = downloads.inner().clone();
+    blocking(move || Ok(downloads.status())).await
+}
+
+/// Starts downloading model group `group` (e.g. `"segmentation"`) in the background and
+/// resolves immediately. Emits `ModelDownloadProgress` and, exactly once, `ModelDownloadFinished`.
+/// Installed files are skipped, partial files resumed, every file SHA-256 verified.
+/// `invalid_argument` for an unknown group or while a download is already running.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_models(app: AppHandle, downloads: State<'_, ModelDownloads>, group: String) -> AppResult<()> {
+    let progress_app = app.clone();
+    downloads.start(
+        &group,
+        move |p| {
+            let _ = p.emit(&progress_app);
+        },
+        move |f| {
+            if let Some(e) = &f.error {
+                eprintln!("model download ({}): {e}", f.group);
+            }
+            let _ = f.emit(&app);
+        },
+    )
+}
+
+/// Cancels the model download in flight (no-op when idle); `ModelDownloadFinished`
+/// (`cancelled: true`) follows.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_model_download(downloads: State<'_, ModelDownloads>) -> AppResult<()> {
+    downloads.cancel();
+    Ok(())
 }

@@ -1,6 +1,7 @@
-import { memo } from "react";
-import { AlertTriangle, Anchor, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, X } from "lucide-react";
+import { memo, useState } from "react";
+import { AlertTriangle, Anchor, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, Unplug, X } from "lucide-react";
 import { convertFileSrc, type RawImageEntry } from "../ipc";
+import { useFileHealth } from "../lib/errors";
 import { LABEL_COLOR, TAG_SHORT, TAG_STYLE, tagName } from "../lib/format";
 
 interface Props {
@@ -24,10 +25,28 @@ export function Stars({ n, className = "size-3" }: { n: number; className?: stri
   );
 }
 
+/** "Missing" (original moved / drive disconnected) or "Unreadable" (decode failed), from what the backend reported. */
+export function HealthBadge({ entry, testPrefix = "health" }: { entry: RawImageEntry; testPrefix?: string }) {
+  const h = useFileHealth(entry.path);
+  if (!h) return null;
+  const missing = h.kind === "missing";
+  return (
+    <span
+      title={h.message}
+      data-testid={`${testPrefix}-${entry.id}`}
+      data-health={h.kind}
+      className={`flex items-center gap-0.5 rounded px-1 text-[10px] font-semibold ${missing ? "bg-amber-800 text-amber-100" : "bg-red-900 text-red-100"}`}
+    >
+      {missing ? <Unplug className="size-3" /> : <ImageOff className="size-3" />}
+      {missing ? "Missing" : "Unreadable"}
+    </span>
+  );
+}
+
 export function XmpBadge({ entry }: { entry: RawImageEntry }) {
   if (entry.xmp.error)
     return (
-      <span title={`XMP error: ${entry.xmp.error}`} data-xmp="error" className="text-red-400">
+      <span title={`Sidecar not written: ${entry.xmp.error}`} data-xmp="error" data-testid={`xmp-error-${entry.id}`} className="text-red-400">
         <AlertTriangle className="size-3.5" />
       </span>
     );
@@ -65,6 +84,19 @@ export function CompanionBadge({ entry, testPrefix = "companion" }: { entry: Raw
   );
 }
 
+/** Cached thumbnail; when the file cannot be loaded (cache folder cleaned, drive offline) a placeholder replaces the broken image. */
+function Thumb({ src, name }: { src: string; name: string | undefined }) {
+  const [broken, setBroken] = useState<string | null>(null);
+  if (broken === src)
+    return (
+      <div className="flex size-full flex-col items-center justify-center gap-1 text-center" data-testid="thumb-broken" title="The cached preview could not be loaded. Regenerate previews from the More menu, or re-import the folder.">
+        <ImageOff className="size-5 text-neutral-500" />
+        <span className="text-[10px] text-neutral-400">Preview unavailable</span>
+      </div>
+    );
+  return <img src={src} decoding="async" draggable={false} alt={name} className="size-full object-contain" onError={() => setBroken(src)} />;
+}
+
 export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick }: Props) {
   const t = entry?.thumbnail;
   const compact = size < 150;
@@ -84,16 +116,11 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
       style={{ contain: "strict" }}
     >
       {t?.status === "ready" ? (
-        <img
-          src={`${convertFileSrc(t.path)}?v=${version}`}
-          decoding="async"
-          draggable={false}
-          alt={entry?.fileName}
-          className="size-full object-contain"
-        />
+        <Thumb src={`${convertFileSrc(t.path)}?v=${version}`} name={entry?.fileName} />
       ) : t?.status === "failed" ? (
-        <div className="flex size-full items-center justify-center" title={t.reason}>
+        <div className="flex size-full flex-col items-center justify-center gap-1 px-1 text-center" title={t.reason} data-testid={`thumb-failed-${id}`}>
           <ImageOff className="size-5 text-red-500" />
+          {!compact && <span className="text-[10px] text-red-300">No preview</span>}
         </div>
       ) : (
         <div className="flex size-full items-center justify-center">
@@ -108,6 +135,7 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
             {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={entry.colorLabel} />}
           </div>
           <div className="pointer-events-none absolute right-1 top-1 flex items-center gap-1">
+            <HealthBadge entry={entry} />
             <XmpBadge entry={entry} />
             <CompanionBadge entry={entry} />
             <SceneBadge entry={entry} />

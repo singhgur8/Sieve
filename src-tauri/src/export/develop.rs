@@ -167,7 +167,7 @@ pub fn render_full(
         None => Cow::Borrowed(&src.pixels),
     };
     let tone = crate::develop::pipeline::tone_context(src, orientation_code(orientation), adjustments, profile);
-    let ctx = DevelopContext { profile, scale, seed, tone: Some(&tone) };
+    let ctx = DevelopContext { profile, scale, seed, tone: Some(&tone), masks: None };
     let encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings, &ctx);
     drop(pixels);
     Ok(finish(encoded, size, settings))
@@ -182,11 +182,27 @@ pub struct DevelopContext<'a> {
     pub seed: u64,
     /// Local tone context of the whole uncropped source (`pipeline::tone_context`).
     pub tone: Option<&'a crate::develop::pipeline::ToneContext>,
+    /// Local adjustments evaluated on the output grid (`develop::masks::render`).
+    pub masks: Option<&'a crate::develop::masks::LocalPlanes>,
 }
 
 /// EXIF orientation code (1..=8) of an optional tag.
 pub fn orientation_code(tag: Option<u8>) -> u8 {
     orientation(tag)
+}
+
+/// Neutral sensor-frame render of `src` (<= 2048 px): the guide Sieve AI mattes are refined
+/// against (`develop::masks::render::ResolvedMattes::refine`).
+pub fn sensor_guide(src: &LinearImage, profile: &Profile) -> crate::develop::masks::render::SensorGuide {
+    let prep = source::prepare(src, 1, &CropSettings::default(), None, 2048);
+    let input = RenderInput {
+        frame_long_edge: prep.frame_long_edge,
+        view: prep.view,
+        quality: Quality::Draft,
+        ..RenderInput::simple(prep.width, prep.height, &prep.pixels, &src.color, profile)
+    };
+    let img = pipeline::render(&input, &ParametricAdjustments::default(), None);
+    crate::develop::masks::render::SensorGuide { width: img.width, height: img.height, rgb: img.rgb }
 }
 
 /// Pipeline + output colour space on prepared (cropped, oriented, output-size) camera RGB.
@@ -211,7 +227,7 @@ pub fn develop_prepared(
         quality: Quality::Export,
         tone: ctx.tone,
     };
-    pipeline::render_output(&input, adjustments, lut, color::output_space(settings.color_space))
+    pipeline::render_output_masked(&input, adjustments, lut, color::output_space(settings.color_space), ctx.masks)
 }
 
 /// Output sharpening + quantization of the encoded 16-bit pipeline output.

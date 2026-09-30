@@ -4,8 +4,17 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
-import { completeAdjustments, lerpAdjustments } from "../ipc";
+import { completeAdjustments, lerpAdjustments, orientPoint } from "../ipc";
 import type {
+  AiMaskRequest,
+  AiMaskStatus,
+  MaskCapabilities,
+  MaskGroup,
+  ModelDownloadFinished,
+  ModelDownloadProgress,
+  ModelDownloadStatus,
+  MaskOverlayOptions,
+  NormPoint,
   DevelopWarning,
   LookProfileInfo,
   BurstGroup,
@@ -40,6 +49,137 @@ import type {
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
 const LABELS = [null, null, null, "red", "yellow", "green", "blue", "purple"] as const;
 
+const MOCK_MASK_CAPABILITIES: MaskCapabilities = {
+  ai: [
+    { kind: "subject", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "sky", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "background", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "people", available: true, model: "mock-segmenter@1", reason: null },
+    { kind: "object", available: false, model: null, reason: "mock: no object model" },
+    { kind: "landscape", available: false, model: null, reason: "mock: no landscape model" },
+  ],
+  personParts: ["face_skin", "body_skin", "eyebrows", "eye_sclera", "iris_pupil", "lips", "teeth", "hair", "clothes"],
+  landscape: [],
+};
+
+// ---- model downloads (v12) ----
+/** Mirror of Rust `model_fetch::SEGMENTATION` (name, bytes). */
+const MOCK_SEGMENTATION_FILES: [string, number][] = [
+  ["birefnet_lite.onnx", 224_005_088],
+  ["skyseg.onnx", 175_997_079],
+  ["yolox_m.onnx", 101_259_744],
+  ["efficientsam_ti_encoder.onnx", 24_799_761],
+  ["efficientsam_ti_decoder.onnx", 16_565_728],
+  ["selfie_multiclass_256x256.onnx", 16_454_560],
+];
+/** Segmentation models installed in the mock; `?models=missing` starts without them. */
+let mockModelsInstalled = true;
+
+/** Capabilities with the families listed in `?noai=sky,people` (URL of the mock page) switched off. */
+function mockCapabilities(): MaskCapabilities {
+  const off = new Set((new URLSearchParams(typeof location === "undefined" ? "" : location.search).get("noai") ?? "").split(",").filter(Boolean));
+  if (!mockModelsInstalled) for (const k of ["subject", "background", "sky", "people", "parts"]) off.add(k);
+  return {
+    ...MOCK_MASK_CAPABILITIES,
+    ai: MOCK_MASK_CAPABILITIES.ai.map((c) => (off.has(c.kind) ? { ...c, available: false, model: null, reason: `mock: ${c.kind} model not installed` } : c)),
+    personParts: off.has("parts") ? [] : MOCK_MASK_CAPABILITIES.personParts,
+  };
+}
+
+/** Orientation of the mock image with this id: id 21 is a portrait frame stored rotated (EXIF 8). */
+const mockOrientation = (id: number) => (id === 21 ? 8 : 1);
+
+/**
+ * Generates a grayscale PNG (data URL) approximating the mask of `target` in the displayed frame:
+ * brush dabs, gradients, ellipses; AI/range masks are a soft centred blob. Only for the mock.
+ */
+function mockOverlayPng(groups: MaskGroup[], target: { groupId: string; componentId: string | null }, w: number, h: number, orientation: number): string {
+  const c = document.createElement("canvas");
+  c.width = Math.max(2, Math.round(w));
+  c.height = Math.max(2, Math.round(h));
+  const g = c.getContext("2d")!;
+  g.fillStyle = "#000";
+  g.fillRect(0, 0, c.width, c.height);
+  const grp = groups.find((x) => x.id === target.groupId);
+  if (!grp) return c.toDataURL("image/png");
+  const P = (x: number, y: number) => {
+    const d = orientPoint({ x, y }, orientation);
+    return { x: d.x * c.width, y: d.y * c.height };
+  };
+  const comps = grp.components.filter((k) => k.active && (!target.componentId || k.id === target.componentId));
+  for (const comp of comps) {
+    const sh = comp.shape;
+    g.save();
+    g.globalAlpha = comp.opacity;
+    g.fillStyle = "#fff";
+    g.strokeStyle = "#fff";
+    if (sh.kind === "brush") {
+      for (const st of sh.strokes) {
+        g.fillStyle = st.erase ? "#000" : "#fff";
+        for (const d of st.dabs) {
+          const p = P(d.x, d.y);
+          g.beginPath();
+          g.arc(p.x, p.y, Math.max(2, st.radius * c.width), 0, Math.PI * 2);
+          g.fill();
+        }
+      }
+    } else if (sh.kind === "linear") {
+      const a = P(sh.full.x, sh.full.y);
+      const b = P(sh.zero.x, sh.zero.y);
+      const gr = g.createLinearGradient(a.x, a.y, b.x, b.y);
+      gr.addColorStop(0, "#fff");
+      gr.addColorStop(1, "#000");
+      g.fillStyle = gr;
+      g.fillRect(0, 0, c.width, c.height);
+    } else if (sh.kind === "radial") {
+      const p = P((sh.left + sh.right) / 2, (sh.top + sh.bottom) / 2);
+      const swap = orientation >= 5;
+      const rx = (((sh.right - sh.left) / 2) * (swap ? c.height : c.width)) || 1;
+      const ry = (((sh.bottom - sh.top) / 2) * (swap ? c.width : c.height)) || 1;
+      g.beginPath();
+      g.ellipse(p.x, p.y, swap ? ry : rx, swap ? rx : ry, (sh.angle * Math.PI) / 180, 0, Math.PI * 2);
+      g.fill();
+    } else {
+      const gr = g.createRadialGradient(c.width / 2, c.height / 2, 0, c.width / 2, c.height / 2, c.width * 0.4);
+      gr.addColorStop(0, "#fff");
+      gr.addColorStop(1, "#000");
+      g.fillStyle = gr;
+      g.fillRect(0, 0, c.width, c.height);
+    }
+    g.restore();
+    if (comp.inverted) {
+      g.globalCompositeOperation = "difference";
+      g.fillStyle = "#fff";
+      g.fillRect(0, 0, c.width, c.height);
+      g.globalCompositeOperation = "source-over";
+    }
+  }
+  return c.toDataURL("image/png");
+}
+
+/** Deterministic 32-hex "digest" for mock AI mattes. */
+function mockDigest(s: string): string {
+  let h = 2166136261;
+  let out = "";
+  for (let round = 0; round < 4; round++) {
+    for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+    h = Math.imul(h ^ round, 16777619) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return out.toUpperCase();
+}
+
+/** Mock AI status: components with a digest are ready, others need an update. */
+function mockAiStatus(groups: MaskGroup[]): AiMaskStatus[] {
+  return groups.flatMap((g) =>
+    g.components.flatMap((c) =>
+      c.shape.kind === "ai"
+        ? [{ groupId: g.id, componentId: c.id, state: c.shape.digest ? ("ready" as const) : ("needs_update" as const), info: null }]
+        : [],
+    ),
+  );
+}
+
 export interface MockCall {
   cmd: string;
   args: Record<string, unknown>;
@@ -58,6 +198,18 @@ declare global {
     __mockExportStep?: (n?: number) => void;
     /** Test hook: ms per progress step of mock `detect_scenes` / `match_scene` (default 30). */
     __mockSceneDelay?: number;
+    /** Test hook: ms `compute_ai_mask` takes in the mock (default 250). */
+    __mockAiDelay?: number;
+    /** Test hook: ms per progress step of mock `download_models` (10 steps per file; default 40). */
+    __mockModelDelay?: number;
+    /** Test hook: when set, mock `download_models` fails with this error at the third file. */
+    __mockModelFail?: string;
+    /** Test hook: commands that reject with the given AppError (`{ cmd: { kind, message } }`); `once` entries are consumed. */
+    __mockFail?: Record<string, { kind: string; message: string; once?: boolean }>;
+    /** Test hook: `get_images` returns malformed entries (exercises the view error boundaries). */
+    __mockCorruptImages?: boolean;
+    /** Test hook: every export item fails with this reason (e.g. a disk-full message). */
+    __mockExportFail?: string;
   }
 }
 
@@ -151,7 +303,7 @@ export function installMockBackend(count: number) {
       },
       width: 6000,
       height: 4000,
-      orientation: 1,
+      orientation: mockOrientation(id),
       fileSize: 30_000_000,
       fileMtimeMs: base,
       thumbnail: { status: "ready", path: `/mock/thumb/${id}.jpg`, previewPath: `/mock/preview/${id}.jpg`, width: 480, height: 320 },
@@ -188,6 +340,21 @@ export function installMockBackend(count: number) {
       g.endedAtMs = entry.capture.capturedAtMs ?? 0;
       if (entry.isBurstKeeper) g.keeperImageId = id;
       bursts.set(group, g);
+    }
+  }
+  // `?errors=1`: failure fixtures. id % 10 === 3 -> original missing, 7 -> thumbnail decode failure, 5 -> sidecar not writable.
+  const errorsOn = new URLSearchParams(location.search).get("errors") === "1";
+  const mockMissing = (id: number) => errorsOn && id % 10 === 3;
+  const mockReadOnly = (id: number) => errorsOn && id % 10 === 5;
+  const missingError = (id: number) => ({
+    kind: "not_found",
+    message: `Original file is missing or was moved: /shoot/DSC${String(id).padStart(5, "0")}.ARW. Reconnect the drive or move the file back, then try again.`,
+  });
+  const READ_ONLY = (id: number) => `Could not write /shoot/DSC${String(id).padStart(5, "0")}.xmp: the volume is read-only. Choose a writable location.`;
+  if (errorsOn) {
+    for (const r of rows) {
+      if (r.id % 10 === 7) r.thumbnail = { status: "failed", reason: `Could not decode ${r.path}: unsupported RAW variant. The file may be damaged, still copying, or from an unsupported camera.` };
+      if (mockReadOnly(r.id)) r.xmp = { dirty: true, syncedAtMs: null, error: READ_ONLY(r.id) };
     }
   }
   // A few pre-set flags so screenshots show something.
@@ -372,10 +539,11 @@ export function installMockBackend(count: number) {
       imageId: id,
       slot: o.slot,
       seq,
-      url: `/mock/render/${id}/${o.slot}?${q}`,
-      width: o.maxEdge,
-      // A crop changes the frame's aspect (mock frames are 3:2, orientation 1).
-      height: Math.round(o.maxEdge * (o.region ? 1 : a.crop?.enabled ? (a.crop.bottom - a.crop.top) / (1.5 * (a.crop.right - a.crop.left)) : 2 / 3)),
+      url: `/mock/render/${id}/${o.slot}?${q}${mockOrientation(id) >= 5 ? "&p=1" : ""}`,
+      // Portrait frames (EXIF 8) are 2:3; the long edge is `maxEdge` either way.
+      width: mockOrientation(id) >= 5 ? Math.round((o.maxEdge * 2) / 3) : o.maxEdge,
+      // A crop changes the frame's aspect (mock frames are 3:2).
+      height: mockOrientation(id) >= 5 ? o.maxEdge : Math.round(o.maxEdge * (o.region ? 1 : a.crop?.enabled ? (a.crop.bottom - a.crop.top) / (1.5 * (a.crop.right - a.crop.left)) : 2 / 3)),
       histogram: histogram(a),
       renderMs: 7 + (seq % 5),
       lutMissing: !!a.lut && !luts.some((l) => l.id === a.lut!.id),
@@ -404,9 +572,9 @@ export function installMockBackend(count: number) {
       const id = run.ids[run.job.done];
       const r = byId.get(id);
       run.job.done++;
-      if (id % 7 === 0) {
+      if (window.__mockExportFail || id % 7 === 0) {
         run.job.failed++;
-        run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: "Decode error (mock)" });
+        run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: window.__mockExportFail ?? "Decode error (mock)" });
       } else run.job.succeeded++;
       void emit("export-progress", {
         jobId: run.job.id,
@@ -553,10 +721,56 @@ export function installMockBackend(count: number) {
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
   let uiPrefs: UiPrefs = {};
 
+  // ---- model downloads (v12): simulated progress, honours cancel ----
+  mockModelsInstalled = new URLSearchParams(location.search).get("models") !== "missing";
+  let modelRun: { cancelled: boolean } | null = null;
+  function modelStatus(): ModelDownloadStatus {
+    const files = MOCK_SEGMENTATION_FILES.map(([name, bytes]) => ({ name, installed: mockModelsInstalled, bytes }));
+    return {
+      groups: [{ id: "segmentation", label: "AI masking models", installed: mockModelsInstalled, bytesTotal: files.reduce((s, f) => s + f.bytes, 0), files }],
+      downloading: modelRun ? "segmentation" : null,
+    };
+  }
+  async function runModelDownload(run: { cancelled: boolean }) {
+    const group = "segmentation";
+    const total = MOCK_SEGMENTATION_FILES.reduce((s, [, b]) => s + b, 0);
+    let before = 0;
+    let error: string | null = null;
+    outer: for (const [i, [name, bytes]] of MOCK_SEGMENTATION_FILES.entries()) {
+      for (let k = 1; k <= 10; k++) {
+        await sleep(window.__mockModelDelay ?? 40);
+        if (run.cancelled) {
+          error = "model download cancelled";
+          break outer;
+        }
+        if (i === 2 && k === 10 && window.__mockModelFail) {
+          error = window.__mockModelFail;
+          break outer;
+        }
+        const payload: ModelDownloadProgress = { group, name, fileIndex: i, fileCount: MOCK_SEGMENTATION_FILES.length, bytesDone: before + Math.round((bytes * k) / 10), bytesTotal: total };
+        void emit("model-download-progress", payload);
+      }
+      before += bytes;
+    }
+    modelRun = null;
+    if (!error) mockModelsInstalled = true;
+    const finished: ModelDownloadFinished = { group, ok: !error, cancelled: run.cancelled, error };
+    void emit("model-download-finished", finished);
+  }
+
   mockIPC(
     (cmd, payload) => {
       const args = (payload ?? {}) as Record<string, unknown>;
       window.__ipcLog.push({ cmd, args });
+      const injected = window.__mockFail?.[cmd];
+      if (injected) {
+        if (injected.once) delete window.__mockFail![cmd];
+        throw { kind: injected.kind, message: injected.message };
+      }
+      if (errorsOn && ["get_adjustments", "get_history", "get_develop_info", "render_preview", "prepare_develop"].includes(cmd)) {
+        const target = (args.id as number | undefined) ?? (args.ids as number[] | undefined)?.[0];
+        if (target != null && mockMissing(target)) throw missingError(target);
+      }
       const ids = (args.ids as number[] | undefined) ?? [];
       switch (cmd) {
         case "get_catalog_state":
@@ -569,6 +783,8 @@ export function installMockBackend(count: number) {
           return { items: all.slice(q.offset, q.offset + q.limit).map((i) => byId.get(i)), total: all.length };
         }
         case "get_images":
+          // Test hook for the error boundary: entries the grid cannot render.
+          if (window.__mockCorruptImages) return ids.map((i) => ({ ...byId.get(i), tags: null }));
           return ids.map((i) => byId.get(i));
         case "get_image":
           return byId.get(args.id as number);
@@ -602,12 +818,14 @@ export function installMockBackend(count: number) {
           return faces(args.id as number);
         case "list_burst_groups":
           return [...bursts.values()];
-        case "write_xmp":
+        case "write_xmp": {
+          const bad = ids.filter((i) => mockReadOnly(i) || mockMissing(i));
           ids.forEach((i) => {
             const r = byId.get(i);
-            if (r) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
+            if (r && !bad.includes(i)) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
           });
-          return { ...ok, succeeded: ids.length, changed: [] };
+          return { ...ok, succeeded: ids.length - bad.length, failed: bad.map((i) => ({ imageId: i, reason: mockMissing(i) ? missingError(i).message : READ_ONLY(i) })), changed: [] };
+        }
         case "read_xmp":
           return { ...ok, skipped: ids.length };
         case "apply_suggestions": {
@@ -699,7 +917,17 @@ export function installMockBackend(count: number) {
           const look = completeAdjustments(getAdj(args.id as number)).profile.look;
           const warnings: DevelopWarning[] = [...(byId.get(args.id as number)?.developWarnings ?? [])];
           if (look && !MOCK_LOOKS.find((l) => l.uuid === look.uuid)?.available) warnings.push({ code: "look_unavailable", detail: look.name });
-          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: 3000, sourceHeight: 2000, fullWidth: 6000, fullHeight: 4000, warnings };
+          const portrait = mockOrientation(args.id as number) >= 5;
+          if (completeAdjustments(getAdj(args.id as number)).masks.some((g) => g.components.some((c) => c.shape.kind === "ai" && !c.shape.digest))) warnings.push({ code: "ai_mask_needs_update", detail: "1" });
+          return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: portrait ? 2000 : 3000, sourceHeight: portrait ? 3000 : 2000, fullWidth: portrait ? 4000 : 6000, fullHeight: portrait ? 6000 : 4000, warnings };
+        }
+        case "sample_white_balance": {
+          // IPC v11 WB picker. Deterministic fake: temperature follows x, tint follows y
+          // (sensor frame); the top 5 % of the frame is "clipped".
+          const p = args.point as NormPoint;
+          if (!(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1)) throw { kind: "invalid_argument", message: "white balance sample point must be within 0..=1" };
+          if (p.y < 0.05) throw { kind: "invalid_argument", message: "the sampled area is clipped (overexposed); pick a neutral grey or white that is not blown out" };
+          return { temperatureK: Math.round(3000 + p.x * 5000), tint: Math.round((p.y - 0.5) * 40) };
         }
         case "list_profiles":
           return {
@@ -715,6 +943,69 @@ export function installMockBackend(count: number) {
             searchDirs: ["/Library/Application Support/Adobe/CameraRaw/CameraProfiles"],
           };
         case "prepare_develop":
+          return null;
+        // Masks (IPC v10): minimal fakes so the masking UI can be built and tested.
+        case "list_masks": {
+          const groups = completeAdjustments(getAdj(args.id as number)).masks;
+          return { imageId: args.id, groups, ai: mockAiStatus(groups) };
+        }
+        case "save_masks":
+          commit(args.id as number, { ...completeAdjustments(getAdj(args.id as number)), masks: args.masks as MaskGroup[] }, args.label as string);
+          return historyDto(args.id as number);
+        case "compute_ai_mask": {
+          const r = args.request as AiMaskRequest;
+          return sleep(window.__mockAiDelay ?? 250).then(() => ({
+            digest: mockDigest(`${args.id}:${JSON.stringify(r.target)}:${JSON.stringify(r.referencePoint)}`),
+            target: r.target,
+            referencePoint: r.referencePoint,
+            origin: "sieve",
+            modelVersion: "mock-segmenter@1",
+            width: 1920,
+            height: 1280,
+            bounds: { x: 0, y: 0, width: 1, height: 1 },
+            coverage: 0.3,
+          }));
+        }
+        case "detect_people":
+          return [
+            { referencePoint: { x: 0.35, y: 0.3 }, bbox: { x: 0.2, y: 0.1, width: 0.3, height: 0.85 }, face: { x: 0.3, y: 0.15, width: 0.1, height: 0.14 } },
+            { referencePoint: { x: 0.65, y: 0.35 }, bbox: { x: 0.5, y: 0.15, width: 0.3, height: 0.8 }, face: { x: 0.6, y: 0.2, width: 0.1, height: 0.14 } },
+          ];
+        case "render_mask_overlay": {
+          const o = args.options as MaskOverlayOptions;
+          const id = args.id as number;
+          const key = `${id}:mask`;
+          const seq = (seqs.get(key) ?? 0) + 1;
+          seqs.set(key, seq);
+          const portrait = mockOrientation(id) >= 5;
+          const width = portrait ? Math.round((o.maxEdge * 2) / 3) : o.maxEdge;
+          const height = portrait ? o.maxEdge : Math.round((o.maxEdge * 2) / 3);
+          const groups = ((args.adjustments as ParametricAdjustments).masks ?? []) as MaskGroup[];
+          const t = args.target as { groupId: string; componentId: string | null };
+          return {
+            imageId: id,
+            seq,
+            url: mockOverlayPng(groups, t, width, height, mockOrientation(id)),
+            width,
+            height,
+            coverage: 0.25,
+            renderMs: 5,
+          };
+        }
+        case "get_mask_capabilities":
+          return mockCapabilities();
+        case "model_downloads_status":
+          return modelStatus();
+        case "download_models": {
+          if (args.group !== "segmentation") throw { kind: "invalid_argument", message: `unknown model group \`${String(args.group)}\`` };
+          if (modelRun) throw { kind: "invalid_argument", message: "the segmentation models are already downloading" };
+          const run = { cancelled: false };
+          modelRun = run;
+          void runModelDownload(run);
+          return null;
+        }
+        case "cancel_model_download":
+          if (modelRun) modelRun.cancelled = true;
           return null;
         case "render_preview":
           return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);

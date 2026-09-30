@@ -25,10 +25,14 @@
 pub mod bursts;
 pub mod canonical_face;
 pub mod imgproc;
+pub mod masking;
 pub mod metrics;
 pub mod models;
 pub mod pose;
+pub mod refine;
 pub mod scoring;
+pub mod segment;
+pub mod segment_models;
 pub mod store;
 pub mod thresholds;
 pub mod worker;

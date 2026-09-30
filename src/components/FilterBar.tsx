@@ -16,7 +16,6 @@ interface Props {
   query: Query;
   setQuery: (fn: (q: Query) => Query) => void;
   counts: FilterCounts | null;
-  shown: number;
 }
 
 const chip = "whitespace-nowrap rounded px-2 py-0.5 text-xs transition-colors";
@@ -55,7 +54,7 @@ export function useFilterCounts(folderId: number | null, epoch: number): FilterC
 const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
 
 /** Row 1 of the Library chrome: culling tags, flags and the result count. */
-export function FilterBar({ query, setQuery, counts, shown }: Props) {
+export function FilterBar({ query, setQuery, counts }: Props) {
   const tagCount = (t: CullTag) => counts?.tags.find((x) => x.tag === t)?.count ?? 0;
   const pickCount = (p: PickFlag) => (counts ? { pick: counts.picked, reject: counts.rejected, unflagged: counts.unflagged }[p] : 0);
 
@@ -68,9 +67,9 @@ export function FilterBar({ query, setQuery, counts, shown }: Props) {
     });
 
   return (
-    <div className={rowClass} data-testid="filter-bar">
+    <div className={`${rowClass} min-w-0`} data-testid="filter-bar">
       <Filter className="size-3.5 shrink-0 text-neutral-400" />
-      <div className="flex items-center gap-1" data-testid="filter-tags">
+      <div className="flex shrink-0 items-center gap-1" data-testid="filter-tags">
         {ALL_TAGS.map((t) => {
           const inc = query.includeTags.includes(t);
           const exc = query.excludeTags.includes(t);
@@ -98,7 +97,7 @@ export function FilterBar({ query, setQuery, counts, shown }: Props) {
         </select>
       </div>
 
-      <div className="flex items-center gap-1" data-testid="filter-picks">
+      <div className="flex shrink-0 items-center gap-1" data-testid="filter-picks">
         {PICKS.map((p) => (
           <button
             key={p.key}
@@ -111,20 +110,16 @@ export function FilterBar({ query, setQuery, counts, shown }: Props) {
         ))}
       </div>
 
-      <span className="ml-auto flex items-center gap-2 pl-2 text-neutral-300" data-testid="shown-count">
-        {shown}
-        {counts ? ` of ${counts.total}` : ""}
-        {isFiltered(query) && (
-          <button
-            onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
-            className="flex items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700"
-            data-testid="clear-filters"
-          >
-            <RotateCcw className="size-3" />
-            Clear
-          </button>
-        )}
-      </span>
+      {isFiltered(query) && (
+        <button
+          onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
+          className="ml-auto flex shrink-0 items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
+          data-testid="clear-filters"
+        >
+          <RotateCcw className="size-3" />
+          Clear
+        </button>
+      )}
     </div>
   );
 }

@@ -140,21 +140,36 @@ fn orient_into(src: View, orientation: u16, out: &mut Vec<u8>) -> (u32, u32) {
     let (dw, dh) = if swap { (h, w) } else { (w, h) };
     out.clear();
     out.resize(w * h * 3, 0);
-    for y in 0..dh {
-        for x in 0..dw {
-            let (sx, sy) = match orientation {
-                2 => (w - 1 - x, y),
-                3 => (w - 1 - x, h - 1 - y),
-                4 => (x, h - 1 - y),
-                5 => (y, x),
-                6 => (y, h - 1 - x),
-                7 => (w - 1 - y, h - 1 - x),
-                8 => (w - 1 - y, x),
-                _ => (x, y),
-            };
-            let s = (sy * w + sx) * 3;
-            let d = (y * dw + x) * 3;
-            out[d..d + 3].copy_from_slice(&src.pixels[s..s + 3]);
+    if w == 0 || h == 0 {
+        return (dw as u32, dh as u32);
+    }
+    // Source pixel index of destination (x, y) = base + x * dx + y * dy (pixels); hoisting
+    // the orientation out of the loop and walking 64x64 destination tiles (so the strided
+    // source reads of 90-degree rotations stay in cache) makes this ~4x faster than a
+    // per-pixel match over whole rows (Phase 8 ingest profile).
+    let (wi, hi) = (w as isize, h as isize);
+    let (base, dx, dy): (isize, isize, isize) = match orientation {
+        2 => (wi - 1, -1, wi),
+        3 => (hi * wi - 1, -1, -wi),
+        4 => ((hi - 1) * wi, 1, -wi),
+        5 => (0, wi, 1),
+        6 => ((hi - 1) * wi, -wi, 1),
+        7 => ((hi - 1) * wi + wi - 1, -wi, -1),
+        8 => (wi - 1, wi, -1),
+        _ => (0, 1, wi),
+    };
+    const TILE: usize = 64;
+    for ty in (0..dh).step_by(TILE) {
+        for tx in (0..dw).step_by(TILE) {
+            for y in ty..(ty + TILE).min(dh) {
+                let row = base + y as isize * dy;
+                let d0 = y * dw;
+                for x in tx..(tx + TILE).min(dw) {
+                    let s = (row + x as isize * dx) as usize * 3;
+                    let d = (d0 + x) * 3;
+                    out[d..d + 3].copy_from_slice(&src.pixels[s..s + 3]);
+                }
+            }
         }
     }
     (dw as u32, dh as u32)
@@ -281,6 +296,37 @@ mod tests {
 
     fn quad(w: u32, h: u32) -> Rgb {
         decode_jpeg(&quadrant_jpeg(w as u16, h as u16), 10_000).unwrap()
+    }
+
+    /// The tiled strided implementation matches the per-pixel definition exactly (odd sizes
+    /// spanning several tiles, every orientation).
+    #[test]
+    fn orientation_matches_reference_on_every_pixel() {
+        let (w, h) = (131usize, 77usize);
+        let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let src = Rgb { width: w as u32, height: h as u32, pixels };
+        for o in 1..=8u16 {
+            let got = orient(src.clone(), o);
+            let (dw, dh) = if o >= 5 { (h, w) } else { (w, h) };
+            assert_eq!((got.width as usize, got.height as usize), (dw, dh));
+            for y in 0..dh {
+                for x in 0..dw {
+                    let (sx, sy) = match o {
+                        2 => (w - 1 - x, y),
+                        3 => (w - 1 - x, h - 1 - y),
+                        4 => (x, h - 1 - y),
+                        5 => (y, x),
+                        6 => (y, h - 1 - x),
+                        7 => (w - 1 - y, h - 1 - x),
+                        8 => (w - 1 - y, x),
+                        _ => (x, y),
+                    };
+                    let s = (sy * w + sx) * 3;
+                    let d = (y * dw + x) * 3;
+                    assert_eq!(got.pixels[d..d + 3], src.pixels[s..s + 3], "orientation {o} at ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]

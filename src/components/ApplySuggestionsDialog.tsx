@@ -4,13 +4,17 @@ import { commands, unwrap, type RawImageEntry } from "../ipc";
 import { Dialog } from "./Dialog";
 
 interface Props {
-  ids: number[];
-  scopeLabel: string;
+  /** The current multi-selection (0 or 1 photos count as "nothing selected", like Export). */
+  selected: number[];
+  /** Every photo in the current view. */
+  all: number[];
   onCancel: () => void;
-  onConfirm: (onlyUnset: boolean) => void;
+  onConfirm: (ids: number[], onlyUnset: boolean) => void;
 }
 
-export function ApplySuggestionsDialog({ ids, scopeLabel, onCancel, onConfirm }: Props) {
+export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: Props) {
+  const [scope, setScope] = useState<"selected" | "all">(selected.length > 1 ? "selected" : "all");
+  const ids = scope === "selected" ? selected : all;
   const [rows, setRows] = useState<RawImageEntry[] | null>(null);
   const [skipManual, setSkipManual] = useState(true);
 
@@ -60,13 +64,23 @@ export function ApplySuggestionsDialog({ ids, scopeLabel, onCancel, onConfirm }:
       testid="apply-dialog"
       className="w-[26rem] rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl"
       onCancel={onCancel}
-      onConfirm={() => onConfirm(skipManual)}
+      onConfirm={() => onConfirm(ids, skipManual)}
       canConfirm={() => rows != null && c.apply > 0}
     >
       <h2 className="mb-1 text-sm font-semibold" data-testid="apply-title">
-        Apply suggestions to {n} photo{n === 1 ? "" : "s"}
+        Apply suggestions
       </h2>
-      <p className="mb-3 text-xs text-neutral-400">{scopeLabel}. This replaces flags and star ratings with the automatic suggestions. You can undo it afterwards.</p>
+      <p className="mb-3 text-xs text-neutral-400">Replaces flags and star ratings with Sieve&apos;s suggestions. You can undo it afterwards.</p>
+      <div className="mb-3 flex gap-4 text-sm" role="radiogroup" aria-label="Scope" data-testid="apply-scope">
+        <label className={`flex items-center gap-1.5 ${selected.length === 0 ? "opacity-50" : ""}`}>
+          <input type="radio" name="apply-scope" checked={scope === "selected"} disabled={selected.length === 0} onChange={() => setScope("selected")} data-testid="apply-scope-selected" />
+          Selected ({selected.length})
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="radio" name="apply-scope" checked={scope === "all"} onChange={() => setScope("all")} data-testid="apply-scope-all" />
+          All in view ({all.length})
+        </label>
+      </div>
       <label className="mb-3 flex items-center gap-2 text-sm">
         <input type="checkbox" data-autofocus checked={skipManual} onChange={(e) => setSkipManual(e.target.checked)} data-testid="apply-only-unset" />
         Skip photos I already flagged or rated
@@ -97,7 +111,7 @@ export function ApplySuggestionsDialog({ ids, scopeLabel, onCancel, onConfirm }:
         <button
           className="rounded bg-sky-700 px-3 py-1.5 text-white hover:bg-sky-600 disabled:opacity-40"
           disabled={rows == null || c.apply === 0}
-          onClick={() => onConfirm(skipManual)}
+          onClick={() => onConfirm(ids, skipManual)}
           data-testid="apply-confirm"
         >
           Apply to {rows == null ? n : c.apply}

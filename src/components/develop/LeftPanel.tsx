@@ -12,9 +12,11 @@ interface Props {
   onUndo: () => void;
   onRedo: () => void;
   onGoto: (entryId: number) => void;
+  /** Photos a preset / reset would hit (> 1 shows a "-> n" hint). */
+  targetCount?: number;
 }
 
-export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto }: Props) {
+export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1 }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const entries = history ? [...history.entries].reverse() : [];
   return (
@@ -26,13 +28,18 @@ export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDel
             <Save className="size-3.5" /> Save
           </button>
         </div>
-        {presets.length === 0 && <p className="text-neutral-400">No presets yet</p>}
+        {presets.length === 0 && <p className="text-neutral-400">No presets yet. Save the current settings with Save.</p>}
         <ul data-testid="preset-list">
           {presets.map((p) => (
             <li key={p.id} className="group flex items-center justify-between rounded px-1.5 py-1 hover:bg-neutral-800">
               <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
                 {p.name}
               </button>
+              {targetCount > 1 && (
+                <span className="invisible mr-1 shrink-0 text-sky-300 group-hover:visible" data-testid={`preset-hint-${p.id}`}>
+                  → {targetCount}
+                </span>
+              )}
               {confirming === p.id ? (
                 <span className="flex shrink-0 items-center gap-1">
                   <button
@@ -70,7 +77,7 @@ export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDel
             </button>
           </div>
         </div>
-        {entries.length === 0 && <p className="text-neutral-400">No edits yet</p>}
+        {entries.length === 0 && <p className="text-neutral-400">No edits yet. Each change you make is listed here.</p>}
         <ul data-testid="history-list">
           {entries.map((e) => (
             <li key={e.id}>

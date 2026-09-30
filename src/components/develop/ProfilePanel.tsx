@@ -70,6 +70,7 @@ export function ProfilePanel({ editor, imageId, onError }: { editor: Editor; ima
             min={0}
             max={200}
             step={1}
+            defaultValue={100}
             display={(v) => `${v}%`}
             onInput={(v) => editor.edit((a) => ({ ...a, profile: { ...a.profile, look: a.profile.look ? { ...a.profile.look, amount: v / 100 } : null } }), "Profile: Amount")}
             onCommit={editor.commit}

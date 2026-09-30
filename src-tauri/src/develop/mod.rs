@@ -26,7 +26,9 @@
 pub mod camera;
 pub mod highlights;
 pub mod history;
+pub mod local;
 mod local_tone_data;
+pub mod masks;
 mod param_data;
 pub mod parity;
 pub mod pipeline;
@@ -46,8 +48,9 @@ use tauri::http;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    CameraCalibration, CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect,
+    CameraCalibration, CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormPoint, NormRect,
     ParametricAdjustments, ProfileSettings, RenderOptions, RenderSlot, RenderedPreview, WhiteBalance,
+    WhiteBalanceValues,
 };
 use crate::lut::LutLibrary;
 use crate::profiles::ProfileLibrary;
@@ -65,14 +68,31 @@ pub const PREPARED_PER_IMAGE: usize = 3;
 pub const MAX_ENCODED: usize = 24;
 
 /// Resolved at startup by `lib.rs`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DevelopConfig {
     /// Upper bound of decoded sources + working copies kept in memory.
     pub cache_bytes: u64,
+    /// AI matte cache for masks (Phase 7c); `None` = AI mask components render empty.
+    pub mask_cache: Option<masks::MaskCache>,
 }
 
 impl DevelopConfig {
     pub const DEFAULT_CACHE_MB: u64 = 1024;
+}
+
+impl Default for DevelopConfig {
+    fn default() -> Self {
+        DevelopConfig { cache_bytes: Self::DEFAULT_CACHE_MB * 1024 * 1024, mask_cache: None }
+    }
+}
+
+impl std::fmt::Debug for DevelopConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopConfig")
+            .field("cache_bytes", &self.cache_bytes)
+            .field("mask_cache", &self.mask_cache.as_ref().map(|c| c.config().clone()))
+            .finish()
+    }
 }
 
 /// What the engine needs to know about an image (resolved from the catalog by the command).
@@ -181,6 +201,23 @@ impl Entry {
         self.profile(&ParametricAdjustments::defaults_for(self.meta.format).profile)
     }
 
+    /// Neutral render of the whole image in the sensor frame (guide for refining Sieve AI
+    /// mattes, `develop::masks::render`).
+    fn sensor_guide(&self) -> masks::render::SensorGuide {
+        let prep = source::prepare(&self.image, 1, &CropSettings::default(), None, 2048);
+        let profile = self.default_profile();
+        let mut adj = ParametricAdjustments::defaults_for(self.meta.format);
+        adj.masks.clear();
+        let input = pipeline::RenderInput {
+            frame_long_edge: prep.frame_long_edge,
+            view: prep.view,
+            quality: pipeline::Quality::Draft,
+            ..pipeline::RenderInput::simple(prep.width, prep.height, &prep.pixels, &self.image.color, &profile)
+        };
+        let img = pipeline::render(&input, &adj, None);
+        masks::render::SensorGuide { width: img.width, height: img.height, rgb: img.rgb }
+    }
+
     fn input<'a>(
         &'a self,
         prepared: &'a Prepared,
@@ -213,7 +250,12 @@ impl Entry {
     ) -> Option<pipeline::ToneContext> {
         let look = profile.look.as_ref().map(|l| (l.parameters.shadows, l.parameters.highlights));
         let (ls, lh) = look.unwrap_or((0.0, 0.0));
-        if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 {
+        // Local Shadows/Highlights (mask groups) sample the same whole-frame context.
+        let local = adjustments
+            .masks
+            .iter()
+            .any(|g| g.active && g.amount != 0.0 && (g.adjustments.shadows != 0.0 || g.adjustments.highlights != 0.0));
+        if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 && !local {
             return None;
         }
         let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
@@ -234,6 +276,19 @@ impl Entry {
         let (w, h) = (self.image.width, self.image.height);
         Some((*base).clone().with_crop(&adjustments.crop, w, h, orientation))
     }
+}
+
+/// Half-size decode of an original with user-facing errors: a missing/moved file is
+/// `not_found` ("Original file is missing ..."), a decoder failure says so (`io`).
+fn decode_source(path: &std::path::Path) -> AppResult<(LinearImage, SourceMeta)> {
+    crate::raw::access::require_original(path)?;
+    source::decode_half_size_meta(path).map_err(|e| match e.kind {
+        crate::ipc::error::ErrorKind::Internal => {
+            let prefix = format!("{}: ", path.display());
+            crate::raw::access::decode_failed(path, e.message.strip_prefix(&prefix).unwrap_or(&e.message))
+        }
+        _ => e,
+    })
 }
 
 fn quality_for(max_edge: u32) -> pipeline::Quality {
@@ -269,6 +324,8 @@ struct Inner {
     /// Newest finished JPEG per key: (seq, bytes), plus insertion order for bounding.
     encoded: Mutex<EncodedStore>,
     prefetch: Mutex<Prefetch>,
+    /// Evaluated mask weights of recent renders (Phase 7c).
+    weights: masks::render::WeightCache,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -282,8 +339,14 @@ pub struct DevelopCache {
     config: DevelopConfig,
     /// Newest ticket issued per (image, slot).
     latest: Arc<Mutex<HashMap<(ImageId, RenderSlot), u32>>>,
+    /// Catalog facts (path, orientation) of recently edited images, so slider renders skip
+    /// the catalog (and its lock) entirely. Filled by the commands; see [`Self::source`].
+    sources: Arc<Mutex<HashMap<ImageId, SourceImage>>>,
     inner: Arc<Inner>,
 }
+
+/// Remembered [`SourceImage`]s (cleared wholesale when exceeded; each is ~100 bytes).
+pub const MAX_SOURCES: usize = 4096;
 
 impl DevelopCache {
     pub fn new(config: DevelopConfig) -> Self {
@@ -293,18 +356,47 @@ impl DevelopCache {
         Self {
             config,
             latest: Arc::new(Mutex::new(HashMap::new())),
+            sources: Arc::new(Mutex::new(HashMap::new())),
             inner: Arc::new(Inner {
                 lru: Mutex::new(Lru::default()),
                 decoding: Mutex::new(HashMap::new()),
                 rendering: Mutex::new(HashMap::new()),
                 encoded: Mutex::new((HashMap::new(), VecDeque::new())),
                 prefetch: Mutex::new(Prefetch::default()),
+                weights: masks::render::WeightCache::default(),
             }),
         }
     }
 
     pub fn config(&self) -> &DevelopConfig {
         &self.config
+    }
+
+    /// The remembered catalog facts of image `id` (see [`Self::remember_source`]).
+    pub fn source(&self, id: ImageId) -> Option<SourceImage> {
+        lock(&self.sources).get(&id).cloned()
+    }
+
+    /// Remembers `src` for [`Self::source`]. Callers only remember images whose metadata is
+    /// settled (thumbnail extraction finished: orientation known).
+    pub fn remember_source(&self, src: SourceImage) {
+        let mut map = lock(&self.sources);
+        if map.len() >= MAX_SOURCES && !map.contains_key(&src.id) {
+            map.clear();
+        }
+        map.insert(src.id, src);
+    }
+
+    /// Forgets remembered sources: `Some(ids)` (e.g. thumbnails regenerated: orientation
+    /// may change) or all (`None`, e.g. after an import re-registered files).
+    pub fn forget_sources(&self, ids: Option<&[ImageId]>) {
+        let mut map = lock(&self.sources);
+        match ids {
+            Some(ids) => ids.iter().for_each(|id| {
+                map.remove(id);
+            }),
+            None => map.clear(),
+        }
     }
 
     /// Issues the next ticket for (image, slot). Call on the async side, before any
@@ -346,7 +438,14 @@ impl DevelopCache {
         if let Some(e) = self.cached(src) {
             return Ok(e);
         }
-        let (image, meta) = source::decode_half_size_meta(&src.path)?;
+        let decoded = decode_source(&src.path);
+        let (image, meta) = match decoded {
+            Ok(d) => d,
+            Err(e) => {
+                lock(&self.inner.decoding).remove(&src.id);
+                return Err(e);
+            }
+        };
         let entry = Arc::new(Entry {
             path: src.path.clone(),
             image,
@@ -422,7 +521,8 @@ impl DevelopCache {
         let profile = entry.profile(&adjustments.profile);
         let tone = entry.tone_context(src.orientation(), adjustments, &profile);
         let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
-        let img = pipeline::render(&input, adjustments, lut.as_deref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &input, options.region);
+        let img = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
         if !self.is_current(ticket) {
             return Ok(None);
         }
@@ -475,6 +575,7 @@ impl DevelopCache {
         if let Some(detail) = img.source_color.as_ref().and_then(|c| c.assumed_detail()) {
             warnings.push(DevelopWarning { code: DevelopWarningCode::SourceColorAssumed, detail: Some(detail) });
         }
+        warnings.extend(self.mask_warning(src.id));
         Ok(DevelopInfo { image_id: src.id, as_shot, source_width, source_height, full_width, full_height, warnings })
     }
 
@@ -553,10 +654,135 @@ impl DevelopCache {
         let profile = entry.profile(&adjustments.profile);
         let tone = entry.tone_context(src.orientation(), adjustments, &profile);
         let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge), tone.as_ref());
-        let image = pipeline::render(&input, adjustments, lut.as_deref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &input, region);
+        let image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
     }
+}
+
+impl DevelopCache {
+    /// Seam steps 1-4 (`develop::masks`) for a render of `input` (prepared from `src` with
+    /// `adjustments.crop` and `region`): the local planes of `adjustments.masks` on the
+    /// input's grid, weights cached across renders. `(None, [])` for unmasked edits.
+    fn local_planes(
+        &self,
+        entry: &Entry,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+        input: &pipeline::RenderInput,
+        region: Option<NormRect>,
+    ) -> (Option<masks::LocalPlanes>, Vec<DevelopWarning>) {
+        if !masks::render::any_rendered(&adjustments.masks) {
+            return (None, Vec::new());
+        }
+        let mut mattes =
+            masks::render::ResolvedMattes::resolve(self.config.mask_cache.as_ref(), src.id, &adjustments.masks);
+        if mattes.needs_guide() {
+            mattes.refine(|| Some(entry.sensor_guide()));
+        }
+        let geom = masks::MaskGeometry {
+            sensor_width: entry.image.full_width,
+            sensor_height: entry.image.full_height,
+            orientation: src.orientation(),
+            crop: adjustments.crop,
+            region,
+            width: input.width,
+            height: input.height,
+        };
+        masks::render::local_planes(
+            &adjustments.masks,
+            &geom,
+            src.id,
+            &mattes,
+            || local::range_guide(input.pixels, input.color, input.profile, adjustments),
+            masks::render::guide_key(adjustments),
+            Some(&self.inner.weights),
+        )
+    }
+
+    /// `ai_mask_needs_update` for the image's stored masks (`DevelopInfo.warnings`).
+    fn mask_warning(&self, id: ImageId) -> Option<DevelopWarning> {
+        let cache = self.config.mask_cache.as_ref()?;
+        let conn = masks::open_catalog_read_only(&cache.config().catalog_path).ok()?;
+        let adj = crate::db::repo::get_adjustments(&conn, id).ok()?;
+        if !masks::render::any_rendered(&adj.masks) {
+            return None;
+        }
+        let mattes = masks::render::ResolvedMattes::resolve(Some(cache), id, &adj.masks);
+        masks::render::needs_update_warning(&adj.masks, &mattes)
+    }
+
+    /// Blocking. White balance picker: the temperature/tint that makes the 5x5 source-pixel
+    /// neighbourhood around `point` (sensor frame: normalized, un-oriented, uncropped) neutral,
+    /// through the colour matrices of `adjustments.profile` (same path as `DevelopInfo.asShot`).
+    /// `invalid_argument` if the sample is clipped or too dark. Decodes the source if needed.
+    pub fn sample_white_balance(
+        &self,
+        src: &SourceImage,
+        point: NormPoint,
+        adjustments: &ParametricAdjustments,
+    ) -> AppResult<WhiteBalanceValues> {
+        let entry = self.entry(src)?;
+        self.evict(src.id);
+        let mul = sample_multipliers(&entry.image, point)?;
+        let profile = entry.profile(&adjustments.profile);
+        camera::values_of_multipliers(mul, &entry.image.color, &profile)
+            .ok_or_else(|| AppError::invalid("could not measure a white balance at this point"))
+    }
+}
+
+/// Half-width of the white balance picker's sample window (5x5 source pixels).
+pub const WB_SAMPLE_RADIUS: u32 = 2;
+/// A sample pixel with any channel at or above this (white = 65535) counts as clipped.
+pub const WB_CLIP_LEVEL: u16 = 64_200;
+/// Mean channel values below this (about -12 EV) are too dark to measure.
+pub const WB_MIN_LEVEL: f64 = 16.0;
+
+/// Multipliers (R, G, B; G = 1) that neutralize the mean of the 5x5 window of `img`
+/// (un-oriented source pixels) around `point` (sensor frame). The window is shifted inside
+/// the image near edges. Errors (`invalid_argument`): point outside 0..=1, any sample pixel
+/// clipped, any channel mean too dark.
+pub fn sample_multipliers(img: &LinearImage, point: NormPoint) -> AppResult<[f32; 3]> {
+    let inside = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+    if !inside(point.x) || !inside(point.y) {
+        return Err(AppError::invalid("white balance sample point must be within 0..=1"));
+    }
+    if img.width == 0 || img.height == 0 || img.pixels.len() < img.width as usize * img.height as usize * 3 {
+        return Err(AppError::internal("develop source has no pixels"));
+    }
+    let span = |norm: f32, size: u32| {
+        let size = i64::from(size);
+        let r = i64::from(WB_SAMPLE_RADIUS);
+        let c = ((f64::from(norm) * size as f64).floor() as i64).clamp(0, size - 1);
+        let lo = (c - r).clamp(0, (size - 2 * r - 1).max(0));
+        let hi = (lo + 2 * r).min(size - 1);
+        (lo as usize, hi as usize)
+    };
+    let (x0, x1) = span(point.x, img.width);
+    let (y0, y1) = span(point.y, img.height);
+    let mut sum = [0.0f64; 3];
+    let mut n = 0.0f64;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = (y * img.width as usize + x) * 3;
+            let px = &img.pixels[i..i + 3];
+            if px.iter().any(|&v| v >= WB_CLIP_LEVEL) {
+                return Err(AppError::invalid(
+                    "the sampled area is clipped (overexposed); pick a neutral grey or white that is not blown out",
+                ));
+            }
+            for (s, &v) in sum.iter_mut().zip(px) {
+                *s += f64::from(v);
+            }
+            n += 1.0;
+        }
+    }
+    let mean = sum.map(|s| s / n);
+    if mean.iter().any(|&m| m < WB_MIN_LEVEL) {
+        return Err(AppError::invalid("the sampled area is too dark to measure; pick a brighter neutral"));
+    }
+    Ok([(mean[1] / mean[0]) as f32, 1.0, (mean[1] / mean[2]) as f32])
 }
 
 /// Result of [`DevelopCache::render_image`].
@@ -632,9 +858,208 @@ pub fn handle_protocol(cache: &DevelopCache, request: &http::Request<Vec<u8>>) -
 mod tests {
     use super::*;
 
+    /// Sony ILCE-7M3 `ColorMatrix2` (XYZ -> camera).
+    const A7M3: [[f32; 3]; 3] = [[0.7374, -0.2389, -0.0551], [-0.5435, 1.3162, 0.2519], [-0.1006, 0.1795, 0.6552]];
+
+    /// Uniform `w` x `h` source of camera RGB `rgb` with one pixel overridden.
+    fn flat_source(w: u32, h: u32, rgb: [u16; 3], as_shot: [f32; 3], hot: Option<(u32, u32, [u16; 3])>) -> LinearImage {
+        let mut pixels: Vec<u16> = (0..w * h).flat_map(|_| rgb).collect();
+        if let Some((x, y, v)) = hot {
+            let i = ((y * w + x) * 3) as usize;
+            pixels[i..i + 3].copy_from_slice(&v);
+        }
+        LinearImage {
+            width: w,
+            height: h,
+            pixels,
+            color: source::ColorInfo {
+                as_shot_mul: Some(as_shot),
+                daylight_mul: [1.0; 3],
+                rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                xyz_to_cam: A7M3,
+                calibration: [1.0; 3],
+            },
+            full_width: w * 2,
+            full_height: h * 2,
+            display_referred: false,
+            source_color: None,
+        }
+    }
+
+    /// Camera RGB of a grey card lit by the illuminant the multipliers neutralize.
+    fn grey_under(mul: [f32; 3], level: f32) -> [u16; 3] {
+        mul.map(|m| (level / m).round() as u16)
+    }
+
+    #[test]
+    fn wb_sample_of_as_shot_grey_returns_as_shot() {
+        let as_shot = [2.1, 1.0, 1.6];
+        let img = flat_source(40, 30, grey_under(as_shot, 20_000.0), as_shot, None);
+        let mul = sample_multipliers(&img, NormPoint { x: 0.5, y: 0.5 }).unwrap();
+        for (a, b) in mul.iter().zip(as_shot) {
+            assert!((a - b).abs() < 1e-3, "{mul:?}");
+        }
+        // Matrix path and DCP path both match what DevelopInfo.asShot reports.
+        let dcp = camera::Profile { dcp: Some(Arc::new(camera::matrix_dcp(&img.color))), ..Default::default() };
+        for profile in [camera::Profile::matrix(0.0), dcp] {
+            let want = camera::as_shot_values(&img.color, &profile).unwrap();
+            let got = camera::values_of_multipliers(mul, &img.color, &profile).unwrap();
+            assert!((got.temperature_k - want.temperature_k).abs() < 5.0, "{got:?} vs {want:?}");
+            assert!((got.tint - want.tint).abs() < 0.5, "{got:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn wb_sample_recovers_a_known_cast() {
+        // A grey card under 3200 K / +10 on a daylight-as-shot frame.
+        let target = WhiteBalanceValues { temperature_k: 3200.0, tint: 10.0 };
+        let cast = wb::multipliers_for(target, &A7M3);
+        let img = flat_source(20, 20, grey_under(cast, 15_000.0), [2.0, 1.0, 1.4], None);
+        // Corners: the window shifts inside the image.
+        for p in [NormPoint { x: 0.0, y: 0.0 }, NormPoint { x: 1.0, y: 1.0 }, NormPoint { x: 0.3, y: 0.7 }] {
+            let mul = sample_multipliers(&img, p).unwrap();
+            let v = camera::values_of_multipliers(mul, &img.color, &camera::Profile::matrix(0.0)).unwrap();
+            assert!((v.temperature_k - 3200.0).abs() < 15.0, "{v:?}");
+            assert!((v.tint - 10.0).abs() < 1.0, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn wb_sample_rejects_clipped_dark_and_out_of_range() {
+        let grey = grey_under([2.0, 1.0, 1.5], 20_000.0);
+        let hot = Some((10, 10, [30_000, 65_535, 20_000]));
+        let img = flat_source(21, 21, grey, [2.0, 1.0, 1.5], hot);
+        let e = sample_multipliers(&img, NormPoint { x: 0.5, y: 0.5 }).unwrap_err();
+        assert_eq!(e.kind, crate::ipc::error::ErrorKind::InvalidArgument);
+        assert!(e.message.contains("clipped"), "{}", e.message);
+        // Away from the clipped pixel (outside its 5x5 window) is fine.
+        assert!(sample_multipliers(&img, NormPoint { x: 0.05, y: 0.05 }).is_ok());
+        let dark = flat_source(10, 10, [3, 5, 4], [2.0, 1.0, 1.5], None);
+        let e = sample_multipliers(&dark, NormPoint { x: 0.5, y: 0.5 }).unwrap_err();
+        assert!(e.message.contains("too dark"), "{}", e.message);
+        for p in [NormPoint { x: -0.1, y: 0.5 }, NormPoint { x: 0.5, y: 1.2 }, NormPoint { x: f32::NAN, y: 0.5 }] {
+            let e = sample_multipliers(&img, p).unwrap_err();
+            assert_eq!(e.kind, crate::ipc::error::ErrorKind::InvalidArgument);
+        }
+    }
+
+    /// End to end through the cache on a display-referred PNG (orientation 6): the point is
+    /// in the un-oriented frame; grey neutralizes to ~D65, white is clipped.
+    #[test]
+    fn wb_sample_through_cache() {
+        let (w, h) = (24u32, 12u32);
+        let mut px = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&if x < w / 2 { [128u8, 128, 128] } else { [255, 255, 255] });
+            }
+        }
+        let bytes = crate::raw::png::test_support::encode(w, h, None, Some(&px), None, None, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grey.png");
+        std::fs::write(&path, bytes).unwrap();
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 64 << 20, mask_cache: None });
+        let src = SourceImage { id: 1, path, orientation: Some(6) };
+        let adj = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Png);
+        let v = cache.sample_white_balance(&src, NormPoint { x: 0.2, y: 0.5 }, &adj).unwrap();
+        // sRGB grey = D65 in Adobe's temperature/tint model.
+        let (t65, n65) = wb::temp_tint_for(0.3127, 0.3290);
+        assert!((f64::from(v.temperature_k) - t65).abs() < 30.0, "{v:?} vs {t65}");
+        assert!((f64::from(v.tint) - n65).abs() < 1.0, "{v:?} vs {n65}");
+        let e = cache.sample_white_balance(&src, NormPoint { x: 0.8, y: 0.5 }, &adj).unwrap_err();
+        assert!(e.message.contains("clipped"), "{}", e.message);
+    }
+
+    /// Phase 7c: renders through the cache apply masks in the displayed frame (orientation),
+    /// and `info` reports AI components without a matte.
+    #[test]
+    fn masks_render_through_cache_and_info_reports_missing_mattes() {
+        use crate::ipc::types::{
+            AiMask, AiMaskOrigin, AiTarget, DevelopWarningCode, ImportOptions, LocalAdjustments, MaskBlendMode,
+            MaskComponent, MaskGroup, MaskShape,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("src");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (w, h) = (40u32, 20u32);
+        let px: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 100, 100]).collect();
+        std::fs::write(
+            folder.join("g.png"),
+            crate::raw::png::test_support::encode(w, h, None, Some(&px), None, None, None),
+        )
+        .unwrap();
+        let catalog = dir.path().join("cat.sqlite");
+        let mut conn = crate::db::open(&catalog).unwrap();
+        let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+        crate::db::repo::import_folder(&mut conn, &folder, &opts).unwrap();
+        let id: ImageId = conn.query_row("SELECT id FROM images", [], |r| r.get(0)).unwrap();
+        let mattes = masks::MaskCache::new(masks::MaskCacheConfig {
+            catalog_path: catalog.clone(),
+            cache_dir: dir.path().join("cache"),
+        });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 64 << 20, mask_cache: Some(mattes.clone()) });
+        let src = SourceImage { id, path: folder.join("g.png"), orientation: Some(6) };
+        let digest = "0123456789ABCDEF0123456789ABCDEF".to_owned();
+        let mut adj = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Png);
+        adj.masks = vec![MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Subject".into(),
+            active: true,
+            amount: 1.0,
+            adjustments: LocalAdjustments { exposure: 1.5, ..Default::default() },
+            components: vec![MaskComponent {
+                id: format!("{:032X}", 2),
+                name: String::new(),
+                active: true,
+                mode: MaskBlendMode::Add,
+                inverted: false,
+                opacity: 1.0,
+                shape: MaskShape::Ai(AiMask {
+                    target: AiTarget::Subject,
+                    reference_point: None,
+                    digest: Some(digest.clone()),
+                }),
+            }],
+        }];
+        crate::develop::history::commit(&mut conn, id, &adj, "Mask").unwrap();
+        let luts = LutLibrary::new(PathBuf::from("/nonexistent"));
+        let render = |a: &ParametricAdjustments| cache.render_image(&src, a, None, 512, &luts).unwrap().image;
+        let plain = ParametricAdjustments { masks: Vec::new(), ..adj.clone() };
+        let base = render(&plain);
+        assert_eq!((base.width, base.height), (h, w), "orientation 6");
+        let warned = |c: &DevelopCache| {
+            c.info(&src).unwrap().warnings.iter().any(|w| w.code == DevelopWarningCode::AiMaskNeedsUpdate)
+        };
+        assert!(warned(&cache), "matte missing");
+        assert_eq!(render(&adj).rgb, base.rgb, "missing matte renders empty");
+
+        // Lightroom matte selecting the sensor's left half = the displayed top half (o = 6).
+        let matte = masks::AlphaMask {
+            width: w,
+            height: h,
+            bounds: NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            data: (0..w * h).map(|i| if i % w < w / 2 { 255 } else { 0 }).collect(),
+        };
+        let new = masks::NewMatte {
+            kind: "subject".into(),
+            target: AiTarget::Subject,
+            reference_point: None,
+            origin: AiMaskOrigin::Lightroom,
+            digest: Some(digest),
+            model_version: "lr:1".into(),
+            input_digest: None,
+        };
+        mattes.put(&conn, id, &new, &matte).unwrap();
+        assert!(!warned(&cache));
+        let img = render(&adj);
+        let g = |im: &pipeline::RenderedImage, x: u32, y: u32| im.rgb[((y * im.width + x) * 3 + 1) as usize];
+        assert!(g(&img, 10, 5) > g(&base, 10, 5) + 30, "top (masked) brighter");
+        assert_eq!(g(&img, 10, 35), g(&base, 10, 35), "bottom unchanged");
+    }
+
     #[test]
     fn tickets_are_latest_wins_per_key() {
-        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 0 });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 0, mask_cache: None });
         let a1 = cache.ticket(1, RenderSlot::Main);
         let b1 = cache.ticket(1, RenderSlot::Before);
         let a2 = cache.ticket(1, RenderSlot::Main);
@@ -651,6 +1076,51 @@ mod tests {
         assert!(url.ends_with("/render/42/detail?v=7"), "{url}");
     }
 
+    /// Phase 8 error states: renders of a moved original / an undecodable file fail with
+    /// actionable messages (no panic, nothing cached), and the decode lock is released.
+    #[test]
+    fn missing_and_undecodable_originals_have_actionable_errors() {
+        use crate::ipc::error::ErrorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let luts = LutLibrary::new(dir.path().join("luts"));
+        let opts = RenderOptions { max_edge: 512, slot: RenderSlot::Main, region: None };
+        let adj = ParametricAdjustments::default();
+
+        let gone = SourceImage { id: 1, path: dir.path().join("DSC0001.ARW"), orientation: None };
+        let e = cache.render(cache.ticket(1, RenderSlot::Main), &gone, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert!(e.message.starts_with(crate::raw::access::MISSING_PREFIX), "{}", e.message);
+        assert_eq!(cache.info(&gone).unwrap_err().kind, ErrorKind::NotFound);
+
+        let junk = dir.path().join("DSC0002.ARW");
+        std::fs::write(&junk, b"II*\0not a raw at all").unwrap();
+        let bad = SourceImage { id: 2, path: junk, orientation: None };
+        let e = cache.render(cache.ticket(2, RenderSlot::Main), &bad, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Io);
+        assert!(e.message.starts_with("Could not decode") && e.message.contains("damaged"), "{}", e.message);
+        assert_eq!(cache.cached_count(), 0);
+        assert!(lock(&cache.inner.decoding).is_empty(), "decode locks released on failure");
+    }
+
+    #[test]
+    fn remembered_sources_are_bounded_and_forgotten() {
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let src = |id: ImageId| SourceImage { id, path: PathBuf::from(format!("/x/{id}.arw")), orientation: Some(6) };
+        assert_eq!(cache.source(1), None);
+        cache.remember_source(src(1));
+        cache.remember_source(src(2));
+        assert_eq!(cache.source(1), Some(src(1)));
+        cache.forget_sources(Some(&[1]));
+        assert_eq!((cache.source(1), cache.source(2)), (None, Some(src(2))));
+        cache.forget_sources(None);
+        assert_eq!(cache.source(2), None);
+        for id in 0..(MAX_SOURCES as i64 + 10) {
+            cache.remember_source(src(id));
+        }
+        assert!(lock(&cache.sources).len() <= MAX_SOURCES);
+    }
+
     fn get(cache: &DevelopCache, uri: &str) -> http::Response<Vec<u8>> {
         let req = http::Request::builder().uri(uri).body(Vec::new()).unwrap();
         handle_protocol(cache, &req)
@@ -658,7 +1128,7 @@ mod tests {
 
     #[test]
     fn protocol_serves_newest_encoded_render() {
-        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 0 });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 0, mask_cache: None });
         assert_eq!(get(&cache, "sieve://localhost/render/5/main?v=1").status(), 404);
         cache.store_encoded((5, RenderSlot::Main), 3, vec![0xFF, 0xD8, 1]);
         let r = get(&cache, "sieve://localhost/render/5/main?v=3");
@@ -692,7 +1162,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_an_error_not_a_panic() {
-        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 1 << 30 });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 1 << 30, mask_cache: None });
         let src = SourceImage { id: 1, path: PathBuf::from("/nonexistent/x.arw"), orientation: None };
         assert!(cache.info(&src).is_err());
         let t = cache.ticket(1, RenderSlot::Main);
@@ -723,7 +1193,7 @@ mod tests {
     fn real_sample_render() {
         let raws = sample_raws(3);
         assert!(!raws.is_empty());
-        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 150 << 20 });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 150 << 20, mask_cache: None });
         let luts = LutLibrary::new(PathBuf::from("/nonexistent"));
         for (i, path) in raws.iter().enumerate() {
             let src = SourceImage { id: i as i64 + 1, path: path.clone(), orientation: Some(8) };

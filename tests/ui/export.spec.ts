@@ -9,6 +9,9 @@ async function openDialog(page: Page, { manual = false }: { manual?: boolean } =
   for (let i = 0; i < 3; i++) await page.keyboard.press("Shift+ArrowRight");
   await page.keyboard.press("Meta+Shift+E");
   await expect(page.getByTestId("export-dialog")).toBeVisible();
+  // UX2 P1-10: rejects are skipped by default (one of these four is rejected); these tests export all four.
+  await expect(page.getByTestId("export-count")).toHaveText("3 photos");
+  await page.getByTestId("export-skip-rejected").uncheck();
   await expect(page.getByTestId("export-count")).toHaveText("4 photos");
 }
 
@@ -254,6 +257,8 @@ test.describe("export", () => {
     await page.getByTestId("export-button").click();
     await expect(page.getByTestId("export-count")).toHaveText("2 photos");
     await page.getByTestId("export-scope-filtered").check();
+    await expect(page.getByTestId("export-count")).toHaveText("28 photos"); // 2 rejects skipped by default
+    await page.getByTestId("export-skip-rejected").uncheck();
     await expect(page.getByTestId("export-count")).toHaveText("30 photos");
     await page.getByTestId("export-dest-kind").selectOption("source_folder");
     await clearCalls(page);

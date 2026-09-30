@@ -16,6 +16,7 @@ src-tauri/
   migrations/0007_scenes.sql   v7: scenes, images.scene_id/scene_anchor, scene_features
   migrations/0008_ux.sql       v8: burst_keeper_pins (user-chosen burst keepers)
   migrations/0009_parity_sources.sql v9: images.format CHECK += jpeg/heic/tiff/png (in place), companion_path, develop_warnings
+  migrations/0010_masks.sql    v10: mask_cache (AI mattes), images.masks_pending_import
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -24,6 +25,7 @@ src-tauri/
                                debug-build export of src/ipc/bindings.ts
     ipc/
       types.rs                 all contract types (source of truth for TS)
+      masks.rs                 mask / local-adjustment types (v10), re-exported from types.rs
       commands.rs              #[tauri::command] handlers + Catalog state (runs DB work on blocking pool)
       events.rs                ImportProgress, ThumbnailReady, ThumbnailFailed,
                                AnalysisProgress, AnalysisReady, AnalysisFailed, AnalysisFinished,
@@ -44,13 +46,16 @@ src-tauri/
     ingest/mod.rs              background pipeline (Ingest state, start/regenerate, import_status)
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
+    ml/masking.rs              AI mask seam: Segmenter (managed state), SegmentModel trait (v10)
     xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
     xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
+    xmp/masks.rs               crs:MaskGroupBasedCorrections <-> masks (mapping tables, Lightroom mattes) (v10)
     develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
       parity.rs                Lightroom-parity stages: curves, color grading, calibration, detail, effects, crop (v9)
+      masks.rs                 mask evaluation, local parameter planes, overlays, MaskCache (AI mattes) (v10)
     profiles/mod.rs            installed Adobe DCPs + looks (read in place), ProfileLibrary (v9)
       dcp.rs look.rs table.rs  DCP parser; look profiles; Adobe crs:Table_ big-table decoder
     lut/mod.rs                 .cube LUT library (directory) + parse/apply
@@ -124,6 +129,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `get_xmp_status` / `getXmpStatus` | – | `XmpStatus` |
 | `render_preview` / `renderPreview` | `id: number, adjustments: ParametricAdjustments, options: RenderOptions` | `RenderedPreview \| null` (`null` = superseded) |
 | `get_develop_info` / `getDevelopInfo` | `id: number` | `DevelopInfo` |
+| `sample_white_balance` / `sampleWhiteBalance` (v11) | `id: number, point: NormPoint` (sensor frame), `adjustments: ParametricAdjustments` | `WhiteBalanceValues` (`invalid_argument` if clipped/too dark) |
 | `prepare_develop` / `prepareDevelop` | `ids: number[]` | `null` (background decode) |
 | `get_history` / `getHistory` | `id: number` | `AdjustmentHistory` |
 | `undo_adjustments` / `undoAdjustments` | `id: number` | `EditState` |
@@ -166,6 +172,16 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `set_ui_prefs` / `setUiPrefs` | `prefs: UiPrefs` | `null` (replaces all) |
 | `reveal_in_finder` / `revealInFinder` | `path: string` (absolute, existing) | `null` |
 | `write_xmp_all_dirty` / `writeXmpAllDirty` | `folderId: number \| null` | `XmpSyncReport` (catalog wins) |
+| `list_profiles` / `listProfiles` | `id: number` | `ProfileCatalog` |
+| `list_masks` / `listMasks` | `id: number` | `MaskList` (stored groups + AI status) |
+| `save_masks` / `saveMasks` | `id: number, masks: MaskGroup[], label: string` | `AdjustmentHistory` (replaces only `masks`) |
+| `compute_ai_mask` / `computeAiMask` | `id: number, request: AiMaskRequest` | `AiMaskInfo` (cached per image + kind + model) |
+| `detect_people` / `detectPeople` | `id: number` | `DetectedPerson[]` |
+| `render_mask_overlay` / `renderMaskOverlay` | `id: number, adjustments: ParametricAdjustments, target: MaskOverlayTarget, options: MaskOverlayOptions` | `RenderedMaskOverlay \| null` (`mask` slot, latest-wins) |
+| `get_mask_capabilities` / `getMaskCapabilities` | – | `MaskCapabilities` |
+| `model_downloads_status` / `modelDownloadsStatus` (v12) | – | `ModelDownloadStatus` (groups + installed files + `downloading`) |
+| `download_models` / `downloadModels` (v12) | `group: string` (`MODEL_GROUP_SEGMENTATION`) | `null` (background; `invalid_argument` if unknown / already downloading) |
+| `cancel_model_download` / `cancelModelDownload` (v12) | – | `null` (no-op when idle) |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -179,6 +195,8 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `exportProgress {jobId,done,total,failed,skipped,currentFile}`,
 `exportFinished {jobId,succeeded,skipped,failed,cancelled,outputDir,elapsedMs}` (Phase 6).
 `sceneProgress {task: "detect" | "match", done, total}` (Phase 7).
+`modelDownloadProgress {group,name,fileIndex,fileCount,bytesDone,bytesTotal}`,
+`modelDownloadFinished {group,ok,cancelled,error}` (v12).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -290,6 +308,12 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - White balance happens in the pipeline on raw data: `as_shot` uses the camera multipliers; `custom` converts
   temperature/tint -> multipliers through the camera matrix (`develop::wb`). `getDevelopInfo().asShot` gives the
   as-shot temperature/tint for the sliders.
+- White balance picker (IPC v11, `sampleWhiteBalance`): mean of the 5x5 develop-source pixels (half-size decode,
+  camera RGB, before WB) around a sensor-frame point (convert clicks with `unorientPoint` + crop mapping, as for
+  masks); multipliers = G/R, 1, G/B of that mean; Temp/Tint through `camera::values_of_multipliers` (the DCP of
+  `adjustments.profile` when resolved, else `wb::values_for` with `cam_xyz`: the same path as `asShot`), clamped to
+  the slider ranges. Any sample pixel >= 64200/65535 in any channel => `invalid_argument` "...clipped...";
+  any channel mean < 16 => "...too dark...". The UI commits `whiteBalance: custom` ("White Balance: Picker").
 - Pipeline (shared with Phase 6 full-res export): WB -> camera->linear Rec.2020 -> exposure -> tone (contrast,
   highlights/shadows/whites/blacks) -> texture/clarity/dehaze -> vibrance/saturation -> HSL -> sRGB encode -> LUT
   (amount blend) -> 8-bit -> histogram -> JPEG (TurboJPEG q90 4:4:4). Orientation applied; `region` crops first.
@@ -449,8 +473,7 @@ grain, black_and_white, crop, profile`. `AdjustmentField::DEFAULT_SYNC` / TS `DE
 (default of `MatchOptions.copyFields`; the Sync dialog's default selection). `reset_adjustments` resets every
 group (incl. profile) to the image's format default.
 
-Phase 7c (masks) plugs in as `ParametricAdjustments.masks` (+ field `masks`) with per-mask *local* parameter sets
-mirroring `crs:Local*`; pipeline stages must be able to take per-pixel parameter overrides (`develop/parity.rs` docs).
+Phase 7c (masks, IPC v10) plugs in as `ParametricAdjustments.masks` (+ field `masks`); see "Masks" below.
 
 ### crs mapping (`xmp/crs.rs` is the source of truth)
 | Group | crs properties | Format |
@@ -471,8 +494,8 @@ mirroring `crs:Local*`; pipeline stages must be able to take per-pixel parameter
 Write rules: every owned scalar is written on every develop write (Lightroom accepts the full set); curves need
 `rdf:Seq` create/replace in `packet` (rust-engine-dev: `crs::encode_curves` is ready); the profile is written only
 when it differs from the sidecar's (`crs::encode_profile`), `crs:CameraProfileDigest` removed then; `crs:Look`
-struct copied from the installed look profile. Never written: `crs:Table_*`, `CameraProfileDigest`, masks,
-retouch, lens, transform, `PointColors`, `CurveRefineSaturation`, `crd:*` -- preserved byte-for-byte.
+struct copied from the installed look profile. Never written here: `crs:Table_*`, `CameraProfileDigest`, masks
+(v10: `xmp/masks.rs`), retouch, lens, transform, `PointColors`, `CurveRefineSaturation`, `crd:*` -- preserved byte-for-byte.
 Read rules: top-level properties only (the look's `crs:Parameters` never leak into the user's settings); missing
 properties read as RAW defaults; out-of-range values clamp; unordered splits / inverted crop fall back to defaults;
 malformed numbers/curves fail the develop import (ratings still sync). `crs::unsupported_warnings` fills
@@ -515,6 +538,118 @@ Crop enabled: renders, `RenderOptions.region`, histograms, scene stats and expor
   neutral = the original). As-shot WB reported as 6500 K / 0. Export uses the same decode at full size.
 
 
+## Masks (Phase 7c, IPC v10)
+
+Goal (user requirement): Sieve replaces Lightroom, so local adjustments use Lightroom's model
+(`crs:MaskGroupBasedCorrections`) 1:1: a user's Lightroom masks import, render and round-trip; masks made in Sieve
+open in Lightroom. Types: `src-tauri/src/ipc/masks.rs`; XMP: `xmp/masks.rs`; rendering + matte cache:
+`develop/masks.rs`; AI: `ml/masking.rs`.
+
+### What the user's sidecars contain (Jasmit Natalie Proposal, 394 XMPs, Lightroom Classic 8.1 / ACR 17.1)
+- 50 sidecars with a top-level `crs:MaskGroupBasedCorrections`: 50 groups, 1 component each, all `Mask/Image`
+  `MaskSubType="1"` ("Subject 1"), `MaskBlendMode="0"`, not inverted, `MaskValue="1"`, from the Adaptive: Subject
+  presets (`CorrectionName` "Cool Soft" 48, "Pop" 1, "Warm Pop" 1; `CorrectionAmount` 1.0..1.51).
+  Non-zero locals: `LocalClarity2012` 50 (-0.195..0.101), `LocalTexture` 50 (-0.149..0.201), `LocalTemperature` 49
+  (-0.198..0.151), `LocalContrast2012` 5, `LocalExposure2012` 1 (0.0825); `LocalCurveRefineSaturation` = 100 on all;
+  the PV2010 `LocalExposure/Brightness/Contrast/Clarity/Saturation/Sharpness/ToningHue/ToningSaturation` = 0.
+- 45 more copies sit inside `<crs:Preset><crs:Parameters>` (the applied preset's own definition: no digest,
+  `ReferencePoint="0.5 0.5"`, `ErrorReason="0"`). With the 50 top-level groups these are the "95 mask groups";
+  only the top level is image state. No brush / gradient / range masks were used as masks.
+- AI mattes: `crs:Table_<MaskDigest>` (50, one per component) = Adobe base-85 -> 16-byte header (`2,1,0,0`) + TIFF,
+  8-bit gray tile, compression 52546 (JPEG XL), e.g. 1605x1332 at `Origin="0,296"` in a
+  `WholeImageArea="0/1,0/1,1920/1,2880/1"` space (2880 px long edge). Decoded (ImageIO): soft subject mattes,
+  stored un-oriented (an orientation-8 frame's matte is sideways). `ModelVersion` 251659306, `InputDigest` present.
+- The other 115 `crs:Table_*` belong to `crs:RetouchAreas` (20 sidecars, generative/heal spots: `pm_patch`,
+  `pm_patch_mask`, `pm_patch_variation`, `IngestInfo`), whose masks are `Mask/Ellipse` (1) and `Mask/Paint` (23
+  strokes, 1322 `d x y` dabs + 1 `r` item): out of scope (retouch), preserved.
+- Brush radius scale verified from those strokes: `crs:Radius` x sensor width + ~9 px = Lightroom's `pm_target_*`
+  box on 12/12 strokes (Sony 7008 px, Canon 6960 px, Fuji 6240 px widths).
+
+### Model
+`ParametricAdjustments.masks: MaskGroup[]` (in the stored adjustments JSON; history/undo/presets/copy/sync for free).
+A group = local slider set (`LocalAdjustments`, UI units, offsets added to the global sliders where the mask is 1)
++ ordered components combined with add (max) / subtract (`acc*(1-v)`) / intersect (`acc*v`); component value =
+`opacity * (inverted ? 1 - shape : shape)`; group weight = mask x `amount` (0..=2). Shapes: brush strokes, linear,
+radial, luminance range, colour range, AI (`subject | sky | background | people{parts} | object{region} |
+landscape{category} | other`), `unsupported` (Lightroom kinds Sieve does not model, preserved verbatim). Ids are
+Lightroom SyncIDs (32 hex), which the XMP writer uses to preserve unmodelled attributes.
+
+**Frame.** All geometry is in the sensor frame: normalized, un-oriented, uncropped (Lightroom's convention; crop
+`crs:Crop*` is in the same frame). The UI converts pointer positions: displayed (cropped, oriented) -> uncropped
+oriented (crop rect + angle) -> `unorientPoint(p, orientation)`. Brush radius = fraction of the sensor width.
+
+### Rendering
+Masks are evaluated per output pixel in the sensor frame, so preview, 1:1 regions and full-res export use one
+code path at any resolution (`develop/masks.rs` module docs: component formulas, pipeline seam steps 1-6). Local
+parameters become per-pixel offset planes (`LocalPlanes`) that the existing stages add to their global value;
+per-group curves / colour tint blend after the global point curves. Mask weights are cached per (image, geometry,
+components) so local slider drags only rebuild the planes. Range masks read a guide image after global WB +
+exposure. Unmasked images pay nothing (`LocalPlanes::build` returns `None`).
+
+Implementation (Phase 7c integration): `develop/masks/render.rs` resolves + loads the mattes of a render
+(`ResolvedMattes`, Sieve mattes refined once against a neutral sensor-frame render), evaluates / caches the group
+weights (`local_planes`) and is called by `DevelopCache::{render, render_image}` (preview, scene stats) and by the
+export (`export_one`, after `compute_missing` has run the Segmenter). `develop/local.rs` (`LocalOps`) is the
+per-pixel side inside `pipeline::develop`: stage A local WB (matrix), stage C Shadows/Highlights/Clarity/Texture/
+Dehaze amounts, stage D local tone as an input gain before the global LUT (exact global slider response), Hue /
+Saturation in Oklab, group curves/colour after the LUT (display-linear ProPhoto), stage E Sharpness/Noise.
+Moire/Defringe are stored and round-tripped but not rendered. Scales fitted to Camera Raw: `docs/decisions.md`.
+Tools: `examples/mask_render.rs` (renders the user's masked frames with/without masks, ΔE vs Camera Raw),
+`examples/mask_bench.rs` (latency through `DevelopCache`).
+
+### AI mattes
+- Stored in `mask_cache` + PNG files (`<cacheDir>/masks/<id>/<digest>.png`), with sensor-frame bounds; sampled
+  bilinearly at render resolution.
+- Lightroom mattes (origin `lightroom`) are decoded at XMP read from the sidecar's table and render exactly as
+  Lightroom's selection, whatever their kind (no model needed).
+- Sieve mattes (origin `sieve`) come from `compute_ai_mask` (`ml::masking::Segmenter`, models chosen by
+  vision-ml-dev, cached per image + `AiMask::cache_kind` + model version, invalidated when the original changes).
+  A component without a digest (pasted, synced, preset, or Lightroom mask without a table) uses the cached Sieve
+  matte of its kind if any, else renders empty with `ai_mask_needs_update` ("Update" in the UI). Export computes
+  missing mattes before rendering.
+
+### XMP
+Read/write rules are in `xmp/masks.rs` (module docs; mapping tables `LOCAL_SCALARS`, `LOCAL_CURVES`, `BLEND_MODES`,
+`AI_SUBTYPES`, `PERSON_PARTS`, `LANDSCAPE_CATEGORIES` with an evidence level each). Summary:
+- Unchanged masks leave the sidecar's element byte-for-byte; changed ones are regenerated with each item's
+  unmodelled attributes carried over by SyncID; unchanged items re-emitted verbatim.
+- Lightroom's AI tables are kept while their component exists (and removed when it is deleted); Sieve never writes
+  its own mattes into sidecars. Sieve-made AI components are written in Lightroom's preset form (kind + reference
+  point, no digest), which Lightroom recomputes with its own model on open.
+- `images.masks_pending_import` (migration 0010) protects sidecar masks read before v10 from being overwritten by
+  an empty list until they are imported.
+- Lightroom-verified: group/component attribute set, subject subtype, add blend code, local scalar scale
+  (1/100 for percentage sliders, observed), matte table format and placement, brush radius/dab format.
+  Provisional (no sample): other AI subtypes / person-part / landscape codes, subtract/intersect codes, local
+  exposure (EV/4) and hue (deg/180) scales, range-mask structure, brush erase/feather encoding, per-mask curves.
+  Unknown codes read as `other` / `unsupported` and are preserved, so provisional mappings can only affect masks
+  created in Sieve.
+
+### Frontend API summary (frontend-dev)
+- Open the Masks panel (Shift+W): `listMasks(id)` -> groups + AI status; `getMaskCapabilities()` once per session
+  (disable AI buttons with the reason as tooltip).
+- Create: "Add" menu -> brush / linear / radial / luminance / colour / subject / sky / background / people /
+  object (/ landscape): `newMaskGroup("Mask N", [newMaskComponent(shape, "Brush 1")])`. AI: `computeAiMask(id,
+  {target, referencePoint, force: false})` -> set `shape.digest` to the result. People: `detectPeople(id)` ->
+  pick person(s) + parts (checkboxes from `capabilities.personParts`) -> one component with
+  `{kind: "people", parts}` + `referencePoint`. Background = `{kind: "background"}`.
+- Components: add / subtract / intersect (Lightroom "Add", "Subtract" buttons; Alt-click = subtract), invert,
+  opacity, show/hide, rename, delete, reorder; group: amount, show/hide, rename, duplicate, invert, delete.
+- Editing: while dragging (brush stroke, gradient handle, local slider) send `renderPreview(id,
+  {...adjustments, masks: live}, opts)` as for global sliders (draft size while dragging); commit with
+  `saveMasks(id, masks, "Mask: <what>")` on release (same-label saves coalesce).
+- Overlay (O toggles, Shift+O cycles colour; "Show overlay" checkbox): `renderMaskOverlay(id, liveAdjustments,
+  {groupId, componentId}, {maxEdge, region})` -> grayscale JPEG with the same frame as the main render; composite
+  as a CSS luminance mask over a colour layer (Lightroom styles: colour overlay, on black/white, B&W). Hovering a
+  component shows its own overlay (`componentId`); the selected group shows the combined mask.
+- Tools and shortcuts (Lightroom Classic): K brush (`[` / `]` size, Shift+`[` / `]` feather, Alt = eraser,
+  A auto-mask), M linear gradient, Shift+M radial gradient, Shift+J colour range, Shift+Q luminance range,
+  O overlay, Shift+O overlay colour, H show/hide pins, Delete remove the selected component, Enter / Esc done,
+  Cmd+Z undo (history covers masks). Brush cursor radius on screen = `radius x sensorWidth` in displayed px
+  (from `DevelopInfo.fullWidth/Height` + orientation).
+- Warnings: `ai_mask_needs_update` (offer "Update all" = `computeAiMask` for each `needs_update` component, then
+  save the digests), `masks_unsupported` (Lightroom components kept but not rendered).
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -524,7 +659,7 @@ migrations tracked by `PRAGMA user_version`.
 |---|---|
 | `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `folders` | imported roots |
-| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read) |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
@@ -539,9 +674,54 @@ migrations tracked by `PRAGMA user_version`.
 | `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
 | `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`) |
 | `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
+| `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.
 - `cargo test` fails (`bindings_are_up_to_date`) if the committed bindings are stale;
   fix with `UPDATE_BINDINGS=1 cargo test bindings`.
 - Log every contract change in `docs/ipc-changelog.md`.
+
+## Packaging (Phase 8)
+
+`pnpm tauri build` (Apple Silicon, macOS 15+) produces
+`src-tauri/target/release/bundle/macos/Sieve.app` (~58 MB) and `bundle/dmg/Sieve_<version>_aarch64.dmg` (~35 MB).
+`beforeBuildCommand` = `pnpm build && bash scripts/fetch-models.sh --culling`.
+
+- **Native libraries** (`build.rs`, macOS): LibRaw (`libraw_r`) and TurboJPEG are found in Homebrew as before,
+  then copied with their non-system transitive deps (`libomp`, `libjpeg.8`, `liblcms2.2`) into
+  `src-tauri/target/sieve-stage/Frameworks/`, install ids / references rewritten to `@rpath/<name>`, ad-hoc
+  re-signed, and linked from there. `tauri.conf.json` `bundle.macOS.frameworks` lists the staged files
+  (build.rs fails with a clear message if Homebrew's dependency graph changes); tauri-build copies them to
+  `target/Frameworks` and adds `-rpath @executable_path/../Frameworks`, the bundler ships them in
+  `Contents/Frameworks`. build.rs also copies them to `target/<profile>/Frameworks` so test/example binaries
+  (`target/<profile>/{deps,examples}`) resolve the same rpath. No `/opt/homebrew` load command remains in the
+  bundle. Homebrew bottles set the minimum OS (currently 15.0 = `minimumSystemVersion`).
+- **ONNX Runtime** is statically linked by `ort` (no dylib); the CoreML EP works from the bundle.
+- **Models**: the culling models (~27 MB: SCRFD, 2d106, open/closed eye, FaceMesh) are staged by build.rs into
+  `target/sieve-stage/models/` and bundled as `Contents/Resources/models` (resource map in tauri.conf.json;
+  release bundle builds fail if they are missing). The AI-mask models (~560 MB) are not bundled: release builds
+  read them from `<app_data_dir>/models` (`~/Library/Application Support/com.sieve.app/models`), where
+  `model_fetch::link_bundled` symlinks the bundled face models at startup (people / part masks need them) and
+  `model_fetch::fetch` downloads the segmentation set (system `curl`, resumable `.part`, SHA-256 from
+  `models/checksums.sha256`, rename only after verification). Until installed, AI masks report "model file ...
+  not installed"; `scripts/fetch-models.sh --dest <that dir>` pre-seeds them. Debug builds and `SIEVE_MODELS`
+  keep using a single directory.
+- **In-app download (IPC v12)**: managed state `model_fetch::ModelDownloads` (lib.rs, dir = the segmenter's
+  models dir: `<app_data_dir>/models` release, `src-tauri/models` dev, or `SIEVE_MODELS`). `download_models`
+  runs `model_fetch::fetch` on a `model-download` thread (one at a time), emits `ModelDownloadProgress`
+  (throttled ~5/s + one per completed file) and exactly one `ModelDownloadFinished`; `cancel_model_download`
+  kills curl (the `.part` is kept and resumed next time). `model_downloads_status` is a size check per file.
+  No restart needed: `Segmenter::capabilities` / `available` check the model files on every call and sessions
+  load lazily, so `get_mask_capabilities` flips to available as soon as the verified files are renamed in.
+- **Signing**: ad-hoc (`signingIdentity: "-"`), hardened runtime, `Entitlements.plist` =
+  `com.apple.security.cs.disable-library-validation` only (required: without it dyld rejects the ad-hoc
+  Frameworks under the hardened runtime — verified). Not sandboxed (user-chosen folders, sidecars, Adobe
+  profiles read in place). Adobe files are never bundled. Developer ID signing + notarization need an Apple
+  Developer account (future; Tauri notarizes when `APPLE_*` env vars are set).
+- **Icon**: `src-tauri/icons/sieve.svg` → `pnpm tauri icon src-tauri/icons/sieve.svg` (then drop android/ios).
+- **Smoke test**: `cargo build --release --example bundle_smoke && scripts/bundle-smoke.sh <copied samples>
+  [work_dir]` — checks load commands and signature, launches `Contents/MacOS/sieve` with a clean env and scratch
+  catalog (migrations, dylibs mapped from `Contents/Frameworks` via `lsof`; the hardened runtime ignores
+  `DYLD_PRINT_LIBRARIES`), then runs import → thumbnails → CoreML culling → render → full-res JPEG export from
+  inside a copy of the bundle.

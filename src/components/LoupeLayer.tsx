@@ -1,10 +1,11 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Flag, X } from "lucide-react";
-import { commands, convertFileSrc, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
+import { commands, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
-import { SceneBadge, Stars, XmpBadge } from "./Cell";
+import { CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
+import { Filmstrip } from "./Filmstrip";
+import { usePanels } from "../lib/panels";
 import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
 
 export interface CompareState {
@@ -37,6 +38,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
   const [info, setInfo] = useState<InfoLevel>("full");
   const faceIdx = useRef(-1);
   const metrics = useRef<Metrics | null>(null);
+  const panels = usePanels("loupe");
   const viewRef = useRef(view);
   viewRef.current = view;
 
@@ -123,7 +125,9 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
           {faces.length > 0 ? ` · ${faces.length} face${faces.length > 1 ? "s" : ""}` : ""}
         </div>
       </div>
-      {mode === "loupe" && <Filmstrip lib={lib} activeId={activeId} onOpen={onOpen} />}
+      {mode === "loupe" && !panels.chrome && (
+        <Filmstrip lib={lib} activeId={activeId} onPick={(id) => onOpen(id)} cellW={80} cellH={64} height={72} scenePrefix="loupe-film-scene" align="center" />
+      )}
     </div>
   );
 });
@@ -165,7 +169,9 @@ function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | unde
         {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} />}
         {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
         <Stars n={entry.rating} />
+        <HealthBadge entry={entry} testPrefix="loupe-health" />
         <XmpBadge entry={entry} />
+        <CompanionBadge entry={entry} testPrefix="loupe-companion" />
         {showKeeper && entry.isBurstKeeper && (
           <span className="rounded bg-green-900 px-1.5 text-green-200" data-testid="keeper-badge">
             Keeper
@@ -191,50 +197,6 @@ function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | unde
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function Filmstrip({ lib, activeId, onOpen }: { lib: Library; activeId: number | null; onOpen: (id: number) => void }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const { ids, ensure } = lib;
-  const v = useVirtualizer({ horizontal: true, count: ids.length, getScrollElement: () => ref.current, estimateSize: () => 84, overscan: 8 });
-  const idx = activeId == null ? -1 : ids.indexOf(activeId);
-  useEffect(() => {
-    if (idx >= 0) v.scrollToIndex(idx, { align: "center" });
-  }, [idx, v]);
-  const items = v.getVirtualItems();
-  const first = items[0]?.index ?? 0;
-  const last = (items[items.length - 1]?.index ?? -1) + 1;
-  useEffect(() => {
-    ensure(ids.slice(first, last));
-  }, [ids, first, last, ensure]);
-  const open = useCallback((id: number) => onOpen(id), [onOpen]);
-  return (
-    <div ref={ref} className="h-[72px] shrink-0 overflow-x-auto overflow-y-hidden border-t border-neutral-800 bg-neutral-950" data-testid="filmstrip">
-      <div style={{ width: v.getTotalSize(), height: "100%", position: "relative" }}>
-        {items.map((it) => {
-          const id = ids[it.index];
-          const e = lib.getEntry(id);
-          const t = e?.thumbnail;
-          return (
-            <button
-              key={it.key}
-              tabIndex={-1}
-              onClick={() => open(id)}
-              className={`absolute top-1 h-16 w-20 overflow-hidden rounded bg-neutral-900 ${id === activeId ? "ring-2 ring-sky-500" : "opacity-70 hover:opacity-100"}`}
-              style={{ left: 0, transform: `translateX(${it.start}px)` }}
-            >
-              {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(id)}`} alt="" className="size-full object-cover" draggable={false} />}
-              {e && e.sceneId != null && (
-                <span className="absolute bottom-0.5 left-0.5">
-                  <SceneBadge entry={e} testPrefix="loupe-film-scene" />
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
     </div>
   );
 }

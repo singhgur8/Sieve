@@ -1,6 +1,6 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
-import { Aperture, Check, ChevronDown, CloudUpload, Columns2, DownloadCloud, FolderOpen, Grid3x3, Keyboard, Maximize, MoreHorizontal, ScanSearch, Share, SlidersHorizontal, Layers3 } from "lucide-react";
+import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, Grid3x3, Keyboard, Maximize, MoreHorizontal, RefreshCw, ScanSearch, Share, SlidersHorizontal, Layers3 } from "lucide-react";
 import type { CatalogState, ImportOptions, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
@@ -35,6 +35,8 @@ interface Props {
   onReadXmp: () => void;
   onExport: () => void;
   onCheatSheet: () => void;
+  onModels: () => void;
+  onRegenerate: () => void;
   /** 0-100 while export jobs run, otherwise null. */
   exportPct: number | null;
 }
@@ -220,6 +222,28 @@ export function TopBar(p: Props) {
               }}
             >
               <Keyboard className="size-4" /> Keyboard shortcuts <span className="ml-auto text-xs text-neutral-400">?</span>
+            </button>
+            <button
+              className={menuItem}
+              disabled={!p.hasSelection}
+              data-testid="regenerate-previews"
+              title="Extract the thumbnails and previews of the selection again (when they look broken or are missing)"
+              onClick={() => {
+                close();
+                p.onRegenerate();
+              }}
+            >
+              <RefreshCw className="size-4" /> Regenerate previews
+            </button>
+            <button
+              className={menuItem}
+              data-testid="manage-models"
+              onClick={() => {
+                close();
+                p.onModels();
+              }}
+            >
+              <Cpu className="size-4" /> Manage AI models…
             </button>
           </>
         )}
