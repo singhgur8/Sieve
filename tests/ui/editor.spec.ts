@@ -257,6 +257,31 @@ test.describe("develop", () => {
     await expect(page.getByTestId("slider-value-tint")).toHaveText("+8");
   });
 
+  test("resetting Temp/Tint returns to As Shot when values match as-shot", async ({ page }) => {
+    await openDevelop(page);
+    await setSlider(page, "tint", 40);
+    await setSlider(page, "temp", 0.7);
+    await page.getByTestId("slider-label-tint").dblclick();
+    let wb = (await saves(page)).pop()!.args.adjustments.whiteBalance;
+    expect(wb).toMatchObject({ mode: "custom", tint: 8 });
+    await page.getByTestId("slider-label-temp").dblclick();
+    wb = (await saves(page)).pop()!.args.adjustments.whiteBalance;
+    expect(wb).toEqual({ mode: "as_shot" });
+    await expect(page.getByTestId("slider-value-temp")).toHaveText("5200 K");
+  });
+
+  test("End/PageDown keys commit the slider", async ({ page }) => {
+    await openDevelop(page);
+    const s = page.getByTestId("slider-exposure");
+    await s.focus();
+    await clearCalls(page);
+    await page.keyboard.press("End");
+    await expect.poll(async () => (await saves(page)).length).toBe(1);
+    expect((await saves(page))[0].args.adjustments.exposure).toBeGreaterThan(0);
+    await page.keyboard.press("PageDown");
+    await expect.poll(async () => (await saves(page)).pop()?.args.adjustments.exposure).toBeLessThan(5);
+  });
+
   test("Color Mixer edits a band and section reset clears it", async ({ page }) => {
     await openDevelop(page);
     await setSlider(page, "hsl-hue-blue", 30);

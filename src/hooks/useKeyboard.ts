@@ -23,7 +23,8 @@ export function useKeyboard(handler: (e: KeyboardEvent) => void) {
     const release = (e: Event) => {
       const t = e.target;
       if (!(t instanceof HTMLElement)) return;
-      if (t.closest("button, input[type=checkbox], input[type=range]") || (e.type === "change" && t.closest("select"))) t.blur();
+      // Range inputs keep focus on `change` so repeated arrow/Home/End/Page keys keep adjusting.
+      if (e.type === "click" ? t.closest("button, input[type=checkbox], input[type=range]") : t.closest("select, input[type=checkbox]")) t.blur();
     };
     window.addEventListener("keydown", down);
     window.addEventListener("click", release);

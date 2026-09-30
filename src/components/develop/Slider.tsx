@@ -45,9 +45,9 @@ export const Slider = memo(function Slider({ id, label, value, min, max, step, d
         disabled={disabled}
         onChange={(e) => onInput(Number(e.target.value))}
         onPointerUp={onCommit}
-        onKeyUp={(e) => e.key.startsWith("Arrow") && onCommit()}
+        onKeyUp={(e) => (e.key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(e.key)) && onCommit()}
         onBlur={onCommit}
-        onDoubleClick={onReset}
+        onDoubleClick={disabled ? undefined : onReset}
       />
     </div>
   );

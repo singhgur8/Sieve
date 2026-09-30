@@ -75,6 +75,12 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
   const temp = wb.mode === "custom" ? wb.temperatureK : asShot.temperatureK;
   const tint = wb.mode === "custom" ? wb.tint : asShot.tint;
   const setWb = (t: number, ti: number, label: string) => edit((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: t, tint: ti } }), label);
+  const wbReady = info !== null;
+  const resetWb = (t: number, ti: number, label: string) =>
+    change(
+      (a) => ({ ...a, whiteBalance: t === asShot.temperatureK && ti === asShot.tint ? { mode: "as_shot" } : { mode: "custom", temperatureK: t, tint: ti } }),
+      label,
+    );
   const lut = adj.lut;
   const setLut = (l: ParametricAdjustments["lut"], commitNow: boolean) => (commitNow ? change : edit)((a) => ({ ...a, lut: l }), "LUT");
 
@@ -112,7 +118,8 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
           accent="#fbbf24"
           onInput={(p) => setWb(posToTemp(p), tint, "Temp")}
           onCommit={commit}
-          onReset={() => change((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: asShot.temperatureK, tint } }), "Temp")}
+          onReset={() => resetWb(asShot.temperatureK, tint, "Temp")}
+          disabled={!wbReady}
         />
         <Slider
           id="tint"
@@ -124,7 +131,8 @@ export function AdjustPanel({ editor, luts, onImportLut }: Props) {
           accent="#e879f9"
           onInput={(v) => setWb(temp, v, "Tint")}
           onCommit={commit}
-          onReset={() => change((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: temp, tint: asShot.tint } }), "Tint")}
+          onReset={() => resetWb(temp, asShot.tint, "Tint")}
+          disabled={!wbReady}
         />
         {BASIC.map(simple)}
       </Section>
