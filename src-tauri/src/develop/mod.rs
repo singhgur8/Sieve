@@ -24,6 +24,7 @@
 //!   queue); concurrent decodes of the same image are coalesced.
 
 pub mod camera;
+pub mod fastmath;
 pub mod highlights;
 pub mod history;
 pub mod local;
@@ -240,24 +241,16 @@ impl Entry {
         }
     }
 
-    /// Local tone context of the whole uncropped source (so drafts, previews, zoomed
-    /// regions and exports adapt alike); `None` when Shadows/Highlights are neutral.
+    /// Local tone + highlight-reconstruction context of the whole uncropped source (so
+    /// drafts, previews, zoomed regions and exports adapt and rebuild clipped highlights
+    /// alike, local Shadows/Highlights of mask groups included); cached per white balance /
+    /// calibration / profile.
     fn tone_context(
         &self,
         orientation: u8,
         adjustments: &ParametricAdjustments,
         profile: &Profile,
     ) -> Option<pipeline::ToneContext> {
-        let look = profile.look.as_ref().map(|l| (l.parameters.shadows, l.parameters.highlights));
-        let (ls, lh) = look.unwrap_or((0.0, 0.0));
-        // Local Shadows/Highlights (mask groups) sample the same whole-frame context.
-        let local = adjustments
-            .masks
-            .iter()
-            .any(|g| g.active && g.amount != 0.0 && (g.adjustments.shadows != 0.0 || g.adjustments.highlights != 0.0));
-        if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 && !local {
-            return None;
-        }
         let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
         let cached = lock(&self.tone_ctx).as_ref().filter(|(k, _)| *k == key).map(|(_, c)| c.clone());
         let base = match cached {

@@ -36,19 +36,6 @@ const VOTE_HI: f32 = 0.6;
 const DESAT_ONE: f32 = 0.3;
 const DESAT_TWO: f32 = 1.0;
 
-/// TEMP experiment knobs (`SIEVE_K="name=v,..."`).
-pub fn knob(name: &str, default: f32) -> f32 {
-    static K: std::sync::OnceLock<Vec<(String, f32)>> = std::sync::OnceLock::new();
-    let k = K.get_or_init(|| {
-        std::env::var("SIEVE_K")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|kv| kv.split_once('=').map(|(a, b)| (a.to_owned(), b.parse().unwrap_or(0.0))))
-            .collect()
-    });
-    k.iter().find(|(a, _)| a == name).map_or(default, |(_, v)| *v)
-}
-
 #[inline]
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);

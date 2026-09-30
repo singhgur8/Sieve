@@ -35,6 +35,7 @@ use crate::profiles::dcp::{self as dcpm, HsvTable};
 use crate::profiles::table::{BigTable, RgbTable};
 
 use super::camera::{self, ColorSetup, Profile, PROPHOTO_TO_XYZ};
+use super::fastmath;
 use super::highlights::{self, HighlightField};
 use super::local::LocalOps;
 use super::masks::{LocalParam, LocalPlanes};
@@ -635,46 +636,40 @@ struct Chain<'a> {
 }
 
 /// Highlight roll-off anchored at the raw clip level (pre-exposure scene EV, neutral clip =
-/// 0), measured on real frames: Camera Raw renders near-clip and reconstructed values
-/// `delta(e) = STRENGTH * WIDTH * ln(1 + exp((e - KNEE) / WIDTH))` EV darker than its
-/// exposure / tone model of unclipped data implies (0.04 EV at -1.5, ~0.33 at the clip).
-/// Applied hue-preservingly on the RGB max/min (like the tone curve), so it also
-/// desaturates the brightest colours.
+/// 0), measured on real frames (`tools/acr-oracle`, round 2): Camera Raw renders near-clip
+/// and reconstructed values `delta(e) = STRENGTH * WIDTH * ln(1 + exp((e - KNEE) / WIDTH))`
+/// EV darker than its exposure / tone model of unclipped data implies (0.03 EV at -1.5,
+/// 0.29 at the clip, independent of the exposure slider). Applied hue-preservingly on the
+/// RGB max/min (like the tone curve), which also desaturates the brightest colours
+/// (fit-set dE 2.31 vs 2.38 as a luminance gain).
 struct Shoulder {
     table: SqrtTable,
-    rgb: bool,
 }
+
+const SHOULDER_STRENGTH: f32 = 0.4;
+const SHOULDER_KNEE: f32 = -0.6;
+const SHOULDER_WIDTH: f32 = 0.5;
 
 impl Shoulder {
     fn new() -> Self {
-        let (c, k, w) = (highlights::knob("shc", 0.4), highlights::knob("shk", -0.6), highlights::knob("shw", 0.5));
+        let (c, k, w) = (SHOULDER_STRENGTH, SHOULDER_KNEE, SHOULDER_WIDTH);
         let table = SqrtTable::new(LUT_LOG_MAX.exp2(), 4096, move |x| {
             if x <= 0.0 {
                 return 0.0;
             }
-            let e = x.log2();
-            let d = c * w * (1.0 + ((e - k) / w).exp()).ln();
+            let d = c * w * (1.0 + ((x.log2() - k) / w).exp()).ln();
             x * (-d).exp2()
         });
-        Shoulder { table, rgb: highlights::knob("shrgb", 1.0) > 0.0 }
+        Shoulder { table }
     }
 
     #[inline]
     fn apply(&self, v: [f32; 3]) -> [f32; 3] {
-        if self.rgb {
-            let [r, g, b] = v;
-            let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
-            let (h2, l2) = (self.table.eval(hi), self.table.eval(lo));
-            let map = |c: f32| if hi > lo { l2 + (h2 - l2) * (c - lo) / (hi - lo) } else { h2 };
-            [map(r), map(g), map(b)]
-        } else {
-            let y = dot(PROPHOTO_Y, v);
-            if y <= 0.0 {
-                return v;
-            }
-            let k = self.table.eval(y) / y;
-            v.map(|c| c * k)
-        }
+        let [r, g, b] = v;
+        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+        let (h2, l2) = (self.table.eval(hi), self.table.eval(lo));
+        let map = |c: f32| if hi > lo { l2 + (h2 - l2) * (c - lo) / (hi - lo) } else { h2 };
+        [map(r), map(g), map(b)]
     }
 }
 
@@ -741,7 +736,7 @@ impl Chain<'_> {
         if let Some(l) = &self.look_rgb {
             v = l.apply(v);
         }
-        let mut e = v.map(|c| srgb_encode(c.clamp(0.0, 1.0)));
+        let mut e = v.map(|c| fastmath::srgb_encode(c.clamp(0.0, 1.0)));
         for (k, lut) in self.rgb_curves.iter().enumerate() {
             if let Some(lut) = lut {
                 e[k] = parity::eval_lut(lut, e[k]);
@@ -750,7 +745,7 @@ impl Chain<'_> {
         e = self.grade.apply(e);
         let _ = self.display_referred;
         // Display-linear ProPhoto; the output stage runs per pixel after the LUT.
-        e.map(|c| srgb_decode(c.clamp(0.0, 1.0)))
+        e.map(|c| fastmath::srgb_decode(c.clamp(0.0, 1.0)))
     }
 }
 
@@ -807,6 +802,10 @@ const LUT_LOG_MAX: f32 = 4.0;
 
 impl Lut3 {
     fn build(chain: &Chain, n: usize) -> Lut3 {
+        Self::build_with(n, |v| chain.eval(v))
+    }
+
+    fn build_with(n: usize, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) -> Lut3 {
         let a = LUT_LOG_A.exp2();
         let step = ((LUT_LOG_MAX.exp2() + a).log2() - LUT_LOG_A) / (n - 1) as f32;
         let node = |i: usize| ((LUT_LOG_A + i as f32 * step).exp2() - a).max(0.0);
@@ -815,7 +814,7 @@ impl Lut3 {
         data.par_chunks_mut(n * n).enumerate().for_each(|(r, plane)| {
             for g in 0..n {
                 for b in 0..n {
-                    plane[g * n + b] = chain.eval([coords[r], coords[g], coords[b]]);
+                    plane[g * n + b] = f([coords[r], coords[g], coords[b]]);
                 }
             }
         });
@@ -825,7 +824,7 @@ impl Lut3 {
     #[inline(always)]
     fn coord(&self, x: f32) -> f32 {
         let a = LUT_LOG_A.exp2();
-        (((x.max(0.0) + a).log2() - LUT_LOG_A) * self.inv_step).clamp(0.0, (self.n - 1) as f32)
+        ((fastmath::log2(x.max(0.0) + a) - LUT_LOG_A) * self.inv_step).clamp(0.0, (self.n - 1) as f32)
     }
 
     /// Tetrahedral interpolation.
@@ -1030,7 +1029,7 @@ fn develop(
         curve,
         rgb_curves: [luts.red, luts.green, luts.blue],
         grade: Grade::new(&adj.color_grading),
-        shoulder: (!display && highlights::knob("sh", 1.0) > 0.0).then(Shoulder::new),
+        shoulder: (!display).then(Shoulder::new),
         _marker: std::marker::PhantomData,
     };
     let lut = Lut3::build(&chain, quality.lut_size());
@@ -1092,16 +1091,43 @@ fn develop(
 }
 
 /// Camera RGB16 -> white-balanced linear ProPhoto (pre-exposure; neutral clip = 1).
-/// Raw-clipped channels are reconstructed ([`highlights`]) for camera sources; display-
-/// referred sources clip at 1.
+/// Raw-clipped channels are reconstructed ([`highlights`]) for camera sources with the
+/// highlight field of the whole-frame context (`input.tone`) when given (so zoomed regions
+/// rebuild like the whole frame), else of this input; display-referred sources clip at 1.
 fn to_working(input: &RenderInput, setup: &ColorSetup) -> Vec<f32> {
+    if input.profile.display_referred {
+        return to_working_with(input, setup, None::<(&HighlightField, fn(f32, f32) -> (f32, f32))>);
+    }
+    let view = input.view;
+    match input.tone.and_then(|t| t.highlights.as_ref().map(|f| (t, f))) {
+        Some((ctx, field)) => {
+            let (fw, fh) = (view.frame_w.max(1e-3), view.frame_h.max(1e-3));
+            let to_field = |x: f32, y: f32| ctx.to_source((x - view.frame_x) / fw, (y - view.frame_y) / fh);
+            to_working_with(input, setup, Some((field, to_field)))
+        }
+        None if input.tone.is_some() => {
+            to_working_with(input, setup, None::<(&HighlightField, fn(f32, f32) -> (f32, f32))>)
+        }
+        None => {
+            let (w, h) = (input.width as usize, input.height as usize);
+            let own = HighlightField::compute(input.pixels, w, h, setup.mul);
+            let (wf, hf) = (w as f32, h as f32);
+            to_working_with(input, setup, own.as_ref().map(|f| (f, move |x: f32, y: f32| (x / wf, y / hf))))
+        }
+    }
+}
+
+/// [`to_working`] with an explicit highlight field and a map from input pixel centres to
+/// the field's normalized coordinates (`None` = no raw clipping: clip at 1).
+fn to_working_with<F: Fn(f32, f32) -> (f32, f32) + Sync>(
+    input: &RenderInput,
+    setup: &ColorSetup,
+    field: Option<(&HighlightField, F)>,
+) -> Vec<f32> {
     let (w, h) = (input.width as usize, input.height as usize);
     let m = setup.m;
     let mut rgb = vec![0.0f32; w * h * 3];
-    let field = (!input.profile.display_referred && highlights::knob("hlr", 1.0) > 0.0)
-        .then(|| HighlightField::compute(input.pixels, w, h, setup.mul))
-        .flatten();
-    let Some(field) = field else {
+    let Some((field, to_field)) = field else {
         let mul = setup.mul.map(|m| m / 65535.0);
         rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
             for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
@@ -1118,11 +1144,12 @@ fn to_working(input: &RenderInput, setup: &ColorSetup) -> Vec<f32> {
     let mul = setup.mul;
     let lo = (highlights::CLIP_LO * 65535.0) as u16;
     rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).enumerate().for_each(|(y, (out, inp))| {
-        let v = (y as f32 + 0.5) / h as f32;
+        let yc = y as f32 + 0.5;
         for (x, (o, p)) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0).enumerate() {
             let mut c = [0, 1, 2].map(|k| f32::from(p[k]) / 65535.0 * mul[k]);
             if p[0].max(p[1]).max(p[2]) > lo {
-                c = highlights::reconstruct(c, mul, field.sample((x as f32 + 0.5) / w as f32, v));
+                let (u, v) = to_field(x as f32 + 0.5, yc);
+                c = highlights::reconstruct(c, mul, field.sample(u, v));
             }
             o.copy_from_slice(&mat3(&m, c));
         }
@@ -1162,6 +1189,8 @@ pub struct ToneContext {
     pub stats: ToneStats,
     fine: Vec<f32>,
     coarse: Vec<f32>,
+    /// Highlight chromaticity of the whole source ([`highlights`]); `None` without clipping.
+    highlights: Option<HighlightField>,
     bw: usize,
     bh: usize,
     /// Render frame (normalized, oriented, cropped) -> context grid (normalized).
@@ -1178,8 +1207,19 @@ impl ToneContext {
     pub fn compute(input: &RenderInput, adjustments: &ParametricAdjustments) -> ToneContext {
         let adj = effective(adjustments, input.profile);
         let setup = camera::color_setup(input.color, input.profile, &adj.white_balance, &adj.calibration);
-        let rgb = to_working(input, &setup);
-        ToneContext::from_working(&rgb, input.width as usize, input.height as usize)
+        let (w, h) = (input.width as usize, input.height as usize);
+        let field =
+            (!input.profile.display_referred).then(|| HighlightField::compute(input.pixels, w, h, setup.mul)).flatten();
+        let (wf, hf) = (w as f32, h as f32);
+        let rgb = to_working_with(input, &setup, field.as_ref().map(|f| (f, move |x: f32, y: f32| (x / wf, y / hf))));
+        ToneContext { highlights: field, ..ToneContext::from_working(&rgb, w, h) }
+    }
+
+    /// Render-frame coordinates (0..=1) -> this context's source coordinates (0..=1).
+    #[inline]
+    fn to_source(&self, u: f32, v: f32) -> (f32, f32) {
+        let m = &self.map;
+        (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5])
     }
 
     /// Maps render frames of `crop` + EXIF `orientation` (un-oriented source `src_w` x
@@ -1257,14 +1297,13 @@ impl ToneContext {
             || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_FINE), ld::RANGE, ld::RANGE_POWER),
             || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_COARSE), ld::RANGE, ld::RANGE_POWER),
         );
-        ToneContext { stats, fine, coarse, bw: gw, bh: gh, map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] }
+        ToneContext { stats, fine, coarse, highlights: None, bw: gw, bh: gh, map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] }
     }
 
     /// Fine and coarse bases (log2 Y) at render-frame coordinates `u`, `v` (0..=1).
     #[inline]
     pub fn bases(&self, u: f32, v: f32) -> (f32, f32) {
-        let m = &self.map;
-        let (su, sv) = (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+        let (su, sv) = self.to_source(u, v);
         let gx = (su * self.bw as f32 - 0.5).clamp(0.0, (self.bw - 1) as f32);
         let gy = (sv * self.bh as f32 - 0.5).clamp(0.0, (self.bh - 1) as f32);
         let (x0, y0) = (gx as usize, gy as usize);
@@ -1776,6 +1815,25 @@ mod tests {
         adj.lut = Some(LutRef { id: "inv".into(), amount: 50.0 });
         let half = run(&adj, Some(&lut));
         assert!(half.rgb.iter().step_by(97).all(|&v| (i32::from(v) - 128).abs() <= 2));
+    }
+
+    /// The clip-anchored shoulder: ~0.29 EV at the raw clip, negligible 3 EV below it,
+    /// monotone, and hue-preserving (channel order kept, colours desaturate slightly).
+    #[test]
+    fn highlight_shoulder_rolls_off_at_the_raw_clip() {
+        let s = Shoulder::new();
+        let ev = |x: f32| (s.apply([x; 3])[0] / x).log2();
+        assert!((ev(1.0) + 0.29).abs() < 0.02, "{}", ev(1.0));
+        assert!(ev(0.125).abs() < 0.01, "{}", ev(0.125));
+        let mut last = 0.0;
+        for i in 1..400 {
+            let y = s.apply([i as f32 * 0.01; 3])[0];
+            assert!(y > last);
+            last = y;
+        }
+        let c = s.apply([1.2, 0.9, 0.5]);
+        assert!(c[0] > c[1] && c[1] > c[2]);
+        assert!(c[0] / c[2] < 1.2 / 0.5, "{c:?}");
     }
 
     #[test]

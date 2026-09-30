@@ -609,21 +609,7 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     }
 }
 
-fn srgb_encode(v: f32) -> f32 {
-    if v <= 0.003_130_8 {
-        12.92 * v
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn srgb_decode(e: f32) -> f32 {
-    if e <= 0.040_45 {
-        e / 12.92
-    } else {
-        ((e + 0.055) / 1.055).powf(2.4)
-    }
-}
+use crate::develop::fastmath::{srgb_decode, srgb_encode};
 
 impl HsvTable {
     /// Identity table (hue 0, scales 1).

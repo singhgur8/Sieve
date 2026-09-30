@@ -657,45 +657,88 @@ pub fn box2d(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             out[x] = acc / cnt as f32;
         }
     });
-    // Vertical running sums over column strips.
-    const STRIP: usize = 64;
+    // Vertical sliding sums over blocks of rows (each block primes its window from `tmp`,
+    // then slides; whole rows, written straight into the output).
+    const BLOCK: usize = 32;
     let mut out = vec![0.0f32; w * h];
-    let strips: Vec<usize> = (0..w).step_by(STRIP).collect();
-    let results: Vec<(usize, Vec<f32>)> = strips
-        .par_iter()
-        .map(|&x0| {
-            let sw = STRIP.min(w - x0);
-            let mut col = vec![0.0f32; sw * h];
-            let mut acc = vec![0.0f32; sw];
-            let mut cnt = 0usize;
-            for y in 0..r.min(h) {
-                let row = &tmp[y * w + x0..y * w + x0 + sw];
-                acc.iter_mut().zip(row).for_each(|(a, v)| *a += *v);
-                cnt += 1;
-            }
-            for y in 0..h {
+    let row = |y: usize| &tmp[y * w..(y + 1) * w];
+    out.par_chunks_mut(w * BLOCK).enumerate().for_each(|(b, chunk)| {
+        let y0 = b * BLOCK;
+        let mut acc = vec![0.0f32; w];
+        let lo = y0.saturating_sub(r);
+        let hi = (y0 + r).min(h - 1);
+        for y in lo..=hi {
+            acc.iter_mut().zip(row(y)).for_each(|(a, v)| *a += *v);
+        }
+        for (k, o) in chunk.chunks_mut(w).enumerate() {
+            let y = y0 + k;
+            if k > 0 {
                 if y + r < h {
-                    let row = &tmp[(y + r) * w + x0..(y + r) * w + x0 + sw];
-                    acc.iter_mut().zip(row).for_each(|(a, v)| *a += *v);
-                    cnt += 1;
+                    acc.iter_mut().zip(row(y + r)).for_each(|(a, v)| *a += *v);
                 }
                 if y > r {
-                    let row = &tmp[(y - r - 1) * w + x0..(y - r - 1) * w + x0 + sw];
-                    acc.iter_mut().zip(row).for_each(|(a, v)| *a -= *v);
-                    cnt -= 1;
+                    acc.iter_mut().zip(row(y - r - 1)).for_each(|(a, v)| *a -= *v);
                 }
-                let inv = 1.0 / cnt as f32;
-                col[y * sw..(y + 1) * sw].iter_mut().zip(&acc).for_each(|(o, a)| *o = a * inv);
             }
-            (x0, col)
-        })
-        .collect();
-    for (x0, col) in results {
-        let sw = STRIP.min(w - x0);
-        for y in 0..h {
-            out[y * w + x0..y * w + x0 + sw].copy_from_slice(&col[y * sw..(y + 1) * sw]);
+            let cnt = (y + r).min(h - 1) + 1 - y.saturating_sub(r);
+            let inv = 1.0 / cnt as f32;
+            o.iter_mut().zip(&acc).for_each(|(o, a)| *o = a * inv);
         }
+    });
+    out
+}
+
+/// [`box2d`] of `C` interleaved planes at once (one pair of passes instead of `C`).
+pub fn box2d_multi<const C: usize>(src: &[[f32; C]], w: usize, h: usize, r: usize) -> Vec<[f32; C]> {
+    if r == 0 {
+        return src.to_vec();
     }
+    let add = |a: &mut [f32; C], v: &[f32; C]| (0..C).for_each(|c| a[c] += v[c]);
+    let sub = |a: &mut [f32; C], v: &[f32; C]| (0..C).for_each(|c| a[c] -= v[c]);
+    let mut tmp = vec![[0.0f32; C]; w * h];
+    tmp.par_chunks_mut(w).zip(src.par_chunks(w)).for_each(|(out, row)| {
+        let mut acc = [0.0f32; C];
+        let mut cnt = 0usize;
+        for v in row.iter().take(r.min(w)) {
+            add(&mut acc, v);
+            cnt += 1;
+        }
+        for x in 0..w {
+            if x + r < w {
+                add(&mut acc, &row[x + r]);
+                cnt += 1;
+            }
+            if x > r {
+                sub(&mut acc, &row[x - r - 1]);
+                cnt -= 1;
+            }
+            out[x] = acc.map(|a| a / cnt as f32);
+        }
+    });
+    const BLOCK: usize = 32;
+    let mut out = vec![[0.0f32; C]; w * h];
+    let row = |y: usize| &tmp[y * w..(y + 1) * w];
+    out.par_chunks_mut(w * BLOCK).enumerate().for_each(|(b, chunk)| {
+        let y0 = b * BLOCK;
+        let mut acc = vec![[0.0f32; C]; w];
+        for y in y0.saturating_sub(r)..=(y0 + r).min(h - 1) {
+            acc.iter_mut().zip(row(y)).for_each(|(a, v)| add(a, v));
+        }
+        for (k, o) in chunk.chunks_mut(w).enumerate() {
+            let y = y0 + k;
+            if k > 0 {
+                if y + r < h {
+                    acc.iter_mut().zip(row(y + r)).for_each(|(a, v)| add(a, v));
+                }
+                if y > r {
+                    acc.iter_mut().zip(row(y - r - 1)).for_each(|(a, v)| sub(a, v));
+                }
+            }
+            let cnt = (y + r).min(h - 1) + 1 - y.saturating_sub(r);
+            let inv = 1.0 / cnt as f32;
+            o.iter_mut().zip(&acc).for_each(|(o, a)| *o = a.map(|v| v * inv));
+        }
+    });
     out
 }
 
@@ -739,46 +782,174 @@ fn small_blur(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     out
 }
 
+/// [`guided`] of two planes `p1`, `p2` by the same guide `i` (cross-guided), sharing the
+/// guide's statistics; results equal two `guided` calls exactly.
+pub fn guided_pair(i: &[f32], p1: &[f32], p2: &[f32], w: usize, h: usize, r: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
+    let mean_i = box2d(i, w, h, r);
+    let var_i: Vec<f32> = {
+        let ii: Vec<f32> = i.par_iter().map(|a| a * a).collect();
+        let mean_ii = box2d(&ii, w, h, r);
+        mean_ii.par_iter().zip(&mean_i).map(|(m2, m)| (m2 - m * m).max(0.0)).collect()
+    };
+    let one = |p: &[f32]| -> Vec<f32> {
+        let mean_p = box2d(p, w, h, r);
+        let mut mean_ip = {
+            let ip: Vec<f32> = i.par_iter().zip(p).map(|(a, b)| a * b).collect();
+            box2d(&ip, w, h, r)
+        };
+        // a -> mean_ip's buffer, b -> mean_p's.
+        let mut b = mean_p;
+        mean_ip.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (a, bb))| {
+            let cov = *a - mean_i[k] * *bb;
+            let av = cov / (var_i[k] + eps);
+            *bb -= av * mean_i[k];
+            *a = av;
+        });
+        let ma = box2d(&mean_ip, w, h, r);
+        drop(mean_ip);
+        let mb = box2d(&b, w, h, r);
+        b.par_iter_mut().enumerate().for_each(|(k, q)| *q = ma[k] * i[k] + mb[k]);
+        b
+    };
+    let (q1, q2) = rayon::join(|| one(p1), || one(p2));
+    (q1, q2)
+}
+
+/// Block means of `src` (w x h) over `s` x `s` blocks (edge blocks partial).
+fn downsample(src: &[f32], w: usize, h: usize, s: usize) -> (Vec<f32>, usize, usize) {
+    let (dw, dh) = (w.div_ceil(s), h.div_ceil(s));
+    let mut out = vec![0.0f32; dw * dh];
+    out.par_chunks_mut(dw).enumerate().for_each(|(y, row)| {
+        let (y0, y1) = (y * s, ((y + 1) * s).min(h));
+        for (x, o) in row.iter_mut().enumerate() {
+            let (x0, x1) = (x * s, ((x + 1) * s).min(w));
+            let mut acc = 0.0f32;
+            for yy in y0..y1 {
+                acc += src[yy * w + x0..yy * w + x1].iter().sum::<f32>();
+            }
+            *o = acc / ((y1 - y0) * (x1 - x0)) as f32;
+        }
+    });
+    (out, dw, dh)
+}
+
+/// Linear coefficients of the cross-guided filter of `p1` and `p2` by `i` (all `w` x `h`),
+/// box radius `r`, already box-averaged, interleaved `[a1, b1, a2, b2]`: q = a * guide + b.
+fn guided_coeffs_pair(i: &[f32], p1: &[f32], p2: &[f32], w: usize, h: usize, r: usize, eps: f32) -> Vec<[f32; 4]> {
+    let raw: Vec<[f32; 6]> = (0..w * h)
+        .into_par_iter()
+        .map(|k| {
+            let (g, a, b) = (i[k], p1[k], p2[k]);
+            [g, g * g, a, g * a, b, g * b]
+        })
+        .collect();
+    let st = box2d_multi(&raw, w, h, r);
+    drop(raw);
+    let ab: Vec<[f32; 4]> = st
+        .par_iter()
+        .map(|m| {
+            let var = (m[1] - m[0] * m[0]).max(0.0);
+            let a1 = (m[3] - m[0] * m[2]) / (var + eps);
+            let a2 = (m[5] - m[0] * m[4]) / (var + eps);
+            [a1, m[2] - a1 * m[0], a2, m[4] - a2 * m[0]]
+        })
+        .collect();
+    drop(st);
+    box2d_multi(&ab, w, h, r)
+}
+
+/// Bilinear upsampling taps of a coarse grid (factor `s`) for one axis of length `n`.
+fn up_taps(n: usize, coarse: usize, s: usize) -> Vec<(usize, usize, f32)> {
+    (0..n)
+        .map(|x| {
+            let g = ((x as f32 + 0.5) / s as f32 - 0.5).clamp(0.0, (coarse - 1) as f32);
+            let x0 = g as usize;
+            (x0, (x0 + 1).min(coarse - 1), g - x0 as f32)
+        })
+        .collect()
+}
+
+/// Fast guided filter (He & Sun 2015) of two planes by one guide: the linear coefficients
+/// are computed on `s` x `s` block means (box radius `r / s`) and bilinearly upsampled,
+/// then applied to the full-resolution guide. `s = 1` = [`guided_pair`].
+#[allow(clippy::too_many_arguments)]
+pub fn fast_guided_pair(
+    i: &[f32],
+    p1: &[f32],
+    p2: &[f32],
+    w: usize,
+    h: usize,
+    r: usize,
+    eps: f32,
+    s: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    if s <= 1 || w < 2 * s || h < 2 * s {
+        return guided_pair(i, p1, p2, w, h, r, eps);
+    }
+    let (il, lw, lh) = downsample(i, w, h, s);
+    let (p1l, _, _) = downsample(p1, w, h, s);
+    let (p2l, _, _) = downsample(p2, w, h, s);
+    let rl = ((r as f32 / s as f32).round() as usize).max(1);
+    let c = guided_coeffs_pair(&il, &p1l, &p2l, lw, lh, rl, eps);
+    let (xt, yt) = (up_taps(w, lw, s), up_taps(h, lh, s));
+    let mut q1 = vec![0.0f32; w * h];
+    let mut q2 = vec![0.0f32; w * h];
+    q1.par_chunks_mut(w).zip(q2.par_chunks_mut(w)).enumerate().for_each(|(y, (r1, r2))| {
+        let (y0, y1, fy) = yt[y];
+        for (x, &(x0, x1, fx)) in xt.iter().enumerate() {
+            let [a1, b1, a2, b2] = bilinear4(&c, lw, y0, y1, fy, x0, x1, fx);
+            let g = i[y * w + x];
+            r1[x] = a1 * g + b1;
+            r2[x] = a2 * g + b2;
+        }
+    });
+    (q1, q2)
+}
+
+/// Bilinear sample of four interleaved coarse planes.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn bilinear4(c: &[[f32; 4]], lw: usize, y0: usize, y1: usize, fy: f32, x0: usize, x1: usize, fx: f32) -> [f32; 4] {
+    let (a, b, d, e) = (c[y0 * lw + x0], c[y0 * lw + x1], c[y1 * lw + x0], c[y1 * lw + x1]);
+    [0, 1, 2, 3].map(|k| {
+        let t = a[k] + (b[k] - a[k]) * fx;
+        let u = d[k] + (e[k] - d[k]) * fx;
+        t + (u - t) * fy
+    })
+}
+
 /// Self-guided / cross-guided filter (He et al.): smooths `p` where the guide `i` is flat,
 /// preserves edges of the guide. `eps` in squared guide units.
 pub fn guided(i: &[f32], p: &[f32], w: usize, h: usize, r: usize, eps: f32) -> Vec<f32> {
-    let self_guided = std::ptr::eq(i, p);
-    let mean_i = box2d(i, w, h, r);
-    let mut mean_ii = {
-        let ii: Vec<f32> = i.par_iter().map(|a| a * a).collect();
-        box2d(&ii, w, h, r)
+    // Interleaved statistics / coefficients through `box2d_multi` (per channel identical to
+    // separate `box2d` passes).
+    let ab: Vec<[f32; 2]> = if std::ptr::eq(i, p) {
+        let raw: Vec<[f32; 2]> = i.par_iter().map(|&a| [a, a * a]).collect();
+        let st = box2d_multi(&raw, w, h, r);
+        drop(raw);
+        st.par_iter()
+            .map(|m| {
+                let var = (m[1] - m[0] * m[0]).max(0.0);
+                let a = var / (var + eps);
+                [a, m[0] - a * m[0]]
+            })
+            .collect()
+    } else {
+        let raw: Vec<[f32; 4]> = i.par_iter().zip(p).map(|(&a, &b)| [a, a * a, b, a * b]).collect();
+        let st = box2d_multi(&raw, w, h, r);
+        drop(raw);
+        st.par_iter()
+            .map(|m| {
+                let var = (m[1] - m[0] * m[0]).max(0.0);
+                let cov = m[3] - m[0] * m[2];
+                let a = cov / (var + eps);
+                [a, m[2] - a * m[0]]
+            })
+            .collect()
     };
-    let cross = (!self_guided).then(|| {
-        let ip: Vec<f32> = i.par_iter().zip(p).map(|(a, b)| a * b).collect();
-        (box2d(p, w, h, r), box2d(&ip, w, h, r))
-    });
-    // a -> mean_ii's buffer, b -> a new plane (or mean_p's).
-    let mut b = match cross {
-        Some((mean_p, mut mean_ip)) => {
-            mean_ii.par_iter_mut().zip(mean_ip.par_iter_mut()).enumerate().for_each(|(k, (a, bb))| {
-                let var = (*a - mean_i[k] * mean_i[k]).max(0.0);
-                let cov = *bb - mean_i[k] * mean_p[k];
-                *a = cov / (var + eps);
-                *bb = mean_p[k] - *a * mean_i[k];
-            });
-            mean_ip
-        }
-        None => {
-            let mut b = vec![0.0f32; w * h];
-            mean_ii.par_iter_mut().zip(b.par_iter_mut()).enumerate().for_each(|(k, (a, bb))| {
-                let var = (*a - mean_i[k] * mean_i[k]).max(0.0);
-                *a = var / (var + eps);
-                *bb = mean_i[k] - *a * mean_i[k];
-            });
-            b
-        }
-    };
-    drop(mean_i);
-    let ma = box2d(&mean_ii, w, h, r);
-    drop(mean_ii);
-    let mb = box2d(&b, w, h, r);
-    b.par_iter_mut().enumerate().for_each(|(k, q)| *q = ma[k] * i[k] + mb[k]);
-    b
+    let mab = box2d_multi(&ab, w, h, r);
+    drop(ab);
+    mab.par_iter().zip(i).map(|(m, g)| m[0] * g + m[1]).collect()
 }
 
 /// Range bins per `range` of [`bilateral_grid`].
@@ -1056,6 +1227,30 @@ fn nr_sigmas(rgb: &[f32], w: usize, h: usize) -> [f32; 3] {
 /// Denoises rows of `rgb` (w wide) and returns the processed rows.
 fn nr_region(rgb: &[f32], w: usize, p: &NrParams) -> Vec<f32> {
     let h = rgb.len() / 3 / w;
+    // Colour radius >= 3: the fast guided filter at half resolution, fused (full-resolution
+    // chroma planes are never built).
+    if let Some((r, eps)) = p.col.filter(|(r, _)| *r >= 3 && w >= 4 && h >= 4) {
+        return nr_region_half(rgb, w, h, p, r, eps);
+    }
+    // Luminance only: one plane; the untouched chroma terms are recomputed from `rgb`.
+    if p.col.is_none() {
+        if let Some((r, eps, keep, contrast, blur_sigma)) = p.lum {
+            let yq: Vec<f32> = rgb.par_chunks(3).map(|q| nr_pixel(q)[0]).collect();
+            let smooth = guided(&yq, &yq, w, h, r, eps);
+            let base = if contrast > 0.0 { Some(blur(&smooth, w, h, blur_sigma)) } else { None };
+            let mut out = vec![0.0f32; rgb.len()];
+            out.par_chunks_mut(3).zip(rgb.par_chunks(3)).enumerate().for_each(|(k, (o, q))| {
+                let [l0, c1, c2] = nr_pixel(q);
+                let s = smooth[k];
+                let mut v = s + (l0 - s) * keep;
+                if let Some(b) = &base {
+                    v += (s - b[k]) * contrast * 0.3;
+                }
+                nr_rgb(v, c1, c2, o);
+            });
+            return out;
+        }
+    }
     let (mut yq, mut c1, mut c2) = nr_planes(rgb);
     if let Some((r, eps, keep, contrast, blur_sigma)) = p.lum {
         let smooth = guided(&yq, &yq, w, h, r, eps);
@@ -1070,8 +1265,7 @@ fn nr_region(rgb: &[f32], w: usize, p: &NrParams) -> Vec<f32> {
         });
     }
     if let Some((r, eps)) = p.col {
-        c1 = guided(&yq, &c1, w, h, r, eps);
-        c2 = guided(&yq, &c2, w, h, r, eps);
+        (c1, c2) = guided_pair(&yq, &c1, &c2, w, h, r, eps);
     }
     let mut out = vec![0.0f32; rgb.len()];
     out.par_chunks_mut(3).enumerate().for_each(|(k, o)| {
@@ -1082,6 +1276,88 @@ fn nr_region(rgb: &[f32], w: usize, p: &NrParams) -> Vec<f32> {
         o[0] = r * r;
         o[1] = g * g;
         o[2] = b * b;
+    });
+    out
+}
+
+/// Square-root opponent planes of one pixel: (luminance, R - L, B - L).
+#[inline(always)]
+fn nr_pixel(p: &[f32]) -> [f32; 3] {
+    let q = [p[0].max(0.0).sqrt(), p[1].max(0.0).sqrt(), p[2].max(0.0).sqrt()];
+    let l = 0.3 * q[0] + 0.6 * q[1] + 0.1 * q[2];
+    [l, q[0] - l, q[2] - l]
+}
+
+/// Inverse of [`nr_pixel`] into linear RGB.
+#[inline(always)]
+fn nr_rgb(l: f32, c1: f32, c2: f32, o: &mut [f32]) {
+    let r = (c1 + l).max(0.0);
+    let b = (c2 + l).max(0.0);
+    let g = ((l - 0.3 * r - 0.1 * b) / 0.6).max(0.0);
+    o[0] = r * r;
+    o[1] = g * g;
+    o[2] = b * b;
+}
+
+/// [`nr_region`] with the colour guided filter at half resolution ([`fast_guided_pair`]):
+/// full-resolution luminance + 2x2 block means of the three planes in one pass, the
+/// coefficients at half resolution, then one pass that upsamples them and rebuilds RGB.
+fn nr_region_half(rgb: &[f32], w: usize, h: usize, p: &NrParams, r: usize, eps: f32) -> Vec<f32> {
+    let (lw, lh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut yq = vec![0.0f32; w * h];
+    let mut low = vec![[0.0f32; 3]; lw * lh];
+    yq.par_chunks_mut(2 * w).zip(low.par_chunks_mut(lw)).enumerate().for_each(|(ly, (yrows, lrow))| {
+        let rows = yrows.len() / w;
+        for (lx, cell) in lrow.iter_mut().enumerate() {
+            let mut acc = [0.0f32; 3];
+            let mut n = 0.0f32;
+            for dy in 0..rows {
+                let y = 2 * ly + dy;
+                for x in 2 * lx..(2 * lx + 2).min(w) {
+                    let q = nr_pixel(&rgb[(y * w + x) * 3..(y * w + x) * 3 + 3]);
+                    yrows[dy * w + x] = q[0];
+                    acc[0] += q[0];
+                    acc[1] += q[1];
+                    acc[2] += q[2];
+                    n += 1.0;
+                }
+            }
+            *cell = acc.map(|v| v / n);
+        }
+    });
+    let mut il: Vec<f32> = low.par_iter().map(|c| c[0]).collect();
+    let c1l: Vec<f32> = low.par_iter().map(|c| c[1]).collect();
+    let c2l: Vec<f32> = low.par_iter().map(|c| c[2]).collect();
+    drop(low);
+    // Luminance NR (full resolution); the colour guide is the denoised luminance.
+    let mut yd = None;
+    if let Some((lr, leps, keep, contrast, blur_sigma)) = p.lum {
+        let smooth = guided(&yq, &yq, w, h, lr, leps);
+        let base = if contrast > 0.0 { Some(blur(&smooth, w, h, blur_sigma)) } else { None };
+        let mut d = yq.clone();
+        d.par_iter_mut().enumerate().for_each(|(k2, y)| {
+            let s = smooth[k2];
+            let mut v = s + (*y - s) * keep;
+            if let Some(b) = &base {
+                v += (s - b[k2]) * contrast * 0.3;
+            }
+            *y = v;
+        });
+        il = downsample(&d, w, h, 2).0;
+        yd = Some(d);
+    }
+    let guide = yd.as_deref().unwrap_or(&yq);
+    let rl = ((r as f32 / 2.0).round() as usize).max(1);
+    let c = guided_coeffs_pair(&il, &c1l, &c2l, lw, lh, rl, eps);
+    let (xt, yt) = (up_taps(w, lw, 2), up_taps(h, lh, 2));
+    let mut out = vec![0.0f32; rgb.len()];
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, orow)| {
+        let (y0, y1, fy) = yt[y];
+        for (x, &(x0, x1, fx)) in xt.iter().enumerate() {
+            let [a1, b1, a2, b2] = bilinear4(&c, lw, y0, y1, fy, x0, x1, fx);
+            let l = guide[y * w + x];
+            nr_rgb(l, a1 * l + b1, a2 * l + b2, &mut orow[x * 3..x * 3 + 3]);
+        }
     });
     out
 }
@@ -1113,7 +1389,8 @@ pub fn denoise_banded(img: &mut Working, nr: &NoiseReduction, scale: f32, lumina
     });
     // Support: guided = 2 boxes of r; blur = 3 boxes of ~sigma.
     let lum_support = lum.map_or(0, |(r, _, _, c, bs)| 2 * r + if c > 0.0 { 3 * (bs.ceil() as usize + 1) } else { 0 });
-    let col_support = col.map_or(0, |(r, _)| 2 * r);
+    // (+ the half-resolution grid of the fast guided filter: rounding + bilinear support.)
+    let col_support = col.map_or(0, |(r, _)| 2 * r + 6);
     let p = NrParams { lum, col, overlap: lum_support + col_support + 2 };
     if band_rows >= h {
         let out = nr_region(img.rgb, w, &p);
@@ -1126,7 +1403,8 @@ pub fn denoise_banded(img: &mut Working, nr: &NoiseReduction, scale: f32, lumina
     let mut y0 = 0;
     while y0 < h {
         let y1 = (y0 + band_rows).min(h);
-        let (a, b) = (y0.saturating_sub(p.overlap), (y1 + p.overlap).min(h));
+        // Even start: the fast guided filter's 2x2 grid stays aligned with the whole image's.
+        let (a, b) = (y0.saturating_sub(p.overlap) & !1, (y1 + p.overlap).min(h));
         let out = nr_region(&img.rgb[a * w * 3..b * w * 3], w, &p);
         if let Some((py, rows)) = pending.take() {
             img.rgb[py * w * 3..py * w * 3 + rows.len()].copy_from_slice(&rows);
@@ -1482,6 +1760,80 @@ pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u
 mod tests {
     use super::*;
     use crate::ipc::types::PrimaryCalibration;
+
+    /// `box2d` equals a naive edge-clamped window mean (sizes around the row block).
+    #[test]
+    fn box2d_matches_naive_mean() {
+        for (w, h, r) in [(37usize, 70usize, 3usize), (5, 3, 4), (64, 33, 1), (19, 100, 12)] {
+            let src: Vec<f32> = (0..w * h).map(|k| ((k * 7919) % 101) as f32 / 101.0).collect();
+            let got = box2d(&src, w, h, r);
+            for y in 0..h {
+                for x in 0..w {
+                    let (mut s, mut n) = (0.0f64, 0);
+                    for yy in y.saturating_sub(r)..=(y + r).min(h - 1) {
+                        for xx in x.saturating_sub(r)..=(x + r).min(w - 1) {
+                            s += f64::from(src[yy * w + xx]);
+                            n += 1;
+                        }
+                    }
+                    let e = (s / f64::from(n)) as f32;
+                    assert!((got[y * w + x] - e).abs() < 1e-5, "{w}x{h} r{r} at {x},{y}: {} vs {e}", got[y * w + x]);
+                }
+            }
+        }
+    }
+
+    /// The fused half-resolution colour NR equals the explicit route (opponent planes ->
+    /// fast guided filter -> RGB).
+    #[test]
+    fn fused_colour_nr_matches_explicit_fast_guided() {
+        let (w, h) = (83usize, 57usize);
+        let rgb: Vec<f32> = (0..w * h * 3).map(|k| 0.05 + 0.3 * (((k * 2654435761) % 1000) as f32 / 1000.0)).collect();
+        let p = NrParams { lum: None, col: Some((5, 0.002)), overlap: 0 };
+        let got = nr_region(&rgb, w, &p);
+        let (yq, c1, c2) = nr_planes(&rgb);
+        let (q1, q2) = fast_guided_pair(&yq, &c1, &c2, w, h, 5, 0.002, 2);
+        let mut want = vec![0.0f32; rgb.len()];
+        for k in 0..w * h {
+            nr_rgb(yq[k], q1[k], q2[k], &mut want[k * 3..k * 3 + 3]);
+        }
+        let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "worst {worst}");
+    }
+
+    /// Luminance-only NR (one plane) equals the three-plane route bit for bit.
+    #[test]
+    fn luminance_only_nr_matches_three_plane_route() {
+        let (w, h) = (71usize, 45usize);
+        let rgb: Vec<f32> = (0..w * h * 3).map(|k| 0.02 + 0.4 * (((k * 2654435761) % 997) as f32 / 997.0)).collect();
+        let lum = (2usize, 0.004f32, 0.2f32, 0.4f32, 3.0f32);
+        let got = nr_region(&rgb, w, &NrParams { lum: Some(lum), col: None, overlap: 0 });
+        let (mut yq, c1, c2) = nr_planes(&rgb);
+        let smooth = guided(&yq, &yq, w, h, lum.0, lum.1);
+        let base = blur(&smooth, w, h, lum.4);
+        for k in 0..w * h {
+            let s = smooth[k];
+            yq[k] = s + (yq[k] - s) * lum.2 + (s - base[k]) * lum.3 * 0.3;
+        }
+        let mut want = vec![0.0f32; rgb.len()];
+        for k in 0..w * h {
+            nr_rgb(yq[k], c1[k], c2[k], &mut want[k * 3..k * 3 + 3]);
+        }
+        assert_eq!(got, want);
+    }
+
+    /// The paired cross-guided filter equals two single calls bit for bit.
+    #[test]
+    fn guided_pair_matches_two_guided_calls() {
+        let (w, h) = (97usize, 61usize);
+        let f = |k: usize, a: f32| ((k as f32 * a).sin() * 0.5 + 0.5) * (1.0 + (k % 7) as f32 * 0.1);
+        let i: Vec<f32> = (0..w * h).map(|k| f(k, 0.013)).collect();
+        let p1: Vec<f32> = (0..w * h).map(|k| f(k, 0.071) - 0.3).collect();
+        let p2: Vec<f32> = (0..w * h).map(|k| f(k, 0.029) * 0.2).collect();
+        let (a, b) = guided_pair(&i, &p1, &p2, w, h, 5, 0.01);
+        assert_eq!(a, guided(&i, &p1, w, h, 5, 0.01));
+        assert_eq!(b, guided(&i, &p2, w, h, 5, 0.01));
+    }
 
     /// The hyper-Gaussian bilateral grid averages moderate contrasts (texture, soft
     /// gradients) but keeps strong steps exactly (no halo), and preserves constants.
