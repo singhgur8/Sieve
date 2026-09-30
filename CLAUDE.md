@@ -44,6 +44,7 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 - [Rust Engine Dev]: Focuses on `src-tauri/`, LibRaw pipeline, multi-threaded thumbnail extraction, and XMP read/write.
 - [Vision/ML Dev]: Focuses on ONNX runtime integration (SCRFD face detection, Eye Aspect Ratio, Laplacian blur metrics).
 - [Frontend Dev]: Focuses on `src/`, 60fps virtualized filmstrip, dual-pane loupe comparison, and slider controls.
+- [UX Designer]: Reviews layout polish, workflow friction and keyboard/shortcut coverage; writes prioritized specs for Frontend Dev (never edits code). Runs after UI work lands, before the phase QA gate.
 
 ## Milestone Roadmap
 Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of truth). Summary:
@@ -69,7 +70,7 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 The main session is the orchestrator. It runs `docs/roadmap.md` to completion without checking in with the user.
 1. Read `docs/roadmap.md`; the first unchecked task is next. Work on branch `phase-N-<slug>`.
 2. Contract/schema changes go to the `architect` agent first. Then spawn specialists (`rust-engine-dev`,
-   `vision-ml-dev`, `frontend-dev`) — in parallel with `isolation: "worktree"` when they touch disjoint paths —
+   `vision-ml-dev`, `frontend-dev`; `ux-designer` reviews UI changes) — in parallel with `isolation: "worktree"` when they touch disjoint paths —
    and merge their work. If a custom agent type is unavailable, spawn `general-purpose` with the contents of
    its `.claude/agents/<name>.md` as the role prompt.
 3. After each task, `qa-engineer` runs the baseline gate + the phase's acceptance checks and reports pass/fail per
