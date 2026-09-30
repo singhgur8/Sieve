@@ -5,6 +5,7 @@ pub mod ingest;
 pub mod ipc;
 pub mod lut;
 pub mod ml;
+pub mod model_fetch;
 pub mod profiles;
 pub mod raw;
 pub mod scene;
@@ -35,7 +36,7 @@ const CATALOG_ENV: &str = "SIEVE_CATALOG";
 /// Overrides the derived-file cache root (thumbnails live in `<cache>/thumbs/`).
 const CACHE_ENV: &str = "SIEVE_CACHE";
 /// Overrides the ONNX model directory (default: `src-tauri/models` in debug builds,
-/// `<resource_dir>/models` in release).
+/// `<resource_dir>/models` + `<app_data_dir>/models` for AI masks in release).
 const MODELS_ENV: &str = "SIEVE_MODELS";
 /// Overrides the LUT library directory (default `<app_data_dir>/luts`).
 const LUTS_ENV: &str = "SIEVE_LUTS";
@@ -197,10 +198,24 @@ pub fn run() {
                 Some(p) => PathBuf::from(p),
                 None => app.path().app_cache_dir()?,
             };
-            let models_dir = match std::env::var_os(MODELS_ENV) {
-                Some(p) => PathBuf::from(p),
-                None if cfg!(debug_assertions) => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/models")),
-                None => app.path().resource_dir()?.join("models"),
+            // `models_dir`: culling models; `segment_models_dir`: AI-mask models (+ face models).
+            // Release bundles ship the culling models read-only in `<resource_dir>/models` and
+            // download the segmentation models into `<app_data_dir>/models` on first use, with
+            // the bundled face models symlinked alongside (see `model_fetch`).
+            let (models_dir, segment_models_dir) = match std::env::var_os(MODELS_ENV) {
+                Some(p) => (PathBuf::from(&p), PathBuf::from(p)),
+                None if cfg!(debug_assertions) => {
+                    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/models"));
+                    (dev.clone(), dev)
+                }
+                None => {
+                    let bundled = app.path().resource_dir()?.join("models");
+                    let downloaded = app.path().app_data_dir()?.join("models");
+                    if let Err(e) = model_fetch::link_bundled(&bundled, &downloaded) {
+                        eprintln!("models: linking bundled models into {}: {e}", downloaded.display());
+                    }
+                    (bundled, downloaded)
+                }
             };
             let luts_dir = match std::env::var_os(LUTS_ENV) {
                 Some(p) => PathBuf::from(p),
@@ -222,7 +237,7 @@ pub fn run() {
             let mask_cache =
                 MaskCache::new(MaskCacheConfig { catalog_path: path.clone(), cache_dir: config.cache_dir.clone() });
             let segmenter = Segmenter::new(
-                SegmenterConfig { models_dir: models_dir.clone(), catalog_path: path.clone() },
+                SegmenterConfig { models_dir: segment_models_dir, catalog_path: path.clone() },
                 mask_cache.clone(),
             );
 

@@ -5,7 +5,10 @@
 # Every file is verified against src-tauri/models/checksums.sha256; a mismatch
 # aborts with a non-zero exit code and the bad file is removed.
 #
-# Usage: scripts/fetch-models.sh [--force]
+# Usage: scripts/fetch-models.sh [--force] [--culling] [--dest DIR]
+#   --culling   only the culling models bundled into the app (~27 MB; `pnpm tauri build` runs this)
+#   --dest DIR  install into DIR instead of src-tauri/models (e.g. the app's data dir,
+#               ~/Library/Application Support/com.sieve.app/models, to pre-seed AI-mask models)
 #
 # Licenses: the insightface model zoo weights (det_10g, 2d106det) are released for NON-COMMERCIAL
 # research use only (see src-tauri/models/README.md and docs/decisions.md).
@@ -15,7 +18,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS_DIR="$ROOT/src-tauri/models"
 CHECKSUMS="$MODELS_DIR/checksums.sha256"
 FORCE=0
-[[ "${1:-}" == "--force" ]] && FORCE=1
+CULLING_ONLY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=1 ;;
+    --culling) CULLING_ONLY=1 ;;
+    --dest) shift; MODELS_DIR="${1:?--dest needs a directory}" ;;
+    *) echo "fetch-models: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+# Bundled with the app (keep in sync with BUNDLED_MODELS in src-tauri/build.rs).
+CULLING_MODELS=" det_10g.onnx 2d106det.onnx open_closed_eye.onnx face_landmarks_detector_1x3x256x256.onnx "
 
 # Pinned HuggingFace revision of public-data/insightface (mirror of the
 # insightface buffalo_l model pack, v0.7 release).
@@ -81,6 +95,9 @@ mkdir -p "$MODELS_DIR"
 
 for entry in "${MODELS[@]}"; do
   IFS='|' read -r name url member <<< "$entry"
+  if [[ $CULLING_ONLY -eq 1 && "$CULLING_MODELS" != *" $name "* ]]; then
+    continue
+  fi
   dest="$MODELS_DIR/$name"
   want="$(expected_sha "$name")"
   [[ -n "$want" ]] || die "no checksum for $name in $CHECKSUMS"
