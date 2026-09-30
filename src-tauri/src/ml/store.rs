@@ -1,14 +1,14 @@
 //! Catalog SQL of the analysis worker (reads the queue, writes measurements, scores,
 //! auto tags and burst groups). Command-side reads live in `db::repo`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use super::{AutoTag, ImageMetrics, Scored, MODEL_VERSION};
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::{AnalysisScope, AnalysisStatus, CullTag, ImageId};
+use crate::ipc::types::{AnalysisScope, AnalysisStatus, BurstGroupId, CullTag, ImageId};
 
 /// SQL predicate (over `t` = thumbnails, `a` = image_analysis, `?1` = model version) for
 /// "has a usable preview and needs (re)analysis".
@@ -253,13 +253,9 @@ pub fn write_bursts(tx: &Transaction, bursts: &[BurstRow]) -> AppResult<u32> {
             }
         }
     }
-    let mut upsert = tx.prepare(
-        "INSERT INTO image_tags (image_id, tag, source, confidence, suppressed) VALUES (?1, 'duplicate_burst', 'auto', 1.0, 0)
-         ON CONFLICT(image_id, tag) DO NOTHING",
-    )?;
     for (&id, &is_dup) in &dup {
         if is_dup {
-            upsert.execute([id])?;
+            set_duplicate_tag(tx, id, true)?;
         }
     }
     let stale: Vec<ImageId> = tx
@@ -268,13 +264,80 @@ pub fn write_bursts(tx: &Transaction, bursts: &[BurstRow]) -> AppResult<u32> {
         )?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    let mut delete = tx.prepare("DELETE FROM image_tags WHERE image_id = ?1 AND tag = 'duplicate_burst'")?;
     for id in stale {
         if !dup.get(&id).copied().unwrap_or(false) {
-            delete.execute([id])?;
+            set_duplicate_tag(tx, id, false)?;
         }
     }
     Ok(bursts.len() as u32)
+}
+
+/// The one rule for the auto `duplicate_burst` tag (burst non-keepers carry it):
+/// `true` adds it as `auto` unless a row exists (a suppressed or `user` row is left alone);
+/// `false` removes an unsuppressed `auto` row (suppressed and `user` rows are left alone).
+pub fn set_duplicate_tag(conn: &Connection, id: ImageId, duplicate: bool) -> AppResult<()> {
+    if duplicate {
+        conn.prepare_cached(
+            "INSERT INTO image_tags (image_id, tag, source, confidence, suppressed)
+             VALUES (?1, 'duplicate_burst', 'auto', 1.0, 0)
+             ON CONFLICT(image_id, tag) DO NOTHING",
+        )?
+        .execute([id])?;
+    } else {
+        conn.prepare_cached(
+            "DELETE FROM image_tags
+             WHERE image_id = ?1 AND tag = 'duplicate_burst' AND source = 'auto' AND suppressed = 0",
+        )?
+        .execute([id])?;
+    }
+    Ok(())
+}
+
+/// Images the user chose as burst keepers (`set_burst_keeper`); [`crate::ml::bursts::apply_pins`]
+/// honours them when bursts are regrouped.
+pub fn pinned_keepers(conn: &Connection) -> AppResult<HashSet<ImageId>> {
+    let mut stmt = conn.prepare_cached("SELECT image_id FROM burst_keeper_pins")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// `set_burst_keeper`: makes `keeper` the keeper of burst `group` now (keeper column,
+/// `duplicate_burst` on the other members, removed from the keeper) and pins it so later
+/// regrouping keeps the choice (other members of the group are unpinned). Atomic.
+/// Unknown group or image -> `not_found`; image not a member -> `invalid_argument`.
+/// Returns the members whose tags may have changed. Suggested rating/pick are refreshed by
+/// the next rescore (the command kicks one).
+pub fn set_burst_keeper(conn: &mut Connection, group: BurstGroupId, keeper: ImageId) -> AppResult<Vec<ImageId>> {
+    let tx = conn.transaction()?;
+    let exists: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM burst_groups WHERE id = ?1)", [group], |r| r.get(0))?;
+    if !exists {
+        return Err(AppError::not_found(format!("burst group {group}")));
+    }
+    let member_of: Option<Option<BurstGroupId>> =
+        tx.query_row("SELECT burst_group_id FROM images WHERE id = ?1", [keeper], |r| r.get(0)).optional()?;
+    match member_of {
+        None => return Err(AppError::not_found(format!("image {keeper}"))),
+        Some(g) if g != Some(group) => {
+            return Err(AppError::invalid(format!("image {keeper} is not a member of burst group {group}")))
+        }
+        Some(_) => {}
+    }
+    let members: Vec<ImageId> = tx
+        .prepare("SELECT id FROM images WHERE burst_group_id = ?1 ORDER BY id")?
+        .query_map([group], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    tx.execute("UPDATE burst_groups SET keeper_image_id = ?2 WHERE id = ?1", params![group, keeper])?;
+    tx.execute(
+        "DELETE FROM burst_keeper_pins WHERE image_id IN (SELECT id FROM images WHERE burst_group_id = ?1)",
+        [group],
+    )?;
+    tx.execute("INSERT INTO burst_keeper_pins (image_id, pinned_at) VALUES (?1, ?2)", params![keeper, now_ms()])?;
+    for &m in &members {
+        set_duplicate_tag(&tx, m, m != keeper)?;
+    }
+    tx.commit()?;
+    Ok(members)
 }
 
 #[cfg(test)]
@@ -426,5 +489,48 @@ mod tests {
         tx.commit().unwrap();
         assert!(crate::db::repo::list_burst_groups(&conn, None).unwrap().is_empty());
         assert!(tags(&conn, 1).is_empty());
+    }
+
+    #[test]
+    fn set_burst_keeper_moves_duplicate_tag_and_pins() {
+        let mut conn = open_in_memory();
+        seed(&conn);
+        let tx = conn.transaction().unwrap();
+        write_bursts(&tx, &[BurstRow { members: vec![1, 2, 3], keeper: 2, started_at_ms: 10, ended_at_ms: 30 }])
+            .unwrap();
+        tx.commit().unwrap();
+        let gid = crate::db::repo::list_burst_groups(&conn, None).unwrap()[0].id;
+        // 3's duplicate tag was suppressed by the user: stays suppressed whatever happens.
+        conn.execute("UPDATE image_tags SET suppressed = 1 WHERE image_id = 3", []).unwrap();
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+
+        assert_eq!(set_burst_keeper(&mut conn, 99, 1).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(set_burst_keeper(&mut conn, gid, 99).unwrap_err().kind, ErrorKind::NotFound);
+        conn.execute("UPDATE images SET burst_group_id = NULL WHERE id = 3", []).unwrap();
+        assert_eq!(set_burst_keeper(&mut conn, gid, 3).unwrap_err().kind, ErrorKind::InvalidArgument);
+        conn.execute("UPDATE images SET burst_group_id = ?1 WHERE id = 3", [gid]).unwrap();
+
+        assert_eq!(set_burst_keeper(&mut conn, gid, 1).unwrap(), vec![1, 2, 3]);
+        let g = &crate::db::repo::list_burst_groups(&conn, None).unwrap()[0];
+        assert_eq!(g.keeper_image_id, Some(1));
+        assert!(tags(&conn, 1).is_empty(), "new keeper loses duplicate_burst");
+        assert_eq!(tags(&conn, 2), vec![("duplicate_burst".into(), "auto".into(), false)], "old keeper gains it");
+        assert_eq!(tags(&conn, 3), vec![("duplicate_burst".into(), "auto".into(), true)], "suppressed kept");
+        let dirty: Vec<ImageId> = conn
+            .prepare("SELECT id FROM images WHERE xmp_dirty = 1 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(dirty, vec![1, 2]);
+        assert_eq!(pinned_keepers(&conn).unwrap(), HashSet::from([1]));
+
+        // Re-choosing moves the pin; a user tag on the new keeper is left alone.
+        conn.execute("UPDATE image_tags SET source = 'user' WHERE image_id = 2", []).unwrap();
+        set_burst_keeper(&mut conn, gid, 2).unwrap();
+        assert_eq!(pinned_keepers(&conn).unwrap(), HashSet::from([2]));
+        assert_eq!(tags(&conn, 2), vec![("duplicate_burst".into(), "user".into(), false)]);
+        assert_eq!(tags(&conn, 1), vec![("duplicate_burst".into(), "auto".into(), false)]);
     }
 }

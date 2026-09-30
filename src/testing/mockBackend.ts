@@ -8,7 +8,9 @@ import { lerpAdjustments } from "../ipc";
 import type {
   BurstGroup,
   CatalogState,
+  CullSnapshot,
   CullTag,
+  UiPrefs,
   FaceInfo,
   AdjustmentField,
   AdjustmentHistory,
@@ -524,6 +526,7 @@ export function installMockBackend(count: number) {
   }
 
   const ok = { succeeded: 0, skipped: 0, failed: [], changed: [] };
+  let uiPrefs: UiPrefs = {};
 
   mockIPC(
     (cmd, payload) => {
@@ -582,8 +585,63 @@ export function installMockBackend(count: number) {
           return { ...ok, succeeded: ids.length, changed: [] };
         case "read_xmp":
           return { ...ok, skipped: ids.length };
-        case "apply_suggestions":
-          return ids.length;
+        case "apply_suggestions": {
+          let applied = 0;
+          ids.forEach((i) => {
+            const r = byId.get(i);
+            if (!r?.quality) return;
+            if (args.onlyUnset && (r.pick !== "unflagged" || r.rating !== 0)) return;
+            r.rating = r.quality.suggestedRating;
+            r.pick = r.quality.suggestedPick;
+            r.xmp = { ...r.xmp, dirty: true };
+            applied++;
+          });
+          return { applied, skipped: ids.length - applied };
+        }
+        case "get_cull_snapshot":
+          return ids.map((i) => {
+            const r = byId.get(i)!;
+            return { imageId: i, rating: r.rating, pick: r.pick, colorLabel: r.colorLabel };
+          });
+        case "restore_cull_snapshot": {
+          const changed: number[] = [];
+          for (const s of args.snapshots as CullSnapshot[]) {
+            const r = byId.get(s.imageId);
+            if (!r || (r.rating === s.rating && r.pick === s.pick && r.colorLabel === s.colorLabel)) continue;
+            r.rating = s.rating;
+            r.pick = s.pick;
+            r.colorLabel = s.colorLabel;
+            r.xmp = { ...r.xmp, dirty: true };
+            changed.push(s.imageId);
+          }
+          return changed;
+        }
+        case "get_ui_prefs":
+          return uiPrefs;
+        case "set_ui_prefs":
+          uiPrefs = { ...(args.prefs as UiPrefs) };
+          return null;
+        case "reveal_in_finder":
+          return null;
+        case "set_burst_keeper": {
+          const g = bursts.get(args.groupId as number)!;
+          const keeper = args.imageId as number;
+          g.keeperImageId = keeper;
+          for (const m of g.imageIds) {
+            const r = byId.get(m)!;
+            r.isBurstKeeper = m === keeper;
+            const has = r.tags.some((t) => t.tag === "duplicate_burst");
+            if (m === keeper) r.tags = r.tags.filter((t) => !(t.tag === "duplicate_burst" && t.source === "auto" && !t.suppressed));
+            else if (!has) r.tags = [...r.tags, { tag: "duplicate_burst", source: "auto", confidence: 1, suppressed: false }];
+          }
+          return g;
+        }
+        case "write_xmp_all_dirty": {
+          const folderId = args.folderId as number | null;
+          const dirty = rows.filter((r) => r.xmp.dirty && (folderId == null || r.folderId === folderId));
+          dirty.forEach((r) => (r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null }));
+          return { ...ok, succeeded: dirty.length };
+        }
         case "set_xmp_auto_sync":
           catalog = { ...catalog, xmpAutoSync: args.enabled as boolean };
           return null;

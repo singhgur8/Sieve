@@ -876,23 +876,99 @@ pub fn list_burst_groups(conn: &Connection, folder: Option<FolderId>) -> AppResu
 }
 
 /// Copies `suggested_rating` / `suggested_pick` into the user's rating/pick for `ids`.
-/// Unanalyzed images are skipped. Atomic; unknown ids fail with `not_found`.
-/// Returns how many images were updated.
-pub fn apply_suggestions(conn: &mut Connection, ids: &[ImageId]) -> AppResult<u32> {
+/// Unanalyzed images are skipped; with `only_unset`, so are images already flagged
+/// (`pick != unflagged`) or rated (`rating != 0`). Atomic; unknown ids fail with `not_found`.
+pub fn apply_suggestions(
+    conn: &mut Connection,
+    ids: &[ImageId],
+    only_unset: bool,
+) -> AppResult<ApplySuggestionsResult> {
     let tx = conn.transaction()?;
-    let mut updated = 0;
-    for &id in ids {
-        ensure_image(&tx, id)?;
-        updated += tx.execute(
+    let mut applied = 0;
+    {
+        let mut stmt = tx.prepare(
             "UPDATE images SET
                  rating = (SELECT suggested_rating FROM quality_scores WHERE image_id = ?1),
                  pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
-             WHERE id = ?1 AND EXISTS (SELECT 1 FROM quality_scores WHERE image_id = ?1)",
-            [id],
-        )? as u32;
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM quality_scores WHERE image_id = ?1)
+               AND (?2 = 0 OR (pick = 'unflagged' AND rating = 0))",
+        )?;
+        for &id in ids {
+            ensure_image(&tx, id)?;
+            applied += stmt.execute(params![id, only_unset])? as u32;
+        }
     }
     tx.commit()?;
-    Ok(updated)
+    Ok(ApplySuggestionsResult { applied, skipped: ids.len() as u32 - applied })
+}
+
+// ---------------------------------------------------------------------------
+// Culling snapshots (undo) and UI preferences (IPC v8)
+// ---------------------------------------------------------------------------
+
+/// Current rating/pick/label of `ids`, in the given order. Unknown ids -> `not_found`.
+pub fn cull_snapshot(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<CullSnapshot>> {
+    let mut stmt = conn.prepare_cached("SELECT rating, pick, color_label FROM images WHERE id = ?1")?;
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let snap = stmt
+            .query_row([id], |r| {
+                Ok(CullSnapshot {
+                    image_id: id,
+                    rating: r.get(0)?,
+                    pick: enum_col(r, 1, PickFlag::parse)?,
+                    color_label: opt_enum_col(r, 2, ColorLabel::parse)?,
+                })
+            })
+            .optional()?
+            .ok_or_else(|| AppError::not_found(format!("image {id}")))?;
+        out.push(snap);
+    }
+    Ok(out)
+}
+
+/// Writes every snapshot back in one transaction (all or nothing). Rating > 5 ->
+/// `invalid_argument`; unknown ids -> `not_found`. Changed images become `xmp_dirty`
+/// through the usual triggers. Returns the ids whose values actually changed.
+pub fn restore_cull_snapshot(conn: &mut Connection, snapshots: &[CullSnapshot]) -> AppResult<Vec<ImageId>> {
+    if let Some(s) = snapshots.iter().find(|s| s.rating > 5) {
+        return Err(AppError::invalid(format!("rating {} is outside 0..=5", s.rating)));
+    }
+    let tx = conn.transaction()?;
+    let mut changed = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4
+             WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4)",
+        )?;
+        for s in snapshots {
+            ensure_image(&tx, s.image_id)?;
+            let label = s.color_label.map(|l| l.as_str());
+            if stmt.execute(params![s.image_id, s.rating, s.pick.as_str(), label])? > 0
+                && !changed.contains(&s.image_id)
+            {
+                changed.push(s.image_id);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+const UI_PREFS_KEY: &str = "ui_prefs";
+
+/// Stored UI preferences; defaults when unset or unreadable (prefs never block the app).
+pub fn ui_prefs(conn: &Connection) -> AppResult<UiPrefs> {
+    let json: Option<String> =
+        conn.query_row("SELECT value FROM catalog_meta WHERE key = ?1", [UI_PREFS_KEY], |r| r.get(0)).optional()?;
+    Ok(json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+pub fn set_ui_prefs(conn: &Connection, prefs: &UiPrefs) -> AppResult<()> {
+    if prefs.last_export_folder.as_deref().is_some_and(|f| f.is_empty() || f.len() > 4096) {
+        return Err(AppError::invalid("lastExportFolder must be 1..=4096 bytes"));
+    }
+    set_meta(conn, UI_PREFS_KEY, &serde_json::to_string(prefs)?)
 }
 
 #[cfg(test)]
@@ -1265,9 +1341,15 @@ mod tests {
         assert_eq!(list_burst_groups(&conn, Some(1)).unwrap().len(), 1);
         assert!(list_burst_groups(&conn, Some(2)).unwrap().is_empty());
 
-        assert_eq!(apply_suggestions(&mut conn, &[1, 99]).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(apply_suggestions(&mut conn, &[1, 99], false).unwrap_err().kind, ErrorKind::NotFound);
         assert_eq!(get_image(&conn, 1).unwrap().rating, 2);
-        assert_eq!(apply_suggestions(&mut conn, &[1, 2, 3]).unwrap(), 2);
+        // onlyUnset: 1 is rated (2), 3 is unanalyzed; only 2 (unflagged, 0 stars) is applied.
+        let r = apply_suggestions(&mut conn, &[1, 2, 3], true).unwrap();
+        assert_eq!(r, ApplySuggestionsResult { applied: 1, skipped: 2 });
+        assert_eq!(get_image(&conn, 1).unwrap().rating, 2);
+        assert_eq!(get_image(&conn, 2).unwrap().pick, PickFlag::Pick);
+        let r = apply_suggestions(&mut conn, &[1, 2, 3], false).unwrap();
+        assert_eq!(r, ApplySuggestionsResult { applied: 2, skipped: 1 });
         let (a, b, c) = (get_image(&conn, 1).unwrap(), get_image(&conn, 2).unwrap(), get_image(&conn, 3).unwrap());
         assert_eq!((a.rating, a.pick), (1, PickFlag::Reject));
         assert_eq!((b.rating, b.pick), (4, PickFlag::Pick));
@@ -1414,5 +1496,54 @@ mod tests {
         assert!(catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
         set_rating(&mut conn, &[4], 1).unwrap();
         assert_eq!(xmp_status(&conn, true).unwrap(), XmpStatus { dirty: 1, failed: 1, running: true, auto_sync: true });
+    }
+
+    #[test]
+    fn cull_snapshot_round_trip_is_atomic_and_marks_dirty() {
+        let mut conn = phase4_fixture();
+        let before = cull_snapshot(&conn, &[2, 1]).unwrap();
+        assert_eq!(
+            before,
+            vec![
+                CullSnapshot { image_id: 2, rating: 5, pick: PickFlag::Pick, color_label: None },
+                CullSnapshot { image_id: 1, rating: 2, pick: PickFlag::Unflagged, color_label: Some(ColorLabel::Red) },
+            ]
+        );
+        assert_eq!(cull_snapshot(&conn, &[1, 99]).unwrap_err().kind, ErrorKind::NotFound);
+
+        set_rating(&mut conn, &[1, 2], 0).unwrap();
+        set_pick(&mut conn, &[1], PickFlag::Reject).unwrap();
+        conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
+
+        // Unknown id: nothing restored.
+        let mut bad = before.clone();
+        bad.push(CullSnapshot { image_id: 99, rating: 0, pick: PickFlag::Unflagged, color_label: None });
+        assert_eq!(restore_cull_snapshot(&mut conn, &bad).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(get_image(&conn, 1).unwrap().pick, PickFlag::Reject);
+        let mut bad = before.clone();
+        bad[0].rating = 6;
+        assert_eq!(restore_cull_snapshot(&mut conn, &bad).unwrap_err().kind, ErrorKind::InvalidArgument);
+
+        assert_eq!(restore_cull_snapshot(&mut conn, &before).unwrap(), vec![2, 1]);
+        assert_eq!(cull_snapshot(&conn, &[2, 1]).unwrap(), before);
+        assert!(get_image(&conn, 1).unwrap().xmp.dirty && get_image(&conn, 2).unwrap().xmp.dirty);
+        // Restoring unchanged values is a no-op.
+        assert!(restore_cull_snapshot(&mut conn, &before).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ui_prefs_round_trip() {
+        let conn = open_in_memory();
+        assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
+        let prefs = UiPrefs { last_export_folder: Some("/Users/me/Exports".into()) };
+        set_ui_prefs(&conn, &prefs).unwrap();
+        assert_eq!(ui_prefs(&conn).unwrap(), prefs);
+        let empty = UiPrefs { last_export_folder: Some(String::new()) };
+        assert_eq!(set_ui_prefs(&conn, &empty).unwrap_err().kind, ErrorKind::InvalidArgument);
+        // Unknown / missing fields from other versions are tolerated.
+        set_meta(&conn, UI_PREFS_KEY, r#"{"futureThing":1}"#).unwrap();
+        assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
+        set_meta(&conn, UI_PREFS_KEY, "not json").unwrap();
+        assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
     }
 }

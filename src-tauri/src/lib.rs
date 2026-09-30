@@ -115,6 +115,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::match_scene,
             commands::apply_scene_match,
             commands::get_render_stats,
+            commands::set_burst_keeper,
+            commands::get_cull_snapshot,
+            commands::restore_cull_snapshot,
+            commands::get_ui_prefs,
+            commands::set_ui_prefs,
+            commands::reveal_in_finder,
+            commands::write_xmp_all_dirty,
         ])
         .events(collect_events![
             ImportProgress,

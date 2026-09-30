@@ -14,6 +14,7 @@ src-tauri/
   migrations/0005_editor.sql   v5: adjustment_history, presets, adjustments.neutral/history_entry_id, develop dirty triggers
   migrations/0006_export.sql   v6: export_presets, export_jobs, export_items
   migrations/0007_scenes.sql   v7: scenes, images.scene_id/scene_anchor, scene_features
+  migrations/0008_ux.sql       v8: burst_keeper_pins (user-chosen burst keepers)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -108,7 +109,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `set_cull_thresholds` / `setCullThresholds` | `shootType: ShootType, thresholds: CullThresholds \| null` | `null` (`null` = reset) |
 | `get_faces` / `getFaces` | `id: number` | `FaceInfo[]` |
 | `list_burst_groups` / `listBurstGroups` | `folderId: number \| null` | `BurstGroup[]` |
-| `apply_suggestions` / `applySuggestions` | `ids: number[]` | `number` (images updated) |
+| `apply_suggestions` / `applySuggestions` | `ids: number[], onlyUnset: boolean` | `ApplySuggestionsResult` (`{applied, skipped}`) |
 | `get_images` / `getImages` | `ids: number[]` | `RawImageEntry[]` (given order) |
 | `list_image_ids` / `listImageIds` | `query: ImageQuery` | `number[]` (all matches, sorted; offset/limit ignored) |
 | `get_filter_counts` / `getFilterCounts` | `folderId: number \| null` | `FilterCounts` |
@@ -153,6 +154,13 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `match_scene` / `matchScene` | `anchorIds: number[] (1..=2), targetIds: number[], options: MatchOptions` | `MatchPreview[]` (nothing saved) |
 | `apply_scene_match` / `applySceneMatch` | `applications: MatchApplication[], label: string \| null` | `number[]` (changed ids; history + XMP) |
 | `get_render_stats` / `getRenderStats` | `id: number, adjustments: ParametricAdjustments \| null, region: NormRect \| null` | `ImageStats` |
+| `set_burst_keeper` / `setBurstKeeper` | `groupId: number, imageId: number` | `BurstGroup` (pinned; kicks rescore) |
+| `get_cull_snapshot` / `getCullSnapshot` | `ids: number[]` | `CullSnapshot[]` (given order) |
+| `restore_cull_snapshot` / `restoreCullSnapshot` | `snapshots: CullSnapshot[]` | `number[]` (changed ids; atomic) |
+| `get_ui_prefs` / `getUiPrefs` | – | `UiPrefs` |
+| `set_ui_prefs` / `setUiPrefs` | `prefs: UiPrefs` | `null` (replaces all) |
+| `reveal_in_finder` / `revealInFinder` | `path: string` (absolute, existing) | `null` |
+| `write_xmp_all_dirty` / `writeXmpAllDirty` | `folderId: number \| null` | `XmpSyncReport` (catalog wins) |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -391,6 +399,25 @@ size without sharpening matches `render_preview` within 2 levels.
 - Cost: first match of an image decodes its RAW into the develop cache (~0.3-0.8 s, shared with the editor); each
   measurement is a 640 px pipeline run (~10-20 ms). Targets are processed in parallel; `sceneProgress` reports.
 
+## UX additions (v8)
+
+Thin command code implemented by the architect (bodies may be taken over by the listed owners):
+repo functions in `db/repo.rs` (rust-engine-dev), `ml::store::set_burst_keeper` / `set_duplicate_tag` /
+`pinned_keepers` and `ml::bursts::apply_pins` (vision-ml-dev), `XmpSync::write_dirty` (rust-engine-dev).
+
+- Culling undo (frontend stack): before a culling write, `getCullSnapshot(ids)` and push it; undo =
+  `restoreCullSnapshot(before)` (take a fresh snapshot first to allow redo). Covers rating/pick/label, including
+  `applySuggestions` batches. Tag changes are undone with the inverse `setUserTag`.
+- `applySuggestions(ids, onlyUnset)`: "Apply to unflagged only" = `onlyUnset: true` (keeps manual culls).
+- Burst keeper: `setBurstKeeper(groupId, imageId)` updates `burst_groups.keeper_image_id` and `duplicate_burst`
+  immediately (one tag rule: `ml::store::set_duplicate_tag`, shared with `write_bursts`) and pins the image in
+  `burst_keeper_pins`; `rescore_all` makes a pinned member the keeper of whatever group it lands in (best
+  `overall` if several), so suggestions (non-keeper demotion) follow after the kicked rescore. Choosing another
+  keeper unpins the other members of that group.
+- `UiPrefs` in `catalog_meta['ui_prefs']` (JSON, per catalog). Frontend does read-modify-write.
+- `revealInFinder(path)`: `/usr/bin/open -R` with the path as a single argument (no shell, no plugin).
+- `writeXmpAllDirty(folderId | null)`: explicit "Save all metadata" regardless of auto-sync.
+
 ## Catalog (SQLite)
 
 Location: `<app_data_dir>/catalog.sqlite` (override with `SIEVE_CATALOG=/path`). WAL, `foreign_keys=ON`,
@@ -398,7 +425,7 @@ migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |
 |---|---|
-| `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON) |
+| `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `folders` | imported roots |
 | `images` | one row per RAW: identity, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor` |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
@@ -406,6 +433,7 @@ migrations tracked by `PRAGMA user_version`.
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
 | `image_analysis` | per-image analysis status (queued/done/failed), model version, error, `phash` (u64 as i64), `faces_json` (`FaceInfo[]`), `metrics_json` (`ml::ImageMetrics`) |
 | `burst_groups` | time/similarity clusters, optional keeper |
+| `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
 | `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated) |
 | `presets` | name (unique, NOCASE), params JSON, fields JSON |
