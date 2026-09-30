@@ -22,7 +22,14 @@
 //!   emitted *unless suppressed*; never touch suppressed rows (no resurrection) or
 //!   `source = 'user'` rows. Never write `images.rating` / `images.pick`.
 
+pub mod bursts;
+pub mod imgproc;
+pub mod metrics;
+pub mod models;
+pub mod scoring;
+pub mod store;
 pub mod thresholds;
+pub mod worker;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +47,7 @@ use crate::ipc::types::{
 
 /// Stored in `image_analysis.model_version` / `quality_scores.model_version`. Bump when
 /// models or measurement code change: rows with another version count as pending.
-pub const MODEL_VERSION: &str = "unimplemented-0";
+pub const MODEL_VERSION: &str = "scrfd10g-2d106-v1";
 
 // ---------------------------------------------------------------------------
 // Managed state (fixed surface)
@@ -55,16 +62,37 @@ pub struct AnalysisConfig {
     pub models_dir: PathBuf,
 }
 
+/// Flags shared between [`Analysis`] and its worker thread.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerFlags {
+    /// Claimed by `start`, released by the worker when idle.
+    pub running: Arc<AtomicBool>,
+    /// Stop after the images in flight.
+    pub cancel: Arc<AtomicBool>,
+    /// A rescore pass (scores, tags, bursts from stored metrics) was requested.
+    pub rescore: Arc<AtomicBool>,
+}
+
 /// Managed Tauri state for the analysis worker.
 pub struct Analysis {
     config: AnalysisConfig,
     running: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    rescore: Arc<AtomicBool>,
 }
 
 impl Analysis {
     pub fn new(config: AnalysisConfig) -> Self {
-        Self { config, running: Arc::new(AtomicBool::new(false)), cancel: Arc::new(AtomicBool::new(false)) }
+        Self {
+            config,
+            running: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rescore: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn flags(&self) -> WorkerFlags {
+        WorkerFlags { running: self.running.clone(), cancel: self.cancel.clone(), rescore: self.rescore.clone() }
     }
 
     pub fn config(&self) -> &AnalysisConfig {
@@ -79,11 +107,8 @@ impl Analysis {
     /// `Images`/`Folder`/`All` mark their rows for re-measurement (validating ids first:
     /// unknown ids fail with `not_found`); `Pending` only kicks; `Rescore` requests a
     /// rescore pass (no ML). Clears a previous cancel request.
-    ///
-    /// STUB (vision-ml-dev): currently a no-op so import/launch keep working.
     pub fn start(&self, app: &AppHandle, scope: AnalysisScope) -> AppResult<()> {
-        let _ = (app, scope, &self.config, &self.running);
-        Ok(())
+        worker::kick(&self.config, &self.flags(), scope, app.clone())
     }
 
     /// Asks the worker to stop after the images in flight. Unprocessed work stays
@@ -96,11 +121,8 @@ impl Analysis {
 }
 
 /// Catalog-wide analysis counts (see `AnalysisStatus` for the buckets).
-///
-/// STUB (vision-ml-dev).
 pub fn analysis_status(conn: &Connection, running: bool) -> AppResult<AnalysisStatus> {
-    let _ = (conn, running);
-    todo!("vision-ml-dev: count image_analysis / thumbnails buckets")
+    store::analysis_status(conn, running)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,45 +140,78 @@ pub struct FaceMetrics {
     pub ear: Option<f32>,
     /// Normalized 0..=1 sharpness of the eye region (face crop fallback).
     pub sharpness: f32,
+    /// EAR of the image-left / image-right eye (upright crop).
+    pub ear_left: Option<f32>,
+    pub ear_right: Option<f32>,
+    /// Inner-lip gap / mouth width (laughing/talking mouths are open).
+    pub mouth_open: Option<f32>,
+    /// Nose offset along the eye line / inter-ocular distance: ~0 frontal, |yaw| >~0.3 turned.
+    pub yaw: f32,
+    /// Inter-ocular distance in preview pixels.
+    pub iod_px: f32,
+    /// Sharpness 0..=1 of the central face crop.
+    pub face_sharpness: f32,
+    /// Mean |gradient| of the eye region (luma levels/px): low = no detail to judge.
+    pub eye_texture: f32,
+    /// Directional blur anisotropy 0..=1 of the face (high = motion blur).
+    pub anisotropy: f32,
+    /// Frontal enough for EAR / eye-region sharpness (landmarks present and
+    /// inter-ocular distance >= `metrics::FRONTAL_MIN` x face height).
+    pub frontal: bool,
+}
+
+/// Tiled whole-frame sharpness over textured tiles (~1024 px luma).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TileStats {
+    /// 90th / 50th percentile tile sharpness, 0..=1.
+    pub p90: f32,
+    pub p50: f32,
+    /// Share of tiles with enough texture to be judged.
+    pub textured: f32,
+    /// Mean directional anisotropy of the sharpest quarter of tiles.
+    pub anisotropy: f32,
 }
 
 /// Threshold-independent measurements of one preview: the expensive part, stored as
-/// `image_analysis.metrics_json` so rescoring needs no ML. Add fields freely (e.g.
-/// directional blur stats); stored JSON is tied to `MODEL_VERSION`.
+/// `image_analysis.metrics_json` so rescoring needs no ML. Stored JSON is tied to
+/// `MODEL_VERSION`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageMetrics {
     /// Preview pixel size the measurements were taken on.
     pub width: u32,
     pub height: u32,
+    /// Largest first.
     pub faces: Vec<FaceMetrics>,
-    /// Normalized 0..=1 whole-frame sharpness.
+    /// Normalized 0..=1 whole-frame sharpness (`tiles.p90`).
     pub global_sharpness: f32,
     pub exposure: ExposureStats,
     /// 64-bit perceptual hash (also stored as `image_analysis.phash`, bit-cast to i64).
     pub phash: u64,
+    pub tiles: TileStats,
 }
 
-/// Loaded ONNX sessions (SCRFD + 106-pt landmarks). One per worker thread.
+/// Loaded ONNX sessions (SCRFD + 106-pt landmarks) plus reusable buffers. One per
+/// worker thread (`ort::Session::run` needs `&mut`).
 pub struct Analyzer {
-    _sessions: (),
+    models: models::Models,
+    work: metrics::Work,
 }
 
 impl Analyzer {
     /// Loads the models from `models_dir` (CoreML EP, CPU fallback).
-    ///
-    /// STUB (vision-ml-dev).
     pub fn load(models_dir: &Path) -> Result<Self, String> {
-        let _ = models_dir;
-        todo!("vision-ml-dev: build ort sessions")
+        Ok(Self { models: models::Models::load(models_dir)?, work: metrics::Work::default() })
+    }
+
+    /// Execution providers of the detector / landmark sessions.
+    pub fn providers(&self) -> (models::Provider, models::Provider) {
+        (self.models.det_provider, self.models.lmk_provider)
     }
 
     /// Measures the preview JPEG at `preview_path`. Errors are human-readable reasons
     /// (stored in `image_analysis.error`, sent as `AnalysisFailed.reason`).
-    ///
-    /// STUB (vision-ml-dev).
     pub fn measure(&mut self, preview_path: &Path) -> Result<ImageMetrics, String> {
-        let _ = preview_path;
-        todo!("vision-ml-dev: decode, detect faces, EAR, sharpness, exposure, phash")
+        metrics::measure(&mut self.models, &mut self.work, preview_path)
     }
 }
 
@@ -179,12 +234,9 @@ pub struct Scored {
 }
 
 /// Pure: tags, scores and suggestions from measurements. Wedding/Portrait: eyes open +
-/// eye sharpness dominate; `require_all_eyes_open` for group shots.
-///
-/// STUB (vision-ml-dev).
+/// eye sharpness dominate; `require_all_eyes_open` for group shots. See [`scoring`].
 pub fn score(metrics: &ImageMetrics, thresholds: &CullThresholds, shoot_type: ShootType) -> Scored {
-    let _ = (metrics, thresholds, shoot_type);
-    todo!("vision-ml-dev: scoring")
+    scoring::score(metrics, thresholds, shoot_type)
 }
 
 /// Input to burst grouping, one per analyzed image with a capture time.
@@ -208,9 +260,6 @@ pub struct Burst {
 /// `<= window_ms` and hash distance `<= max_hash_distance`; picks the keeper. The caller
 /// writes `burst_groups`, `images.burst_group_id`, `duplicate_burst` on non-keepers
 /// and lowers their suggested pick/rating.
-///
-/// STUB (vision-ml-dev).
 pub fn group_bursts(frames: &[BurstFrame], window_ms: u32, max_hash_distance: u32) -> Vec<Burst> {
-    let _ = (frames, window_ms, max_hash_distance);
-    todo!("vision-ml-dev: burst grouping")
+    bursts::group_bursts(frames, window_ms, max_hash_distance)
 }
