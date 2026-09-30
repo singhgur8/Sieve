@@ -115,6 +115,66 @@ fn variations(lut: &str) -> Vec<(&'static str, ParametricAdjustments)> {
     ]
 }
 
+/// The sample shoot's typical Lightroom edit (AZA06589.xmp): custom WB, strong PV2012 tone,
+/// HSL, parametric + point curves (master + RGB), split toning / colour grading,
+/// calibration, luminance NR and sharpening, Adobe Color profile.
+fn user_style() -> ParametricAdjustments {
+    use sieve_lib::ipc::types::{ColorWheel, PrimaryCalibration};
+    let mut a = ParametricAdjustments {
+        white_balance: WhiteBalance::Custom { temperature_k: 6825.0, tint: 12.0 },
+        exposure: -0.87,
+        contrast: -59.0,
+        highlights: -66.0,
+        shadows: 30.0,
+        whites: -18.0,
+        blacks: 25.0,
+        vibrance: 25.0,
+        saturation: 5.0,
+        hsl: HslAdjustments {
+            hue: HslChannels {
+                red: 15.0,
+                yellow: -20.0,
+                green: 10.0,
+                aqua: 5.0,
+                blue: -5.0,
+                purple: 20.0,
+                ..Default::default()
+            },
+            saturation: HslChannels {
+                red: 10.0,
+                orange: -10.0,
+                yellow: -20.0,
+                green: -40.0,
+                aqua: 10.0,
+                blue: -10.0,
+                ..Default::default()
+            },
+            luminance: HslChannels { orange: -10.0, ..Default::default() },
+        },
+        ..Default::default()
+    };
+    let p = &mut a.tone_curve.parametric;
+    (p.shadows, p.darks, p.lights, p.highlights) = (-5.0, -15.0, 20.0, -15.0);
+    (p.shadow_split, p.midtone_split, p.highlight_split) = (15.0, 35.0, 75.0);
+    let pc = &mut a.tone_curve.point;
+    pc.master = vec![[0.0, 14.0], [44.0, 46.0], [106.0, 110.0], [255.0, 252.0]];
+    pc.red = vec![[0.0, 0.0], [29.0, 21.0], [115.0, 133.0], [179.0, 195.0], [255.0, 255.0]];
+    pc.green = vec![[0.0, 0.0], [28.0, 20.0], [115.0, 133.0], [181.0, 196.0], [255.0, 255.0]];
+    pc.blue = vec![[0.0, 0.0], [28.0, 18.0], [117.0, 134.0], [179.0, 195.0], [255.0, 255.0]];
+    let g = &mut a.color_grading;
+    g.shadows = ColorWheel { hue: 30.0, saturation: 2.0, luminance: 0.0 };
+    g.highlights = ColorWheel { hue: 30.0, saturation: 3.0, luminance: 0.0 };
+    g.midtones = ColorWheel { hue: 185.0, saturation: 5.0, luminance: 0.0 };
+    g.blending = 100.0;
+    a.calibration.red = PrimaryCalibration { hue: 0.0, saturation: 20.0 };
+    a.calibration.green = PrimaryCalibration { hue: 0.0, saturation: -25.0 };
+    a.calibration.blue = PrimaryCalibration { hue: -10.0, saturation: 20.0 };
+    a.detail.sharpening.amount = 20.0;
+    a.detail.noise_reduction.luminance = 24.0;
+    a.detail.noise_reduction.color = 0.0;
+    a
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let check = args.iter().position(|a| a == "--check").map(|i| {
@@ -148,7 +208,10 @@ fn main() {
     let cube = tmp.join("warm film.cube");
     std::fs::write(&cube, film_cube()).unwrap();
     let lut_id = luts.import(&cube).expect("import LUT").id;
-    let vars = variations(&lut_id);
+    let mut vars = variations(&lut_id);
+    vars.push(("user_style", user_style()));
+    let mut user = Vec::new();
+    let mut draft = Vec::new();
 
     let cache = DevelopCache::new(DevelopConfig { cache_bytes: 2048 << 20 });
     let (mut decode, mut prepare, mut warm, mut pipe, mut enc, mut region) =
@@ -186,6 +249,9 @@ fn main() {
                 let e = ms(t);
                 warm.push(e);
                 per_image.push(e);
+                if *name == "user_style" {
+                    user.push(e);
+                }
                 if round == 0 {
                     if let Some(dir) = &check {
                         if i < 3 || *name == "neutral" {
@@ -244,6 +310,15 @@ fn main() {
             region.push(ms(t));
         }
 
+        // Slider-drag drafts (1024 px) of the user-style edit.
+        let dopts = RenderOptions { max_edge: 1024, slot: RenderSlot::Main, region: None };
+        let us = user_style();
+        for _ in 0..5 {
+            let t = Instant::now();
+            cache.render(cache.ticket(src.id, RenderSlot::Main), &src, &us, &dopts, &luts).unwrap().unwrap();
+            draft.push(ms(t));
+        }
+
         let mut pi = per_image.clone();
         println!(
             "{stem}: orient {:?} src {}x{} full {}x{} as-shot {:?} | decode {d:.0} ms | first 2048 {:.1} ms ({}x{}) | warm p50 {:.1} p95 {:.1} ms",
@@ -282,6 +357,17 @@ fn main() {
         pct(&mut warm.clone(), 0.5),
         pct(&mut warm.clone(), 0.95),
         pct(&mut warm, 1.0)
+    );
+    println!(
+        "user-style edit 2048      p50 {:.1} ms  p95 {:.1} ms  ({} renders: tone+HSL+curves+grading+calibration+NR+sharpening)",
+        pct(&mut user.clone(), 0.5),
+        pct(&mut user.clone(), 0.95),
+        user.len()
+    );
+    println!(
+        "user-style draft 1024     p50 {:.1} ms  p95 {:.1} ms",
+        pct(&mut draft.clone(), 0.5),
+        pct(&mut draft, 0.95)
     );
     println!("  pipeline only           p50 {:.1} ms  p95 {:.1} ms", pct(&mut pipe.clone(), 0.5), pct(&mut pipe, 0.95));
     println!("  JPEG encode (q90 4:4:4) p50 {:.1} ms  p95 {:.1} ms", pct(&mut enc.clone(), 0.5), pct(&mut enc, 0.95));
