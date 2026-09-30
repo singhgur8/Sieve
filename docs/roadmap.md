@@ -111,6 +111,7 @@ copy subsets into `test-data/` for anything that writes.
   (preview + export), within the slider latency budget.
 - [ ] **Masking UI** (frontend-dev): Lightroom-style masks panel, brush with size/feather/flow/auto-mask, gradient
   handles, AI select buttons, overlay visualization, keyboard shortcuts (O overlay, K brush, M linear, Shift+M radial).
+- [ ] **Masking polish** (frontend-dev + rust-engine-dev): per-mask tone curve editor, reorder groups/components, overlay rendered for the visible region at 100% zoom, verify crop-angle sign + gradient geometry against real renders, luminance eyedropper via backend sample (not canvas).
 - [ ] **QA gate**: the user's 50 AI subject masks (Adaptive: Subject presets; mattes embedded as JPEG XL in crs:Table_*) import and render like Lightroom (decoded mattes); new brush/gradient/range/AI masks work end to end; round trip preserves Lightroom mask data byte-for-byte when unchanged.
 
 ## Phase 8 — Hardening + packaging
