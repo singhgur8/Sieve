@@ -74,7 +74,7 @@ Conventions
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
 ## Phase 8 — Hardening + packaging
-- [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log.
+- [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
 - [ ] Error states, empty states, crash-safe catalog writes.
 - [ ] `pnpm tauri build` → `.app` / `.dmg`; smoke-test the bundle.
 - [ ] Final report in `docs/final-report.md`: what works, known gaps, how to use.
