@@ -26,6 +26,7 @@ pub mod features;
 pub mod matching;
 pub mod stats;
 pub mod store;
+pub mod workflow;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

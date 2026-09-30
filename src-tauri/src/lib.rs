@@ -9,6 +9,7 @@ pub mod model_fetch;
 pub mod profiles;
 pub mod raw;
 pub mod scene;
+pub mod styles;
 pub mod xmp;
 
 use std::path::PathBuf;
@@ -23,12 +24,13 @@ use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
     AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress, ImportProgress,
-    ModelDownloadFinished, ModelDownloadProgress, SceneProgress, ThumbnailFailed, ThumbnailReady, XmpSynced,
-    XmpWriteFailed,
+    ModelDownloadFinished, ModelDownloadProgress, SceneProgress, StyleModelFinished, StyleModelProgress,
+    ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
 use ml::masking::{Segmenter, SegmenterConfig};
+use ml::style::{StyleModel, StyleModelConfig};
 use ml::{Analysis, AnalysisConfig};
 use xmp::{XmpSync, XmpSyncConfig};
 
@@ -140,6 +142,27 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::cancel_model_download,
             commands::relocate_folder,
             commands::restore_catalog_backup,
+            // IPC v14
+            commands::import_style_folder,
+            commands::list_styles,
+            commands::remove_style_group,
+            commands::resolve_preset,
+            commands::auto_tone,
+            commands::auto_white_balance,
+            commands::get_workflow_step,
+            commands::set_workflow_step,
+            commands::set_keeper_rule,
+            commands::get_edit_plan,
+            commands::set_scene_representative,
+            commands::apply_scene_edit,
+            commands::apply_all_edited_scenes,
+            commands::undo_edit_batch,
+            commands::paste_previous,
+            commands::style_model_status,
+            commands::train_style_model,
+            commands::cancel_style_training,
+            commands::predict_style,
+            commands::apply_style_prediction,
         ])
         .events(collect_events![
             ImportProgress,
@@ -155,7 +178,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             ExportFinished,
             SceneProgress,
             ModelDownloadProgress,
-            ModelDownloadFinished
+            ModelDownloadFinished,
+            StyleModelProgress,
+            StyleModelFinished
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -167,6 +192,15 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         .constant("DEFAULT_LOCAL_ADJUSTMENTS", ipc::types::LocalAdjustments::default())
         // `download_models` group id of the AI-mask models (IPC v12).
         .constant("MODEL_GROUP_SEGMENTATION", ipc::types::MODEL_GROUP_SEGMENTATION)
+        // IPC v14: Copy... / Sync... / Save Preset dialog layout (Lightroom's groups), built-in
+        // style groups, the sliders with an Auto, the default keeper rule.
+        .constant("COPY_SETTINGS_GROUPS", ipc::types::copy_settings_groups())
+        .constant("USER_PRESETS_GROUP_ID", ipc::types::USER_PRESETS_GROUP_ID)
+        .constant("LUT_LIBRARY_GROUP_ID", ipc::types::LUT_LIBRARY_GROUP_ID)
+        .constant("AUTO_TONE_FIELDS", ipc::types::AdjustmentField::AUTO_TONE.to_vec())
+        .constant("PASTE_PREVIOUS_FIELDS", ipc::types::AdjustmentField::PASTE_PREVIOUS.to_vec())
+        .constant("DEFAULT_KEEPER_RULE", ipc::types::KeeperRule::default())
+        .constant("DEFAULT_SCENE_APPLY_OPTIONS", ipc::types::SceneApplyOptions::default())
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -258,6 +292,8 @@ pub fn run() {
             app.manage(catalog);
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
+            // Personal style model (IPC v14; training runs on its own thread + connection).
+            app.manage(StyleModel::new(StyleModelConfig { catalog_path: path.clone() }));
             app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }).with_mask_cache(mask_cache.clone()));
             app.manage(DevelopCache::new(DevelopConfig {
                 cache_bytes: develop_cache_mb * 1024 * 1024,

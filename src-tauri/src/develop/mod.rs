@@ -23,6 +23,8 @@
 //! - Prefetch: one background thread decodes queued sources (newest request replaces the
 //!   queue); concurrent decodes of the same image are coalesced.
 
+pub mod auto;
+pub mod batches;
 pub mod camera;
 pub mod fastmath;
 pub mod highlights;

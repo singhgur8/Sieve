@@ -48,11 +48,18 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
 
     let folders = conn
         .prepare(
-            "SELECT f.id, f.path, COUNT(i.id) FROM folders f
+            "SELECT f.id, f.path, COUNT(i.id), f.workflow_step FROM folders f
              LEFT JOIN images i ON i.folder_id = f.id
              GROUP BY f.id ORDER BY f.path",
         )?
-        .query_map([], |r| Ok(FolderEntry { id: r.get(0)?, path: r.get(1)?, image_count: r.get(2)? }))?
+        .query_map([], |r| {
+            Ok(FolderEntry {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                image_count: r.get(2)?,
+                workflow_step: WorkflowStep::parse(&r.get::<_, String>(3)?).unwrap_or(WorkflowStep::Cull),
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
 
     let tag_counts = conn
@@ -75,6 +82,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
         auto_analyze: auto_analyze(conn)?,
         xmp_auto_sync: xmp_auto_sync(conn)?,
         health: super::health_state(Path::new(catalog_path)),
+        keeper_rule: keeper_rule(conn)?,
     })
 }
 
@@ -88,15 +96,44 @@ pub fn set_auto_analyze(conn: &Connection, enabled: bool) -> AppResult<()> {
     set_meta(conn, "auto_analyze", if enabled { "1" } else { "0" })
 }
 
-/// `catalog_meta.xmp_auto_sync`; default off.
+/// `catalog_meta.xmp_auto_sync`; default on since schema v12 (IPC v14).
 pub fn xmp_auto_sync(conn: &Connection) -> AppResult<bool> {
     let v: Option<String> =
         conn.query_row("SELECT value FROM catalog_meta WHERE key = 'xmp_auto_sync'", [], |r| r.get(0)).optional()?;
-    Ok(v.as_deref() == Some("1"))
+    Ok(v.as_deref() != Some("0"))
 }
 
+/// Also records that the user chose explicitly (`xmp_auto_sync_user_set`, see migration 0012).
 pub fn set_xmp_auto_sync(conn: &Connection, enabled: bool) -> AppResult<()> {
-    set_meta(conn, "xmp_auto_sync", if enabled { "1" } else { "0" })
+    set_meta(conn, "xmp_auto_sync", if enabled { "1" } else { "0" })?;
+    set_meta(conn, "xmp_auto_sync_user_set", "1")
+}
+
+/// `catalog_meta.keeper_rule` (IPC v14); default [`KeeperRule::default`].
+pub fn keeper_rule(conn: &Connection) -> AppResult<KeeperRule> {
+    let v: Option<String> =
+        conn.query_row("SELECT value FROM catalog_meta WHERE key = 'keeper_rule'", [], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|j| serde_json::from_str::<KeeperRule>(&j).ok()).filter(|r| r.validate().is_ok()).unwrap_or_default())
+}
+
+pub fn set_keeper_rule(conn: &Connection, rule: &KeeperRule) -> AppResult<()> {
+    rule.validate().map_err(AppError::invalid)?;
+    set_meta(conn, "keeper_rule", &serde_json::to_string(rule)?)
+}
+
+/// Guided-workflow step of a folder (IPC v14). Unknown folder -> `not_found`.
+pub fn workflow_step(conn: &Connection, folder_id: FolderId) -> AppResult<WorkflowStep> {
+    let v: Option<String> =
+        conn.query_row("SELECT workflow_step FROM folders WHERE id = ?1", [folder_id], |r| r.get(0)).optional()?;
+    let v = v.ok_or_else(|| AppError::not_found(format!("folder {folder_id}")))?;
+    Ok(WorkflowStep::parse(&v).unwrap_or(WorkflowStep::Cull))
+}
+
+pub fn set_workflow_step(conn: &Connection, folder_id: FolderId, step: WorkflowStep) -> AppResult<()> {
+    if conn.execute("UPDATE folders SET workflow_step = ?2 WHERE id = ?1", params![folder_id, step.as_str()])? == 0 {
+        return Err(AppError::not_found(format!("folder {folder_id}")));
+    }
+    Ok(())
 }
 
 pub fn xmp_status(conn: &Connection, running: bool) -> AppResult<XmpStatus> {
@@ -2146,6 +2183,9 @@ mod tests {
             XmpSyncState { dirty: false, synced_at_ms: Some(5), error: Some("x".into()) }
         );
 
+        // On by default since v12 (IPC v14).
+        assert!(catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
+        set_xmp_auto_sync(&conn, false).unwrap();
         assert!(!catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
         set_xmp_auto_sync(&conn, true).unwrap();
         assert!(catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
@@ -2190,10 +2230,15 @@ mod tests {
     fn ui_prefs_round_trip() {
         let conn = open_in_memory();
         assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
-        let prefs = UiPrefs { last_export_folder: Some("/Users/me/Exports".into()) };
+        let prefs = UiPrefs {
+            last_export_folder: Some("/Users/me/Exports".into()),
+            copy_fields: Some(vec![AdjustmentField::Exposure, AdjustmentField::ProcessVersion]),
+            xmp_explainer_seen: Some(true),
+            scene_strip_visible: Some(false),
+        };
         set_ui_prefs(&conn, &prefs).unwrap();
         assert_eq!(ui_prefs(&conn).unwrap(), prefs);
-        let empty = UiPrefs { last_export_folder: Some(String::new()) };
+        let empty = UiPrefs { last_export_folder: Some(String::new()), ..Default::default() };
         assert_eq!(set_ui_prefs(&conn, &empty).unwrap_err().kind, ErrorKind::InvalidArgument);
         // Unknown / missing fields from other versions are tolerated.
         set_meta(&conn, UI_PREFS_KEY, r#"{"futureThing":1}"#).unwrap();

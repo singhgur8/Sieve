@@ -18,10 +18,12 @@ use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::masking::Segmenter;
+use crate::ml::style::StyleModel;
 use crate::ml::{self, Analysis};
 use crate::model_fetch::ModelDownloads;
 use crate::profiles::{CameraKey, ProfileLibrary};
 use crate::scene;
+use crate::styles;
 use crate::xmp::XmpSync;
 
 /// Managed state: the open catalog.
@@ -565,7 +567,9 @@ pub async fn reset_adjustments(
     Ok(())
 }
 
-/// Applies preset `presetId` (its `fields` only) to `ids` ("Preset: <name>"). Atomic.
+/// Applies preset `presetId` to `ids` ("Preset: <name>" entry per changed image). Atomic.
+/// Sieve presets copy their `fields` groups; imported Lightroom presets (v14) set exactly the
+/// `crs:` settings they contain and leave every other setting alone (`styles::resolve_preset`).
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_preset(
@@ -575,13 +579,7 @@ pub async fn apply_preset(
     ids: Vec<ImageId>,
     preset_id: PresetId,
 ) -> AppResult<()> {
-    catalog
-        .run(move |c| {
-            let preset = develop::presets::get(c, preset_id)?;
-            let label = format!("{}{}", develop::history::LABEL_PRESET_PREFIX, preset.name);
-            develop::history::apply_fields(c, &ids, &preset.adjustments, &preset.fields, &label)
-        })
-        .await?;
+    catalog.run(move |c| styles::apply_preset(c, &ids, preset_id)).await?;
     xmp.notify(&app);
     Ok(())
 }
@@ -1291,16 +1289,32 @@ mod tests {
 
 /// Profile browser contents for image `id`: camera profiles (DCPs) installed for its camera
 /// and the installed looks (read in place from the user's Adobe installation; empty lists
-/// when none are installed). Select one by saving `adjustments.profile`.
+/// when none are installed), plus (v14) the style library's imported looks / DCPs for this
+/// camera (`styleId` set, `group` = style group name) and every LUT profile (`luts`).
+/// Select one by saving `adjustments.profile` / `adjustments.lut` (`applyStyleProfile`).
 #[tauri::command]
 #[specta::specta]
 pub async fn list_profiles(
     catalog: State<'_, Catalog>,
     profiles: State<'_, ProfileLibrary>,
+    luts: State<'_, LutLibrary>,
     id: ImageId,
 ) -> AppResult<ProfileCatalog> {
     let entry = catalog.run(move |c| repo::get_image(c, id)).await?;
-    let camera = CameraKey {
+    let camera = camera_key(&entry);
+    let mut listing = profiles.catalog(entry.id, &camera);
+    let luts = luts.inner().clone();
+    catalog
+        .run(move |c| {
+            styles::sync_lut_library(c, &luts)?;
+            styles::extend_profile_catalog(c, &mut listing, &camera)?;
+            Ok(listing)
+        })
+        .await
+}
+
+fn camera_key(entry: &RawImageEntry) -> CameraKey {
+    CameraKey {
         format: entry.format,
         // Adobe's spelling of the makes Sieve identifies ("Sony ILCE-7M4", "Fujifilm X-M5").
         make: match entry.camera.make {
@@ -1310,8 +1324,7 @@ pub async fn list_profiles(
             CameraMake::Other => None,
         },
         model: entry.camera.model.clone(),
-    };
-    Ok(profiles.catalog(entry.id, &camera))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,4 +1510,408 @@ pub async fn download_models(app: AppHandle, downloads: State<'_, ModelDownloads
 pub async fn cancel_model_download(downloads: State<'_, ModelDownloads>) -> AppResult<()> {
     downloads.cancel();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IPC v14 (Phase 8b): style library, auto tone / WB, guided workflow, edit plan, edit
+// batches, style model, paste from previous
+// ---------------------------------------------------------------------------
+
+/// Imports every Lightroom develop preset (`.xmp` `crs:PresetType="Normal"`, legacy
+/// `.lrtemplate`), creative profile (`.xmp` `crs:PresetType="Look"`), camera profile (`.dcp`)
+/// and `.cube` LUT under `path` (recursive), one style group per source folder; re-importing a
+/// folder replaces its group. Looks/DCPs are read in place later (never copied); LUTs are
+/// copied into the LUT library. Errors: `not_found` (no such folder), `invalid_argument`
+/// (nothing importable found). Body: rust-engine-dev (`styles::import_folder`).
+#[tauri::command]
+#[specta::specta]
+pub async fn import_style_folder(
+    catalog: State<'_, Catalog>,
+    luts: State<'_, LutLibrary>,
+    path: String,
+) -> AppResult<ImportStyleReport> {
+    let luts = luts.inner().clone();
+    // rust-engine-dev: also refresh `ProfileLibrary` with `styles::imported_profile_paths`.
+    catalog.run(move |c| styles::import_folder(c, &luts, Path::new(&path))).await
+}
+
+/// The whole style library (every project sees every group): "User Presets", imported groups
+/// by name, "LUTs" (the pre-v14 LUT library, registered on first listing).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_styles(catalog: State<'_, Catalog>, luts: State<'_, LutLibrary>) -> AppResult<StyleLibrary> {
+    let luts = luts.inner().clone();
+    catalog
+        .run(move |c| {
+            styles::sync_lut_library(c, &luts)?;
+            styles::list(c)
+        })
+        .await
+}
+
+/// Removes an imported style group and its presets/profiles (source files untouched; images
+/// using them keep their settings). Built-in groups -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_style_group(catalog: State<'_, Catalog>, group_id: StyleGroupId) -> AppResult<()> {
+    catalog.run(move |c| styles::remove_group(c, group_id)).await
+}
+
+/// What `apply_preset(presetId)` would make of image `id`'s settings (`adjustments` = the live
+/// settings, `null` = stored ones), for hover previews (`renderPreview` with slot
+/// `navigator`). Nothing is saved.
+#[tauri::command]
+#[specta::specta]
+pub async fn resolve_preset(
+    catalog: State<'_, Catalog>,
+    id: ImageId,
+    preset_id: PresetId,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<ParametricAdjustments> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    catalog
+        .run(move |c| {
+            let base = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            styles::resolve_preset(c, preset_id, &base)
+        })
+        .await
+}
+
+/// Lightroom's Basic "Auto": absolute values for the tone + presence sliders in `keys`
+/// (`null` = all of `AdjustmentField::AUTO_TONE`; Shift-double-click a slider = just that one)
+/// given the live `adjustments` (`null` = stored). Nothing is saved: the UI merges the values
+/// (`applyAutoTone`) and saves one "Auto Tone" history entry. Body: rust-engine-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_tone(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+    keys: Option<Vec<AdjustmentField>>,
+) -> AppResult<AutoToneValues> {
+    let keys = keys.unwrap_or_else(|| AdjustmentField::AUTO_TONE.to_vec());
+    if keys.is_empty() {
+        return Err(AppError::invalid("keys must not be empty"));
+    }
+    if let Some(k) = keys.iter().find(|k| !AdjustmentField::AUTO_TONE.contains(k)) {
+        return Err(AppError::invalid(format!("{} has no Auto", k.as_str())));
+    }
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    let adjustments = match adjustments {
+        Some(a) => a,
+        None => catalog.run(move |c| repo::get_adjustments(c, id)).await?,
+    };
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let r = blocking(move || develop::auto::auto_tone(&cache, &src, &adjustments, &keys)).await;
+    note_if_missing(&catalog, id, r).await
+}
+
+/// Lightroom's "Auto" white balance: temperature/tint for the live `adjustments` (`null` =
+/// stored). Nothing is saved: the UI commits `whiteBalance: custom` ("Auto White Balance").
+/// Body: rust-engine-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_white_balance(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<WhiteBalanceValues> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    let adjustments = match adjustments {
+        Some(a) => a,
+        None => catalog.run(move |c| repo::get_adjustments(c, id)).await?,
+    };
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let r = blocking(move || develop::auto::auto_white_balance(&cache, &src, &adjustments)).await;
+    note_if_missing(&catalog, id, r).await
+}
+
+/// Guided-workflow step of folder `folderId` (also in `CatalogState.folders[].workflowStep`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_workflow_step(catalog: State<'_, Catalog>, folder_id: FolderId) -> AppResult<WorkflowStep> {
+    catalog.run(move |c| repo::workflow_step(c, folder_id)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_workflow_step(catalog: State<'_, Catalog>, folder_id: FolderId, step: WorkflowStep) -> AppResult<()> {
+    catalog.run(move |c| repo::set_workflow_step(c, folder_id, step)).await
+}
+
+/// Changes which images count as keepers (`CatalogState.keeperRule`). `minRating` 1..=5.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_keeper_rule(catalog: State<'_, Catalog>, rule: KeeperRule) -> AppResult<()> {
+    catalog.run(move |c| repo::set_keeper_rule(c, &rule)).await
+}
+
+/// The Edit step of folder `folderId`: keepers, their scenes, one representative per scene and
+/// the checklist status. Proposes (and remembers) representatives for scenes without one.
+/// Keepers outside every scene are listed in `unassignedKeeperIds` (run `detect_scenes`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_edit_plan(catalog: State<'_, Catalog>, folder_id: FolderId) -> AppResult<EditPlan> {
+    catalog.run(move |c| scene::workflow::edit_plan(c, folder_id)).await
+}
+
+/// Chooses scene `sceneId`'s representative (`imageId` must be a keeper member) or hands the
+/// choice back to Sieve (`null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_scene_representative(
+    catalog: State<'_, Catalog>,
+    scene_id: SceneId,
+    image_id: Option<ImageId>,
+) -> AppResult<SceneEditEntry> {
+    catalog.run(move |c| scene::workflow::set_representative(c, scene_id, image_id)).await
+}
+
+/// Matches every job's targets to its representative (`match_scene` machinery) off the
+/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets.
+async fn match_scene_jobs(
+    app: AppHandle,
+    develop: &DevelopCache,
+    luts: &LutLibrary,
+    jobs: Vec<scene::workflow::SceneApplyJob>,
+    options: MatchOptions,
+) -> AppResult<(Vec<scene::workflow::SceneApplyJob>, Vec<Vec<MatchPreview>>)> {
+    let cache = develop.clone();
+    let luts = luts.clone();
+    blocking(move || {
+        let emit = scene::progress_emitter(app, SceneTask::Apply);
+        let total: u32 = jobs.iter().map(|j| j.targets.len() as u32).sum();
+        let mut offset = 0u32;
+        let mut previews = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            if job.targets.is_empty() {
+                previews.push(Vec::new());
+                continue;
+            }
+            let base = offset;
+            let progress = |done: u32, _: u32| emit(base + done, total);
+            let mut out = Vec::with_capacity(job.targets.len());
+            for chunk in job.targets.chunks(MatchOptions::MAX_TARGETS) {
+                out.extend(scene::matching::match_images(
+                    &cache,
+                    &luts,
+                    std::slice::from_ref(&job.representative),
+                    chunk,
+                    &options,
+                    &progress,
+                )?);
+            }
+            offset += job.targets.len() as u32;
+            previews.push(out);
+        }
+        emit(total, total);
+        Ok((jobs, previews))
+    })
+    .await
+}
+
+async fn apply_scenes(
+    app: AppHandle,
+    catalog: &Catalog,
+    develop: &DevelopCache,
+    luts: &LutLibrary,
+    xmp: &XmpSync,
+    scene_ids: SceneIds,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    let options = options.unwrap_or_default();
+    options.match_options.validate().map_err(AppError::invalid)?;
+    let opts = options.clone();
+    let jobs = catalog
+        .run(move |c| {
+            let ids = match scene_ids {
+                SceneIds::One(id) => vec![id],
+                SceneIds::EditedIn(folder) => scene::workflow::edited_scenes(c, folder)?,
+            };
+            scene::workflow::apply_inputs(c, &ids, &opts)
+        })
+        .await?;
+    let (jobs, previews) = match_scene_jobs(app.clone(), develop, luts, jobs, options.match_options).await?;
+    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews)).await?;
+    if !result.batch.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+enum SceneIds {
+    One(SceneId),
+    EditedIn(FolderId),
+}
+
+/// "Apply to scene": copies the representative's edit to the scene's other keepers (and
+/// non-keepers with `includeNonKeepers`) with relative matching (exposure / white balance
+/// normalised per frame, `SceneApplyOptions.matchOptions`), skipping frames the user retouched
+/// after the last apply (`skipUserEdited`). One undoable batch (`undo_edit_batch`); one "Apply
+/// to Scene" history entry per changed image. Blocking until done (`sceneProgress` task
+/// `apply`). Representative without edits -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_scene_edit(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    xmp: State<'_, XmpSync>,
+    scene_id: SceneId,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::One(scene_id), options).await
+}
+
+/// `apply_scene_edit` for every scene of `folderId` whose status is `edited` or `outdated`,
+/// as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_all_edited_scenes(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    xmp: State<'_, XmpSync>,
+    folder_id: FolderId,
+    options: Option<SceneApplyOptions>,
+) -> AppResult<ApplyScenesResult> {
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::EditedIn(folder_id), options).await
+}
+
+/// Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
+/// `apply_style_prediction`): images still carrying what the batch wrote get their previous
+/// settings back ("Undo <label>" entry each); images edited since are left alone
+/// (`skippedIds`). Unknown batch -> `not_found`; already undone -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn undo_edit_batch(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    batch_id: EditBatchId,
+) -> AppResult<UndoBatchResult> {
+    let r = catalog.run(move |c| develop::batches::undo(c, batch_id)).await?;
+    if !r.restored_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
+}
+
+/// Lightroom's "Previous" / Paste from previous (Cmd+Alt+V): copies the stored settings of
+/// `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
+/// `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
+/// `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+#[tauri::command]
+#[specta::specta]
+pub async fn paste_previous(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    target_ids: Vec<ImageId>,
+    previous_id: ImageId,
+    fields: Option<Vec<AdjustmentField>>,
+) -> AppResult<()> {
+    let fields = fields.unwrap_or_else(|| AdjustmentField::PASTE_PREVIOUS.to_vec());
+    require_fields(&fields)?;
+    let targets: Vec<ImageId> = target_ids.into_iter().filter(|&id| id != previous_id).collect();
+    catalog
+        .run(move |c| {
+            let src = repo::get_adjustments(c, previous_id)?;
+            develop::history::apply_fields(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
+        })
+        .await?;
+    xmp.notify(&app);
+    Ok(())
+}
+
+/// State of the personal style model ("Auto edit (my style)").
+#[tauri::command]
+#[specta::specta]
+pub async fn style_model_status(catalog: State<'_, Catalog>, style: State<'_, StyleModel>) -> AppResult<StyleModelStatus> {
+    let style = style.inner().clone();
+    catalog.run(move |c| style.status(c)).await
+}
+
+/// Trains the style model from every edited photo in the catalog, in the background
+/// (`styleModelProgress`, then exactly one `styleModelFinished`). Already training ->
+/// `invalid_argument`. Body: vision-ml-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn train_style_model(app: AppHandle, style: State<'_, StyleModel>) -> AppResult<()> {
+    style.start_training(&app)
+}
+
+/// Stops a running training (no-op when idle); `styleModelFinished {cancelled: true}` follows.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_style_training(style: State<'_, StyleModel>) -> AppResult<()> {
+    style.cancel();
+    Ok(())
+}
+
+/// Predicted settings in the user's style for `imageIds` (given order; nothing is saved).
+/// No trained model -> `invalid_argument`. Body: vision-ml-dev.
+#[tauri::command]
+#[specta::specta]
+pub async fn predict_style(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    style: State<'_, StyleModel>,
+    image_ids: Vec<ImageId>,
+) -> AppResult<Vec<StylePrediction>> {
+    let inputs = catalog.run(move |c| scene::store::match_inputs(c, &image_ids)).await?;
+    let (style, cache, luts) = (style.inner().clone(), develop.inner().clone(), luts.inner().clone());
+    blocking(move || style.predict(&cache, &luts, &inputs)).await
+}
+
+/// Predicts and commits the user's style for `imageIds` as one undoable batch ("Auto Edit (My
+/// Style)" entry per changed image; `undo_edit_batch`).
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_style_prediction(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    style: State<'_, StyleModel>,
+    xmp: State<'_, XmpSync>,
+    image_ids: Vec<ImageId>,
+) -> AppResult<EditBatchResult> {
+    let inputs = catalog.run(move |c| scene::store::match_inputs(c, &image_ids)).await?;
+    let (model, cache, lut_lib) = (style.inner().clone(), develop.inner().clone(), luts.inner().clone());
+    let predictions = blocking(move || model.predict(&cache, &lut_lib, &inputs)).await?;
+    let items: Vec<develop::batches::BatchItem> = predictions
+        .into_iter()
+        .map(|p| develop::batches::BatchItem { image_id: p.image_id, adjustments: p.adjustments, scene_id: None })
+        .collect();
+    let r = catalog
+        .run(move |c| {
+            develop::batches::commit_recorded(
+                c,
+                &items,
+                develop::batches::LABEL_STYLE,
+                develop::batches::BatchKind::StylePrediction,
+            )
+        })
+        .await?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }

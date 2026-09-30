@@ -2,19 +2,24 @@
 //!
 //! - `params_json` is overlaid on neutral defaults when read (like `adjustments`).
 //! - `fields_json` is a non-empty, de-duplicated `AdjustmentField[]`.
-//! - Names are trimmed, 1..=100 chars, unique case-insensitively (`invalid_argument` on
-//!   a clash with another preset). Unknown id -> `not_found`.
+//! - Names are trimmed, 1..=100 chars, unique case-insensitively within their style group
+//!   (`invalid_argument` on a clash with another preset). Unknown id -> `not_found`.
+//! - `save` writes Sieve presets (group `USER_PRESETS_GROUP_ID`); imported presets (IPC v14,
+//!   `styles`) carry `settings_json` and are applied key by key (`styles::resolve_preset`).
 //! - Listed by name (case-insensitive).
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::{AdjustmentField, ParametricAdjustments, Preset, PresetId};
+use crate::ipc::types::{
+    AdjustmentField, ParametricAdjustments, Preset, PresetId, StyleGroupId, StyleSourceFormat, USER_PRESETS_GROUP_ID,
+};
 
-const SELECT: &str = "SELECT id, name, params_json, fields_json, created_at, updated_at FROM presets";
+const SELECT: &str = "SELECT id, name, params_json, fields_json, created_at, updated_at, group_id, source_format, \
+                      setting_keys_json FROM presets";
 
-fn overlay(json: &str) -> AppResult<ParametricAdjustments> {
+pub(crate) fn overlay(json: &str) -> AppResult<ParametricAdjustments> {
     fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
         match (base, overlay) {
             (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
@@ -35,17 +40,29 @@ fn overlay(json: &str) -> AppResult<ParametricAdjustments> {
     Ok(serde_json::from_value(value)?)
 }
 
-type RawRow = (PresetId, String, String, String, i64, i64);
+type RawRow = (PresetId, String, String, String, i64, i64, StyleGroupId, String, String);
 
 fn raw(r: &Row) -> rusqlite::Result<RawRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
 }
 
-fn to_preset((id, name, params_json, fields_json, created_at_ms, updated_at_ms): RawRow) -> AppResult<Preset> {
+fn to_preset(
+    (id, name, params_json, fields_json, created_at_ms, updated_at_ms, group_id, source_format, keys_json): RawRow,
+) -> AppResult<Preset> {
     let names: Vec<String> = serde_json::from_str(&fields_json)?;
     // Unknown (future) field names are skipped rather than failing the whole list.
     let fields = names.iter().filter_map(|n| AdjustmentField::parse(n)).collect();
-    Ok(Preset { id, name, adjustments: overlay(&params_json)?, fields, created_at_ms, updated_at_ms })
+    Ok(Preset {
+        id,
+        name,
+        adjustments: overlay(&params_json)?,
+        fields,
+        created_at_ms,
+        updated_at_ms,
+        group_id,
+        source_format: StyleSourceFormat::parse(&source_format).unwrap_or(StyleSourceFormat::Sieve),
+        setting_keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+    })
 }
 
 pub fn list(conn: &Connection) -> AppResult<Vec<Preset>> {
@@ -86,9 +103,11 @@ pub fn save(
         return Err(AppError::invalid("fields must not be empty"));
     }
     let clash: Option<PresetId> = conn
-        .query_row("SELECT id FROM presets WHERE name = ?1 COLLATE NOCASE AND id IS NOT ?2", params![name, id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM presets WHERE group_id = ?3 AND name = ?1 COLLATE NOCASE AND id IS NOT ?2",
+            params![name, id, USER_PRESETS_GROUP_ID],
+            |r| r.get(0),
+        )
         .optional()?;
     if clash.is_some() {
         return Err(AppError::invalid(format!("a preset named {name:?} already exists")));
@@ -98,9 +117,11 @@ pub fn save(
     let now = now_ms();
     let id = match id {
         Some(id) => {
+            // Only Sieve presets are editable; imported ones are replaced by re-importing.
             let n = conn.execute(
-                "UPDATE presets SET name = ?2, params_json = ?3, fields_json = ?4, updated_at = ?5 WHERE id = ?1",
-                params![id, name, params_json, fields_json, now],
+                "UPDATE presets SET name = ?2, params_json = ?3, fields_json = ?4, updated_at = ?5
+                 WHERE id = ?1 AND group_id = ?6",
+                params![id, name, params_json, fields_json, now, USER_PRESETS_GROUP_ID],
             )?;
             if n == 0 {
                 return Err(AppError::not_found(format!("preset {id}")));
