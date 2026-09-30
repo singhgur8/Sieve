@@ -1,5 +1,6 @@
 // Non-blocking export progress cards (bottom-right). A finished job collapses to a 28 px pill after 8 s.
-import { CheckCircle2, FolderSearch, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FolderSearch, X } from "lucide-react";
+import { describeReason, type ErrorCategory } from "../../lib/errors";
 import type { JobView } from "../../hooks/useExportJobs";
 
 interface Props {
@@ -31,6 +32,22 @@ function Pill({ job, onDismiss, onReveal }: { job: JobView; onDismiss: (id: numb
       </button>
     </div>
   );
+}
+
+const FAILURE_HINT: Partial<Record<ErrorCategory, string>> = {
+  disk_full: "The destination disk is full. Free up space or pick another folder, then export the remaining photos again.",
+  read_only: "The destination is read-only. Choose a writable folder in the export dialog.",
+  permission: "Sieve is not allowed to write there. Check the folder's permissions or choose another folder.",
+  folder_gone: "The destination folder no longer exists (moved, or its drive was disconnected). Choose another folder.",
+  missing: "Some originals are missing. Reconnect the drive or move the files back, then export them again.",
+  decode: "Some files could not be decoded. They may be damaged or still copying.",
+};
+
+/** One-line guidance for the most actionable failure category of a finished job. */
+function failureHint(failed: { reason: string }[]): string | null {
+  const cats = new Set(failed.map((f) => describeReason(f.reason).category));
+  for (const c of ["disk_full", "read_only", "permission", "folder_gone", "missing", "decode"] as const) if (cats.has(c)) return FAILURE_HINT[c] ?? null;
+  return null;
 }
 
 function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: (id: number) => void; onDismiss: (id: number) => void; onReveal: (path: string) => void }) {
@@ -82,8 +99,8 @@ function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: 
 
       {f && (
         <div className="mt-1.5 space-y-1 text-xs" data-testid="export-summary">
-          <p className={f.failed.length > 0 ? "text-amber-300" : "text-emerald-300"} data-testid="export-summary-text">
-            {f.cancelled ? "Cancelled: " : "Done: "}
+          <p className={f.failed.length > 0 ? (f.succeeded === 0 ? "text-red-300" : "text-amber-300") : "text-emerald-300"} data-testid="export-summary-text">
+            {f.cancelled ? "Cancelled: " : f.failed.length > 0 && f.succeeded === 0 ? "Export failed: " : "Done: "}
             {f.succeeded} exported
             {f.skipped > 0 && `, ${f.skipped} skipped`}
             {f.failed.length > 0 && `, ${f.failed.length} failed`}
@@ -100,6 +117,12 @@ function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: 
             </div>
           ) : (
             <p className="text-neutral-400">Written next to the original RAW files</p>
+          )}
+          {f.failed.length > 0 && failureHint(f.failed) && (
+            <p className="flex items-start gap-1.5 rounded bg-red-950/60 p-1.5 text-red-200" data-testid="export-failure-hint">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              {failureHint(f.failed)}
+            </p>
           )}
           {f.failed.length > 0 && (
             <ul className="max-h-28 overflow-auto rounded bg-neutral-950 p-1.5 text-red-300" data-testid="export-failures">

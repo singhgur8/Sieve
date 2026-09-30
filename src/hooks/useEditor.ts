@@ -220,7 +220,9 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
         schedule("main", ...(optsRef.current.wantBefore ? (["before"] as const) : []), ...(optsRef.current.region ? (["detail"] as const) : []));
       })
       .catch((e) => {
-        if (!stale) optsRef.current.onError(e);
+        if (stale) return;
+        setLoading(false);
+        optsRef.current.onError(e);
       });
     return () => {
       stale = true;
@@ -314,6 +316,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     setAdjBoth(a);
     setHistory(h);
     setInfo(i);
+    setLoading(false);
     schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     optsRef.current.onChanged(cur);
   }, [commitPending, setAdjBoth, schedule]);

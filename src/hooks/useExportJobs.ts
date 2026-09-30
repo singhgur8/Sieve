@@ -1,6 +1,7 @@
 // Export job tracking: seeds from get_export_jobs, then follows exportProgress / exportFinished.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { commands, events, unwrap, type ExportFinished, type ExportJob } from "../ipc";
+import { noteFailure } from "../lib/errors";
 
 export interface JobView {
   id: number;
@@ -76,6 +77,7 @@ export function useExportJobs(onError: (e: unknown) => void) {
       }),
       events.exportFinished.listen((ev) => {
         const f = ev.payload;
+        f.failed.forEach((x) => noteFailure(x.reason));
         upsert(f.jobId, (c) => ({
           finished: f,
           running: false,

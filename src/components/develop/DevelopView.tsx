@@ -6,6 +6,8 @@ import { commands, convertFileSrc, unwrap, type FaceInfo, type LutInfo, type Nor
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
+import { clearFileHealth, useFileHealth } from "../../lib/errors";
+import { OriginalUnavailable } from "./OriginalUnavailable";
 import { Stars } from "../Cell";
 import { Filmstrip } from "../Filmstrip";
 import { setPanelHidden, usePanels } from "../../lib/panels";
@@ -126,6 +128,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     onChanged,
   });
   const { info } = editor;
+  const health = useFileHealth(entry?.path);
   const fw = info?.fullWidth ?? 0;
   const fh = info?.fullHeight ?? 0;
   const masks = useMasks({ editor, id, onError, onNotice });
@@ -592,6 +595,16 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             inset={cropTool ? CROP_INSET : 0}
             rotate={cropTool ? previewRotation(cropTool.angle, orientation) : 0}
           />
+          {health && !editor.main && entry && (
+            <OriginalUnavailable
+              health={health}
+              fileName={entry.fileName}
+              onRetry={() => {
+                clearFileHealth(entry.path);
+                void editor.reload().catch(onError);
+              }}
+            />
+          )}
           {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} region={zoom.on ? region : null} onError={onError} />}
           {masks.open && masks.tool && !cropTool && (
             <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>

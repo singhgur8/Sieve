@@ -87,7 +87,7 @@ export function useScenes(
     setProgress({ task: "detect", done: 0, total: 0 });
     try {
       const found = await unwrap(commands.detectScenes(folderId, null));
-      notify(`Detected ${found.length} scene${found.length === 1 ? "" : "s"}`);
+      notify(found.length === 0 ? "No scenes found. Scenes need photos taken close together in similar light; make one from a selection with Scene > New scene from selection." : `Detected ${found.length} scene${found.length === 1 ? "" : "s"}`);
       await sync();
     } catch (e) {
       onError(e);

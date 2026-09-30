@@ -8,6 +8,7 @@ import { hint } from "../../lib/keymap";
 import { CREATE_LABEL, CREATE_ORDER, CREATE_SHORT, LOCAL_GROUPS, MODE_GLYPH, OVERLAY_STYLES, componentTitle, type CreateKind } from "../../lib/masks";
 import { Menu, menuItem } from "../Menu";
 import { Section, seg } from "./fields";
+import { ModelsCard } from "../ModelsCard";
 import { Slider } from "./Slider";
 
 const ICON: Record<CreateKind, typeof Brush> = {
@@ -53,6 +54,7 @@ export function MasksPanel({ masks }: Props) {
   return (
     <div className="flex h-full flex-col overflow-hidden px-2" data-testid="masks-panel" data-compact={compact}>
       <div className="shrink-0 py-2">
+        <ModelsCard />
         <div className="mb-1 flex items-center justify-between">
           <h2 className="text-[11px] font-semibold uppercase tracking-wide text-neutral-300">{compact ? "Create" : "Create new mask"}</h2>
           {masks.needsUpdate > 0 && (

@@ -21,12 +21,16 @@ import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
 import { MatchPanel } from "./components/scenes/MatchPanel";
-import { Toasts, useToasts } from "./components/Toasts";
+import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ModelsDialog } from "./components/ModelsCard";
+import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount } from "./lib/modal";
 import { getClipboard } from "./lib/clipboard";
+import { describeReason, noteFailure } from "./lib/errors";
 import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
@@ -47,6 +51,8 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  useModels(); // keeps the download listeners alive so mask capabilities refresh even when no panel is open
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
   const [caps, setCaps] = useState(false);
@@ -322,12 +328,24 @@ export default function App() {
   );
 
   // ---- XMP ----
+  /** Success summary, or a persistent error toast (read-only folder, moved originals...) when some sidecars failed. */
+  const xmpToast = useCallback(
+    (prefix: string, r: { succeeded: number; failed: { imageId: number; reason: string }[] }) => {
+      if (r.failed.length === 0) return setNotice(`${prefix} ${plural(r.succeeded, "photo")}`);
+      r.failed.forEach((f) => noteFailure(f.reason));
+      const why = describeReason(r.failed[0].reason);
+      const lead = r.succeeded > 0 ? `${prefix} ${plural(r.succeeded, "photo")}; ` : "";
+      push(`${lead}${plural(r.failed.length, "sidecar")} could not be written. ${why.message}`, { kind: "error" });
+    },
+    [push, setNotice],
+  );
+
   const writeXmp = useCallback(async () => {
     const t = targets();
     if (t.length === 0) return;
     try {
       const r = await unwrap(commands.writeXmp(t));
-      setNotice(`Saved metadata for ${r.succeeded} photo${r.succeeded === 1 ? "" : "s"}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      xmpToast("Saved metadata for", r);
       await lib.refresh(t);
       status.refreshXmp();
     } catch (e) {
@@ -338,7 +356,7 @@ export default function App() {
   const saveAllDirty = useCallback(async () => {
     try {
       const r = await unwrap(commands.writeXmpAllDirty(null));
-      setNotice(`Saved XMP for ${plural(r.succeeded, "photo")}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed[0].reason}` : ""}`);
+      xmpToast("Saved XMP for", r);
       status.refreshXmp();
       await lib.refreshAll();
     } catch (e) {
@@ -634,6 +652,7 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col">
+      {status.catalogIssue && <IssueBanner issue={status.catalogIssue} onDismiss={() => status.setCatalogIssue(null)} />}
       <TopBar
         catalog={catalog}
         analysis={status.analysis}
@@ -674,18 +693,29 @@ export default function App() {
         onReadXmp={() => void readXmp()}
         onExport={openExport}
         onCheatSheet={() => setCheatOpen(true)}
+        onModels={() => setModelsOpen(true)}
+        onRegenerate={() =>
+          void run(async () => {
+            const t = targets();
+            await unwrap(commands.regenerateThumbnails(t));
+            setNotice(`Regenerating previews for ${plural(t.length, "photo")}`);
+          })
+        }
         exportPct={exportPct}
       />
       <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
       {exportOpen && (
-        <ExportDialog
-          selectionIds={exportOpen}
-          filteredIds={ids}
-          sampleEntry={(id) => lib.getEntry(id)}
-          onClose={() => setExportOpen(null)}
-          onStarted={exportJobs.track}
-        />
+        <ErrorBoundary view="Export" overlay onExit={() => setExportOpen(null)}>
+          <ExportDialog
+            selectionIds={exportOpen}
+            filteredIds={ids}
+            sampleEntry={(id) => lib.getEntry(id)}
+            onClose={() => setExportOpen(null)}
+            onStarted={exportJobs.track}
+          />
+        </ErrorBoundary>
       )}
+      {modelsOpen && <ModelsDialog onClose={() => setModelsOpen(false)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
           selected={applyOpen.selected}
@@ -699,7 +729,7 @@ export default function App() {
       )}
       {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
-        <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} />
+        <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 
@@ -749,6 +779,7 @@ export default function App() {
       />
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
+        <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid
           lib={lib}
           targetSize={size}
@@ -762,7 +793,9 @@ export default function App() {
           onImport={importFolder}
           onClearFilters={clearFilters}
         />
+        </ErrorBoundary>
         {mode === "develop" && (
+          <ErrorBoundary view="Develop" overlay onExit={() => changeMode("grid")}>
           <DevelopView
             key={devEpoch}
             ref={develop}
@@ -773,8 +806,10 @@ export default function App() {
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBack={() => changeMode("grid")}
           />
+          </ErrorBoundary>
         )}
         {(mode === "loupe" || mode === "compare") && (
+          <ErrorBoundary view="Library" overlay onExit={() => changeMode("grid")}>
           <LoupeLayer
             ref={loupe}
             mode={mode}
@@ -788,6 +823,7 @@ export default function App() {
             }}
             onOpen={(id) => sel.set([id], id)}
           />
+          </ErrorBoundary>
         )}
       </div>
       {matchScene && (

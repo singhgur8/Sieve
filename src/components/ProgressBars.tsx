@@ -1,8 +1,8 @@
-import { Loader2 } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 import type { ImportProgress } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 
-export function AnalysisBar({ a, onCancel }: { a: AnalysisView; onCancel: () => void }) {
+export function AnalysisBar({ a, onCancel, onDismiss }: { a: AnalysisView; onCancel: () => void; onDismiss?: () => void }) {
   const pct = a.total > 0 ? Math.min(100, (a.done / a.total) * 100) : 0;
   return (
     <div className="border-b border-neutral-800 px-4 py-1.5" data-testid="analysis-bar">
@@ -11,10 +11,19 @@ export function AnalysisBar({ a, onCancel }: { a: AnalysisView; onCancel: () => 
         <span>
           {a.running ? "Analyzing" : "Analysis paused"}: {a.done} / {a.total}
         </span>
-        {a.failed > 0 && <span className="text-red-400">{a.failed} failed</span>}
+        {a.failed > 0 && (
+          <span className="min-w-0 truncate text-red-400" title={a.lastReason} data-testid="analysis-failed">
+            {a.failed} failed to analyze{a.lastReason ? `: ${a.lastReason}` : ""}. Those photos keep no culling tags; they can still be rated and edited.
+          </span>
+        )}
         {a.running && (
           <button onClick={onCancel} className="ml-auto rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700">
             Cancel
+          </button>
+        )}
+        {!a.running && onDismiss && (
+          <button onClick={onDismiss} aria-label="Dismiss analysis status" data-testid="analysis-dismiss" className="ml-auto shrink-0 text-neutral-400 hover:text-neutral-100">
+            <X className="size-3.5" />
           </button>
         )}
       </div>
@@ -34,7 +43,11 @@ export function ImportBar({ progress, active }: { progress: ImportProgress; acti
         <span>
           {active ? "Extracting thumbnails" : "Done"}: {progress.done} / {progress.total}
         </span>
-        {progress.failed > 0 && <span className="text-red-400">{progress.failed} failed</span>}
+        {progress.failed > 0 && (
+          <span className="text-red-400" data-testid="import-failed">
+            {progress.failed} without a preview (damaged, unsupported or unreadable); they stay in the catalog and show "No preview".
+          </span>
+        )}
       </div>
       <div className="h-1.5 overflow-hidden rounded bg-neutral-800">
         <div className="h-full bg-amber-400 transition-[width]" style={{ width: `${pct}%` }} />
