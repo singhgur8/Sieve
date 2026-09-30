@@ -491,6 +491,135 @@ pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustme
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Ingest (thumbnail + EXIF extraction)
+// ---------------------------------------------------------------------------
+
+/// An image waiting for extraction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingImage {
+    pub id: ImageId,
+    pub path: String,
+    pub format: RawFormat,
+}
+
+/// Up to `limit` images with `thumbnails.status = 'pending'`, lowest id first.
+pub fn pending_thumbnails(conn: &Connection, limit: u32) -> AppResult<Vec<PendingImage>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, i.path, i.format FROM thumbnails t JOIN images i ON i.id = t.image_id
+         WHERE t.status = 'pending' ORDER BY t.image_id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |r| {
+        Ok(PendingImage { id: r.get(0)?, path: r.get(1)?, format: enum_col(r, 2, RawFormat::parse)? })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub fn count_pending(conn: &Connection) -> AppResult<u32> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM thumbnails WHERE status = 'pending'", [], |r| r.get(0))?)
+}
+
+/// Generated cache files for one image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThumbFiles {
+    pub thumb_path: String,
+    pub preview_path: Option<String>,
+    /// Thumbnail pixel size after orientation.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// f32 EXIF values widened to f64 as-is store e.g. 1.4 as 1.399999976; keep 2 decimals.
+fn round_f32(v: f32) -> f64 {
+    (v as f64 * 100.0).round() / 100.0
+}
+
+/// Records one extraction result atomically: EXIF columns (if any were read) and the
+/// thumbnail row (`ready` with files, or `failed` with `reason`).
+pub fn record_extraction(
+    conn: &mut Connection,
+    id: ImageId,
+    meta: Option<&raw::meta::ImageMeta>,
+    outcome: Result<&ThumbFiles, &str>,
+) -> AppResult<()> {
+    let tx = conn.transaction()?;
+    if let Some(m) = meta {
+        tx.prepare_cached(
+            "UPDATE images SET
+                 camera_make = COALESCE(?2, camera_make),
+                 camera_model = COALESCE(?3, camera_model),
+                 sensor_layout = COALESCE(?4, sensor_layout),
+                 lens = ?5, captured_at_ms = ?6, iso = ?7, shutter_s = ?8, aperture = ?9,
+                 focal_length_mm = ?10, width = ?11, height = ?12, orientation = ?13
+             WHERE id = ?1",
+        )?
+        .execute(params![
+            id,
+            m.make.map(|v| v.as_str()),
+            m.model,
+            m.sensor_layout.map(|v| v.as_str()),
+            m.lens,
+            m.captured_at_ms,
+            m.iso,
+            m.shutter_seconds,
+            m.aperture.map(round_f32),
+            m.focal_length_mm.map(round_f32),
+            m.width,
+            m.height,
+            m.orientation,
+        ])?;
+    }
+    let now = now_ms();
+    match outcome {
+        Ok(f) => tx
+            .prepare_cached(
+                "UPDATE thumbnails SET status = 'ready', path = ?2, preview_path = ?3, width = ?4, height = ?5,
+                 error = NULL, extracted_at = ?6
+             WHERE image_id = ?1",
+            )?
+            .execute(params![id, f.thumb_path, f.preview_path, f.width, f.height, now])?,
+        Err(reason) => tx
+            .prepare_cached(
+                "UPDATE thumbnails SET status = 'failed', path = NULL, preview_path = NULL, width = NULL,
+                 height = NULL, error = ?2, extracted_at = ?3
+             WHERE image_id = ?1",
+            )?
+            .execute(params![id, reason, now])?,
+    };
+    tx.commit()?;
+    Ok(())
+}
+
+/// Resets `ids` to `pending` (clearing paths/errors) so the pipeline redoes them.
+/// Atomic; unknown ids fail the batch with `not_found`. Returns the old cache paths
+/// so the caller can delete them.
+pub fn reset_thumbnails(conn: &mut Connection, ids: &[ImageId]) -> AppResult<Vec<String>> {
+    let tx = conn.transaction()?;
+    let mut old = Vec::new();
+    {
+        let mut select = tx.prepare(
+            "SELECT t.path, t.preview_path FROM images i
+                                     LEFT JOIN thumbnails t ON t.image_id = i.id WHERE i.id = ?1",
+        )?;
+        let mut upsert = tx.prepare(
+            "INSERT INTO thumbnails (image_id, status) VALUES (?1, 'pending')
+             ON CONFLICT(image_id) DO UPDATE SET status = 'pending', path = NULL, preview_path = NULL,
+                 width = NULL, height = NULL, error = NULL, extracted_at = NULL",
+        )?;
+        for &id in ids {
+            let paths = select
+                .query_row([id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))
+                .optional()?
+                .ok_or_else(|| AppError::not_found(format!("image {id}")))?;
+            old.extend(paths.0);
+            old.extend(paths.1);
+            upsert.execute([id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +817,73 @@ mod tests {
         let mut expected = ParametricAdjustments { exposure: 1.5, ..Default::default() };
         expected.hsl.hue.red = 10.0;
         assert_eq!(get_adjustments(&conn, id).unwrap(), expected);
+    }
+
+    #[test]
+    fn ingest_records_and_resets() {
+        let mut conn = open_in_memory();
+        let dir = fixture_dir();
+        import(&mut conn, dir.path(), true);
+        let pending = pending_thumbnails(&conn, 10).unwrap();
+        assert_eq!(pending.len(), 4);
+        assert_eq!(count_pending(&conn).unwrap(), 4);
+        assert_eq!(pending_thumbnails(&conn, 2).unwrap(), pending[..2]);
+        let (a, b) = (pending[0].id, pending[1].id);
+
+        let meta = raw::meta::ImageMeta {
+            make: Some(CameraMake::Fujifilm),
+            model: Some("X-T5".into()),
+            sensor_layout: Some(SensorLayout::XTrans),
+            captured_at_ms: Some(1_790_447_764_106),
+            iso: Some(125),
+            shutter_seconds: Some(0.005),
+            aperture: Some(1.4),
+            focal_length_mm: Some(85.0),
+            lens: Some("85mm".into()),
+            width: Some(4608),
+            height: Some(3072),
+            orientation: Some(8),
+        };
+        let files = ThumbFiles {
+            thumb_path: "/c/thumbs/1_512.jpg".into(),
+            preview_path: Some("/c/thumbs/1_2048.jpg".into()),
+            width: 341,
+            height: 512,
+        };
+        record_extraction(&mut conn, a, Some(&meta), Ok(&files)).unwrap();
+        record_extraction(&mut conn, b, None, Err("no embedded JPEG")).unwrap();
+        let stored: f64 = conn.query_row("SELECT aperture FROM images WHERE id = ?1", [a], |r| r.get(0)).unwrap();
+        assert_eq!(stored, 1.4, "f32 widening noise is rounded away");
+
+        let e = get_image(&conn, a).unwrap();
+        assert_eq!(
+            e.camera,
+            CameraInfo { make: CameraMake::Fujifilm, model: Some("X-T5".into()), sensor_layout: SensorLayout::XTrans }
+        );
+        assert_eq!(e.capture.captured_at_ms, Some(1_790_447_764_106));
+        assert_eq!((e.capture.iso, e.capture.shutter_seconds, e.capture.aperture), (Some(125), Some(0.005), Some(1.4)));
+        assert_eq!((e.width, e.height, e.orientation), (Some(4608), Some(3072), Some(8)));
+        assert_eq!(
+            e.thumbnail,
+            ThumbnailState::Ready {
+                path: files.thumb_path.clone(),
+                preview_path: files.preview_path.clone(),
+                width: 341,
+                height: 512
+            }
+        );
+        let fb = get_image(&conn, b).unwrap();
+        assert_eq!(fb.thumbnail, ThumbnailState::Failed { reason: "no embedded JPEG".into() });
+        assert_eq!(fb.camera.make, raw::default_make(pending[1].format), "no meta: defaults kept");
+        assert_eq!(count_pending(&conn).unwrap(), 2);
+
+        // Reset returns old files, is atomic, and puts rows back in the queue.
+        assert_eq!(reset_thumbnails(&mut conn, &[a, 9999]).unwrap_err().kind, ErrorKind::NotFound);
+        assert!(matches!(get_image(&conn, a).unwrap().thumbnail, ThumbnailState::Ready { .. }));
+        let old = reset_thumbnails(&mut conn, &[a, b]).unwrap();
+        assert_eq!(old, ["/c/thumbs/1_512.jpg", "/c/thumbs/1_2048.jpg"]);
+        assert_eq!(get_image(&conn, b).unwrap().thumbnail, ThumbnailState::Pending);
+        assert_eq!(count_pending(&conn).unwrap(), 4);
     }
 
     #[test]
