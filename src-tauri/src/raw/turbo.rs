@@ -302,7 +302,16 @@ pub fn encode_gray(pixels: &[u8], width: u32, height: u32, quality: u8) -> Resul
         let mut size: usize = 0;
         // SAFETY: src holds height rows of width bytes; TurboJPEG allocates `buf`.
         let rc = unsafe {
-            tj3Compress8(tj.0, pixels.as_ptr(), width as c_int, width as c_int, height as c_int, TJPF_GRAY, &mut buf, &mut size)
+            tj3Compress8(
+                tj.0,
+                pixels.as_ptr(),
+                width as c_int,
+                width as c_int,
+                height as c_int,
+                TJPF_GRAY,
+                &mut buf,
+                &mut size,
+            )
         };
         let out = if rc == 0 && !buf.is_null() {
             // SAFETY: TurboJPEG wrote `size` bytes into `buf`, freed below.

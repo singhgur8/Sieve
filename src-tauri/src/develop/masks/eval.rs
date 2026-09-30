@@ -391,9 +391,7 @@ fn box_blur(plane: &mut [f32], w: usize, h: usize, r: usize) {
             let mut acc: f32 = 0.0;
             let n = copy.len();
             // Running sum over [x - r, x + r], clamped at the edges.
-            for i in 0..=r.min(n - 1) {
-                acc += copy[i];
-            }
+            acc += copy[..=r.min(n - 1)].iter().sum::<f32>();
             let mut count = r.min(n - 1) + 1;
             for x in 0..n {
                 row[x] = acc / count as f32;
@@ -475,8 +473,10 @@ fn color(c: &ColorRange, grid: &Grid, guide: &RangeGuide) -> Option<Vec<f32>> {
                 let (x, y) = grid.to_output(s.point.x, s.point.y)?;
                 let r = 1.0;
                 let area_of = |dx: f32, dy: f32| guide_at(guide, x + dx, y + dy);
-                let pts: Vec<[f32; 3]> =
-                    [(0.0, 0.0), (-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r)].iter().filter_map(|&(a, b)| area_of(a, b)).collect();
+                let pts: Vec<[f32; 3]> = [(0.0, 0.0), (-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r)]
+                    .iter()
+                    .filter_map(|&(a, b)| area_of(a, b))
+                    .collect();
                 if pts.is_empty() {
                     return None;
                 }
@@ -644,10 +644,12 @@ pub fn evaluate(
         .collect();
     let mut warnings = Vec::new();
     if unsupported > 0 {
-        warnings.push(DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some(unsupported.to_string()) });
+        warnings
+            .push(DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some(unsupported.to_string()) });
     }
     if missing_ai > 0 {
-        warnings.push(DevelopWarning { code: DevelopWarningCode::AiMaskNeedsUpdate, detail: Some(missing_ai.to_string()) });
+        warnings
+            .push(DevelopWarning { code: DevelopWarningCode::AiMaskNeedsUpdate, detail: Some(missing_ai.to_string()) });
     }
     GroupWeights { width: geom.width, height: geom.height, groups, warnings }
 }

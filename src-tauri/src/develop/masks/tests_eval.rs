@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::ipc::types::{
-    AiTarget, BrushMask, BrushStroke, ColorRange, ColorSample, DevelopWarningCode, LinearMask, LocalAdjustments,
-    LocalColor, LuminanceRange, RadialMask, UnsupportedMask, orient_point,
+    orient_point, AiTarget, BrushMask, BrushStroke, ColorRange, ColorSample, DevelopWarningCode, LinearMask,
+    LocalAdjustments, LocalColor, LuminanceRange, RadialMask, UnsupportedMask,
 };
 
 fn id(n: u32) -> String {
@@ -12,11 +12,26 @@ fn id(n: u32) -> String {
 }
 
 fn comp(n: u32, shape: MaskShape) -> MaskComponent {
-    MaskComponent { id: id(100 + n), name: String::new(), active: true, mode: MaskBlendMode::Add, inverted: false, opacity: 1.0, shape }
+    MaskComponent {
+        id: id(100 + n),
+        name: String::new(),
+        active: true,
+        mode: MaskBlendMode::Add,
+        inverted: false,
+        opacity: 1.0,
+        shape,
+    }
 }
 
 fn group(n: u32, components: Vec<MaskComponent>) -> MaskGroup {
-    MaskGroup { id: id(n), name: String::new(), active: true, amount: 1.0, adjustments: LocalAdjustments::default(), components }
+    MaskGroup {
+        id: id(n),
+        name: String::new(),
+        active: true,
+        amount: 1.0,
+        adjustments: LocalAdjustments::default(),
+        components,
+    }
 }
 
 /// Un-oriented `w x h` sensor rendered 1:1 (orientation 1, no crop).
@@ -85,7 +100,8 @@ fn geometry_applies_crop_region_and_straighten() {
     // Brush radius scale: 300 output px for 3000 sensor px.
     assert!(close(g.sensor_width_px(), 600.0, 1e-2));
     // Region = right half of the cropped frame.
-    let r = MaskGeometry { region: Some(NormRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 }), width: 150, ..g.clone() };
+    let r =
+        MaskGeometry { region: Some(NormRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 }), width: 150, ..g.clone() };
     let p = r.sensor_point(-0.5, -0.5);
     assert!(close(p.x, 0.35, 1e-6) && close(p.y, 0.2, 1e-6));
     // Straighten keeps the centre and the given corners.
@@ -110,7 +126,12 @@ fn geometry_applies_crop_region_and_straighten() {
 
 fn matte() -> AlphaMask {
     // 2 x 2 matte covering the right half of the frame.
-    AlphaMask { width: 2, height: 2, bounds: NormRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 }, data: vec![0, 255, 255, 255] }
+    AlphaMask {
+        width: 2,
+        height: 2,
+        bounds: NormRect { x: 0.5, y: 0.0, width: 0.5, height: 1.0 },
+        data: vec![0, 255, 255, 255],
+    }
 }
 
 #[test]
@@ -187,9 +208,14 @@ fn brush_dabs_respect_radius_feather_flow_density_and_erase() {
     assert_eq!(at(&erased, 200, 120, 50), 0.0);
     // Resolution independence: same stroke at half resolution covers the same area.
     let g2 = MaskGeometry { width: 100, height: 50, ..g.clone() };
-    let small =
-        evaluate_component(&comp(1, MaskShape::Brush(BrushMask { strokes: vec![stroke(vec![pt(0.5, 0.5)])] })), &g2, 1, &NoMattes, None)
-            .unwrap();
+    let small = evaluate_component(
+        &comp(1, MaskShape::Brush(BrushMask { strokes: vec![stroke(vec![pt(0.5, 0.5)])] })),
+        &g2,
+        1,
+        &NoMattes,
+        None,
+    )
+    .unwrap();
     assert_eq!(at(&small, 100, 57, 25), 1.0);
     assert_eq!(at(&small, 100, 62, 25), 0.0);
 }
@@ -255,25 +281,47 @@ fn luminance_and_color_ranges_read_the_guide() {
     // L* ramps 0..99 left to right; left half red, right half blue.
     let lab = guide_lab(100, 10, |x, _| if x < 50 { [x as f32, 60.0, 40.0] } else { [x as f32, 20.0, -60.0] });
     let guide = RangeGuide { width: 100, height: 10, lab: &lab };
-    let lum = comp(1, MaskShape::Luminance(LuminanceRange { feather_low: 0.2, low: 0.4, high: 0.6, feather_high: 0.6, smoothness: 0.0 }));
+    let lum = comp(
+        1,
+        MaskShape::Luminance(LuminanceRange {
+            feather_low: 0.2,
+            low: 0.4,
+            high: 0.6,
+            feather_high: 0.6,
+            smoothness: 0.0,
+        }),
+    );
     let p = evaluate_component(&lum, &g, 1, &NoMattes, Some(&guide)).unwrap();
     assert_eq!(at(&p, 100, 10, 5), 0.0);
     assert!(close(at(&p, 100, 30, 5), 0.5, 1e-5));
     assert_eq!(at(&p, 100, 50, 5), 1.0);
     assert_eq!(at(&p, 100, 61, 5), 0.0, "hard upper edge");
     assert!(evaluate_component(&lum, &g, 1, &NoMattes, None).is_none(), "needs a guide");
-    let col = comp(2, MaskShape::Color(ColorRange {
-        samples: vec![ColorSample { point: pt(0.2, 0.5), area: None, lightroom_model: None }],
-        amount: 50.0,
-    }));
+    let col = comp(
+        2,
+        MaskShape::Color(ColorRange {
+            samples: vec![ColorSample { point: pt(0.2, 0.5), area: None, lightroom_model: None }],
+            amount: 50.0,
+        }),
+    );
     let c = evaluate_component(&col, &g, 1, &NoMattes, Some(&guide)).unwrap();
     assert!(at(&c, 100, 20, 5) > 0.99);
     assert!(at(&c, 100, 25, 5) > 0.9, "similar colour, close luminance");
     assert!(at(&c, 100, 80, 5) < 0.01, "other hue");
-    let smooth = comp(1, MaskShape::Luminance(LuminanceRange { feather_low: 0.4, low: 0.4, high: 0.6, feather_high: 0.6, smoothness: 100.0 }));
+    let smooth = comp(
+        1,
+        MaskShape::Luminance(LuminanceRange {
+            feather_low: 0.4,
+            low: 0.4,
+            high: 0.6,
+            feather_high: 0.6,
+            smoothness: 100.0,
+        }),
+    );
     let g2 = geom(400, 4);
     let lab2 = guide_lab(400, 4, |x, _| [x as f32 / 4.0, 0.0, 0.0]);
-    let s = evaluate_component(&smooth, &g2, 1, &NoMattes, Some(&RangeGuide { width: 400, height: 4, lab: &lab2 })).unwrap();
+    let s = evaluate_component(&smooth, &g2, 1, &NoMattes, Some(&RangeGuide { width: 400, height: 4, lab: &lab2 }))
+        .unwrap();
     assert!(at(&s, 400, 159, 2) > 0.0 && at(&s, 400, 159, 2) < 1.0, "edges are smoothed: {}", at(&s, 400, 159, 2));
 }
 
@@ -304,7 +352,8 @@ fn evaluate_combines_components_in_order_and_reports_warnings() {
     off.active = false;
     let mut grp = group(1, vec![unsupported, lin, sub, missing, off]);
     grp.amount = 1.5;
-    let mut inactive = group(2, vec![comp(9, MaskShape::Linear(LinearMask { zero: pt(0.0, 0.0), full: pt(0.0, 1.0) }))]);
+    let mut inactive =
+        group(2, vec![comp(9, MaskShape::Linear(LinearMask { zero: pt(0.0, 0.0), full: pt(0.0, 1.0) }))]);
     inactive.active = false;
     let w = evaluate(&[grp, inactive, group(3, vec![])], &g, 1, &NoMattes, None);
     assert_eq!(w.groups.len(), 3);
@@ -317,7 +366,10 @@ fn evaluate_combines_components_in_order_and_reports_warnings() {
     let codes: Vec<_> = w.warnings.iter().map(|w| (w.code, w.detail.clone())).collect();
     assert_eq!(
         codes,
-        vec![(DevelopWarningCode::MasksUnsupported, Some("1".into())), (DevelopWarningCode::AiMaskNeedsUpdate, Some("1".into()))]
+        vec![
+            (DevelopWarningCode::MasksUnsupported, Some("1".into())),
+            (DevelopWarningCode::AiMaskNeedsUpdate, Some("1".into()))
+        ]
     );
 }
 
@@ -338,7 +390,10 @@ fn a_few_masks_evaluate_fast_at_preview_size() {
     }
     let src = Any(Arc::new(big));
     let groups = vec![
-        group(1, vec![comp(1, MaskShape::Ai(AiMask { target: AiTarget::Subject, reference_point: None, digest: None }))]),
+        group(
+            1,
+            vec![comp(1, MaskShape::Ai(AiMask { target: AiTarget::Subject, reference_point: None, digest: None }))],
+        ),
         group(2, vec![comp(2, MaskShape::Linear(LinearMask { zero: pt(0.0, 0.0), full: pt(0.0, 0.5) }))]),
         group(3, vec![comp(3, MaskShape::Radial(radial(20.0, 50.0)))]),
     ];
@@ -471,7 +526,14 @@ fn cache_puts_resolves_loads_and_sweeps() {
     assert!(fresh.matte(2, &subject).is_none());
     // A newer model supersedes the unreferenced old Sieve matte; orphan files are removed.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let s2 = cache.put(&conn, 1, &NewMatte { model_version: "m@2".into(), ..sieve.clone() }, &AlphaMask { data: vec![9, 9, 9, 9], ..matte() }).unwrap();
+    let s2 = cache
+        .put(
+            &conn,
+            1,
+            &NewMatte { model_version: "m@2".into(), ..sieve.clone() },
+            &AlphaMask { data: vec![9, 9, 9, 9], ..matte() },
+        )
+        .unwrap();
     std::fs::create_dir_all(cache.masks_dir().join("7")).unwrap();
     std::fs::write(cache.masks_dir().join("7/ABC.png"), b"x").unwrap();
     let removed = cache.sweep(&conn).unwrap();
@@ -503,10 +565,8 @@ fn png_round_trip_keeps_bounds_and_pixels() {
 // ---------------------------------------------------------------------------
 
 const REAL_DIR: &str = "/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-}
+/// Overlays and round-trip copies (gitignored `test-data/` of the main checkout).
+const OUT_DIR: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data/mask-check";
 
 fn sidecars() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = walkdir::WalkDir::new(REAL_DIR)
@@ -533,7 +593,7 @@ fn raw_for(xmp: &std::path::Path) -> Option<PathBuf> {
 #[ignore = "reads the user's Lightroom sidecars (macOS 14+, ImageIO JPEG XL)"]
 fn real_lightroom_masks() {
     use crate::xmp::masks as xm;
-    let out_dir = repo_root().join("test-data/mask-check");
+    let out_dir = PathBuf::from(OUT_DIR);
     std::fs::create_dir_all(&out_dir).unwrap();
     let mut masked = Vec::new();
     let (mut decoded, mut failed, mut total_ms, mut groups_n) = (0, 0, 0.0f64, 0);
@@ -552,7 +612,11 @@ fn real_lightroom_masks() {
                     decoded += 1;
                     assert!(a.coverage() > 0.01, "{}: empty matte", p.display());
                     assert!(a.bounds.x >= -1e-3 && a.bounds.y >= -1e-3);
-                    assert!(a.bounds.x + a.bounds.width <= 1.001 && a.bounds.y + a.bounds.height <= 1.001, "{:?}", a.bounds);
+                    assert!(
+                        a.bounds.x + a.bounds.width <= 1.001 && a.bounds.y + a.bounds.height <= 1.001,
+                        "{:?}",
+                        a.bounds
+                    );
                 }
                 Err(e) => {
                     failed += 1;
@@ -575,8 +639,11 @@ fn real_lightroom_masks() {
     assert_eq!((decoded, failed), (50, 0));
 
     // Overlays for 6 frames (orientation-8 frames first), on the embedded preview.
-    let mut picks: Vec<&(PathBuf, String, xm::MasksRead)> = masked.iter().filter(|m| xmp_attr(&m.1, "tiff:Orientation").as_deref() == Some("8")).take(3).collect();
-    picks.extend(masked.iter().filter(|m| xmp_attr(&m.1, "tiff:Orientation").as_deref() != Some("8")).take(6 - picks.len()));
+    let mut picks: Vec<&(PathBuf, String, xm::MasksRead)> =
+        masked.iter().filter(|m| xmp_attr(&m.1, "tiff:Orientation").as_deref() == Some("8")).take(3).collect();
+    picks.extend(
+        masked.iter().filter(|m| xmp_attr(&m.1, "tiff:Orientation").as_deref() != Some("8")).take(6 - picks.len()),
+    );
     for (p, text, r) in picks {
         let raw = raw_for(p).expect("RAW next to the sidecar");
         let format = crate::raw::format_from_extension(&raw).unwrap();

@@ -359,7 +359,8 @@ impl Ctx<'_> {
                 return self.verbatim_items(o, indent);
             }
         }
-        let first_holders: Vec<usize> = old.and_then(|o| o.items.first()).map(|&i| self.t.struct_holders(i)).unwrap_or_default();
+        let first_holders: Vec<usize> =
+            old.and_then(|o| o.items.first()).map(|&i| self.t.struct_holders(i)).unwrap_or_default();
         match &c.shape {
             MaskShape::Unsupported(_) => match old {
                 // Only Lightroom components can be unsupported: keep them as they were.
@@ -412,7 +413,14 @@ impl Ctx<'_> {
         self.item(indent, &attrs, &children, false)
     }
 
-    fn ai_item(&mut self, c: &MaskComponent, ai: &AiMask, old: Option<&ParsedComponent>, holders: &[usize], indent: &str) -> String {
+    fn ai_item(
+        &mut self,
+        c: &MaskComponent,
+        ai: &AiMask,
+        old: Option<&ParsedComponent>,
+        holders: &[usize],
+        indent: &str,
+    ) -> String {
         let mut md = self.common(c, old.is_none(), "Mask/Image");
         let fmt_codes = |codes: Vec<i32>| codes.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
         let sub = |k: AiTargetKind| AI_SUBTYPES.iter().find(|s| s.1 == k).map_or(1, |s| s.0);
@@ -443,14 +451,26 @@ impl Ctx<'_> {
             AiTarget::Other { sub_type, sub_category } => (*sub_type, sub_category.map(|c| c.to_string()), None),
         };
         md.push(m("MaskSubType", Val::Int(sub_type)));
-        let old_cat = holders.iter().find_map(|&h| self.t.node(h).attr(CRS_NS, "MaskSubCategoryID")).map(|a| a.value.clone());
-        md.push(("MaskSubCategoryID".into(), sub_cat.map(|s| {
-            // Keep Lightroom's own list formatting when the codes are the same.
-            match &old_cat {
-                Some(o) if o.split(|ch: char| ch == ',' || ch.is_whitespace()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(",") == s => Val::Str(o.clone()),
-                _ => Val::Str(s),
-            }
-        })));
+        let old_cat =
+            holders.iter().find_map(|&h| self.t.node(h).attr(CRS_NS, "MaskSubCategoryID")).map(|a| a.value.clone());
+        md.push((
+            "MaskSubCategoryID".into(),
+            sub_cat.map(|s| {
+                // Keep Lightroom's own list formatting when the codes are the same.
+                match &old_cat {
+                    Some(o)
+                        if o.split(|ch: char| ch == ',' || ch.is_whitespace())
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                            == s =>
+                    {
+                        Val::Str(o.clone())
+                    }
+                    _ => Val::Str(s),
+                }
+            }),
+        ));
         md.push(("ObjectRegion".into(), region.map(Val::Str)));
         md.push(("ReferencePoint".into(), ai.reference_point.map(|p| Val::Point(p.x, p.y))));
         // Keep the Lightroom matte attributes only while the selection is unchanged.
@@ -472,7 +492,15 @@ impl Ctx<'_> {
         self.simple_item(holders, &md, drop, indent)
     }
 
-    fn stroke_item(&self, c: &MaskComponent, s: &BrushStroke, i: usize, is_new: bool, holders: &[usize], indent: &str) -> String {
+    fn stroke_item(
+        &self,
+        c: &MaskComponent,
+        s: &BrushStroke,
+        i: usize,
+        is_new: bool,
+        holders: &[usize],
+        indent: &str,
+    ) -> String {
         let mut md = self.common(c, is_new, "Mask/Paint");
         let value = if s.erase { 0.0 } else { s.density * c.opacity };
         for (k, v) in md.iter_mut() {
@@ -621,7 +649,11 @@ pub fn apply(packet: &str, masks: &[MaskGroup]) -> Result<String, String> {
                 p = format!("crs{n}");
                 n += 1;
             }
-            let at = host_node.start + 1 + host_node.prefix.len() + usize::from(!host_node.prefix.is_empty()) + host_node.local.len();
+            let at = host_node.start
+                + 1
+                + host_node.prefix.len()
+                + usize::from(!host_node.prefix.is_empty())
+                + host_node.local.len();
             splices.push((at, at, format!(" xmlns:{p}=\"{CRS_NS}\"")));
             p
         }
@@ -632,7 +664,12 @@ pub fn apply(packet: &str, masks: &[MaskGroup]) -> Result<String, String> {
         crs,
         rdf,
         old_groups: parsed.groups.iter().map(|g| (g.group.id.as_str(), g)).collect(),
-        old_components: parsed.groups.iter().flat_map(|g| &g.components).map(|c| (c.component.id.as_str(), c)).collect(),
+        old_components: parsed
+            .groups
+            .iter()
+            .flat_map(|g| &g.components)
+            .map(|c| (c.component.id.as_str(), c))
+            .collect(),
         written: HashSet::new(),
     };
     if masks.is_empty() {
@@ -670,7 +707,12 @@ pub fn apply(packet: &str, masks: &[MaskGroup]) -> Result<String, String> {
                     return Err("unexpected rdf:Description form".into());
                 }
                 let desc_indent = indent_at(src, host_node.start);
-                let qn = &src[host_node.start + 1..host_node.start + 1 + host_node.prefix.len() + usize::from(!host_node.prefix.is_empty()) + host_node.local.len()];
+                let qn = &src[host_node.start + 1
+                    ..host_node.start
+                        + 1
+                        + host_node.prefix.len()
+                        + usize::from(!host_node.prefix.is_empty())
+                        + host_node.local.len()];
                 splices.push((end - 2, end, format!(">\n{indent}{text}\n{desc_indent}</{qn}>")));
             }
         }

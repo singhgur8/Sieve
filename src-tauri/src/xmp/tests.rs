@@ -930,3 +930,90 @@ fn real_lightroom_sidecars_decode() {
     );
     assert!(total > 0);
 }
+
+const MASKED_SIDECAR: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   xmp:Rating="1"
+   crs:ProcessVersion="15.4"
+   crs:Exposure2012="+0.50">
+   <crs:MaskGroupBasedCorrections>
+    <rdf:Seq>
+     <rdf:li>
+      <rdf:Description
+       crs:What="Correction"
+       crs:CorrectionAmount="1"
+       crs:CorrectionActive="true"
+       crs:CorrectionName="Sky"
+       crs:CorrectionSyncID="11111111111111111111111111111111"
+       crs:LocalExposure2012="-0.25">
+      <crs:CorrectionMasks>
+       <rdf:Seq>
+        <rdf:li
+         crs:What="Mask/Gradient"
+         crs:MaskActive="true"
+         crs:MaskName="Linear Gradient 1"
+         crs:MaskBlendMode="0"
+         crs:MaskInverted="false"
+         crs:MaskSyncID="22222222222222222222222222222222"
+         crs:MaskValue="1"
+         crs:ZeroX="0.5"
+         crs:ZeroY="0.6"
+         crs:FullX="0.5"
+         crs:FullY="0.2"/>
+       </rdf:Seq>
+      </crs:CorrectionMasks>
+      </rdf:Description>
+     </rdf:li>
+    </rdf:Seq>
+   </crs:MaskGroupBasedCorrections>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+#[test]
+fn masks_import_on_read_and_are_protected_until_imported() {
+    let f = Fixture::new(1);
+    let id = f.ids[0];
+    fs::write(f.sidecar(0), MASKED_SIDECAR).unwrap();
+    // Pre-v10 read: masks only reported. A develop edit must not delete them on write.
+    {
+        let mut conn = f.conn();
+        conn.execute("UPDATE images SET masks_pending_import = 1 WHERE id = ?1", [id]).unwrap();
+        let adj = ParametricAdjustments { exposure: 1.0, ..Default::default() };
+        crate::develop::history::commit(&mut conn, id, &adj, "Exposure").unwrap();
+    }
+    assert_eq!(f.sync.write_images(&[id]).unwrap().succeeded, 1);
+    let written = fs::read_to_string(f.sidecar(0)).unwrap();
+    assert!(!written.contains("crs:Exposure2012=\"+0.50\""), "develop written: {written}");
+    assert!(written.contains("<crs:MaskGroupBasedCorrections>"), "pending masks kept");
+    // Read imports them, clears the flag and reports no unsupported masks.
+    assert_eq!(f.sync.read_images(&[id]).unwrap().succeeded, 1);
+    let mut conn = f.conn();
+    let adj = repo::get_adjustments(&conn, id).unwrap();
+    assert_eq!(adj.masks.len(), 1);
+    assert_eq!(adj.masks[0].name, "Sky");
+    assert_eq!(adj.masks[0].adjustments.exposure, -1.0);
+    assert!(!store::masks_pending(&conn, id).unwrap());
+    let warnings: Option<String> =
+        conn.query_row("SELECT develop_warnings FROM images WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert!(!warnings.unwrap_or_default().contains("masks_unsupported"));
+    // Now edits to masks reach the sidecar; untouched components keep their bytes.
+    let mut edited = adj.clone();
+    edited.masks[0].amount = 0.5;
+    crate::develop::history::commit(&mut conn, id, &edited, "Mask").unwrap();
+    assert_eq!(f.sync.write_images(&[id]).unwrap().succeeded, 1);
+    let written = fs::read_to_string(f.sidecar(0)).unwrap();
+    assert!(written.contains("crs:CorrectionAmount=\"0.5\""), "{written}");
+    assert!(written.contains("crs:ZeroY=\"0.6\""));
+    assert_eq!(masks::read(&written).unwrap().unwrap().groups, edited.masks);
+    // Deleting all masks removes the element.
+    let mut none = edited;
+    none.masks.clear();
+    crate::develop::history::commit(&mut conn, id, &none, "Mask").unwrap();
+    f.sync.write_images(&[id]).unwrap();
+    assert!(!fs::read_to_string(f.sidecar(0)).unwrap().contains("MaskGroupBasedCorrections"));
+}

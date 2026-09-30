@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use super::tree::{Tree, NS_RDF};
 use super::{
-    local_field_mut, md5, LightroomMatte, AI_SUBTYPES, BLEND_MODES, LANDSCAPE_CATEGORIES, LOCAL_CURVES,
-    LOCAL_SCALARS, PERSON_PARTS,
+    local_field_mut, md5, LightroomMatte, AI_SUBTYPES, BLEND_MODES, LANDSCAPE_CATEGORIES, LOCAL_CURVES, LOCAL_SCALARS,
+    PERSON_PARTS,
 };
 use crate::ipc::types::{
     is_mask_id, AiMask, AiTarget, AiTargetKind, BrushMask, BrushStroke, ColorRange, ColorSample, DevelopWarning,
@@ -165,10 +165,9 @@ pub fn parse(src: &str) -> Result<Parsed, String> {
         }
     }
     if unsupported > 0 {
-        parsed.warnings.push(DevelopWarning {
-            code: DevelopWarningCode::MasksUnsupported,
-            detail: Some(unsupported.to_string()),
-        });
+        parsed
+            .warnings
+            .push(DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some(unsupported.to_string()) });
     }
     Ok(parsed)
 }
@@ -359,7 +358,8 @@ fn parse_component(
     let fnum = |name: &str| field(name).as_deref().and_then(num);
     let node = t.node(item);
     let id = unique_id(field("MaskSyncID"), &src[node.start..node.end], salt, ids);
-    let unsupported = |w: &str| MaskShape::Unsupported(UnsupportedMask { what: if w.is_empty() { "?".into() } else { w.into() } });
+    let unsupported =
+        |w: &str| MaskShape::Unsupported(UnsupportedMask { what: if w.is_empty() { "?".into() } else { w.into() } });
     let mode_code = field("MaskBlendMode").as_deref().and_then(int).unwrap_or(0);
     let mode = BLEND_MODES.iter().find(|b| b.0 == mode_code).map(|b| b.1);
     let mut inverted = field("MaskInverted").as_deref().and_then(boolean).unwrap_or(false);
@@ -389,7 +389,8 @@ fn parse_component(
                 Some(AiTargetKind::Object) => match field("ObjectRegion").map(|s| numbers(&s)) {
                     Some(v) if v.len() == 4 && v[2] > 0.0 && v[3] > 0.0 => {
                         let r = NormRect { x: v[0], y: v[1], width: v[2], height: v[3] };
-                        let ok = r.x >= 0.0 && r.y >= 0.0 && r.x + r.width <= 1.0 + 1e-4 && r.y + r.height <= 1.0 + 1e-4;
+                        let ok =
+                            r.x >= 0.0 && r.y >= 0.0 && r.x + r.width <= 1.0 + 1e-4 && r.y + r.height <= 1.0 + 1e-4;
                         if ok {
                             AiTarget::Object { region: r }
                         } else {
@@ -501,7 +502,8 @@ fn parse_range(src: &str, t: &Tree, item: usize) -> Option<MaskShape> {
                 let Some(list) = t.field_elem(e, CRS_NS, name) else { continue };
                 for li in t.items(list) {
                     let n = t.node(li);
-                    let (model, text) = if n.children.is_empty() && n.attrs.iter().all(|a| a.uri == NS_RDF || a.is_xmlns())
+                    let (model, text) = if n.children.is_empty()
+                        && n.attrs.iter().all(|a| a.uri == NS_RDF || a.is_xmlns())
                     {
                         (n.text.trim().to_owned(), n.text.clone())
                     } else {
@@ -516,10 +518,19 @@ fn parse_range(src: &str, t: &Tree, item: usize) -> Option<MaskShape> {
                     let v = numbers(&text);
                     let sample = if is_area && v.len() >= 4 {
                         let (x0, y0, x1, y1) = (v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3]));
-                        let (x0, y0, x1, y1) = (x0.clamp(0.0, 1.0), y0.clamp(0.0, 1.0), x1.clamp(0.0, 1.0), y1.clamp(0.0, 1.0));
-                        let area = (x1 > x0 && y1 > y0)
-                            .then_some(NormRect { x: x0, y: y0, width: span(x0, x1), height: span(y0, y1) });
-                        ColorSample { point: NormPoint { x: (x0 + x1) / 2.0, y: (y0 + y1) / 2.0 }, area, lightroom_model: None }
+                        let (x0, y0, x1, y1) =
+                            (x0.clamp(0.0, 1.0), y0.clamp(0.0, 1.0), x1.clamp(0.0, 1.0), y1.clamp(0.0, 1.0));
+                        let area = (x1 > x0 && y1 > y0).then_some(NormRect {
+                            x: x0,
+                            y: y0,
+                            width: span(x0, x1),
+                            height: span(y0, y1),
+                        });
+                        ColorSample {
+                            point: NormPoint { x: (x0 + x1) / 2.0, y: (y0 + y1) / 2.0 },
+                            area,
+                            lightroom_model: None,
+                        }
                     } else if v.len() >= 2 {
                         ColorSample {
                             point: NormPoint { x: v[0].clamp(0.0, 1.0), y: v[1].clamp(0.0, 1.0) },

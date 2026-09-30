@@ -12,9 +12,8 @@ pub fn macos_major() -> Option<u32> {
         let mut buf = [0u8; 64];
         let mut len = buf.len();
         // SAFETY: buf/len describe a valid writable buffer; name is NUL-terminated.
-        let rc = unsafe {
-            libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
-        };
+        let rc =
+            unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
         if rc != 0 {
             return None;
         }

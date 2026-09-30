@@ -92,9 +92,9 @@ pub fn render_overlay(
         .find(|g| g.id == target.group_id)
         .ok_or_else(|| AppError::invalid("unknown mask group"))?;
     let component = match &target.component_id {
-        Some(id) => {
-            Some(group.components.iter().find(|c| &c.id == id).ok_or_else(|| AppError::invalid("unknown mask component"))?)
-        }
+        Some(id) => Some(
+            group.components.iter().find(|c| &c.id == id).ok_or_else(|| AppError::invalid("unknown mask component"))?,
+        ),
         None => None,
     };
     let info = develop.info(src)?;
@@ -148,7 +148,9 @@ pub fn render_overlay(
         Some(p) => p.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
         None => vec![0u8; n],
     };
-    let coverage = plane.as_ref().map_or(0.0, |p| (p.iter().map(|v| f64::from(v.clamp(0.0, 1.0))).sum::<f64>() / n.max(1) as f64) as f32);
+    let coverage = plane
+        .as_ref()
+        .map_or(0.0, |p| (p.iter().map(|v| f64::from(v.clamp(0.0, 1.0))).sum::<f64>() / n.max(1) as f64) as f32);
     drop(plane);
     if !develop.is_current(ticket) {
         return Ok(None);

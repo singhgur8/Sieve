@@ -329,12 +329,8 @@ impl MaskCache {
         for g in groups {
             for c in &g.components {
                 let MaskShape::Ai(ai) = &c.shape else { continue };
-                let status = |state, info| AiMaskStatus {
-                    group_id: g.id.clone(),
-                    component_id: c.id.clone(),
-                    state,
-                    info,
-                };
+                let status =
+                    |state, info| AiMaskStatus { group_id: g.id.clone(), component_id: c.id.clone(), state, info };
                 // An explicit matte (Lightroom's or a computed one) renders whatever the models.
                 if ai.digest.is_some() {
                     if let Some(info) = self.resolve(conn, image_id, ai, None)? {

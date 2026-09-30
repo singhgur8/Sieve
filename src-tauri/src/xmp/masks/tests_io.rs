@@ -3,11 +3,11 @@
 
 use super::table::{decode_base85, decode_matte as decode_lr_matte, encode_base85, placement};
 use super::*;
-use crate::xmp::packet;
 use crate::ipc::types::{
     validate_masks, AiMask, BrushMask, BrushStroke, ColorRange, ColorSample, DevelopWarningCode, LinearMask,
     LuminanceRange, MaskComponent, MaskShape, NormRect, RadialMask,
 };
+use crate::xmp::packet;
 
 const CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
 
@@ -166,11 +166,13 @@ fn matte_table_bytes(w: u32, h: u32, px: &[u8]) -> Vec<u8> {
 
 fn attr_of<'a>(packet: &'a str, name: &str) -> Vec<&'a str> {
     let key = format!("{name}=\"");
-    packet.match_indices(&key).map(|(i, _)| {
-        let rest = &packet[i + key.len()..];
-        &rest[..rest.find('"').unwrap()]
-    })
-    .collect()
+    packet
+        .match_indices(&key)
+        .map(|(i, _)| {
+            let rest = &packet[i + key.len()..];
+            &rest[..rest.find('"').unwrap()]
+        })
+        .collect()
 }
 
 #[test]
@@ -206,7 +208,10 @@ fn reads_top_level_groups_and_ignores_preset_copies() {
     assert_eq!(a.curve_refine_saturation, 100.0);
     assert_eq!(g.components.len(), 1);
     let c = &g.components[0];
-    assert_eq!((c.id.as_str(), c.name.as_str(), c.mode, c.inverted, c.opacity), ("C4D6A34764A442CCB7F70C2EA1C7188A", "Subject 1", MaskBlendMode::Add, false, 1.0));
+    assert_eq!(
+        (c.id.as_str(), c.name.as_str(), c.mode, c.inverted, c.opacity),
+        ("C4D6A34764A442CCB7F70C2EA1C7188A", "Subject 1", MaskBlendMode::Add, false, 1.0)
+    );
     match &c.shape {
         MaskShape::Ai(ai) => {
             assert_eq!(ai.target, AiTarget::Subject);
@@ -225,7 +230,8 @@ fn reads_top_level_groups_and_ignores_preset_copies() {
     assert!(r.warnings.is_empty());
     validate_masks(&r.groups).unwrap();
     // Without its table the digest reads as missing (recompute).
-    let no_table = p.replace("crs:Table_E71A59AFC894F4F898F72751E30113DA", "crs:Table_00000000000000000000000000000000");
+    let no_table =
+        p.replace("crs:Table_E71A59AFC894F4F898F72751E30113DA", "crs:Table_00000000000000000000000000000000");
     let r2 = read(&no_table).unwrap().unwrap();
     match &r2.groups[0].components[0].shape {
         MaskShape::Ai(ai) => assert_eq!(ai.digest, None),
@@ -275,8 +281,14 @@ fn changed_local_slider_rewrites_only_that_value() {
     let diff_old: Vec<&str> = p.lines().filter(|l| !out.contains(*l)).collect();
     assert_eq!(diff_old, vec!["       crs:LocalExposure2012=\"0.0825\""]);
     // Component item, matte table and retouch table untouched.
-    assert!(out.contains(&p[p.find("        <rdf:li\n         crs:What=\"Mask/Image\"").unwrap()..p.find("crs:ModelVersion=\"251659306\"/>").unwrap()]));
-    assert_eq!(attr_of(&out, "crs:Table_E71A59AFC894F4F898F72751E30113DA"), attr_of(&p, "crs:Table_E71A59AFC894F4F898F72751E30113DA"));
+    assert!(out.contains(
+        &p[p.find("        <rdf:li\n         crs:What=\"Mask/Image\"").unwrap()
+            ..p.find("crs:ModelVersion=\"251659306\"/>").unwrap()]
+    ));
+    assert_eq!(
+        attr_of(&out, "crs:Table_E71A59AFC894F4F898F72751E30113DA"),
+        attr_of(&p, "crs:Table_E71A59AFC894F4F898F72751E30113DA")
+    );
     assert!(out.contains("crs:Table_72332FE69583D719E860C3ABD10EDA83=\"retouchdata\""));
     // The preset copy is untouched.
     assert_eq!(attr_of(&out, "crs:ErrorReason"), ["0"]);
@@ -366,22 +378,36 @@ fn all_kinds() -> Vec<MaskGroup> {
         auto_mask: false,
         dabs: vec![NormPoint { x, y: 0.5 }, NormPoint { x: x + 0.01, y: 0.51 }],
     };
-    let ai = |target: AiTarget| MaskShape::Ai(AiMask { target, reference_point: Some(NormPoint { x: 0.25, y: 0.75 }), digest: None });
-    let mut subtract = comp(3, MaskShape::Radial(RadialMask {
-        top: 0.1,
-        left: 0.2,
-        bottom: 0.6,
-        right: 0.9,
-        angle: 12.5,
-        midpoint: 40.0,
-        roundness: -20.0,
-        feather: 70.0,
-        flipped: false,
-    }));
+    let ai = |target: AiTarget| {
+        MaskShape::Ai(AiMask { target, reference_point: Some(NormPoint { x: 0.25, y: 0.75 }), digest: None })
+    };
+    let mut subtract = comp(
+        3,
+        MaskShape::Radial(RadialMask {
+            top: 0.1,
+            left: 0.2,
+            bottom: 0.6,
+            right: 0.9,
+            angle: 12.5,
+            midpoint: 40.0,
+            roundness: -20.0,
+            feather: 70.0,
+            flipped: false,
+        }),
+    );
     subtract.mode = MaskBlendMode::Subtract;
     subtract.inverted = true;
     subtract.opacity = 0.8;
-    let mut intersect = comp(4, MaskShape::Luminance(LuminanceRange { feather_low: 0.1, low: 0.2, high: 0.7, feather_high: 0.9, smoothness: 30.0 }));
+    let mut intersect = comp(
+        4,
+        MaskShape::Luminance(LuminanceRange {
+            feather_low: 0.1,
+            low: 0.2,
+            high: 0.7,
+            feather_high: 0.9,
+            smoothness: 30.0,
+        }),
+    );
     intersect.mode = MaskBlendMode::Intersect;
     let g1 = MaskGroup {
         id: id(1),
@@ -401,20 +427,29 @@ fn all_kinds() -> Vec<MaskGroup> {
         },
         components: vec![
             comp(1, MaskShape::Brush(BrushMask { strokes: vec![stroke(false, 0.3), stroke(true, 0.31)] })),
-            comp(2, MaskShape::Linear(LinearMask { zero: NormPoint { x: 0.0, y: 0.2 }, full: NormPoint { x: 0.0, y: 0.6 } })),
+            comp(
+                2,
+                MaskShape::Linear(LinearMask {
+                    zero: NormPoint { x: 0.0, y: 0.2 },
+                    full: NormPoint { x: 0.0, y: 0.6 },
+                }),
+            ),
             subtract,
             intersect,
-            comp(5, MaskShape::Color(ColorRange {
-                samples: vec![
-                    ColorSample { point: NormPoint { x: 0.4, y: 0.4 }, area: None, lightroom_model: None },
-                    ColorSample {
-                        point: NormPoint { x: 0.55, y: 0.55 },
-                        area: Some(NormRect { x: 0.5, y: 0.5, width: 0.1, height: 0.1 }),
-                        lightroom_model: None,
-                    },
-                ],
-                amount: 60.0,
-            })),
+            comp(
+                5,
+                MaskShape::Color(ColorRange {
+                    samples: vec![
+                        ColorSample { point: NormPoint { x: 0.4, y: 0.4 }, area: None, lightroom_model: None },
+                        ColorSample {
+                            point: NormPoint { x: 0.55, y: 0.55 },
+                            area: Some(NormRect { x: 0.5, y: 0.5, width: 0.1, height: 0.1 }),
+                            lightroom_model: None,
+                        },
+                    ],
+                    amount: 60.0,
+                }),
+            ),
         ],
     };
     let g2 = MaskGroup {
@@ -426,7 +461,12 @@ fn all_kinds() -> Vec<MaskGroup> {
         components: vec![
             comp(10, ai(AiTarget::Subject)),
             comp(11, ai(AiTarget::Sky)),
-            comp(12, ai(AiTarget::People { parts: vec![crate::ipc::types::PersonPart::FaceSkin, crate::ipc::types::PersonPart::Lips] })),
+            comp(
+                12,
+                ai(AiTarget::People {
+                    parts: vec![crate::ipc::types::PersonPart::FaceSkin, crate::ipc::types::PersonPart::Lips],
+                }),
+            ),
             comp(13, ai(AiTarget::Object { region: NormRect { x: 0.1, y: 0.2, width: 0.3, height: 0.4 } })),
             comp(14, ai(AiTarget::Landscape { category: crate::ipc::types::LandscapeCategory::Water })),
             comp(15, ai(AiTarget::Other { sub_type: 9, sub_category: Some(3) })),
@@ -551,14 +591,19 @@ fn lightroom_brush_items_join_and_split_on_radius_changes() {
     }
     assert!(matches!(&comps[2].shape, MaskShape::Unsupported(u) if u.what == "Mask/Gradient"), "unknown blend code");
     assert!(matches!(&comps[3].shape, MaskShape::Unsupported(u) if u.what == "Mask/Depth"));
-    assert_eq!(r.warnings, vec![DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some("2".into()) }]);
+    assert_eq!(
+        r.warnings,
+        vec![DevelopWarning { code: DevelopWarningCode::MasksUnsupported, detail: Some("2".into()) }]
+    );
     validate_masks(&r.groups).unwrap();
     // Editing the group keeps unsupported components verbatim.
     let mut groups = r.groups.clone();
     groups[0].amount = 0.5;
     groups[0].components.remove(1);
     let out = apply(&p, &groups).unwrap();
-    assert!(out.contains("<rdf:li crs:What=\"Mask/Depth\" crs:MaskSyncID=\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\" crs:Foo=\"bar\"/>"));
+    assert!(out.contains(
+        "<rdf:li crs:What=\"Mask/Depth\" crs:MaskSyncID=\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\" crs:Foo=\"bar\"/>"
+    ));
     assert!(!out[..out.find("<crs:RetouchAreas>").unwrap()].contains("Mask/Paint"));
     assert_eq!(read(&out).unwrap().unwrap().groups, groups);
 }

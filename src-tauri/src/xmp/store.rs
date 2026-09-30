@@ -145,6 +145,18 @@ pub fn set_develop_warnings(conn: &Connection, id: ImageId, warnings: &[DevelopW
     Ok(())
 }
 
+/// `images.masks_pending_import` (migration 0010): sidecar masks not imported yet.
+pub fn masks_pending(conn: &Connection, id: ImageId) -> AppResult<bool> {
+    let v: i64 = conn.query_row("SELECT masks_pending_import FROM images WHERE id = ?1", [id], |r| r.get(0))?;
+    Ok(v != 0)
+}
+
+/// The sidecar's masks were imported.
+pub fn clear_masks_pending(conn: &Connection, id: ImageId) -> AppResult<()> {
+    conn.execute("UPDATE images SET masks_pending_import = 0 WHERE id = ?1 AND masks_pending_import <> 0", [id])?;
+    Ok(())
+}
+
 pub fn mark_failed(conn: &Connection, id: ImageId, reason: &str) -> AppResult<()> {
     conn.execute("UPDATE images SET xmp_error = ?2 WHERE id = ?1", params![id, reason])?;
     Ok(())

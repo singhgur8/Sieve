@@ -150,7 +150,8 @@ impl Row {
     }
 }
 
-const COLUMNS: &str = "digest, kind, origin, model_version, width, height, bounds_x, bounds_y, bounds_w, bounds_h, coverage";
+const COLUMNS: &str =
+    "digest, kind, origin, model_version, width, height, bounds_x, bounds_y, bounds_w, bounds_h, coverage";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let origin: String = r.get(2)?;
