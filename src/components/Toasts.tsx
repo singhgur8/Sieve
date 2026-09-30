@@ -55,7 +55,7 @@ export function useToasts(): ToastApi {
 }
 
 /** Persistent inline banner (top of the window) for problems that do not go away by themselves. */
-export function IssueBanner({ issue, onDismiss }: { issue: ErrorInfo; onDismiss: () => void }) {
+export function IssueBanner({ issue, onDismiss, onRestore }: { issue: ErrorInfo; onDismiss: () => void; onRestore?: () => void }) {
   return (
     <div role="alert" className="flex shrink-0 items-start gap-2 border-b border-amber-800 bg-amber-950 px-4 py-2 text-xs text-amber-100" data-testid="issue-banner" data-category={issue.category}>
       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-400" />
@@ -63,6 +63,11 @@ export function IssueBanner({ issue, onDismiss }: { issue: ErrorInfo; onDismiss:
         <p className="font-semibold">{issue.title}</p>
         <p className="break-words select-text">{issue.message}</p>
       </div>
+      {issue.remedy === "restore" && onRestore && (
+        <button onClick={onRestore} data-testid="issue-restore" className="shrink-0 rounded bg-amber-800 px-2 py-1 font-medium text-amber-50 hover:bg-amber-700">
+          Restore backup…
+        </button>
+      )}
       <button onClick={onDismiss} aria-label="Dismiss banner" data-testid="issue-banner-dismiss" className="shrink-0 text-amber-300 hover:text-amber-100">
         <X className="size-4" />
       </button>
@@ -70,12 +75,24 @@ export function IssueBanner({ issue, onDismiss }: { issue: ErrorInfo; onDismiss:
   );
 }
 
-export function Toasts({ api, error, onDismissError }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void }) {
+export function Toasts({ api, error, onDismissError, onLocate }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void }) {
   return (
     <div className="pointer-events-none fixed bottom-24 left-1/2 z-40 flex w-[min(480px,92vw)] -translate-x-1/2 flex-col items-stretch gap-2" data-testid="toasts">
       {error && (
         <div role="alert" className="pointer-events-auto flex items-start justify-between gap-3 rounded-lg border border-red-800 bg-red-950 px-3 py-2 text-sm text-red-200 shadow-xl" data-testid="error" data-category={error.category}>
           <span className="min-w-0 break-words">{error.message}</span>
+          {error.remedy === "locate" && onLocate && (
+            <button
+              onClick={() => {
+                onDismissError();
+                onLocate();
+              }}
+              data-testid="error-locate"
+              className="shrink-0 rounded bg-red-800 px-2 py-0.5 text-xs font-medium text-red-50 hover:bg-red-700"
+            >
+              Locate folder…
+            </button>
+          )}
           <button onClick={onDismissError} aria-label="Dismiss error" className="shrink-0">
             <X className="size-4" />
           </button>

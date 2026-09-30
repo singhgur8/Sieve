@@ -1,10 +1,10 @@
 // One place that turns backend AppErrors / failure reasons into user-facing wording, and remembers which
-// originals are known to be missing or undecodable so the grid, loupe and Develop can say so (session-only
-// until IPC v13's `missingSinceMs` lands; then the entry field is authoritative).
+// originals are known to be missing or undecodable so the grid, loupe and Develop can say so. The entry's
+// `missingSinceMs` (IPC v13) is authoritative for "missing"; the session registry covers decode failures and
+// failures seen before the entry is refetched.
 //
 // Classification branches on the v13 error kinds (file_missing, disk_full, read_only, decode_failed,
-// catalog_read_only) and falls back to the message text for kinds that carry no detail (not_found, io,
-// database, ...), which is what the backend emits today.
+// catalog_read_only) and falls back to the message text for kinds without detail (io, database, ...).
 import { useSyncExternalStore } from "react";
 
 export type ErrorCategory = "missing" | "disk_full" | "read_only" | "permission" | "decode" | "folder_gone" | "catalog_readonly" | "catalog_full" | "other";
@@ -15,6 +15,8 @@ export interface ErrorInfo {
   message: string;
   /** Persistent problems get an inline banner instead of a dismissible toast. */
   persistent: boolean;
+  /** The remedy the UI offers next to the message. */
+  remedy?: "locate" | "restore";
 }
 
 const TITLES: Record<ErrorCategory, string> = {
@@ -58,7 +60,8 @@ export function describeError(e: unknown): ErrorInfo {
   const message = isObj && typeof err.message === "string" ? err.message : String(e);
   const kind = isObj && typeof err.kind === "string" ? err.kind : undefined;
   const category = categorize(kind, message);
-  return { category, title: TITLES[category], message, persistent: category === "catalog_readonly" };
+  const remedy = category === "missing" ? "locate" : category === "catalog_readonly" ? "restore" : undefined;
+  return { category, title: TITLES[category], message, persistent: category === "catalog_readonly", remedy };
 }
 
 /** A failure reason string (XMP write, export item, analysis). */
@@ -113,4 +116,14 @@ export function useFileHealth(path: string | undefined): FileHealth | undefined 
     },
     () => (path ? files.get(path) : undefined),
   );
+}
+
+/** Health of an entry's original: `missingSinceMs` first, then the session registry. */
+export function useEntryHealth(entry: { path: string; missingSinceMs?: number | null } | undefined): FileHealth | undefined {
+  const reg = useFileHealth(entry?.path);
+  if (reg) return reg;
+  if (entry && entry.missingSinceMs != null) {
+    return { kind: "missing", message: `Original file is missing or was moved: ${entry.path}. Reconnect the drive or move the file back, then try again.` };
+  }
+  return undefined;
 }

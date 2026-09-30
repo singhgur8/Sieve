@@ -77,14 +77,15 @@ test.describe("missing and unreadable files", () => {
     await expect(ph).toBeVisible();
     await expect(ph).toHaveAttribute("data-kind", "missing");
     await expect(page.getByTestId("original-unavailable-message")).toContainText("Original file is missing or was moved: /shoot/DSC00003.ARW");
-    await expect(page.getByTestId("original-locate")).toHaveCount(0); // needs IPC v13 relocate_folder
+    await expect(page.getByTestId("original-locate")).toBeVisible();
     await expect(page.getByTestId("error")).toBeVisible(); // transient toast alongside the inline state
     await shot(page, `${P}missing-develop`);
     await page.getByTestId("original-retry").click();
     await expect(ph).toBeVisible(); // still gone
     await page.keyboard.press("g");
     await expect(page.getByTestId("health-3")).toContainText("Missing");
-    await expect(page.getByTestId("health-13")).toHaveCount(0);
+    await expect(page.getByTestId("health-13")).toContainText("Missing"); // every flagged image, not just the ones opened
+    await expect(page.getByTestId("health-14")).toHaveCount(0);
     await shot(page, `${P}missing-cell`);
     await page.getByTestId("cell-3").dblclick();
     await expect(page.getByTestId("loupe-health-3")).toContainText("Missing");

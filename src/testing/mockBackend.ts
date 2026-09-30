@@ -205,6 +205,8 @@ declare global {
     __mockAiDelay?: number;
     /** Test hook: ms per progress step of mock `download_models` (10 steps per file; default 40). */
     __mockModelDelay?: number;
+    /** Folder the mock directory picker returns (default "/mock/export/Smith Wedding"). */
+    __mockPickDir?: string | null;
     /** Test hook: when set, mock `download_models` fails with this error at the third file. */
     __mockModelFail?: string;
     /** Test hook: commands that reject with the given AppError (`{ cmd: { kind, message } }`); `once` entries are consumed. */
@@ -346,19 +348,17 @@ export function installMockBackend(count: number) {
       bursts.set(group, g);
     }
   }
-  // `?errors=1`: failure fixtures. id % 10 === 3 -> original missing, 7 -> thumbnail decode failure, 5 -> sidecar not writable.
+  // `?errors=1`: failure fixtures. id % 10 === 3 -> original missing (flagged like `?missing=N`, see below),
+  // 7 -> thumbnail decode failure, 5 -> sidecar not writable.
   const errorsOn = new URLSearchParams(location.search).get("errors") === "1";
-  const mockMissing = (id: number) => errorsOn && id % 10 === 3;
+  const mockMissing = (id: number) => byId.get(id)?.missingSinceMs != null;
   const mockReadOnly = (id: number) => errorsOn && id % 10 === 5;
-  const missingError = (id: number) => ({
-    kind: "not_found",
-    message: `Original file is missing or was moved: /shoot/DSC${String(id).padStart(5, "0")}.ARW. Reconnect the drive or move the file back, then try again.`,
-  });
   const READ_ONLY = (id: number) => `Could not write /shoot/DSC${String(id).padStart(5, "0")}.xmp: the volume is read-only. Choose a writable location.`;
   if (errorsOn) {
     for (const r of rows) {
       if (r.id % 10 === 7) r.thumbnail = { status: "failed", reason: `Could not decode ${r.path}: unsupported RAW variant. The file may be damaged, still copying, or from an unsupported camera.` };
       if (mockReadOnly(r.id)) r.xmp = { dirty: true, syncedAtMs: null, error: READ_ONLY(r.id) };
+      if (r.id % 10 === 3) r.missingSinceMs = base + 3_600_000;
     }
   }
   // A few pre-set flags so screenshots show something.
@@ -815,10 +815,6 @@ export function installMockBackend(count: number) {
         if (injected.once) delete window.__mockFail![cmd];
         throw { kind: injected.kind, message: injected.message };
       }
-      if (errorsOn && ["get_adjustments", "get_history", "get_develop_info", "render_preview", "prepare_develop"].includes(cmd)) {
-        const target = (args.id as number | undefined) ?? (args.ids as number[] | undefined)?.[0];
-        if (target != null && mockMissing(target)) throw missingError(target);
-      }
       const ids = (args.ids as number[] | undefined) ?? [];
       switch (cmd) {
         case "get_catalog_state":
@@ -875,7 +871,7 @@ export function installMockBackend(count: number) {
             const r = byId.get(i);
             if (r && !bad.includes(i)) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
           });
-          return { ...ok, succeeded: ids.length - bad.length, failed: bad.map((i) => ({ imageId: i, reason: mockMissing(i) ? missingError(i).message : READ_ONLY(i) })), changed: [] };
+          return { ...ok, succeeded: ids.length - bad.length, failed: bad.map((i) => ({ imageId: i, reason: mockMissing(i) ? missingMessage(byId.get(i)!) : READ_ONLY(i) })), changed: [] };
         }
         case "read_xmp":
           return { ...ok, skipped: ids.length };
@@ -996,6 +992,7 @@ export function installMockBackend(count: number) {
             searchDirs: ["/Library/Application Support/Adobe/CameraRaw/CameraProfiles"],
           };
         case "prepare_develop":
+          guardOriginal(args.id as number);
           return null;
         // Masks (IPC v10): minimal fakes so the masking UI can be built and tested.
         case "list_masks": {
@@ -1329,7 +1326,7 @@ export function installMockBackend(count: number) {
         case "get_render_stats":
           return mockStats(args.id as number, 0.5, 0.01);
         case "plugin:dialog|open":
-          return (args.options as { directory?: boolean } | undefined)?.directory ? "/mock/export/Smith Wedding" : "/mock/import/Moody Blue.cube";
+          return (args.options as { directory?: boolean } | undefined)?.directory ? (window.__mockPickDir !== undefined ? window.__mockPickDir : "/mock/export/Smith Wedding") : "/mock/import/Moody Blue.cube";
         default:
           return null;
       }

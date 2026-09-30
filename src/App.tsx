@@ -30,7 +30,8 @@ import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount } from "./lib/modal";
 import { getClipboard } from "./lib/clipboard";
-import { describeReason, noteFailure } from "./lib/errors";
+import { clearFileHealth, describeReason, noteFailure } from "./lib/errors";
+import { HealthBanner, RestoreBackupDialog } from "./components/CatalogHealth";
 import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
 
 const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8": "green", "9": "blue" };
@@ -51,6 +52,8 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState<number[] | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [healthDismissed, setHealthDismissed] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
   useModels(); // keeps the download listeners alive so mask capabilities refresh even when no panel is open
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
@@ -414,6 +417,41 @@ export default function App() {
     [run, status, lib, setNotice],
   );
 
+  /** "Locate folder…": pick the moved folder, relink the catalog folder to it, refresh everything. */
+  const locateFolder = useCallback(
+    (imageId?: number) =>
+      void run(async () => {
+        let folderId: number | null | undefined = imageId != null ? lib.getEntry(imageId)?.folderId : query.folderId;
+        if (folderId == null) {
+          const [first] = await unwrap(commands.listImageIds({ ...query, missingOnly: true, folderId: null, sceneId: null, offset: 0, limit: 1 }));
+          if (first != null) folderId = (await unwrap(commands.getImage(first))).folderId;
+        }
+        folderId ??= status.catalog?.folders[0]?.id;
+        if (folderId == null) return;
+        const path = await open({ directory: true, title: "Locate folder" });
+        if (typeof path !== "string") return;
+        const r = await unwrap(commands.relocateFolder(folderId, path));
+        push(`Relinked ${plural(r.matched, "photo")}${r.stillMissing > 0 ? ` · ${r.stillMissing} still missing` : ""}`);
+        clearFileHealth();
+        await status.refreshCatalog();
+        await lib.reset();
+      }),
+    [run, lib, query, status, push],
+  );
+
+  const restoreBackup = useCallback(
+    async (index: number) => {
+      try {
+        const h = await unwrap(commands.restoreCatalogBackup(index));
+        status.setCatalog((c) => (c ? { ...c, health: h } : c));
+        setRestoreOpen(false);
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    [status, reportError],
+  );
+
   const analyze = (kind: "pending" | "all") =>
     void run(async () => {
       status.setAnalysis((a) => ({ done: 0, total: a?.total ?? 0, failed: 0, running: true }));
@@ -652,7 +690,10 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col">
-      {status.catalogIssue && <IssueBanner issue={status.catalogIssue} onDismiss={() => status.setCatalogIssue(null)} />}
+      {catalog && (catalog.health.restorePending || !healthDismissed) && <HealthBanner health={catalog.health} onRestore={() => setRestoreOpen(true)} onDismiss={() => setHealthDismissed(true)} />}
+      {status.catalogIssue && catalog?.health.status !== "read_only" && (
+        <IssueBanner issue={status.catalogIssue} onDismiss={() => status.setCatalogIssue(null)} onRestore={catalog && catalog.health.backups.length > 0 ? () => setRestoreOpen(true) : undefined} />
+      )}
       <TopBar
         catalog={catalog}
         analysis={status.analysis}
@@ -694,6 +735,7 @@ export default function App() {
         onExport={openExport}
         onCheatSheet={() => setCheatOpen(true)}
         onModels={() => setModelsOpen(true)}
+        onLocate={() => locateFolder()}
         onRegenerate={() =>
           void run(async () => {
             const t = targets();
@@ -715,6 +757,7 @@ export default function App() {
           />
         </ErrorBoundary>
       )}
+      {restoreOpen && catalog && <RestoreBackupDialog backups={catalog.health.backups} onCancel={() => setRestoreOpen(false)} onRestore={restoreBackup} />}
       {modelsOpen && <ModelsDialog onClose={() => setModelsOpen(false)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
@@ -737,7 +780,7 @@ export default function App() {
         catalog != null && catalog.imageCount === 0 ? null : (
         <>
           {filtersOpen ? (
-            <FilterBar query={query} setQuery={setQuery} counts={counts} />
+            <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
           ) : (
             <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} />
           )}
@@ -752,7 +795,7 @@ export default function App() {
             capsLock={caps}
             autoAdvance={autoAdvance}
             onAutoAdvance={setAutoAdvance}
-            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={catalog} /> : null}
+            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={catalog} onLocate={() => locateFolder()} /> : null}
           />
         </>
         )
@@ -805,6 +848,7 @@ export default function App() {
             onNotice={setNotice}
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBack={() => changeMode("grid")}
+            onLocate={locateFolder}
           />
           </ErrorBoundary>
         )}
@@ -822,6 +866,7 @@ export default function App() {
               sel.set([cmp[k]], cmp[k]);
             }}
             onOpen={(id) => sel.set([id], id)}
+            onLocate={locateFolder}
           />
           </ErrorBoundary>
         )}
@@ -854,7 +899,7 @@ export default function App() {
           }}
         />
       )}
-      <Toasts api={toasts} error={status.error} onDismissError={() => setError(null)} />
+      <Toasts api={toasts} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
     </main>
   );
 }
