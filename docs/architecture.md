@@ -23,8 +23,13 @@ src-tauri/
       mod.rs                   open (WAL, foreign_keys), user_version migrations
       schema.rs                ordered migration list
       repo.rs                  catalog queries (pure fns over Connection; unit tested)
-    raw/mod.rs                 format identification by extension + magic bytes; Phase 2 adds
-                               embedded-preview + EXIF extraction (submodules chosen by rust-engine-dev)
+    raw/mod.rs                 format identification + `extract` (embedded JPEG pick, LibRaw fallback)
+      source.rs tiff.rs        byte source; TIFF/ARW IFD + EXIF parsing
+      raf.rs cr3.rs jpeg.rs    Fuji RAF header, Canon CR3 ISO-BMFF boxes, JPEG marker scan
+      meta.rs                  EXIF -> CaptureMeta (sub-second time, Fuji sensor layout)
+      preview.rs turbo.rs      TurboJPEG n/8 scaled decode, resize, orientation, encode
+      libraw.rs                minimal FFI to Homebrew libraw_r (build.rs locates it)
+  examples/ingest_bench.rs     release benchmark: files/s, ready/failed, peak RSS/footprint
     ingest/mod.rs              background pipeline (Ingest state, start/regenerate, import_status)
     ml/mod.rs                  placeholder for the culling engine
 src/

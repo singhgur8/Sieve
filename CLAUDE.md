@@ -56,7 +56,8 @@ Detailed tasks, owners and acceptance criteria: `docs/roadmap.md` (source of tru
 - [ ] Phase 7: Anchor-photo scene matching (One-Shot relative grading)
 
 ## Development
-- Toolchain: Rust stable (rustup), Node 24, pnpm (via corepack).
+- Toolchain: Rust stable (rustup; `~/.cargo/bin` may need adding to PATH), Node 24, pnpm (via corepack),
+  `brew install libraw exiftool` (LibRaw + libjpeg-turbo are linked dynamically).
 - Run app: `pnpm tauri dev` (set `LUMENRAW_CATALOG=/tmp/x.sqlite` for a scratch catalog).
 - Rust tests/lint: `cd src-tauri && cargo test && cargo clippy --all-targets && cargo fmt --check`.
 - Frontend type check + build: `pnpm build`.
