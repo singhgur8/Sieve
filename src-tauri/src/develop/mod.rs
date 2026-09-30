@@ -24,6 +24,7 @@
 //!   queue); concurrent decodes of the same image are coalesced.
 
 pub mod camera;
+pub mod highlights;
 pub mod history;
 mod local_tone_data;
 mod param_data;

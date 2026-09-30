@@ -35,6 +35,7 @@ use crate::profiles::dcp::{self as dcpm, HsvTable};
 use crate::profiles::table::{BigTable, RgbTable};
 
 use super::camera::{self, ColorSetup, Profile, PROPHOTO_TO_XYZ};
+use super::highlights::{self, HighlightField};
 use super::parity::{self, CurveLuts, Grade, GrainGen, Vignette, Working, PROPHOTO_Y};
 use super::source::ColorInfo;
 use super::tone::{self, LocalTone, ToneModel, ToneSliders};
@@ -1007,18 +1008,38 @@ fn develop(
 }
 
 /// Camera RGB16 -> white-balanced linear ProPhoto (pre-exposure; neutral clip = 1).
+/// Raw-clipped channels are reconstructed ([`highlights`]) for camera sources; display-
+/// referred sources clip at 1.
 fn to_working(input: &RenderInput, setup: &ColorSetup) -> Vec<f32> {
     let (w, h) = (input.width as usize, input.height as usize);
-    let mul = setup.mul.map(|m| m / 65535.0);
     let m = setup.m;
     let mut rgb = vec![0.0f32; w * h * 3];
-    rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
-        for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
-            let c = [
-                (f32::from(p[0]) * mul[0]).min(1.0),
-                (f32::from(p[1]) * mul[1]).min(1.0),
-                (f32::from(p[2]) * mul[2]).min(1.0),
-            ];
+    let field = (!input.profile.display_referred && highlights::knob("hlr", 1.0) > 0.0)
+        .then(|| HighlightField::compute(input.pixels, w, h, setup.mul))
+        .flatten();
+    let Some(field) = field else {
+        let mul = setup.mul.map(|m| m / 65535.0);
+        rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
+            for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
+                let c = [
+                    (f32::from(p[0]) * mul[0]).min(1.0),
+                    (f32::from(p[1]) * mul[1]).min(1.0),
+                    (f32::from(p[2]) * mul[2]).min(1.0),
+                ];
+                o.copy_from_slice(&mat3(&m, c));
+            }
+        });
+        return rgb;
+    };
+    let mul = setup.mul;
+    let lo = (highlights::CLIP_LO * 65535.0) as u16;
+    rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).enumerate().for_each(|(y, (out, inp))| {
+        let v = (y as f32 + 0.5) / h as f32;
+        for (x, (o, p)) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0).enumerate() {
+            let mut c = [0, 1, 2].map(|k| f32::from(p[k]) / 65535.0 * mul[k]);
+            if p[0].max(p[1]).max(p[2]) > lo {
+                c = highlights::reconstruct(c, mul, field.sample((x as f32 + 0.5) / w as f32, v));
+            }
             o.copy_from_slice(&mat3(&m, c));
         }
     });
@@ -1048,8 +1069,9 @@ pub struct ToneStats {
 /// the whole *uncropped, un-oriented* source like Camera Raw (a crop or zoomed region is
 /// adapted exactly as in the full frame): log-luminance statistics for the image reference
 /// and the adaptation luminance, an edge-aware multi-scale base of the scene log2
-/// luminance (two self-guided filters with box radii `RADIUS_FINE` / `RADIUS_COARSE` px
-/// per 2048 px of the source's long edge) on a ~512 px grid. Render pixels are mapped into
+/// luminance (two hyper-Gaussian bilateral grids, spatial sigmas `SIGMA_FINE` /
+/// `SIGMA_COARSE` px per 2048 px of the source's long edge, range `RANGE` EV) on a ~512 px
+/// grid. Render pixels are mapped into
 /// it through the crop geometry ([`ToneContext::with_crop`]).
 #[derive(Debug, Clone)]
 pub struct ToneContext {
@@ -1141,13 +1163,16 @@ impl ToneContext {
         };
         let key = (total / n as f64) as f32;
         let stats = ToneStats { key, p50: pct(0.5), p90: pct(0.9), p95: pct(0.95), p99: pct(0.99), white: pct(0.995) };
-        // Guided filters on the centred field (f32 variance precision).
-        grid.iter_mut().for_each(|v| *v -= key);
+        // Edge-aware bases: hyper-Gaussian bilateral grids (moderate contrasts averaged,
+        // strong steps kept without halos). Near-black values are clamped so the range
+        // axis stays short.
+        grid.iter_mut().for_each(|v| *v = v.max(ld::BASE_FLOOR));
         let long = gw.max(gh) as f32;
-        let radius = |r: f32| ((r * long / 2048.0).round() as usize).max(1);
-        let mut fine = parity::guided(&grid, &grid, gw, gh, radius(ld::RADIUS_FINE), ld::EPS);
-        let mut coarse = parity::guided(&grid, &grid, gw, gh, radius(ld::RADIUS_COARSE), ld::EPS);
-        fine.iter_mut().chain(coarse.iter_mut()).for_each(|v| *v += key);
+        let sigma = |s: f32| s * long / 2048.0;
+        let (fine, coarse) = rayon::join(
+            || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_FINE), ld::RANGE, ld::RANGE_POWER),
+            || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_COARSE), ld::RANGE, ld::RANGE_POWER),
+        );
         ToneContext { stats, fine, coarse, bw: gw, bh: gh, map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] }
     }
 
@@ -1429,19 +1454,16 @@ mod tests {
         px
     }
 
-    /// Shadows / Highlights are edge-aware: next to an edge a flat area gets nearly the same
-    /// local tone as far from it, while the slider clearly acts. Regression bounds: Camera
-    /// Raw is halo-free on both steps (`tools/acr-oracle/halo_probe.py`), the guided
-    /// adaptation base (best fit to real frames) leaves a small rim that decays within a
-    /// few dozen px (measured worst: 15/255 at 3 px for Shadows +100 on a 3.9 EV step; 7 for
-    /// a user-like Shadows +64 / Highlights -66). A halo-free base (domain transform) fits the
-    /// real frames worse (held-out dE 3.13 vs 2.88), see docs/decisions.md.
+    /// Shadows / Highlights are edge-aware: next to an edge a flat area gets the same local
+    /// tone as far from it, while the slider clearly acts. Camera Raw is halo-free on both
+    /// steps (`tools/acr-oracle/halo_probe.py`); so is the bilateral-grid adaptation base
+    /// (acceptance: <= 4/255 at 3 px from the edge; the guided base of round 1 left 15).
     #[test]
     fn local_tone_has_no_halo_on_a_step_edge() {
         let (w, h) = (512u32, 128u32);
         let c = color();
         let p = Profile::matrix(BASELINE_EV);
-        for (dark, bright, tol) in [(0.02f32, 0.3f32, 16), (0.004, 0.6, 9)] {
+        for (dark, bright, tol) in [(0.02f32, 0.3f32, 4), (0.004, 0.6, 4)] {
             let px = step(w, h, dark, bright);
             let row = |img: &RenderedImage, x: u32| i32::from(img.rgb[((h / 2 * w + x) * 3 + 1) as usize]);
             let base = render(&RenderInput::simple(w, h, &px, &c, &p), &plain(), None);
@@ -1455,8 +1477,9 @@ mod tests {
                 assert!((near_d - far_d).abs() <= tol, "{msg}: dark side halo {near_d} vs {far_d}");
                 assert!((near_b - far_b).abs() <= tol, "{msg}: bright side halo {near_b} vs {far_b}");
                 // The rim decays away from the edge.
-                assert!((row(&img, w / 2 - 30) - far_d).abs() <= 7, "{msg}: dark rim at 30 px");
-                assert!((row(&img, w / 2 + 30) - far_b).abs() <= 7, "{msg}: bright rim at 30 px");
+                eprintln!("{msg}: halo dark {} bright {}", near_d - far_d, near_b - far_b);
+                assert!((row(&img, w / 2 - 30) - far_d).abs() <= 2, "{msg}: dark rim at 30 px");
+                assert!((row(&img, w / 2 + 30) - far_b).abs() <= 2, "{msg}: bright rim at 30 px");
                 if sh > 0.0 {
                     assert!(far_d > row(&base, w / 2 - 200), "{msg}: shadows lift the dark side");
                 }

@@ -781,6 +781,108 @@ pub fn guided(i: &[f32], p: &[f32], w: usize, h: usize, r: usize, eps: f32) -> V
     b
 }
 
+/// Range bins per `range` of [`bilateral_grid`].
+const BG_ZBIN: usize = 4;
+
+/// Bilateral grid (Chen, Paris & Durand 2007) with a *hyper-Gaussian* range kernel
+/// `exp(-(|d| / range)^power)`: differences well below `range` are smoothed like a plain
+/// blur of ~`sigma_s` px, differences beyond it are cut off sharply, so steps stronger than
+/// ~1.2 `range` are kept without halos while moderate contrasts are averaged. Cells of
+/// `sigma_s` px blurred by a unit gaussian, range bins of `range / 4`, trilinear splat /
+/// slice.
+pub fn bilateral_grid(data: &[f32], w: usize, h: usize, sigma_s: f32, range: f32, power: f32) -> Vec<f32> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let s = sigma_s.max(1.0);
+    let (lo, hi) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let dz = range.max(1e-3) / BG_ZBIN as f32;
+    let nz = ((hi - lo) / dz).ceil().max(0.0) as usize + 3;
+    let (gh, gw) = ((h as f32 / s).ceil() as usize + 2, (w as f32 / s).ceil() as usize + 2);
+    let idx = |y: usize, x: usize, z: usize| (y * gw + x) * nz + z;
+    let coord = |k: usize, v: f32| {
+        let (gy, gx, gz) = ((k / w) as f32 / s, (k % w) as f32 / s, (v - lo) / dz);
+        let (y0, x0, z0) = (gy as usize, gx as usize, gz as usize);
+        (y0, x0, z0, gy - y0 as f32, gx - x0 as f32, gz - z0 as f32)
+    };
+    // Splat: interleaved (value sum, weight).
+    let mut grid = vec![[0.0f32; 2]; gh * gw * nz];
+    for (k, &v) in data.iter().enumerate() {
+        let (y0, x0, z0, fy, fx, fz) = coord(k, v);
+        for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+            for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                for (dzz, wz) in [(0, 1.0 - fz), (1, fz)] {
+                    let wv = wy * wx * wz;
+                    let c = &mut grid[idx(y0 + dy, x0 + dx, z0 + dzz)];
+                    c[0] += wv * v;
+                    c[1] += wv;
+                }
+            }
+        }
+    }
+    // Spatial blur (unit gaussian, clamped edges) along y then x; range kernel along z.
+    let gk: Vec<f32> = {
+        let k: Vec<f32> = (-3i32..=3).map(|i| (-(i * i) as f32 / 2.0).exp()).collect();
+        let sum: f32 = k.iter().sum();
+        k.iter().map(|v| v / sum).collect()
+    };
+    let zr = 2 * BG_ZBIN as i32;
+    let zk: Vec<f32> = (-zr..=zr).map(|i| (-((i as f32 * dz).abs() / range).powf(power)).exp()).collect();
+    let conv = |src: &[[f32; 2]], axis: usize| -> Vec<[f32; 2]> {
+        let (n, stride, kernel, clamp) = match axis {
+            0 => (gh, gw * nz, &gk, true),
+            1 => (gw, nz, &gk, true),
+            _ => (nz, 1, &zk, false),
+        };
+        let r = (kernel.len() / 2) as i64;
+        let mut out = vec![[0.0f32; 2]; src.len()];
+        out.par_iter_mut().enumerate().for_each(|(k, o)| {
+            let pos = (k / stride) % n;
+            let base = k - pos * stride;
+            let mut acc = [0.0f32; 2];
+            for (j, kv) in kernel.iter().enumerate() {
+                let p = pos as i64 + j as i64 - r;
+                let p = if clamp {
+                    p.clamp(0, n as i64 - 1)
+                } else if p < 0 || p >= n as i64 {
+                    continue;
+                } else {
+                    p
+                };
+                let c = src[base + p as usize * stride];
+                acc[0] += kv * c[0];
+                acc[1] += kv * c[1];
+            }
+            *o = acc;
+        });
+        out
+    };
+    let grid = conv(&conv(&conv(&grid, 0), 1), 2);
+    // Slice.
+    data.par_iter()
+        .enumerate()
+        .map(|(k, &v)| {
+            let (y0, x0, z0, fy, fx, fz) = coord(k, v);
+            let mut acc = [0.0f32; 2];
+            for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+                for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                    for (dzz, wz) in [(0, 1.0 - fz), (1, fz)] {
+                        let wv = wy * wx * wz;
+                        let c = grid[idx(y0 + dy, x0 + dx, z0 + dzz)];
+                        acc[0] += wv * c[0];
+                        acc[1] += wv * c[1];
+                    }
+                }
+            }
+            if acc[1] > 1e-12 {
+                acc[0] / acc[1]
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
 /// Edge-aware smoothing by the domain transform recursive filter (Gastal & Oliveira 2011):
 /// halo-free, edges of `data` stronger than `sigma_r` are kept, flat areas are smoothed
 /// over ~`sigma_s` pixels. Three iterations, rows and columns in parallel.
@@ -1380,6 +1482,36 @@ pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u
 mod tests {
     use super::*;
     use crate::ipc::types::PrimaryCalibration;
+
+    /// The hyper-Gaussian bilateral grid averages moderate contrasts (texture, soft
+    /// gradients) but keeps strong steps exactly (no halo), and preserves constants.
+    #[test]
+    fn bilateral_grid_smooths_texture_and_keeps_strong_steps() {
+        let (w, h) = (256usize, 64usize);
+        // Left: -6 EV with a +-0.5 EV checkerboard texture; right: -1.5 EV flat (4.5 EV step).
+        let data: Vec<f32> = (0..w * h)
+            .map(|k| {
+                let (x, y) = (k % w, k / w);
+                if x < w / 2 {
+                    -6.0 + if (x / 2 + y / 2) % 2 == 0 { 0.5 } else { -0.5 }
+                } else {
+                    -1.5
+                }
+            })
+            .collect();
+        let out = bilateral_grid(&data, w, h, 8.0, 2.5, 6.0);
+        let at = |x: usize| out[32 * w + x];
+        // Texture averaged away (far from the edge and right next to it).
+        for x in [20usize, 60, 120, 125] {
+            assert!((at(x) + 6.0).abs() < 0.05, "x {x}: {}", at(x));
+        }
+        // Bright side untouched up to the edge.
+        for x in [128usize, 130, 200] {
+            assert!((at(x) + 1.5).abs() < 1e-3, "x {x}: {}", at(x));
+        }
+        let flat = bilateral_grid(&[0.7f32; 100], 10, 10, 3.0, 2.5, 6.0);
+        assert!(flat.iter().all(|v| (v - 0.7).abs() < 1e-5));
+    }
 
     /// Banded noise reduction (exports) equals the whole-image result.
     #[test]

@@ -412,6 +412,24 @@ fn main() {
                 )
                 .unwrap();
             }
+            if std::env::var_os("SIEVE_DUMP_CAM").is_some() {
+                // White-balanced camera RGB (unclipped, 1 = neutral clip; f32 LE interleaved,
+                // render size) + the WB multipliers and camera -> ProPhoto matrix.
+                let s = camera::color_setup(&img.color, &profile, &adj.white_balance, &adj.calibration);
+                let mul = s.mul.map(|m| m / 65535.0);
+                let bytes: Vec<u8> = prep
+                    .pixels
+                    .chunks(3)
+                    .flat_map(|p| (0..3).map(move |c| f32::from(p[c]) * mul[c]))
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                std::fs::write(out_dir.join(format!("{stem}.cam.f32")), bytes).unwrap();
+                std::fs::write(
+                    out_dir.join(format!("{stem}.cam.txt")),
+                    format!("{} {}\n{:?}\n{:?}\n", prep.width, prep.height, s.mul, s.m),
+                )
+                .unwrap();
+            }
             if std::env::var_os("SIEVE_DUMP").is_some() {
                 // Lossless copies for offline analysis (tools/acr-oracle).
                 for (img, tag) in [(&r, "ref"), (&sieve, "sieve")] {
