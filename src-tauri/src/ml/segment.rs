@@ -52,6 +52,8 @@ pub const FACE_MODELS: [&str; 4] = [DET_MODEL, LMK_MODEL, EYE_MODEL, MESH_MODEL]
 
 const SUBJECT_SIZE: usize = 1024;
 const SKY_SIZE: usize = 320;
+/// Long edge of the grid Select Sky is completed on ([`SegmentEngine::sky_raw`]).
+pub const SKY_GRID: usize = 640;
 const PERSON_SIZE: usize = 640;
 const SAM_SIZE: usize = 1024;
 const PARTS_SIZE: usize = 256;
@@ -588,9 +590,32 @@ impl SegmentEngine {
         Ok(lr)
     }
 
-    /// Select Sky probability over the whole image at 320x320 (not min-max normalised, so
-    /// frames without sky stay near 0).
+    /// Select Sky probability over the whole image (expects an upright image): the 320x320
+    /// skyseg pass (not min-max normalised, so frames without sky stay near 0), upsampled to a
+    /// [`SKY_GRID`] grid and completed by [`sky_prior`] (hazy, low-contrast skies the network
+    /// only half-selects).
     pub fn sky_raw(&mut self, img: RgbImage) -> Result<LowRes, String> {
+        let data = self.sky_infer(img)?;
+        let lr = LowRes { roi: [0, 0, img.width, img.height], width: SKY_SIZE, height: SKY_SIZE, data };
+        let (w, h) = (img.width, img.height);
+        let k = SKY_GRID as f32 / w.max(h).max(1) as f32;
+        let (gw, gh) = (((w as f32 * k).round() as usize).max(1), ((h as f32 * k).round() as usize).max(1));
+        let t = Instant::now();
+        let mut grid = lr.resampled([0, 0, w, h], gw, gh);
+        let small = self.resize(img, None, gw, gh)?;
+        sky_prior(&mut grid.data, &small, gw, gh);
+        self.timings.push(("sky_prior", ms(t)));
+        Ok(grid)
+    }
+
+    /// The network output alone (320x320, no completion; evaluation).
+    pub fn sky_network(&mut self, img: RgbImage) -> Result<LowRes, String> {
+        let data = self.sky_infer(img)?;
+        Ok(LowRes { roi: [0, 0, img.width, img.height], width: SKY_SIZE, height: SKY_SIZE, data })
+    }
+
+    /// One skyseg pass over the whole image: the 320x320 probability plane.
+    fn sky_infer(&mut self, img: RgbImage) -> Result<Vec<f32>, String> {
         let t = Instant::now();
         if self.sky.is_none() {
             self.sky = Some(cpu_session(&self.cfg, SKY_MODEL)?);
@@ -611,7 +636,7 @@ impl SegmentEngine {
         let data = out.to_vec();
         drop(outputs);
         self.timings.push(("sky_infer", ms(t)));
-        Ok(LowRes { roi: [0, 0, img.width, img.height], width: SKY_SIZE, height: SKY_SIZE, data })
+        Ok(data)
     }
 
     /// Refined subject matte over the whole image (evaluation / overlays).
@@ -1303,6 +1328,185 @@ pub fn decode_yolox(out: &[f32], size: usize, min_score: f32) -> Result<Vec<([f3
 // ---------------------------------------------------------------------------------------
 
 /// Interleaved RGB8 -> planar NCHW f32 `(v / 255 - mean) / std`.
+/// Sky completion on the matte grid (`p` = network probability, `rgb` = the image at the same
+/// size): the network under-selects hazy, low-contrast skies (half-grey patches between
+/// bridge cables, blotches near a pale horizon). Grows the confident sky (p > 0.8, smooth)
+/// into connected, smooth pixels whose colour matches the sky's colour at that height
+/// (per-row model from the confident pixels) and that the network did not reject outright
+/// (p > [`SKY_GROW_MIN`]; keeps pale water / walls out), including pockets cut off by thin
+/// structure above the sky's lower edge, then fills small enclosed holes of sky colour.
+/// Only ever raises `p`.
+pub fn sky_prior(p: &mut [f32], rgb: &[u8], w: usize, h: usize) {
+    use std::collections::VecDeque;
+    let n = w * h;
+    if n == 0 || p.len() != n || rgb.len() < n * 3 {
+        return;
+    }
+    let lut: Vec<f32> = (0..=255u8)
+        .map(|v| {
+            let x = f32::from(v) / 255.0;
+            if x <= 0.040_45 {
+                x / 12.92
+            } else {
+                ((x + 0.055) / 1.055).powf(2.4)
+            }
+        })
+        .collect();
+    let lab: Vec<[f32; 3]> = (0..n)
+        .map(|i| {
+            let c = &rgb[i * 3..i * 3 + 3];
+            crate::develop::masks::linear_srgb_to_lab(lut[c[0] as usize], lut[c[1] as usize], lut[c[2] as usize])
+        })
+        .collect();
+    // Gradient magnitude of L* (central differences).
+    let grad: Vec<f32> = (0..n)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let l = |x: usize, y: usize| lab[y * w + x][0];
+            let dx = l((x + 1).min(w - 1), y) - l(x.saturating_sub(1), y);
+            let dy = l(x, (y + 1).min(h - 1)) - l(x, y.saturating_sub(1));
+            0.5 * (dx * dx + dy * dy).sqrt()
+        })
+        .collect();
+    let smooth = |i: usize| grad[i] < SKY_GRAD_MAX;
+    let seed: Vec<bool> = (0..n).map(|i| p[i] > 0.8 && smooth(i)).collect();
+    if seed.iter().filter(|s| **s).count() < n / 100 {
+        return;
+    }
+    // Per-row sky colour: mean of the seeds, filled from the nearest rows that have seeds.
+    let mut rows: Vec<Option<[f32; 3]>> = vec![None; h];
+    for (y, row) in rows.iter_mut().enumerate() {
+        let (mut acc, mut k) = ([0.0f32; 3], 0.0f32);
+        for x in 0..w {
+            if seed[y * w + x] {
+                let c = lab[y * w + x];
+                for j in 0..3 {
+                    acc[j] += c[j];
+                }
+                k += 1.0;
+            }
+        }
+        if k >= 3.0 {
+            *row = Some(acc.map(|a| a / k));
+        }
+    }
+    let model: Vec<[f32; 3]> = (0..h)
+        .map(|y| {
+            let up = (0..=y).rev().find_map(|r| rows[r].map(|c| (y - r, c)));
+            let down = (y..h).find_map(|r| rows[r].map(|c| (r - y, c)));
+            match (up, down) {
+                (Some((du, a)), Some((dd, b))) if du + dd > 0 => {
+                    let t = du as f32 / (du + dd) as f32;
+                    [0, 1, 2].map(|j| a[j] * (1.0 - t) + b[j] * t)
+                }
+                (Some((_, a)), _) => a,
+                (_, Some((_, b))) => b,
+                _ => [0.0; 3],
+            }
+        })
+        .collect();
+    let dist = |i: usize| {
+        let (c, m) = (lab[i], model[i / w]);
+        ((c[0] - m[0]).powi(2) * 0.5 + (c[1] - m[1]).powi(2) + (c[2] - m[2]).powi(2)).sqrt()
+    };
+    let sim = |i: usize| (-dist(i).powi(2) / (2.0 * SKY_COLOR_SIGMA * SKY_COLOR_SIGMA)).exp();
+    // Selection strength of a sky-coloured pixel: similarity 0.5 -> 0, >= 0.8 -> 1.
+    let strength = |c: f32| {
+        let t = ((c - 0.5) / 0.3).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // Region growing from the seeds through smooth, sky-coloured, not-rejected pixels.
+    let mut seen = seed.clone();
+    let mut queue: VecDeque<usize> = (0..n).filter(|&i| seed[i]).collect();
+    for &i in &queue {
+        p[i] = p[i].max(strength(sim(i)));
+    }
+    while let Some(i) = queue.pop_front() {
+        let (x, y) = (i % w, i / w);
+        // 4-neighbours at distance 1..=5: hops over thin structure (cables, wires, twigs up
+        // to ~3 px on the grid; the gradient widens them by a pixel each side) without
+        // crossing anything thicker.
+        let nb = (1..=5usize).flat_map(|d| {
+            [
+                (x >= d).then(|| i - d),
+                (x + d < w).then(|| i + d),
+                (y >= d).then(|| i - d * w),
+                (y + d < h).then(|| i + d * w),
+            ]
+        });
+        for j in nb.flatten() {
+            if seen[j] || !smooth(j) || p[j] <= SKY_GROW_MIN {
+                continue;
+            }
+            let c = sim(j);
+            if c < 0.5 {
+                continue;
+            }
+            seen[j] = true;
+            p[j] = p[j].max(strength(c));
+            queue.push_back(j);
+        }
+    }
+    // Pockets cut off by thin structure (cables, branches): sky-coloured, not-rejected
+    // pixels above the lowest grown sky pixel of their column.
+    for x in 0..w {
+        let Some(bottom) = (0..h).rev().find(|&y| seen[y * w + x]) else { continue };
+        for y in 0..bottom {
+            let i = y * w + x;
+            if !seen[i] && p[i] > SKY_GROW_MIN {
+                let c = sim(i);
+                if c >= 0.5 {
+                    p[i] = p[i].max(strength(c));
+                }
+            }
+        }
+    }
+    // Small enclosed holes (not touching the border) of sky colour.
+    let mut label = vec![false; n];
+    for start in 0..n {
+        if label[start] || p[start] >= 0.5 {
+            continue;
+        }
+        let mut comp = vec![start];
+        label[start] = true;
+        let (mut k, mut border) = (0, false);
+        while k < comp.len() {
+            let i = comp[k];
+            k += 1;
+            let (x, y) = (i % w, i / w);
+            border |= x == 0 || y == 0 || x + 1 == w || y + 1 == h;
+            let nb = [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then(|| i + 1),
+                (y > 0).then(|| i - w),
+                (y + 1 < h).then(|| i + w),
+            ];
+            for j in nb.into_iter().flatten() {
+                if !label[j] && p[j] < 0.5 {
+                    label[j] = true;
+                    comp.push(j);
+                }
+            }
+        }
+        if border || comp.len() > n / 500 {
+            continue;
+        }
+        let mean_sim = comp.iter().map(|&i| sim(i)).sum::<f32>() / comp.len() as f32;
+        if mean_sim > 0.5 {
+            for &i in &comp {
+                p[i] = p[i].max(strength(sim(i)).max(0.5));
+            }
+        }
+    }
+}
+
+/// [`sky_prior`]: L* gradient (per grid pixel) above which a pixel is structure, not sky.
+const SKY_GRAD_MAX: f32 = 3.0;
+/// [`sky_prior`]: colour tolerance (Lab, L* halved) around the row's sky colour.
+const SKY_COLOR_SIGMA: f32 = 7.0;
+/// [`sky_prior`]: pixels the network gives at most this probability are never grown into.
+const SKY_GROW_MIN: f32 = 0.08;
+
 fn to_nchw(rgb: &[u8], plane: usize, mean: [f32; 3], std: [f32; 3], bgr: bool) -> Vec<f32> {
     let mut out = vec![0.0f32; 3 * plane];
     for i in 0..plane {
@@ -1492,6 +1696,43 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pale sky with a thin dark cable; the network half-selects the band under the cable
+    /// and gives pale water (same colour as the sky) almost nothing.
+    #[test]
+    fn sky_prior_completes_cut_off_sky_but_not_pale_water() {
+        let (w, h) = (60usize, 60usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        let mut p = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let (c, prob): ([u8; 3], f32) = match y {
+                    0..=19 => ([200, 215, 235], 0.97),
+                    // Cable.
+                    20 => ([60, 60, 60], 0.1),
+                    // Sky cut off by the cable (slight texture).
+                    21..=34 => ([200 - (x % 2) as u8, 215, 235], 0.35),
+                    // Deck.
+                    35..=39 => ([40, 40, 40], 0.0),
+                    // Pale water.
+                    _ => ([200, 215, 235], 0.02),
+                };
+                rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
+                p[i] = prob;
+            }
+        }
+        sky_prior(&mut p, &rgb, w, h);
+        let at = |x: usize, y: usize| p[y * w + x];
+        assert!(at(30, 10) > 0.99, "{}", at(30, 10));
+        assert!(at(30, 28) > 0.9, "cut-off sky completed: {}", at(30, 28));
+        assert_eq!(at(30, 37), 0.0, "deck untouched");
+        assert_eq!(at(30, 50), 0.02, "pale water not grown into");
+        // No confident sky: nothing changes.
+        let mut q = vec![0.3f32; w * h];
+        sky_prior(&mut q, &rgb, w, h);
+        assert!(q.iter().all(|v| *v == 0.3));
+    }
 
     #[test]
     fn polygon_coverage_is_area() {

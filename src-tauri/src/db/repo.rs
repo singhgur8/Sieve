@@ -74,6 +74,7 @@ pub fn catalog_state(conn: &Connection, catalog_path: &str, cache_dir: &str) -> 
         cache_dir: cache_dir.to_owned(),
         auto_analyze: auto_analyze(conn)?,
         xmp_auto_sync: xmp_auto_sync(conn)?,
+        health: super::health_state(Path::new(catalog_path)),
     })
 }
 
@@ -275,6 +276,19 @@ pub fn import_folder(conn: &mut Connection, folder: &Path, opts: &ImportOptions)
             }
         }
     }
+    // Re-import refreshes the missing flags of the folder's images (IPC v13): a file found
+    // again is cleared, a catalogued file that is gone is flagged.
+    let known: Vec<(ImageId, String)> = tx
+        .prepare("SELECT id, path FROM images WHERE folder_id = ?1")?
+        .query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, path) in known {
+        match std::fs::metadata(&path) {
+            Ok(_) => set_original_missing(&tx, id, false)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => set_original_missing(&tx, id, true)?,
+            Err(_) => false,
+        };
+    }
     tx.commit()?;
     Ok(summary)
 }
@@ -303,7 +317,8 @@ const ENTRY_SELECT: &str = "
            EXISTS (SELECT 1 FROM burst_groups b WHERE b.id = i.burst_group_id AND b.keeper_image_id = i.id),
            i.xmp_dirty, i.xmp_synced_at, i.xmp_error,
            i.scene_id, i.scene_anchor,
-           i.companion_path, i.develop_warnings
+           i.companion_path, i.develop_warnings,
+           i.missing_since_ms
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -395,6 +410,7 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
             .get::<_, Option<String>>(49)?
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
+        missing_since_ms: r.get(50)?,
     })
 }
 
@@ -542,6 +558,9 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
                           WHERE b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> m.id{in_folder})"
         ));
     }
+    if q.missing_only {
+        clauses.push("i.missing_since_ms IS NOT NULL".into());
+    }
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
         args.push(Value::Integer(folder));
@@ -653,15 +672,18 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
 /// SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1` predicate cannot).
 pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<FilterCounts> {
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
-    let (pick_sql, tag_sql, burst_sql) = match folder {
+    let (pick_sql, tag_sql, burst_sql, missing_sql) = match folder {
         None => (
-            // Grouping by folder first follows a (folder_id, pick, rating) index without a
-            // temp B-tree; the per-folder rows are summed below.
+            // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
+            // without a temp B-tree; the per-folder rows are summed below.
             "SELECT pick, rating, COUNT(*) FROM images GROUP BY folder_id, pick, rating",
+            // Covered by the partial `idx_image_tags_live` (0011).
             "SELECT tag, COUNT(*) FROM image_tags WHERE suppressed = 0 GROUP BY tag ORDER BY tag",
             "SELECT COUNT(DISTINCT i.burst_group_id),
                     COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
              FROM images i JOIN burst_groups b ON b.id = i.burst_group_id",
+            // Partial `idx_images_missing` (0011): only missing rows are visited.
+            "SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL",
         ),
         Some(_) => (
             "SELECT pick, rating, COUNT(*) FROM images WHERE folder_id = ?1 GROUP BY pick, rating",
@@ -671,6 +693,7 @@ pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<F
             "SELECT COUNT(DISTINCT i.burst_group_id),
                     COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
              FROM images i JOIN burst_groups b ON b.id = i.burst_group_id WHERE i.folder_id = ?1",
+            "SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL AND folder_id = ?1",
         ),
     };
     let args: Vec<FolderId> = folder.into_iter().collect();
@@ -702,7 +725,166 @@ pub fn filter_counts(conn: &Connection, folder: Option<FolderId>) -> AppResult<F
         .collect::<Result<Vec<_>, _>>()?;
     (c.burst_groups, c.burst_non_keepers) =
         conn.prepare_cached(burst_sql)?.query_row(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    c.missing = conn.prepare_cached(missing_sql)?.query_row(params_from_iter(args.iter()), |r| r.get(0))?;
     Ok(c)
+}
+
+// ---------------------------------------------------------------------------
+// Missing originals (IPC v13)
+// ---------------------------------------------------------------------------
+
+/// Records the outcome of accessing image `id`'s original: `missing` sets
+/// `missing_since_ms` (keeping the first time it was found missing), `!missing` clears it.
+/// A no-op write when nothing changes; returns whether the row changed. Unknown ids are
+/// ignored (the image may have been removed meanwhile).
+pub fn set_original_missing(conn: &Connection, id: ImageId, missing: bool) -> AppResult<bool> {
+    let n = if missing {
+        conn.prepare_cached("UPDATE images SET missing_since_ms = ?2 WHERE id = ?1 AND missing_since_ms IS NULL")?
+            .execute(params![id, now_ms()])?
+    } else {
+        conn.prepare_cached("UPDATE images SET missing_since_ms = NULL WHERE id = ?1 AND missing_since_ms IS NOT NULL")?
+            .execute([id])?
+    };
+    Ok(n > 0)
+}
+
+/// [`set_original_missing`] from a per-file failure `reason` (plain string): a missing
+/// original (`raw::access::MISSING_PREFIX`) flags the image; any other failure says nothing
+/// about the file's presence and changes nothing.
+pub fn note_access_failure(conn: &Connection, id: ImageId, reason: &str) -> AppResult<()> {
+    if raw::access::is_missing_message(reason) {
+        set_original_missing(conn, id, true)?;
+    }
+    Ok(())
+}
+
+/// Folder path and its images' (id, path, file name, companion path).
+type FolderImages = (String, Vec<(ImageId, String, String, Option<String>)>);
+
+fn folder_images(conn: &Connection, folder_id: FolderId) -> AppResult<FolderImages> {
+    let folder: String = conn
+        .query_row("SELECT path FROM folders WHERE id = ?1", [folder_id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("folder {folder_id}")))?;
+    let images = conn
+        .prepare("SELECT id, path, file_name, companion_path FROM images WHERE folder_id = ?1 ORDER BY id")?
+        .query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((folder, images))
+}
+
+/// Outcome of [`relocate_folder`] for the command layer.
+#[derive(Debug, Default)]
+pub struct Relocated {
+    pub result: RelocateResult,
+    /// Images whose path changed (their develop sources must be forgotten).
+    pub moved: Vec<ImageId>,
+    /// Moved images whose thumbnail extraction had failed because the file was missing
+    /// (to re-extract).
+    pub retry_thumbnails: Vec<ImageId>,
+}
+
+/// `relocate_folder`: points folder `folder_id` (and its images) at `new_path`, e.g. after
+/// the shoot was moved or its drive remounted under another name. Each image is looked up
+/// at its path relative to the old folder, then by file name anywhere under `new_path`
+/// (unique names only). Images found are repointed and their missing flag cleared; the
+/// rest keep their path and are flagged missing. Companion JPEG/HEIC paths are repointed
+/// the same way. Fails with `invalid_argument` (changing nothing) when `new_path` is not a
+/// directory, is already another catalog folder, or holds none of the folder's images.
+/// Atomic.
+pub fn relocate_folder(conn: &mut Connection, folder_id: FolderId, new_path: &Path) -> AppResult<Relocated> {
+    let new_root = new_path.canonicalize().map_err(|e| AppError::invalid(format!("{}: {e}", new_path.display())))?;
+    if !new_root.is_dir() {
+        return Err(AppError::invalid(format!("{} is not a folder", new_root.display())));
+    }
+    let new_root_s = path_str(&new_root)?;
+    let (old_root, images) = folder_images(conn, folder_id)?;
+    let other: Option<FolderId> = conn
+        .query_row("SELECT id FROM folders WHERE path = ?1 AND id <> ?2", params![new_root_s, folder_id], |r| r.get(0))
+        .optional()?;
+    if other.is_some() {
+        return Err(AppError::invalid(format!(
+            "{new_root_s} is already in the catalog as another folder; choose the folder this shoot was moved to"
+        )));
+    }
+
+    // File name -> path under the new root (names found more than once are ambiguous).
+    let mut by_name: HashMap<String, Option<std::path::PathBuf>> = HashMap::new();
+    let mut indexed = false;
+    let mut index = |by_name: &mut HashMap<String, Option<std::path::PathBuf>>| {
+        if indexed {
+            return;
+        }
+        indexed = true;
+        for e in WalkDir::new(&new_root).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            by_name.entry(name).and_modify(|v| *v = None).or_insert_with(|| Some(e.path().to_path_buf()));
+        }
+    };
+    let old = Path::new(&old_root);
+    let mut locate = |path: &str, name: &str, by_name: &mut HashMap<String, Option<std::path::PathBuf>>| {
+        if let Ok(rel) = Path::new(path).strip_prefix(old) {
+            let candidate = new_root.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        index(by_name);
+        by_name.get(name).cloned().flatten()
+    };
+
+    let mut plan: Vec<(ImageId, Option<String>, Option<String>)> = Vec::with_capacity(images.len());
+    for (id, path, name, companion) in &images {
+        let found = locate(path, name, &mut by_name).map(|p| path_str(&p)).transpose()?;
+        let companion = match companion {
+            Some(c) => {
+                let cname = Path::new(c).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                locate(c, &cname, &mut by_name).map(|p| path_str(&p)).transpose()?
+            }
+            None => None,
+        };
+        plan.push((*id, found, companion));
+    }
+    let matched = plan.iter().filter(|(_, f, _)| f.is_some()).count();
+    if matched == 0 && !images.is_empty() {
+        return Err(AppError::invalid(format!(
+            "None of the {} photos of {old_root} were found in {new_root_s}. Choose the folder the shoot was moved to.",
+            images.len()
+        )));
+    }
+
+    let mut out = Relocated::default();
+    super::atomic(conn, |tx| {
+        tx.execute("UPDATE folders SET path = ?2 WHERE id = ?1", params![folder_id, new_root_s])?;
+        let mut repoint = tx.prepare(
+            "UPDATE images SET path = ?2, missing_since_ms = NULL,
+                               companion_path = COALESCE(?3, companion_path)
+             WHERE id = ?1",
+        )?;
+        let mut taken = tx.prepare("SELECT EXISTS (SELECT 1 FROM images WHERE path = ?1 AND id <> ?2)")?;
+        let mut failed_missing =
+            tx.prepare("SELECT error FROM thumbnails WHERE image_id = ?1 AND status = 'failed'")?;
+        for (id, found, companion) in &plan {
+            let target = match found {
+                // Another catalog image already has that path: leave this one missing.
+                Some(p) if !taken.query_row(params![p, id], |r| r.get::<_, bool>(0))? => p,
+                _ => {
+                    set_original_missing(tx, *id, true)?;
+                    out.result.still_missing += 1;
+                    continue;
+                }
+            };
+            repoint.execute(params![id, target, companion])?;
+            out.result.matched += 1;
+            out.moved.push(*id);
+            let error: Option<Option<String>> = failed_missing.query_row([id], |r| r.get(0)).optional()?;
+            if error.flatten().is_some_and(|e| raw::access::is_missing_message(&e)) {
+                out.retry_thumbnails.push(*id);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1116,12 @@ pub fn record_extraction(
              WHERE image_id = ?1",
             )?
             .execute(params![id, reason, now])?,
+    };
+    // The original was read (success) or found missing (IPC v13 missing flag).
+    match outcome {
+        Ok(_) => set_original_missing(&tx, id, false)?,
+        Err(reason) if raw::access::is_missing_message(reason) => set_original_missing(&tx, id, true)?,
+        Err(_) => false,
     };
     tx.commit()?;
     Ok(())
@@ -1312,6 +1500,88 @@ mod tests {
         assert_eq!(state.folders[0].image_count, 4);
         assert_eq!(state.shoot_type, ShootType::General);
         assert_eq!(state.burst_window_ms, 1500);
+    }
+
+    /// IPC v13: missing flags from re-import / access failures / extraction, the `missing`
+    /// facet and filter, and `relocate_folder`.
+    #[test]
+    fn missing_originals_are_flagged_filtered_and_relocated() {
+        let mut conn = open_in_memory();
+        let root = tempfile::tempdir().unwrap();
+        let shoot = root.path().join("shoot");
+        std::fs::create_dir(&shoot).unwrap();
+        for (name, f) in [("DSC0001.ARW", RawFormat::Arw), ("DSCF0002.RAF", RawFormat::Raf)] {
+            std::fs::write(shoot.join(name), stub_header(f)).unwrap();
+        }
+        std::fs::create_dir(shoot.join("sub")).unwrap();
+        std::fs::write(shoot.join("sub/DSC0004.ARW"), stub_header(RawFormat::Arw)).unwrap();
+        let folder = import(&mut conn, &shoot, true).folder_id;
+        let by_name = |conn: &Connection, name: &str| -> RawImageEntry {
+            let id: ImageId =
+                conn.query_row("SELECT id FROM images WHERE file_name = ?1", [name], |r| r.get(0)).unwrap();
+            get_image(conn, id).unwrap()
+        };
+        let missing_q = ImageQuery { missing_only: true, ..Default::default() };
+        assert!(by_name(&conn, "DSC0001.ARW").missing_since_ms.is_none());
+        assert_eq!(filter_counts(&conn, None).unwrap().missing, 0);
+
+        // Re-import flags a deleted file and clears it once it is back.
+        let a = shoot.join("DSC0001.ARW");
+        std::fs::rename(&a, root.path().join("aside.ARW")).unwrap();
+        import(&mut conn, &shoot, true);
+        let gone = by_name(&conn, "DSC0001.ARW");
+        let since = gone.missing_since_ms.expect("flagged by re-import");
+        assert_eq!(list_image_ids(&conn, &missing_q).unwrap(), [gone.id]);
+        assert_eq!(filter_counts(&conn, None).unwrap().missing, 1);
+        assert_eq!(filter_counts(&conn, Some(folder)).unwrap().missing, 1);
+        assert_eq!(filter_counts(&conn, Some(folder + 1)).unwrap().missing, 0);
+        // A later failure keeps the first time; other failures change nothing.
+        note_access_failure(&conn, gone.id, &raw::access::missing_message(&a)).unwrap();
+        note_access_failure(&conn, gone.id, "Could not decode x").unwrap();
+        assert_eq!(by_name(&conn, "DSC0001.ARW").missing_since_ms, Some(since));
+        std::fs::rename(root.path().join("aside.ARW"), &a).unwrap();
+        import(&mut conn, &shoot, true);
+        assert!(list_image_ids(&conn, &missing_q).unwrap().is_empty());
+
+        // Extraction failures flag it, success clears it.
+        let raf = by_name(&conn, "DSCF0002.RAF").id;
+        let reason = raw::access::missing_message(&shoot.join("DSCF0002.RAF"));
+        record_extraction(&mut conn, raf, None, Err(&reason)).unwrap();
+        assert!(get_image(&conn, raf).unwrap().missing_since_ms.is_some());
+
+        // The shoot moves; sub/DSC0004.ARW lands flat in the new folder (found by name).
+        let moved = root.path().join("moved");
+        std::fs::rename(&shoot, &moved).unwrap();
+        std::fs::rename(moved.join("sub/DSC0004.ARW"), moved.join("DSC0004.ARW")).unwrap();
+        std::fs::remove_file(moved.join("DSCF0002.RAF")).unwrap();
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let e = relocate_folder(&mut conn, folder, &empty).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidArgument);
+        assert!(e.message.starts_with("None of the 3 photos"), "{}", e.message);
+        assert_eq!(relocate_folder(&mut conn, 999, &moved).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(
+            relocate_folder(&mut conn, folder, &root.path().join("nope")).unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+
+        let r = relocate_folder(&mut conn, folder, &moved).unwrap();
+        assert_eq!(r.result, RelocateResult { matched: 2, still_missing: 1 });
+        assert_eq!(r.moved.len(), 2);
+        assert!(r.retry_thumbnails.is_empty());
+        let moved_c = moved.canonicalize().unwrap();
+        assert_eq!(catalog_state(&conn, ":memory:", "").unwrap().folders[0].path, moved_c.to_str().unwrap());
+        assert_eq!(by_name(&conn, "DSC0004.ARW").path, moved_c.join("DSC0004.ARW").to_str().unwrap());
+        assert_eq!(by_name(&conn, "DSC0001.ARW").path, moved_c.join("DSC0001.ARW").to_str().unwrap());
+        assert_eq!(list_image_ids(&conn, &missing_q).unwrap(), [raf]);
+
+        // The RAF turns up: relocating again finds it and queues its failed thumbnail.
+        std::fs::write(moved.join("DSCF0002.RAF"), stub_header(RawFormat::Raf)).unwrap();
+        let r = relocate_folder(&mut conn, folder, &moved).unwrap();
+        assert_eq!(r.result, RelocateResult { matched: 3, still_missing: 0 });
+        assert_eq!(r.retry_thumbnails, [raf]);
+        assert!(list_image_ids(&conn, &missing_q).unwrap().is_empty());
+        assert_eq!(filter_counts(&conn, None).unwrap().missing, 0);
     }
 
     /// RAW + camera JPEG siblings, lone non-RAW files, a bad JPEG.
@@ -1820,6 +2090,7 @@ mod tests {
                 ratings: vec![1, 0, 2, 0, 0, 1],
                 burst_groups: 1,
                 burst_non_keepers: 1,
+                missing: 0,
             }
         );
         let g = filter_counts(&conn, Some(2)).unwrap();

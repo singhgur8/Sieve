@@ -5,7 +5,7 @@
 //! | Family | Model id | Files | Stored (unrefined) output |
 //! |---|---|---|---|
 //! | subject, background | `birefnet-lite-1024@1` | `birefnet_lite.onnx` | 1024x1024 over the frame (background = 1 - subject) |
-//! | sky | `skyseg-u2net-320@1` | `skyseg.onnx` | 320x320 over the frame |
+//! | sky | `skyseg-u2net-320@2` | `skyseg.onnx` | 320x320 over the upright frame + colour-prior completion (640 grid) |
 //! | people, object | `people-yoloxm-effsamti-selfiemc@1` | YOLOX-m, EfficientSAM-Ti, SCRFD + landmarks (faces), selfie multiclass (parts) | person / object ROI; parts on the person grid, features at input resolution |
 //!
 //! People: `referencePoint` selects one person (the one whose face contains the point, else
@@ -26,7 +26,7 @@ use crate::develop::masks::AlphaMask;
 use crate::ipc::types::{AiTarget, AiTargetKind, NormPoint, NormRect, PersonPart};
 
 pub const SUBJECT_ID: &str = "birefnet-lite-1024@1";
-pub const SKY_ID: &str = "skyseg-u2net-320@1";
+pub const SKY_ID: &str = "skyseg-u2net-320@2";
 pub const PEOPLE_ID: &str = "people-yoloxm-effsamti-selfiemc@1";
 
 /// Parts from the selfie-multiclass parser.

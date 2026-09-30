@@ -6,7 +6,7 @@ import { commands, convertFileSrc, unwrap, type FaceInfo, type LutInfo, type Nor
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
-import { clearFileHealth, useFileHealth } from "../../lib/errors";
+import { clearFileHealth, useEntryHealth } from "../../lib/errors";
 import { OriginalUnavailable } from "./OriginalUnavailable";
 import { Stars } from "../Cell";
 import { Filmstrip } from "../Filmstrip";
@@ -79,6 +79,8 @@ interface Props {
   /** Toast with an Undo action (multi-photo reset / preset). */
   onUndoToast: (msg: string, undo: () => void) => void;
   onBack: () => void;
+  /** "Locate folder…" for the folder of image `imageId` (IPC v13 relocate_folder). */
+  onLocate: (imageId: number) => void;
 }
 
 const FILM = 72;
@@ -94,7 +96,7 @@ const TOOL_HELP: Record<string, string> = {
   object: "Objects: drag a rectangle around the object",
 };
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onBack }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onBack, onLocate }, ref) {
   const id = sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -128,7 +130,16 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     onChanged,
   });
   const { info } = editor;
-  const health = useFileHealth(entry?.path);
+  const health = useEntryHealth(entry);
+  // The original became reachable again (relocated folder): load the image that failed to open.
+  const hadHealth = useRef(false);
+  useEffect(() => {
+    if (health) hadHealth.current = true;
+    else if (hadHealth.current) {
+      hadHealth.current = false;
+      if (!editor.main) void editor.reload().catch(onError);
+    }
+  });
   const fw = info?.fullWidth ?? 0;
   const fh = info?.fullHeight ?? 0;
   const masks = useMasks({ editor, id, onError, onNotice });
@@ -599,6 +610,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             <OriginalUnavailable
               health={health}
               fileName={entry.fileName}
+              onLocate={() => onLocate(entry.id)}
               onRetry={() => {
                 clearFileHealth(entry.path);
                 void editor.reload().catch(onError);

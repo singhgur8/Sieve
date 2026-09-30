@@ -272,7 +272,7 @@ impl Entry {
 }
 
 /// Half-size decode of an original with user-facing errors: a missing/moved file is
-/// `not_found` ("Original file is missing ..."), a decoder failure says so (`io`).
+/// `file_missing` ("Original file is missing ..."), a decoder failure is `decode_failed`.
 fn decode_source(path: &std::path::Path) -> AppResult<(LinearImage, SourceMeta)> {
     crate::raw::access::require_original(path)?;
     source::decode_half_size_meta(path).map_err(|e| match e.kind {
@@ -1082,15 +1082,15 @@ mod tests {
 
         let gone = SourceImage { id: 1, path: dir.path().join("DSC0001.ARW"), orientation: None };
         let e = cache.render(cache.ticket(1, RenderSlot::Main), &gone, &adj, &opts, &luts).unwrap_err();
-        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert_eq!(e.kind, ErrorKind::FileMissing);
         assert!(e.message.starts_with(crate::raw::access::MISSING_PREFIX), "{}", e.message);
-        assert_eq!(cache.info(&gone).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(cache.info(&gone).unwrap_err().kind, ErrorKind::FileMissing);
 
         let junk = dir.path().join("DSC0002.ARW");
         std::fs::write(&junk, b"II*\0not a raw at all").unwrap();
         let bad = SourceImage { id: 2, path: junk, orientation: None };
         let e = cache.render(cache.ticket(2, RenderSlot::Main), &bad, &adj, &opts, &luts).unwrap_err();
-        assert_eq!(e.kind, ErrorKind::Io);
+        assert_eq!(e.kind, ErrorKind::DecodeFailed);
         assert!(e.message.starts_with("Could not decode") && e.message.contains("damaged"), "{}", e.message);
         assert_eq!(cache.cached_count(), 0);
         assert!(lock(&cache.inner.decoding).is_empty(), "decode locks released on failure");

@@ -1,9 +1,10 @@
 //! User-facing errors for file access (Phase 8 error states). Every place that reads an
 //! original or writes a sidecar/export maps `std::io::Error`s through here so the message
-//! says what happened and what to do, using the existing [`ErrorKind`]s:
-//! - original missing / moved / unmounted volume -> `not_found` ([`missing_original`]);
-//! - read-only volume or no permission -> `io` ("... is read-only" / "no permission");
-//! - disk full -> `io` ("... disk is full"), see [`is_disk_full`];
+//! says what happened and what to do, with a specific [`ErrorKind`] (IPC v13):
+//! - original missing / moved / unmounted volume -> `file_missing` ([`missing_original`]);
+//! - read-only volume or no permission -> `read_only` ("... is read-only" / "permission denied");
+//! - disk full -> `disk_full` ("... disk is full"), see [`is_disk_full`];
+//! - decoder failure on an existing original -> `decode_failed` ([`decode_failed`]);
 //! - anything else -> `io` with the OS message.
 
 use std::io;
@@ -24,9 +25,14 @@ const EDQUOT: i32 = 122;
 /// EROFS.
 const EROFS: i32 = 30;
 
-/// `not_found` for an original that is not at its catalogued path.
+/// `file_missing` for an original that is not at its catalogued path.
 pub fn missing_original(path: &Path) -> AppError {
-    AppError::not_found(missing_message(path))
+    AppError::new(ErrorKind::FileMissing, missing_message(path))
+}
+
+/// True if a per-file failure `reason` (a plain string in reports) is a missing original.
+pub fn is_missing_message(reason: &str) -> bool {
+    reason.starts_with(MISSING_PREFIX)
 }
 
 /// Message of [`missing_original`] (per-file reports carry plain strings).
@@ -81,16 +87,28 @@ pub fn io_message(path: &Path, verb: &str, e: &io::Error) -> String {
     }
 }
 
-/// [`io_message`] as an [`AppError`] (`not_found` for a missing original read, else `io`).
-pub fn io_error(path: &Path, verb: &str, e: &io::Error) -> AppError {
-    let kind = if e.kind() == io::ErrorKind::NotFound && verb == "read" { ErrorKind::NotFound } else { ErrorKind::Io };
-    AppError::new(kind, io_message(path, verb, e))
+/// The [`ErrorKind`] of an I/O failure while `verb`-ing `path` (see the module docs).
+pub fn io_kind(verb: &str, e: &io::Error) -> ErrorKind {
+    if is_disk_full(e) {
+        ErrorKind::DiskFull
+    } else if is_read_only(e) {
+        ErrorKind::ReadOnly
+    } else if e.kind() == io::ErrorKind::NotFound && verb == "read" {
+        ErrorKind::FileMissing
+    } else {
+        ErrorKind::Io
+    }
 }
 
-/// `internal`-free wording for a decoder failure on an original that exists.
+/// [`io_message`] as an [`AppError`] of kind [`io_kind`].
+pub fn io_error(path: &Path, verb: &str, e: &io::Error) -> AppError {
+    AppError::new(io_kind(verb, e), io_message(path, verb, e))
+}
+
+/// `decode_failed`: wording for a decoder failure on an original that exists.
 pub fn decode_failed(path: &Path, detail: &str) -> AppError {
     AppError::new(
-        ErrorKind::Io,
+        ErrorKind::DecodeFailed,
         format!(
             "Could not decode {}: {detail}. The file may be damaged, still copying, or from an unsupported camera.",
             path.display()
@@ -122,12 +140,12 @@ pub fn available_bytes(dir: &Path) -> Option<u64> {
     Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-/// `io` "not enough disk space" error unless the volume of `dir` has `needed` bytes free
+/// `disk_full` "not enough disk space" error unless the volume of `dir` has `needed` bytes free
 /// (unknown free space passes: the write itself then reports ENOSPC).
 pub fn ensure_space(dir: &Path, needed: u64) -> Result<(), AppError> {
     match available_bytes(dir) {
         Some(free) if free < needed => Err(AppError::new(
-            ErrorKind::Io,
+            ErrorKind::DiskFull,
             format!(
                 "Not enough disk space in {}: {} MB free, about {} MB needed. Free up space or choose another \
                  destination.",
@@ -154,7 +172,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("DSC0001.ARW");
         let e = require_original(&gone).unwrap_err();
-        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert_eq!(e.kind, ErrorKind::FileMissing);
+        assert!(is_missing_message(&e.message));
         assert!(e.message.starts_with(MISSING_PREFIX) && e.message.contains("DSC0001.ARW"), "{}", e.message);
         std::fs::write(&gone, b"x").unwrap();
         require_original(&gone).unwrap();
@@ -168,15 +187,20 @@ mod tests {
         assert!(io_message(Path::new("/o/a.xmp"), "write", &ro).contains("read-only"));
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
         assert!(io_message(Path::new("/o/a.xmp"), "write", &denied).contains("permission denied"));
-        assert_eq!(io_error(Path::new("/o/a.xmp"), "write", &denied).kind, ErrorKind::Io);
+        assert_eq!(io_error(Path::new("/o/a.xmp"), "write", &denied).kind, ErrorKind::ReadOnly);
+        assert_eq!(io_error(Path::new("/o/a.xmp"), "write", &ro).kind, ErrorKind::ReadOnly);
+        assert_eq!(io_error(Path::new("/o/a.jpg"), "write", &full).kind, ErrorKind::DiskFull);
         let nf = io::Error::from(io::ErrorKind::NotFound);
-        assert_eq!(io_error(Path::new("/o/a.arw"), "read", &nf).kind, ErrorKind::NotFound);
+        assert_eq!(io_error(Path::new("/o/a.arw"), "read", &nf).kind, ErrorKind::FileMissing);
+        assert_eq!(io_error(Path::new("/o/x/a.jpg"), "write", &nf).kind, ErrorKind::Io);
+        assert_eq!(decode_failed(Path::new("/o/a.arw"), "bad").kind, ErrorKind::DecodeFailed);
         assert!(io_message(Path::new("/o/x/a.jpg"), "write", &nf).contains("no longer exists"));
 
         let free = available_bytes(dir.path()).unwrap();
         assert!(free > 0);
         ensure_space(dir.path(), 1).unwrap();
         let e = ensure_space(dir.path(), u64::MAX).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::DiskFull);
         assert!(is_disk_full_message(&e.message), "{}", e.message);
         assert!(is_disk_full_message(&io_message(Path::new("/o/a.jpg"), "write", &full)));
     }

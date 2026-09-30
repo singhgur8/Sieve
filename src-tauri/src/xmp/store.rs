@@ -95,7 +95,8 @@ pub fn mark_written(conn: &Connection, row: &ImageRow, sidecar_mtime: Option<i64
     conn.execute(
         "UPDATE images
          SET xmp_dirty = CASE WHEN meta_updated_at IS ?2 THEN 0 ELSE xmp_dirty END,
-             xmp_synced_at = ?3, xmp_mtime_ms = ?4, xmp_error = NULL
+             xmp_synced_at = ?3, xmp_mtime_ms = ?4, xmp_error = NULL,
+             missing_since_ms = NULL -- the writer checked the original exists (IPC v13)
          WHERE id = ?1",
         params![row.id, row.meta_updated_at, now_ms(), sidecar_mtime],
     )?;
@@ -182,7 +183,8 @@ pub fn clear_masks_pending(conn: &Connection, id: ImageId) -> AppResult<()> {
     Ok(())
 }
 
+/// Records a per-file sync failure; a missing original also flags the image missing.
 pub fn mark_failed(conn: &Connection, id: ImageId, reason: &str) -> AppResult<()> {
     conn.execute("UPDATE images SET xmp_error = ?2 WHERE id = ?1", params![id, reason])?;
-    Ok(())
+    crate::db::repo::note_access_failure(conn, id, reason)
 }

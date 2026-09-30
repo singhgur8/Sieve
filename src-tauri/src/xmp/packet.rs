@@ -92,6 +92,11 @@ pub struct Desired {
     /// Camera profile + look to write (`crs::encode_profile` rules, `<crs:Look>` struct);
     /// `None` = leave the sidecar's profile as it is.
     pub profile: Option<ProfileWrite>,
+    /// Format of the image the sidecar belongs to (`None` = RAW). Its develop defaults
+    /// (`ParametricAdjustments::defaults_for`) are what absent `crs:` properties read as, so a
+    /// develop property (or point curve) the sidecar does not carry is only added when its
+    /// value differs from that default ([`omitted_defaults`]); present ones are always updated.
+    pub format: Option<ImageFormat>,
 }
 
 /// Profile part of a develop write.
@@ -106,7 +111,16 @@ pub struct ProfileWrite {
 impl Desired {
     /// Culling-only write (no develop settings).
     pub fn culling(rating: i32, label: Option<&'static str>, tags: Vec<String>, metadata_date: String) -> Self {
-        Desired { develop: Vec::new(), rating, label, tags, metadata_date, seqs: Vec::new(), profile: None }
+        Desired {
+            develop: Vec::new(),
+            rating,
+            label,
+            tags,
+            metadata_date,
+            seqs: Vec::new(),
+            profile: None,
+            format: None,
+        }
     }
 }
 
@@ -612,7 +626,11 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
             LookChange::Replace => put_look(&mut ed, pw),
         }
     }
+    let skip = omitted_defaults(&top, want);
     for edit in &develop_edits {
+        if edit.ns == crs::CRS_NS && skip.contains(edit.name.as_str()) {
+            continue;
+        }
         // Never downgrade a newer process version (Lightroom would re-render with the old one).
         if edit.ns == crs::CRS_NS && edit.name == "ProcessVersion" {
             let current = crs::CrsSource::scalar(&top, crs::CRS_NS, "ProcessVersion");
@@ -631,6 +649,9 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
         }
     }
     for seq in &want.seqs {
+        if seq.ns == crs::CRS_NS && skip.contains(seq.name) {
+            continue;
+        }
         ed.set_seq(seq.ns, seq.name, seq.items.as_deref());
     }
 
@@ -652,6 +673,70 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
     ed.update_list(NS_DC, "subject", &drop_leaf, &want.tags);
     ed.update_list(NS_LR, "hierarchicalSubject", &|v| is_ours(v) && !wanted_hier.iter().any(|w| w == v), &wanted_hier);
     ed.finish()
+}
+
+/// `crs:` properties Sieve writes with every develop write even at their default value
+/// (Lightroom always carries them; `WhiteBalance` also marks the packet as holding develop
+/// settings for `crs::decode_source`).
+const ALWAYS_WRITTEN: [&str; 3] = ["ProcessVersion", "HasSettings", "WhiteBalance"];
+
+/// Legacy split-toning properties: when any is present without `crs:ColorGradeBlending`,
+/// blending reads as 100 instead of its default (`crs::decode_parity`).
+const LEGACY_SPLIT_TONING: [&str; 4] = [
+    "SplitToningShadowHue",
+    "SplitToningShadowSaturation",
+    "SplitToningHighlightHue",
+    "SplitToningHighlightSaturation",
+];
+
+/// Names of `want`'s develop edits / curve seqs to skip: properties absent from the sidecar
+/// whose wanted value equals the format default (reading the absent property gives the same
+/// value, so the round trip stays lossless without adding default-valued keys Lightroom
+/// omitted). Removals are never skipped.
+fn omitted_defaults<'a>(top: &ScopeSource<'_>, want: &'a Desired) -> std::collections::HashSet<&'a str> {
+    use crs::CrsSource;
+    let mut skip = std::collections::HashSet::new();
+    if want.develop.is_empty() && want.seqs.is_empty() {
+        return skip;
+    }
+    let defaults = ParametricAdjustments::defaults_for(want.format.unwrap_or(ImageFormat::Arw));
+    let mut default_values: HashMap<String, String> =
+        crs::encode(&defaults).into_iter().filter_map(|e| Some((e.name, e.value?))).collect();
+    let (default_seqs, curve_name) = crs::encode_curves(&defaults);
+    if let Some(v) = curve_name.value {
+        default_values.insert(curve_name.name, v);
+    }
+    let absent = |name: &str| !top.has(crs::CRS_NS, name);
+    for e in &want.develop {
+        let Some(v) = &e.value else { continue };
+        if e.ns == crs::CRS_NS
+            && !ALWAYS_WRITTEN.contains(&e.name.as_str())
+            && default_values.get(&e.name) == Some(v)
+            && absent(&e.name)
+        {
+            skip.insert(e.name.as_str());
+        }
+    }
+    for s in &want.seqs {
+        let default = default_seqs.iter().find(|d| d.name == s.name).and_then(|d| d.items.as_ref());
+        if s.ns == crs::CRS_NS && s.items.is_some() && s.items.as_ref() == default && absent(s.name) {
+            skip.insert(s.name);
+        }
+    }
+    // Blending: absent reads as 100 (not the default) next to legacy split toning.
+    let legacy_after = LEGACY_SPLIT_TONING
+        .iter()
+        .any(|n| !absent(n) || want.develop.iter().any(|e| e.name == *n && e.value.is_some() && !skip.contains(*n)));
+    if legacy_after {
+        skip.remove("ColorGradeBlending");
+        let hundred = crs::format_num(100.0, crs::NumFormat::Plain);
+        if let Some(e) = want.develop.iter().find(|e| e.ns == crs::CRS_NS && e.name == "ColorGradeBlending") {
+            if e.value.as_deref() == Some(hundred.as_str()) && absent(&e.name) {
+                skip.insert(e.name.as_str());
+            }
+        }
+    }
+    skip
 }
 
 fn put_look(ed: &mut Editor<'_>, pw: &ProfileWrite) {

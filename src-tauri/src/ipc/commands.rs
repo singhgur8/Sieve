@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Manager, State};
 use tauri_specta::Event;
 
-use super::error::{AppError, AppResult};
+use super::error::{AppError, AppResult, ErrorKind};
 use super::types::*;
 use crate::db::{self, repo};
 use crate::develop::masks::MaskCache;
@@ -339,13 +339,29 @@ pub async fn render_preview(
     let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
     let luts = luts.inner().clone();
-    blocking(move || {
+    let rendered = blocking(move || {
         if !cache.is_current(ticket) {
             return Ok(None);
         }
         cache.render(ticket, &src, &adjustments, &options, &luts)
     })
-    .await
+    .await;
+    note_if_missing(&catalog, id, rendered).await
+}
+
+/// Flags image `id` missing (`RawImageEntry.missingSinceMs`, IPC v13) when `result` failed
+/// because its original is gone, then returns `result` unchanged. Presence is recorded by
+/// `get_develop_info` (which reads the row anyway), so a successful slider render never
+/// writes to the catalog.
+async fn note_if_missing<T>(catalog: &Catalog, id: ImageId, result: AppResult<T>) -> AppResult<T> {
+    if let Err(e) = &result {
+        if e.kind == ErrorKind::FileMissing {
+            if let Err(db) = catalog.run(move |c| repo::set_original_missing(c, id, true)).await {
+                eprintln!("image {id}: recording missing original: {}", db.message);
+            }
+        }
+    }
+    result
 }
 
 /// As-shot white balance, develop-source sizes and render warnings (decodes the source if
@@ -364,7 +380,12 @@ pub async fn get_develop_info(
         develop.remember_source(src.clone());
     }
     let cache = develop.inner().clone();
-    let mut info = blocking(move || cache.info(&src)).await?;
+    let info = blocking(move || cache.info(&src)).await;
+    let mut info = note_if_missing(&catalog, id, info).await?;
+    if entry.missing_since_ms.is_some() && Path::new(&entry.path).is_file() {
+        // The original is back at its path (the source may come from the develop cache).
+        catalog.run(move |c| repo::set_original_missing(c, id, false)).await?;
+    }
     let mut warnings = entry.develop_warnings;
     warnings.append(&mut info.warnings);
     info.warnings = warnings;
@@ -392,7 +413,8 @@ pub async fn sample_white_balance(
     adjustments.validate().map_err(AppError::invalid)?;
     let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
-    blocking(move || cache.sample_white_balance(&src, point, &adjustments)).await
+    let sampled = blocking(move || cache.sample_white_balance(&src, point, &adjustments)).await;
+    note_if_missing(&catalog, id, sampled).await
 }
 
 /// Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
@@ -935,6 +957,53 @@ fn reveal(path: &Path) -> AppResult<()> {
         return Err(AppError::internal(format!("open -R exited with {status}")));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 hardening (IPC v13): missing originals, catalog backups
+// ---------------------------------------------------------------------------
+
+/// Points folder `folderId` at `newPath` (the shoot was moved, renamed or its drive mounted
+/// elsewhere). Each image is found at its path relative to the old folder, else by file
+/// name anywhere under `newPath`; found images are repointed and their missing flag
+/// cleared, the others stay flagged missing (`stillMissing`). Errors (nothing changed):
+/// `not_found` for an unknown folder; `invalid_argument` when `newPath` is not a folder, is
+/// already another catalog folder, or holds none of the folder's photos. Develop sources
+/// of the moved images are forgotten, and thumbnails that failed because the file was
+/// missing are re-extracted. Refetch `get_catalog_state` / the visible rows afterwards.
+#[tauri::command]
+#[specta::specta]
+pub async fn relocate_folder(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    ingest: State<'_, Ingest>,
+    folder_id: FolderId,
+    new_path: String,
+) -> AppResult<RelocateResult> {
+    let relocated = catalog.run(move |c| repo::relocate_folder(c, folder_id, Path::new(&new_path))).await?;
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_sources(Some(&relocated.moved));
+    }
+    if !relocated.retry_thumbnails.is_empty() {
+        ingest.regenerate(&app, relocated.retry_thumbnails)?;
+    }
+    Ok(relocated.result)
+}
+
+/// Stages automatic backup `index` (`CatalogState.health.backups[].index`, 1 = newest) to
+/// replace the catalog at the next launch; the current catalog is kept aside as
+/// `<catalog>.corrupt-<ms>`. The UI tells the user to relaunch; changes made before the
+/// relaunch are lost. Returns the updated health (`restorePending: true`). Errors:
+/// `not_found` (no such backup), `invalid_argument` (the backup is damaged too).
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_catalog_backup(catalog: State<'_, Catalog>, index: u32) -> AppResult<CatalogHealth> {
+    let path = catalog.path.clone();
+    blocking(move || {
+        db::stage_restore(&path, index as usize)?;
+        Ok(db::health_state(&path))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

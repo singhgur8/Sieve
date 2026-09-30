@@ -21,6 +21,7 @@ fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
         develop: Vec::new(),
         seqs: Vec::new(),
         profile: None,
+        format: None,
     }
 }
 
@@ -441,6 +442,11 @@ fn read_only_folder_and_missing_raw_are_reported() {
     assert!(!f.sidecar(1).exists());
     let (dirty, _, _, err) = f.state(f.ids[1]);
     assert!(dirty && err.is_some(), "stays dirty, error recorded");
+    // IPC v13: the moved RAW is flagged missing; the written one is not.
+    let missing = |id| repo::get_image(&f.conn(), id).unwrap().missing_since_ms.is_some();
+    let gone = report.failed[0].image_id;
+    assert!(missing(gone));
+    assert!(f.ids[..2].iter().filter(|&&id| id != gone).all(|&id| !missing(id)));
 
     // Read-only folder (e.g. a locked card or a share without write access).
     let shoot = f.dir.path().join("shoot");

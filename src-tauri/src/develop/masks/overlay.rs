@@ -53,21 +53,55 @@ pub fn linear_srgb_to_lab(r: f32, g: f32, b: f32) -> [f32; 3] {
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
 
-/// Lab guide on a `w x h` grid from an interleaved sRGB8 image (nearest resample if sizes
-/// differ).
+/// Lab guide on a `w x h` grid from an interleaved sRGB8 image. Resampled in linear light
+/// when the sizes differ: area average when shrinking, bilinear when enlarging (a nearest
+/// resample would turn range masks into blocks / aliased stairs).
 pub fn guide_from_srgb8(rgb: &[u8], sw: u32, sh: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
     use rayon::prelude::*;
     let lut: Vec<f32> = (0..=255u8).map(srgb8_to_linear).collect();
     let (sw, sh, w, h) = (sw as usize, sh as usize, w as usize, h as usize);
     let mut out = vec![[0.0f32; 3]; w * h];
+    if sw == 0 || sh == 0 || rgb.len() < sw * sh * 3 {
+        return out;
+    }
+    let px = |x: usize, y: usize| {
+        let i = (y * sw + x) * 3;
+        [lut[rgb[i] as usize], lut[rgb[i + 1] as usize], lut[rgb[i + 2] as usize]]
+    };
+    // Source footprint of output column / row `o` (source px, fractional).
+    let (kx, ky) = (sw as f32 / w.max(1) as f32, sh as f32 / h.max(1) as f32);
     out.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
-        let sy = ((y * sh) / h.max(1)).min(sh.saturating_sub(1));
         for (x, v) in row.iter_mut().enumerate() {
-            let sx = ((x * sw) / w.max(1)).min(sw.saturating_sub(1));
-            let i = (sy * sw + sx) * 3;
-            if i + 2 < rgb.len() {
-                *v = linear_srgb_to_lab(lut[rgb[i] as usize], lut[rgb[i + 1] as usize], lut[rgb[i + 2] as usize]);
-            }
+            let c = if sw == w && sh == h {
+                px(x, y)
+            } else if kx > 1.0 || ky > 1.0 {
+                // Area average over the footprint (integer bounds, at least one pixel).
+                let x0 = ((x as f32 * kx) as usize).min(sw - 1);
+                let x1 = (((x + 1) as f32 * kx).ceil() as usize).clamp(x0 + 1, sw);
+                let y0 = ((y as f32 * ky) as usize).min(sh - 1);
+                let y1 = (((y + 1) as f32 * ky).ceil() as usize).clamp(y0 + 1, sh);
+                let mut acc = [0.0f32; 3];
+                for yy in y0..y1 {
+                    for xx in x0..x1 {
+                        let p = px(xx, yy);
+                        for k in 0..3 {
+                            acc[k] += p[k];
+                        }
+                    }
+                }
+                let n = ((x1 - x0) * (y1 - y0)) as f32;
+                acc.map(|a| a / n)
+            } else {
+                // Bilinear at the output pixel centre.
+                let fx = ((x as f32 + 0.5) * kx - 0.5).clamp(0.0, (sw - 1) as f32);
+                let fy = ((y as f32 + 0.5) * ky - 0.5).clamp(0.0, (sh - 1) as f32);
+                let (x0, y0) = (fx as usize, fy as usize);
+                let (x1, y1) = ((x0 + 1).min(sw - 1), (y0 + 1).min(sh - 1));
+                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
+                [0, 1, 2].map(|k| (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty)
+            };
+            *v = linear_srgb_to_lab(c[0], c[1], c[2]);
         }
     });
     out

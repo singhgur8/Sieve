@@ -1,7 +1,7 @@
 import { memo, useState } from "react";
 import { AlertTriangle, Anchor, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, Unplug, X } from "lucide-react";
 import { convertFileSrc, type RawImageEntry } from "../ipc";
-import { useFileHealth } from "../lib/errors";
+import { useEntryHealth } from "../lib/errors";
 import { LABEL_COLOR, TAG_SHORT, TAG_STYLE, tagName } from "../lib/format";
 
 interface Props {
@@ -27,7 +27,7 @@ export function Stars({ n, className = "size-3" }: { n: number; className?: stri
 
 /** "Missing" (original moved / drive disconnected) or "Unreadable" (decode failed), from what the backend reported. */
 export function HealthBadge({ entry, testPrefix = "health" }: { entry: RawImageEntry; testPrefix?: string }) {
-  const h = useFileHealth(entry.path);
+  const h = useEntryHealth(entry);
   if (!h) return null;
   const missing = h.kind === "missing";
   return (

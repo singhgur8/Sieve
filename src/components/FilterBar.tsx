@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Filter, Layers, RotateCcw } from "lucide-react";
+import { Filter, FolderSearch, Layers, RotateCcw, Unplug } from "lucide-react";
 import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type PickFlag } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
@@ -16,6 +16,8 @@ interface Props {
   query: Query;
   setQuery: (fn: (q: Query) => Query) => void;
   counts: FilterCounts | null;
+  /** "Locate folder…" (IPC v13 relocate_folder). */
+  onLocate?: () => void;
 }
 
 const chip = "whitespace-nowrap rounded px-2 py-0.5 text-xs transition-colors";
@@ -32,6 +34,7 @@ export function isFiltered(q: Query): boolean {
     q.colorLabels.length > 0 ||
     q.collapseBursts ||
     q.folderId != null ||
+    q.missingOnly === true ||
     q.sceneId != null
   );
 }
@@ -54,7 +57,7 @@ export function useFilterCounts(folderId: number | null, epoch: number): FilterC
 const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
 
 /** Row 1 of the Library chrome: culling tags, flags and the result count. */
-export function FilterBar({ query, setQuery, counts }: Props) {
+export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
   const tagCount = (t: CullTag) => counts?.tags.find((x) => x.tag === t)?.count ?? 0;
   const pickCount = (p: PickFlag) => (counts ? { pick: counts.picked, reject: counts.rejected, unflagged: counts.unflagged }[p] : 0);
 
@@ -110,6 +113,25 @@ export function FilterBar({ query, setQuery, counts }: Props) {
         ))}
       </div>
 
+      {((counts?.missing ?? 0) > 0 || query.missingOnly) && (
+        <div className="flex shrink-0 items-center gap-1" data-testid="filter-missing-group">
+          <button
+            data-testid="filter-missing"
+            data-state={query.missingOnly ? "include" : "off"}
+            onClick={() => setQuery((q) => ({ ...q, missingOnly: !q.missingOnly }))}
+            title="Photos whose original file cannot be found"
+            className={`${chip} flex items-center gap-1 ${query.missingOnly ? "bg-amber-800 text-amber-100 ring-1 ring-white/40" : off}`}
+          >
+            <Unplug className="size-3" /> Missing <span className="opacity-70">{counts?.missing ?? 0}</span>
+          </button>
+          {onLocate && (counts?.missing ?? 0) > 0 && (
+            <button onClick={onLocate} data-testid="locate-folder" className={`${chip} ${off} flex items-center gap-1`}>
+              <FolderSearch className="size-3" /> Locate folder…
+            </button>
+          )}
+        </div>
+      )}
+
       {isFiltered(query) && (
         <button
           onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
@@ -125,7 +147,7 @@ export function FilterBar({ query, setQuery, counts }: Props) {
 }
 
 /** Rating / label / burst / folder filters (row 2 of the Library chrome, left of the view controls). */
-export function FilterExtras({ query, setQuery, counts, catalog }: { query: Query; setQuery: Props["setQuery"]; counts: FilterCounts | null; catalog: CatalogState | null }) {
+export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { query: Query; setQuery: Props["setQuery"]; counts: FilterCounts | null; catalog: CatalogState | null; onLocate?: () => void }) {
   return (
     <>
       <div className="flex items-center gap-1">
@@ -198,6 +220,11 @@ export function FilterExtras({ query, setQuery, counts, catalog }: { query: Quer
           ))}
         </select>
       )}
+      {onLocate && query.folderId != null && (
+        <button onClick={onLocate} data-testid="locate-selected-folder" title="Point this folder at where its photos were moved" className="flex items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700">
+          <FolderSearch className="size-3" /> Locate…
+        </button>
+      )}
     </>
   );
 }
@@ -212,6 +239,7 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   q.colorLabels.forEach((l) => parts.push(l));
   if (q.collapseBursts) parts.push("bursts collapsed");
   if (q.folderId != null) parts.push("one folder");
+  if (q.missingOnly) parts.push("missing");
   if (q.sceneId != null) parts.push(`Scene ${sceneNumber?.(q.sceneId) || q.sceneId}`);
   return parts.join(", ");
 }

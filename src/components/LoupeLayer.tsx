@@ -29,10 +29,12 @@ interface Props {
   compare: CompareState | null;
   onFocusPane: (which: "a" | "b") => void;
   onOpen: (id: number) => void;
+  /** "Locate folder…" for the folder of image `imageId`. */
+  onLocate?: (imageId: number) => void;
 }
 
 /** Full-area loupe / 2-up compare. Owns zoom/pan state so pans do not re-render the grid. */
-export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen }, ref) {
+export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen, onLocate }, ref) {
   const [view, setView] = useState<View>(FIT);
   const [faces, setFaces] = useState<FaceInfo[]>([]);
   const [info, setInfo] = useState<InfoLevel>("full");
@@ -106,7 +108,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-image-id={id}
                 >
                   <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} />
-                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} />
+                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} />
                 </div>
               );
             })}
@@ -114,7 +116,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
             <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} testId="zoom-a" />
-            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} />
+            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} />
           </div>
         ) : null}
         <div
@@ -144,7 +146,7 @@ function suggestion(entry: RawImageEntry): string | null {
   return `Suggested: ${PICK_LABEL[q.suggestedPick]} · ${q.suggestedRating}★`;
 }
 
-function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean }) {
+function InfoOverlay({ entry, level, showKeeper, onLocate }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean; onLocate?: (id: number) => void }) {
   if (!entry || level === "off") return null;
   if (level === "name")
     return (
@@ -170,6 +172,11 @@ function InfoOverlay({ entry, level, showKeeper }: { entry: RawImageEntry | unde
         {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
         <Stars n={entry.rating} />
         <HealthBadge entry={entry} testPrefix="loupe-health" />
+        {onLocate && entry.missingSinceMs != null && (
+          <button onClick={() => onLocate(entry.id)} data-testid="loupe-locate" className="pointer-events-auto rounded bg-neutral-800 px-1.5 text-[10px] text-neutral-200 hover:bg-neutral-700">
+            Locate folder…
+          </button>
+        )}
         <XmpBadge entry={entry} />
         <CompanionBadge entry={entry} testPrefix="loupe-companion" />
         {showKeeper && entry.isBurstKeeper && (
