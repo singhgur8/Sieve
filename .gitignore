@@ -21,3 +21,4 @@ test-results/
 src-tauri/models/*
 !src-tauri/models/README.md
 !src-tauri/models/checksums.sha256
+.claude/worktrees/
