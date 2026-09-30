@@ -512,3 +512,212 @@ pub fn range_guide(pixels: &[u16], color: &ColorInfo, profile: &Profile, adj: &P
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::masks::{evaluate, MaskGeometry, NoMattes};
+    use super::super::pipeline::{self, RenderInput, RenderedImage, BASELINE_EV};
+    use super::*;
+    use crate::ipc::types::{
+        CropSettings, LinearMask, LocalAdjustments, MaskBlendMode, MaskComponent, MaskGroup, MaskShape, NormPoint,
+    };
+
+    fn color() -> ColorInfo {
+        ColorInfo {
+            as_shot_mul: Some([2.0, 1.0, 1.5]),
+            daylight_mul: [2.0, 1.0, 1.5],
+            rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            xyz_to_cam: [
+                [3.2404542, -1.5371385, -0.4985314],
+                [-0.969266, 1.8760108, 0.041556],
+                [0.0556434, -0.2040259, 1.0572252],
+            ],
+        }
+    }
+
+    fn plain() -> ParametricAdjustments {
+        let mut a = ParametricAdjustments::default();
+        a.detail.sharpening.amount = 0.0;
+        a.detail.noise_reduction.color = 0.0;
+        a.profile = crate::ipc::types::ProfileSettings::none();
+        a
+    }
+
+    const W: u32 = 160;
+    const H: u32 = 100;
+
+    /// Grey ramps (top) and skin-like colour ramps (bottom), camera RGB.
+    fn pixels() -> Vec<u16> {
+        let mut px = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                let v = 0.02 + (x % 40) as f32 / 39.0 * 0.5;
+                let rgb = if y < H / 2 { [v, v, v] } else { [v, v * 0.7, v * 0.5] };
+                px.extend([rgb[0] / 2.0, rgb[1], rgb[2] / 1.5].map(|c| (c * 65535.0) as u16));
+            }
+        }
+        px
+    }
+
+    fn group(zero_x: f32, full_x: f32, adjust: impl Fn(&mut LocalAdjustments)) -> MaskGroup {
+        let mut adjustments = LocalAdjustments::default();
+        adjust(&mut adjustments);
+        MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Mask 1".into(),
+            active: true,
+            amount: 1.0,
+            adjustments,
+            components: vec![MaskComponent {
+                id: format!("{:032X}", 2),
+                name: String::new(),
+                active: true,
+                mode: MaskBlendMode::Add,
+                inverted: false,
+                opacity: 1.0,
+                shape: MaskShape::Linear(LinearMask {
+                    zero: NormPoint { x: zero_x, y: 0.5 },
+                    full: NormPoint { x: full_x, y: 0.5 },
+                }),
+            }],
+        }
+    }
+
+    fn render(adj: &ParametricAdjustments) -> RenderedImage {
+        let px = pixels();
+        let c = color();
+        let p = Profile::matrix(BASELINE_EV);
+        let input = RenderInput::simple(W, H, &px, &c, &p);
+        let geom = MaskGeometry {
+            sensor_width: W,
+            sensor_height: H,
+            orientation: 1,
+            crop: CropSettings::default(),
+            region: None,
+            width: W,
+            height: H,
+        };
+        let weights = evaluate(&adj.masks, &geom, 1, &NoMattes, None);
+        let planes = LocalPlanes::build(&adj.masks, &weights);
+        pipeline::render_masked(&input, adj, None, planes.as_ref())
+    }
+
+    fn px(img: &RenderedImage, x: u32, y: u32) -> [i32; 3] {
+        let i = ((y * img.width + x) * 3) as usize;
+        [0, 1, 2].map(|k| i32::from(img.rgb[i + k]))
+    }
+
+    fn max_diff(a: &RenderedImage, b: &RenderedImage, x0: u32, x1: u32) -> i32 {
+        let mut d = 0;
+        for y in 0..H {
+            for x in x0..x1 {
+                let (p, q) = (px(a, x, y), px(b, x, y));
+                d = d.max((0..3).map(|k| (p[k] - q[k]).abs()).max().unwrap_or(0));
+            }
+        }
+        d
+    }
+
+    fn mean_green(img: &RenderedImage, x0: u32, x1: u32) -> f32 {
+        let mut s = 0.0;
+        for y in 0..H {
+            for x in x0..x1 {
+                s += px(img, x, y)[1] as f32;
+            }
+        }
+        s / ((x1 - x0) * H) as f32
+    }
+
+    #[test]
+    fn local_exposure_applies_only_inside_the_mask() {
+        let base = render(&plain());
+        // Weight 0 left of x = 0.49, 1 right of 0.51.
+        let masked = render(&ParametricAdjustments { masks: vec![group(0.49, 0.51, |a| a.exposure = 1.0)], ..plain() });
+        assert_eq!(max_diff(&base, &masked, 0, W * 45 / 100), 0, "outside the mask: unchanged");
+        let (b, m) = (mean_green(&base, W * 55 / 100, W), mean_green(&masked, W * 55 / 100, W));
+        assert!(m > b + 15.0, "inside the mask: brighter ({b} -> {m})");
+        // Inactive group / neutral group / zero amount: identical render.
+        for g in [
+            MaskGroup { active: false, ..group(0.49, 0.51, |a| a.exposure = 1.0) },
+            group(0.49, 0.51, |_| {}),
+            MaskGroup { amount: 0.0, ..group(0.49, 0.51, |a| a.exposure = 1.0) },
+        ] {
+            let r = render(&ParametricAdjustments { masks: vec![g], ..plain() });
+            assert_eq!(max_diff(&base, &r, 0, W), 0);
+        }
+    }
+
+    /// A mask covering the whole frame renders like the same global slider (Lightroom's
+    /// additive model), within rounding.
+    #[test]
+    fn full_mask_matches_the_global_slider() {
+        type Set = fn(&mut ParametricAdjustments, f32);
+        type SetLocal = fn(&mut LocalAdjustments, f32);
+        let cases: [(&str, Set, SetLocal, f32, i32); 9] = [
+            ("exposure", |a, v| a.exposure = v, |a, v| a.exposure = v, 1.0, 1),
+            ("exposure-", |a, v| a.exposure = v, |a, v| a.exposure = v, -1.5, 1),
+            ("contrast", |a, v| a.contrast = v, |a, v| a.contrast = v, 60.0, 2),
+            ("whites", |a, v| a.whites = v, |a, v| a.whites = v, -50.0, 2),
+            ("blacks", |a, v| a.blacks = v, |a, v| a.blacks = v, 50.0, 2),
+            ("shadows", |a, v| a.shadows = v, |a, v| a.shadows = v, 70.0, 2),
+            ("highlights", |a, v| a.highlights = v, |a, v| a.highlights = v, -70.0, 2),
+            ("clarity", |a, v| a.clarity = v, |a, v| a.clarity = v, 50.0, 1),
+            ("texture", |a, v| a.texture = v, |a, v| a.texture = v, 100.0, 1),
+        ];
+        for (name, set, set_local, v, tol) in cases {
+            let mut global = plain();
+            set(&mut global, v);
+            let g = render(&global);
+            let local = ParametricAdjustments { masks: vec![group(-2.0, -1.0, |a| set_local(a, v))], ..plain() };
+            let l = render(&local);
+            let d = max_diff(&g, &l, 0, W);
+            assert!(d <= tol, "{name}: max diff {d}");
+            assert!(max_diff(&g, &render(&plain()), 0, W) > 0, "{name}: the slider changes the render");
+        }
+    }
+
+    #[test]
+    fn local_colour_temperature_tint_hue_and_saturation() {
+        let base = render(&plain());
+        let full = |f: fn(&mut LocalAdjustments)| {
+            render(&ParametricAdjustments { masks: vec![group(-2.0, -1.0, f)], ..plain() })
+        };
+        let rb = |img: &RenderedImage| {
+            let p = px(img, 30, 10);
+            p[0] - p[2]
+        };
+        assert!(rb(&full(|a| a.temperature = 60.0)) > rb(&base) + 8, "warmer");
+        assert!(rb(&full(|a| a.temperature = -60.0)) < rb(&base) - 8, "cooler");
+        let g = |img: &RenderedImage| {
+            let p = px(img, 30, 10);
+            p[1] - (p[0] + p[2]) / 2
+        };
+        assert!(g(&full(|a| a.tint = 60.0)) < g(&base) - 4, "magenta");
+        // Saturation: the colour row gets closer to grey.
+        let sat = |img: &RenderedImage| {
+            let p = px(img, 30, 80);
+            p[0] - p[2]
+        };
+        assert!(sat(&full(|a| a.saturation = -100.0)) < sat(&base) / 3);
+        assert!(sat(&full(|a| a.saturation = 60.0)) > sat(&base));
+        assert_ne!(px(&full(|a| a.hue = 90.0), 30, 80), px(&base, 30, 80));
+        // Greys stay grey under saturation.
+        let p = px(&full(|a| a.saturation = 80.0), 30, 10);
+        assert!((p[0] - p[2]).abs() <= 2, "{p:?}");
+    }
+
+    #[test]
+    fn group_curve_and_detail_apply_by_weight() {
+        let base = render(&plain());
+        let lifted = render(&ParametricAdjustments {
+            masks: vec![group(0.49, 0.51, |a| a.tone_curve.master = vec![[0.0, 60.0], [255.0, 255.0]])],
+            ..plain()
+        });
+        assert_eq!(max_diff(&base, &lifted, 0, W * 45 / 100), 0);
+        assert!(px(&lifted, W - 40, 10)[1] > px(&base, W - 40, 10)[1] + 20, "curve lifts the masked blacks");
+        let soft =
+            render(&ParametricAdjustments { masks: vec![group(0.49, 0.51, |a| a.sharpness = -100.0)], ..plain() });
+        assert_eq!(max_diff(&base, &soft, 0, W * 40 / 100), 0);
+        assert!(max_diff(&base, &soft, W * 60 / 100, W) > 0, "softened inside");
+    }
+}

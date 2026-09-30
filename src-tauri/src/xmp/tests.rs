@@ -1017,3 +1017,55 @@ fn masks_import_on_read_and_are_protected_until_imported() {
     f.sync.write_images(&[id]).unwrap();
     assert!(!fs::read_to_string(f.sidecar(0)).unwrap().contains("MaskGroupBasedCorrections"));
 }
+
+/// Launch catch-up (migration 0010): pending sidecar masks are imported without touching the
+/// catalog's other settings or dirtying the image; a later write keeps the masks element
+/// byte-for-byte (round trip unchanged).
+#[test]
+fn pending_masks_catch_up_imports_only_masks_and_round_trips() {
+    let f = Fixture::new(2);
+    let (id, other) = (f.ids[0], f.ids[1]);
+    fs::write(f.sidecar(0), MASKED_SIDECAR).unwrap();
+    {
+        let mut conn = f.conn();
+        let adj = ParametricAdjustments { exposure: 1.0, ..Default::default() };
+        crate::develop::history::commit(&mut conn, id, &adj, "Exposure").unwrap();
+        conn.execute("UPDATE images SET masks_pending_import = 1, xmp_dirty = 0 WHERE id IN (?1, ?2)", [id, other])
+            .unwrap();
+        store::set_develop_warnings(
+            &conn,
+            id,
+            &[crate::ipc::types::DevelopWarning {
+                code: crate::ipc::types::DevelopWarningCode::MasksUnsupported,
+                detail: Some("1".into()),
+            }],
+        )
+        .unwrap();
+    }
+    // `other` has no sidecar: its flag is just cleared.
+    assert_eq!(f.sync.import_pending_masks().unwrap(), 1);
+    let conn = f.conn();
+    let adj = repo::get_adjustments(&conn, id).unwrap();
+    assert_eq!(adj.exposure, 1.0, "other settings kept");
+    assert_eq!(adj.masks.len(), 1);
+    assert_eq!(adj.masks[0].name, "Sky");
+    assert!(!store::masks_pending(&conn, id).unwrap() && !store::masks_pending(&conn, other).unwrap());
+    assert!(!store::is_dirty(&conn, id).unwrap(), "imported from the sidecar: nothing to write back");
+    assert!(store::develop_warnings(&conn, id)
+        .unwrap()
+        .iter()
+        .all(|w| w.code != crate::ipc::types::DevelopWarningCode::MasksUnsupported));
+    drop(conn);
+    // Idempotent.
+    assert_eq!(f.sync.import_pending_masks().unwrap(), 0);
+    // A write keeps the masks element as it was.
+    assert_eq!(f.sync.write_images(&[id]).unwrap().succeeded, 1);
+    let written = fs::read_to_string(f.sidecar(0)).unwrap();
+    let element = |t: &str| {
+        let a = t.find("<crs:MaskGroupBasedCorrections>").unwrap();
+        let b = t.find("</crs:MaskGroupBasedCorrections>").unwrap();
+        t[a..b].to_owned()
+    };
+    assert_eq!(element(&written), element(MASKED_SIDECAR));
+    assert_eq!(masks::read(&written).unwrap().unwrap().groups, adj.masks);
+}

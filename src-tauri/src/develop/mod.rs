@@ -862,6 +862,93 @@ mod tests {
         assert!(e.message.contains("clipped"), "{}", e.message);
     }
 
+    /// Phase 7c: renders through the cache apply masks in the displayed frame (orientation),
+    /// and `info` reports AI components without a matte.
+    #[test]
+    fn masks_render_through_cache_and_info_reports_missing_mattes() {
+        use crate::ipc::types::{
+            AiMask, AiMaskOrigin, AiTarget, DevelopWarningCode, ImportOptions, LocalAdjustments, MaskBlendMode,
+            MaskComponent, MaskGroup, MaskShape,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("src");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (w, h) = (40u32, 20u32);
+        let px: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 100, 100]).collect();
+        std::fs::write(
+            folder.join("g.png"),
+            crate::raw::png::test_support::encode(w, h, None, Some(&px), None, None, None),
+        )
+        .unwrap();
+        let catalog = dir.path().join("cat.sqlite");
+        let mut conn = crate::db::open(&catalog).unwrap();
+        let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+        crate::db::repo::import_folder(&mut conn, &folder, &opts).unwrap();
+        let id: ImageId = conn.query_row("SELECT id FROM images", [], |r| r.get(0)).unwrap();
+        let mattes = masks::MaskCache::new(masks::MaskCacheConfig {
+            catalog_path: catalog.clone(),
+            cache_dir: dir.path().join("cache"),
+        });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 64 << 20, mask_cache: Some(mattes.clone()) });
+        let src = SourceImage { id, path: folder.join("g.png"), orientation: Some(6) };
+        let digest = "0123456789ABCDEF0123456789ABCDEF".to_owned();
+        let mut adj = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Png);
+        adj.masks = vec![MaskGroup {
+            id: format!("{:032X}", 1),
+            name: "Subject".into(),
+            active: true,
+            amount: 1.0,
+            adjustments: LocalAdjustments { exposure: 1.5, ..Default::default() },
+            components: vec![MaskComponent {
+                id: format!("{:032X}", 2),
+                name: String::new(),
+                active: true,
+                mode: MaskBlendMode::Add,
+                inverted: false,
+                opacity: 1.0,
+                shape: MaskShape::Ai(AiMask {
+                    target: AiTarget::Subject,
+                    reference_point: None,
+                    digest: Some(digest.clone()),
+                }),
+            }],
+        }];
+        crate::develop::history::commit(&mut conn, id, &adj, "Mask").unwrap();
+        let luts = LutLibrary::new(PathBuf::from("/nonexistent"));
+        let render = |a: &ParametricAdjustments| cache.render_image(&src, a, None, 512, &luts).unwrap().image;
+        let plain = ParametricAdjustments { masks: Vec::new(), ..adj.clone() };
+        let base = render(&plain);
+        assert_eq!((base.width, base.height), (h, w), "orientation 6");
+        let warned = |c: &DevelopCache| {
+            c.info(&src).unwrap().warnings.iter().any(|w| w.code == DevelopWarningCode::AiMaskNeedsUpdate)
+        };
+        assert!(warned(&cache), "matte missing");
+        assert_eq!(render(&adj).rgb, base.rgb, "missing matte renders empty");
+
+        // Lightroom matte selecting the sensor's left half = the displayed top half (o = 6).
+        let matte = masks::AlphaMask {
+            width: w,
+            height: h,
+            bounds: NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            data: (0..w * h).map(|i| if i % w < w / 2 { 255 } else { 0 }).collect(),
+        };
+        let new = masks::NewMatte {
+            kind: "subject".into(),
+            target: AiTarget::Subject,
+            reference_point: None,
+            origin: AiMaskOrigin::Lightroom,
+            digest: Some(digest),
+            model_version: "lr:1".into(),
+            input_digest: None,
+        };
+        mattes.put(&conn, id, &new, &matte).unwrap();
+        assert!(!warned(&cache));
+        let img = render(&adj);
+        let g = |im: &pipeline::RenderedImage, x: u32, y: u32| im.rgb[((y * im.width + x) * 3 + 1) as usize];
+        assert!(g(&img, 10, 5) > g(&base, 10, 5) + 30, "top (masked) brighter");
+        assert_eq!(g(&img, 10, 35), g(&base, 10, 35), "bottom unchanged");
+    }
+
     #[test]
     fn tickets_are_latest_wins_per_key() {
         let cache = DevelopCache::new(DevelopConfig { cache_bytes: 0, mask_cache: None });

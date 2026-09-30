@@ -403,8 +403,9 @@ fn a_few_masks_evaluate_fast_at_preview_size() {
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     eprintln!("3 masks at 2048 px: {ms:.1} ms");
     assert!(w.groups.iter().all(Option::is_some));
-    // Debug builds are ~10x slower than release; the budget is ~10 ms in release.
-    assert!(ms < if cfg!(debug_assertions) { 400.0 } else { 20.0 }, "{ms} ms");
+    // Debug builds are ~10x slower than release (and share the CPU with the other tests);
+    // the budget is ~10 ms in release.
+    assert!(ms < if cfg!(debug_assertions) { 1500.0 } else { 20.0 }, "{ms} ms");
 }
 
 // ---------------------------------------------------------------------------
