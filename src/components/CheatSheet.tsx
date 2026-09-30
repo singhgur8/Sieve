@@ -20,7 +20,7 @@ export function CheatSheet({ onClose, mode = "grid" }: { onClose: () => void; mo
     <Dialog
       label="Keyboard shortcuts"
       testid="cheat-sheet"
-      className="flex max-h-[86vh] w-[min(1280px,96vw)] flex-col rounded-xl border border-neutral-700 bg-neutral-900 shadow-2xl"
+      className="flex max-h-[86vh] w-[min(1560px,96vw)] flex-col rounded-xl border border-neutral-700 bg-neutral-900 shadow-2xl"
       onCancel={onClose}
       onConfirm={onClose}
       backdropClose
@@ -33,7 +33,7 @@ export function CheatSheet({ onClose, mode = "grid" }: { onClose: () => void; mo
           <X className="size-4" />
         </button>
       </header>
-      <div className="min-h-0 flex-1 columns-2 gap-x-8 overflow-y-auto p-4 text-sm min-[1400px]:columns-3" data-testid="cheat-columns">
+      <div className="min-h-0 flex-1 columns-2 gap-x-8 overflow-y-auto p-4 text-sm min-[1400px]:columns-3 min-[1700px]:columns-4" data-testid="cheat-columns">
         {ordered(mode).map((g) => (
           <section key={g.group} className="mb-4 break-inside-avoid" data-testid={`cheat-group-${g.group}`}>
             <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-neutral-400">{g.group}</h3>

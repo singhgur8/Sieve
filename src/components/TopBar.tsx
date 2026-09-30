@@ -1,15 +1,16 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
-import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, Maximize, MoreHorizontal, RefreshCw, ScanSearch, Share, SlidersHorizontal, Layers3 } from "lucide-react";
+import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, ListChecks, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
 import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
 import { Menu, menuItem } from "./Menu";
 import { ProjectSwitcher } from "./ProjectSwitcher";
+import { AnalyzeSplit, ShootSelect } from "./AnalyzeControls";
+import type { ReactNode } from "react";
 
-const SHOOT_TYPES: ShootType[] = ["wedding", "portrait", "sports", "event", "landscape", "general"];
-const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const btn = "flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 text-sm hover:bg-neutral-700 disabled:opacity-50";
+const labelHide = "max-[1439px]:hidden";
 const seg = (on: boolean) => `flex h-7 items-center gap-1 whitespace-nowrap rounded px-2 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
 
 interface Props {
@@ -22,7 +23,7 @@ interface Props {
   analysis: AnalysisView | null;
   xmp: XmpStatus | null;
   busy: boolean;
-  mode: Mode;
+  mode: Mode | "plan";
   onMode: (m: Mode) => void;
   /** Compare view is open (also inside Develop): highlights the Compare button. */
   compareOn?: boolean;
@@ -52,6 +53,12 @@ interface Props {
   onRegenerate: () => void;
   /** 0-100 while export jobs run, otherwise null. */
   exportPct: number | null;
+  /** Workflow step bar (project open): replaces Shoot / Analyze / Export, which move to the Cull bar and step 3. */
+  steps?: ReactNode;
+  /** Plan view segment (Edit step). */
+  plan?: { on: boolean; onPlan: () => void };
+  /** Project without photos (no Cull bar to hold them): keep Shoot type and Analyze in the TopBar. */
+  legacyControls?: boolean;
 }
 
 function Ring({ pct }: { pct: number }) {
@@ -79,13 +86,13 @@ export function TopBar(p: Props) {
     <div className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 px-3" data-testid="top-bar">
       <button onClick={p.onHome} disabled={!p.onHome} className="flex items-center gap-2 rounded-md hover:opacity-80 disabled:hover:opacity-100" data-testid="home-button" title="All projects">
         <Aperture className="size-5 shrink-0 text-amber-400" />
-        <h1 className={`font-semibold tracking-tight `}>Sieve</h1>
+        <h1 className={`font-semibold tracking-tight ${p.steps ? "max-[1439px]:hidden" : ""}`}>Sieve</h1>
       </button>
       {p.project && p.onHome && p.onOpenProject && <ProjectSwitcher project={p.project} onHome={p.onHome} onOpenProject={p.onOpenProject} onSetCover={p.onSetCover ?? null} />}
       <div className="flex" data-testid="import-split">
         <button onClick={p.onImport} disabled={p.busy} className={`${btn} rounded-r-none`} data-testid="import-button" title={`${p.project ? "Add a folder to this project" : "Import a shoot folder"}${hint("import")}`}>
           <FolderOpen className="size-4" />
-          {p.busy ? "Importing…" : "Import"}
+          <span className={p.steps ? "max-[1439px]:hidden" : ""}>{p.busy ? "Importing…" : "Import"}</span>
         </button>
         <Menu trigger={<ChevronDown className="size-4" />} triggerClass={`${btn} rounded-l-none border-l border-neutral-700 px-1.5`} triggerTestId="import-options" title="Import options" disabled={p.busy}>
           {(close) => (
@@ -112,65 +119,23 @@ export function TopBar(p: Props) {
           )}
         </Menu>
       </div>
-      <label className="flex items-center gap-1 text-xs text-neutral-400">
-        <span className="max-[1400px]:hidden">Shoot</span>
-        <select
-          value={c?.shootType ?? "general"}
-          onChange={(e) => p.onShootType(e.target.value as ShootType)}
-          disabled={!c}
-          className="h-7 rounded bg-neutral-800 px-1.5 text-sm text-neutral-200"
-          data-testid="shoot-select"
-        >
-          {SHOOT_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {cap(t)}
-            </option>
-          ))}
-        </select>
-      </label>
-      <div className="flex" data-testid="analyze-split">
-        <button onClick={() => p.onAnalyze("pending")} disabled={p.analysis?.running} className={`${btn} rounded-r-none`} data-testid="analyze-button" title="Analyze photos that have not been analyzed yet">
-          <ScanSearch className="size-4" />
-          Analyze
-        </button>
-        <Menu trigger={<ChevronDown className="size-4" />} triggerClass={`${btn} rounded-l-none border-l border-neutral-700 px-1.5`} triggerTestId="analyze-menu" title="More analysis options">
-          {(close) => (
-            <>
-              <button
-                className={menuItem}
-                disabled={p.analysis?.running}
-                data-testid="reanalyze-all"
-                onClick={() => {
-                  close();
-                  p.onAnalyze("all");
-                }}
-              >
-                Re-analyze all photos
-              </button>
-              <button
-                className={menuItem}
-                disabled={p.detecting || !p.hasImages}
-                data-testid="scenes-detect"
-                onClick={() => {
-                  close();
-                  p.onDetectScenes();
-                }}
-              >
-                <Layers3 className="size-4" /> Detect scenes
-              </button>
-              <label className={`${menuItem} cursor-pointer`}>
-                <input type="checkbox" data-testid="auto-analyze" checked={c?.autoAnalyze ?? false} disabled={!c} onChange={(e) => p.onAutoAnalyze(e.target.checked)} />
-                Auto-analyze new photos
-              </label>
-            </>
-          )}
-        </Menu>
-      </div>
+      {(!p.steps || p.legacyControls) && (
+        <>
+          <ShootSelect catalog={c} onShootType={p.onShootType} />
+          <AnalyzeSplit catalog={c} analysis={p.analysis} hasImages={p.hasImages} detecting={p.detecting} onAnalyze={p.onAnalyze} onAutoAnalyze={p.onAutoAnalyze} onDetectScenes={p.onDetectScenes} />
+        </>
+      )}
+      {p.steps && <div className="mx-auto">{p.steps}</div>}
 
-      <div className="mx-auto flex gap-1" data-testid="mode-switcher">
+      <div className={`${p.steps ? "" : "mx-auto"} flex gap-1`} data-testid="mode-switcher">
+        {p.plan && (
+          <button className={seg(p.plan.on)} aria-pressed={p.plan.on} onClick={p.plan.onPlan} title={`Plan: the scene checklist${hint("toGrid")}`} data-testid="mode-plan">
+            <ListChecks className="size-3.5" /> <span className={p.steps ? labelHide : ""}>Plan</span>
+          </button>
+        )}
         {modes.map(({ m, label, icon: Icon, title, testid }) => (
           <button key={m} className={seg(p.mode === m || (m === "compare" && !!p.compareOn))} aria-pressed={m === "compare" ? !!p.compareOn || p.mode === m : p.mode === m} onClick={() => p.onMode(m)} title={title} data-testid={testid}>
-            <Icon className="size-3.5" /> {label}
+            <Icon className="size-3.5" /> <span className={p.steps ? labelHide : ""}>{label}</span>
           </button>
         ))}
       </div>
@@ -201,10 +166,10 @@ export function TopBar(p: Props) {
         <CloudUpload className="size-4" />
         Save
       </button>
-      <button onClick={p.onExport} disabled={!p.hasImages} data-testid="export-button" className={btn} title={`Export the selection or the filtered set${hint("export")}`}>
+      {!p.steps && <button onClick={p.onExport} disabled={!p.hasImages} data-testid="export-button" className={btn} title={`Export the selection or the filtered set${hint("export")}`}>
         {p.exportPct != null ? <Ring pct={p.exportPct} /> : <Share className="size-4" />}
         Export
-      </button>
+      </button>}
       <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass={btn} triggerTestId="more-menu" title="More actions" align="right">
         {(close) => (
           <>

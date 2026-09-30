@@ -1,8 +1,8 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
-import { BASE_QUERY, useLibrary, type Query } from "./hooks/useLibrary";
+import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type WorkflowStep } from "./ipc";
+import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useKeyboard } from "./hooks/useKeyboard";
@@ -20,12 +20,19 @@ import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
 import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
+import { StepBar } from "./components/StepBar";
+import { AnalyzeSplit, ShootSelect } from "./components/AnalyzeControls";
+import { PlanView } from "./components/edit/PlanView";
+import { EditContextBar } from "./components/edit/EditContextBar";
+import { StyleDialogs } from "./components/edit/StyleDialogs";
+import { useWorkflow } from "./hooks/useWorkflow";
 import { MatchPanel } from "./components/scenes/MatchPanel";
 import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ModelsDialog } from "./components/ModelsCard";
 import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
+import { ChevronRight } from "lucide-react";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount } from "./lib/modal";
@@ -60,9 +67,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const importOptsRef = useRef(importOpts);
   importOptsRef.current = importOpts;
   const [filtersOpen, setFiltersOpen] = useState(true);
-  const [exportOpen, setExportOpen] = useState<number[] | null>(null);
+  const [exportOpen, setExportOpen] = useState<{ sel: number[]; keepers?: number[] } | null>(null);
+  const [exportedCount, setExportedCount] = useState<number | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
-  const [scenesOpen, setScenesOpen] = useState(true);
+  // Scenes are an Edit-step concept inside a project: the strip starts hidden there (Shift+S shows it).
+  const [scenesOpen, setScenesOpen] = useState(projectProp == null);
+  // Edit step overview (the plan) replaces the grid while open; a project that was left in the Edit step reopens on it.
+  const [planOpen, setPlanOpen] = useState(projectProp?.workflowStep === "edit");
+  const [planFocus, setPlanFocus] = useState<number | null>(null);
+  // Review mode after an apply: N walks the frames that need a look.
+  const [reviewScene, setReviewScene] = useState<number | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [healthDismissed, setHealthDismissed] = useState(false);
@@ -85,12 +99,26 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const onLibraryChanged = useCallback(() => reloadRef.current(), []);
   const status = useBackendStatus(onLibraryChanged);
   const { reportError, setError } = status;
-  const lib = useLibrary(query, reportError);
-  reloadRef.current = () => void lib.reload();
-  const { ids } = lib;
+  const rawLib = useLibrary(query, reportError);
+  reloadRef.current = () => void rawLib.reload();
   const exportJobs = useExportJobs(reportError, projectId);
+  const scenes = useScenes(query.folderId, projectId, query.sceneId ?? null, rawLib, reportError, setNotice);
+  const step: WorkflowStep | null = project?.workflowStep ?? null;
+  const changedRef = useRef<(ids: number[]) => Promise<void>>(async () => {});
+  const wf = useWorkflow({
+    projectId,
+    toasts,
+    onError: reportError,
+    onChanged: (changed) => changedRef.current(changed),
+    onScenesDetected: () => scenes.sync(),
+    fileName: (id) => rawLib.getEntry(id)?.fileName ?? `#${id}`,
+  });
+  // The Edit step works on the project's keepers only: the grid, loupe and filmstrip list just those.
+  const keeperSet = useMemo(() => (step === "edit" && wf.plan ? new Set(wf.plan.keeperIds) : null), [step, wf.plan]);
+  const scopedIds = useMemo(() => (keeperSet ? rawLib.ids.filter((i) => keeperSet.has(i)) : rawLib.ids), [keeperSet, rawLib.ids]);
+  const lib: Library = keeperSet ? { ...rawLib, ids: scopedIds } : rawLib;
+  const { ids } = lib;
   const sel = useSelection(ids);
-  const scenes = useScenes(query.folderId, projectId, query.sceneId ?? null, lib, reportError, setNotice);
   const counts = useFilterCounts(query.folderId, projectId, lib.epoch);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
@@ -141,7 +169,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     return sel.active != null ? [sel.active] : [];
   }, [mode, cmp, sel.active, sel.selected]);
 
-  const step = useCallback(
+  const stepPhoto = useCallback(
     (delta: number, extend = false) => {
       if (ids.length === 0) return;
       const i = sel.active != null ? ids.indexOf(sel.active) : -1;
@@ -266,6 +294,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const changeMode = useCallback(
     (m: Mode) => {
+      setPlanOpen(false);
       if (m === "grid") {
         setMode("grid");
         setCmp(null);
@@ -292,10 +321,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     (t: number[], force: boolean) => {
       if ((force || autoAdvance || caps) && t.length === 1) {
         if (mode === "compare") stepCompare(1);
-        else step(1);
+        else stepPhoto(1);
       }
     },
-    [autoAdvance, caps, mode, step, stepCompare],
+    [autoAdvance, caps, mode, stepPhoto, stepCompare],
   );
 
   const mutate = useCallback(
@@ -462,10 +491,24 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     }
   }, [targets, lib, status, reportError, membershipSensitive, setNotice]);
 
-  const openExport = useCallback(() => {
-    if (ids.length === 0) return;
-    setExportOpen(targets());
-  }, [ids.length, targets]);
+  /** Export dialog. In a project's Edit / Export step (or from step 3) it is scoped to the project's keepers. */
+  const openExport = useCallback(
+    async (keepers = false) => {
+      if (projectId != null && (keepers || step === "edit" || step === "export")) {
+        try {
+          const plan = await unwrap(commands.getEditPlan(projectId));
+          if (plan.keeperIds.length === 0) return setNotice("No keepers yet. Pick photos in Cull (P) first.");
+          setExportOpen({ sel: targets(), keepers: plan.keeperIds });
+        } catch (e) {
+          reportError(e);
+        }
+        return;
+      }
+      if (ids.length === 0) return;
+      setExportOpen({ sel: targets() });
+    },
+    [projectId, step, ids.length, targets, reportError, setNotice],
+  );
 
   // ---- top-bar actions ----
   const run = useCallback(
@@ -487,6 +530,41 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [catalog, project],
   );
 
+  // The Edit step re-reads the plan whenever something that feeds it changed (culling, edits, returning to it).
+  const activeEntry = active != null ? lib.getEntry(active) : undefined;
+  const activeStamp = active != null ? `${lib.version(active)}:${activeEntry?.hasEdits ? 1 : 0}` : "";
+  const { refreshPlan, loadPlan } = wf;
+  useEffect(() => {
+    if (step !== "edit") return;
+    const t = setTimeout(refreshPlan, 200);
+    return () => clearTimeout(t);
+  }, [step, mode, planOpen, rawLib.epoch, activeStamp, refreshPlan]);
+  useEffect(() => {
+    if (projectId == null) return;
+    refreshPlan(); // the Edit pill shows scene counts in every step
+  }, [projectId, refreshPlan]);
+  useEffect(() => {
+    if (step === "edit" && planOpen && !wf.plan && !wf.loading) void loadPlan(true);
+  }, [step, planOpen, wf.plan, wf.loading, loadPlan]);
+  useEffect(() => {
+    if (mode !== "grid") setPlanOpen(false);
+  }, [mode]);
+  useEffect(() => {
+    if (step === "edit" && planOpen && planFocus == null && wf.rows[0]) setPlanFocus(wf.rows[0].entry.sceneId);
+  }, [step, planOpen, planFocus, wf.rows]);
+
+  // "Exported N" on the Export pill: the last finished job of this project.
+  const jobsDone = exportJobs.jobs.filter((j) => j.finished).length;
+  useEffect(() => {
+    if (projectId == null) return;
+    unwrap(commands.getExportJobs())
+      .then((list) => {
+        const done = list.filter((j) => j.projectId === projectId && j.state === "completed").sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0));
+        setExportedCount(done[0] ? done[0].succeeded : null);
+      })
+      .catch(() => {});
+  }, [projectId, jobsDone]);
+
   // Header counts / step follow the library (imports, culling, edits all bump `lib.epoch`).
   const refreshProject = useCallback(async () => {
     if (projectId == null) return;
@@ -499,6 +577,138 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   useEffect(() => {
     void refreshProject();
   }, [lib.epoch, refreshProject]);
+
+  changedRef.current = async (changed) => {
+    if (changed.length > 0) await rawLib.refresh(changed.filter((id) => rawLib.getEntry(id)).slice(0, 2000)).catch(reportError);
+    else await rawLib.refreshAll().catch(reportError);
+    setDevEpoch((n) => n + 1);
+    status.refreshXmp();
+    void refreshProject();
+  };
+
+  // ---- workflow steps ----
+  const setStep = useCallback(
+    async (s: WorkflowStep) => {
+      if (projectId == null) return;
+      setProject((p) => (p ? { ...p, workflowStep: s } : p));
+      try {
+        await unwrap(commands.setWorkflowStep(projectId, s));
+      } catch (e) {
+        reportError(e);
+        void refreshProject();
+      }
+    },
+    [projectId, reportError, refreshProject],
+  );
+
+  const openPlan = useCallback(() => {
+    setPlanOpen(true);
+    setMode("grid");
+    setCmp(null);
+    setReviewScene(null);
+    setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
+  }, []);
+
+  /** Project scope of the library: rows of the plan by scene and by photo. */
+  const rowOfImage = useMemo(() => {
+    const m = new Map<number, (typeof wf.rows)[number]>();
+    wf.rows.forEach((r) => r.entry.imageIds.forEach((i) => m.set(i, r)));
+    return m;
+  }, [wf.rows]);
+  const rowOfScene = useCallback((sceneId: number) => wf.rows.find((r) => r.entry.sceneId === sceneId), [wf.rows]);
+
+  /** Develop on a photo of a scene with the filmstrip narrowed to that scene. */
+  const openScene = useCallback(
+    (sceneId: number, photo?: number) => {
+      const row = rowOfScene(sceneId);
+      const id = photo ?? row?.entry.representativeId;
+      if (id == null) return;
+      setQuery((q) => (q.sceneId === sceneId ? q : { ...q, sceneId }));
+      sel.set([id], id);
+      setCmp(null);
+      setPlanOpen(false);
+      setMode("develop");
+    },
+    [rowOfScene, sel],
+  );
+
+  const goStep = useCallback(
+    (s: WorkflowStep) => {
+      if (projectId == null) return;
+      if (s === "cull") {
+        void setStep("cull");
+        setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
+        setPlanOpen(false);
+        setReviewScene(null);
+        setMode("grid");
+        setCmp(null);
+      } else if (s === "edit") {
+        if (step !== "edit") void setStep("edit");
+        void wf.loadPlan(true);
+        openPlan();
+      } else {
+        void openExport(true);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, step, setStep, openPlan, wf.loadPlan],
+  );
+
+  /** G / Esc: back to the overview of the step (the Plan in the Edit step, the Grid otherwise). */
+  const goOverview = useCallback(() => {
+    if (projectId != null && step === "edit") openPlan();
+    else changeMode("grid");
+  }, [projectId, step, openPlan, changeMode]);
+
+  /** N / Shift+N: next / previous scene (N skips scenes that are already applied). */
+  const stepScene = useCallback(
+    (dir: 1 | -1, skipDone: boolean) => {
+      const rows = wf.rows;
+      if (rows.length === 0) return;
+      const cur = planOpen ? rows.findIndex((r) => r.entry.sceneId === planFocus) : active != null ? rows.findIndex((r) => r.entry.imageIds.includes(active)) : -1;
+      for (let k = 1; k <= rows.length; k++) {
+        const r = rows[(((cur < 0 ? (dir === 1 ? -1 : 0) : cur) + dir * k) % rows.length + rows.length) % rows.length];
+        if (skipDone && r.ui === "applied") continue;
+        setReviewScene(null);
+        if (planOpen) setPlanFocus(r.entry.sceneId);
+        else openScene(r.entry.sceneId);
+        return;
+      }
+      setNotice("Every scene is applied");
+    },
+    [wf.rows, planOpen, planFocus, active, openScene, setNotice],
+  );
+
+  /** Review an apply: Develop on the first frame that needs a look; N walks the rest. */
+  const reviewFrames = useCallback(
+    (sceneId: number) => {
+      const row = rowOfScene(sceneId);
+      const first = row?.review[0];
+      if (first == null) return setNotice("Nothing to review in this scene");
+      setReviewScene(sceneId);
+      openScene(sceneId, first);
+    },
+    [rowOfScene, openScene, setNotice],
+  );
+  const nextReview = useCallback(() => {
+    const row = reviewScene != null ? rowOfScene(reviewScene) : active != null ? rowOfImage.get(active) : undefined;
+    if (!row || row.review.length === 0) return setNotice("No more frames to review");
+    const at = active != null ? row.review.indexOf(active) : -1;
+    const next = row.review[at + 1];
+    if (next == null) return setNotice("That was the last frame to review");
+    setReviewScene(row.entry.sceneId);
+    sel.set([next], next);
+  }, [reviewScene, rowOfScene, rowOfImage, active, sel, setNotice]);
+
+  /** Shift+A in the Edit step: the photo becomes the representative of its scene. */
+  const makeRepresentative = useCallback(
+    (id: number | null) => {
+      const row = id != null ? rowOfImage.get(id) : undefined;
+      if (id == null || !row) return setNotice("Open a photo that belongs to a scene first");
+      void wf.setRepresentative(row.entry.sceneId, id);
+    },
+    [rowOfImage, wf, setNotice],
+  );
 
   const setCover = useCallback(
     async (imageId: number) => {
@@ -572,6 +782,22 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       await unwrap(commands.analyzeImages(kind === "all" && projectId != null ? { kind: "project", projectId } : { kind }));
     });
 
+  const onShootTypeChange = (t: ShootType) =>
+    void run(async () => {
+      if (projectId != null) {
+        await unwrap(commands.setProjectShootType(projectId, t));
+        await refreshProject();
+      } else {
+        await unwrap(commands.setShootType(t));
+        await status.refreshCatalog();
+      }
+    });
+  const onAutoAnalyzeChange = (v: boolean) =>
+    void run(async () => {
+      await unwrap(commands.setAutoAnalyze(v));
+      status.setCatalog((c) => (c ? { ...c, autoAnalyze: v } : c));
+    });
+
   const askApplySuggestions = () => {
     if (ids.length === 0) return;
     setApplyOpen({ selected: [...sel.selected], all: ids });
@@ -636,11 +862,51 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // ---- keyboard: one handler driven by the shared keymap ----
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
+    const inPlan = planOpen && projectId != null && step === "edit";
+    if (inPlan && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      // Plan: Up / Down move the row focus, Enter / D open the representative.
+      const at = wf.rows.findIndex((r) => r.entry.sceneId === planFocus);
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const n = wf.rows[Math.min(wf.rows.length - 1, Math.max(0, at + (e.key === "ArrowDown" ? 1 : -1)))];
+        if (n) setPlanFocus(n.entry.sceneId);
+        return;
+      }
+      if ((e.key === "Enter" || e.key.toLowerCase() === "d") && planFocus != null) {
+        e.preventDefault();
+        return openScene(planFocus);
+      }
+    }
     const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
+    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste"];
+    if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
     const k = e.key;
     switch (def.id) {
+      case "stepCull":
+        return goStep("cull");
+      case "stepEdit":
+        return goStep("edit");
+      case "stepExport":
+        return goStep("export");
+      case "nextScene":
+        if (step !== "edit") return;
+        if (mode === "develop" && (reviewScene != null || (active != null && (rowOfImage.get(active)?.review.includes(active) ?? false)))) return nextReview();
+        return stepScene(1, true);
+      case "prevScene":
+        return step === "edit" ? stepScene(-1, false) : undefined;
+      case "applyScene": {
+        if (step !== "edit") return;
+        const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
+        if (!row || row.ui === "todo" || row.targets === 0) return setNotice("Edit this scene's representative first");
+        return void wf.applyScene(row.entry.sceneId, "match", reviewFrames);
+      }
+      case "autoEdit": {
+        if (step !== "edit") return;
+        const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
+        return row ? wf.requestAutoEdit([row.entry.sceneId]) : undefined;
+      }
       case "pick":
         return doPick("pick", e.shiftKey);
       case "reject":
@@ -656,25 +922,27 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "keeperSet":
         return void setKeeper(active ?? null, false);
       case "undoCull":
+        if (wf.lastBatch && wf.lastBatch.at > cull.undoAt()) return wf.undoLast();
         return void cull.undo();
       case "redoCull":
         return void cull.redo();
       case "anchor":
+        if (projectId != null && step === "edit") return makeRepresentative(active ?? null);
         return void scenes.toggleAnchor(active ?? null);
       case "selectBurst":
         return void selectBurst();
       case "navH": {
         const dir = k === "ArrowRight" ? 1 : -1;
         if (cmp) stepCompare(dir);
-        else step(dir, e.shiftKey && mode === "grid");
+        else stepPhoto(dir, e.shiftKey && mode === "grid");
         return;
       }
       case "navV":
-        return step(k === "ArrowDown" ? colsRef.current.cols : -colsRef.current.cols, e.shiftKey);
+        return stepPhoto(k === "ArrowDown" ? colsRef.current.cols : -colsRef.current.cols, e.shiftKey);
       case "gridJump": {
         const page = colsRef.current.page;
         const delta = { Home: -Infinity, End: Infinity, PageUp: -page, PageDown: page }[k] ?? 0;
-        return step(Math.max(-1e9, Math.min(1e9, delta)), e.shiftKey);
+        return stepPhoto(Math.max(-1e9, Math.min(1e9, delta)), e.shiftKey);
       }
       case "toggleLoupe":
         if (mode === "grid") openLoupe();
@@ -683,9 +951,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "devToLoupe":
         return openLoupe();
       case "toGrid":
-        return changeMode("grid");
+        return goOverview();
       case "escape":
-        if (mode !== "grid") changeMode("grid");
+        if (mode !== "grid") goOverview();
         else sel.clear();
         return;
       case "developEscape":
@@ -755,6 +1023,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "undoAdj": {
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
+        if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) return wf.undoLast();
         if (cull.undoAt() > (d?.lastCommitAt() ?? 0)) {
           lastUndone.current = "cull";
           return void cull.undo();
@@ -802,7 +1071,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "saveXmp":
         return void writeXmp();
       case "export":
-        return openExport();
+        return void openExport();
       case "import":
         return importFolder();
       case "cheatSheet":
@@ -832,36 +1101,51 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         analysis={status.analysis}
         xmp={status.xmp}
         busy={busy}
-        mode={mode}
+        mode={planOpen ? "plan" : mode}
         onMode={changeMode}
         compareOn={cmp != null}
-        scenesCount={scenes.scenes.length}
+        scenesCount={step === "edit" ? 0 : scenes.scenes.length}
         scenesOpen={scenesOpen}
         onToggleScenes={toggleScenes}
         hasSelection={targets().length > 0}
         hasImages={ids.length > 0}
         detecting={scenes.detecting}
+        steps={
+          project ? (
+            <StepBar
+              step={step ?? "cull"}
+              exporting={exportOpen != null}
+              cullSub={
+                status.analysis?.running && status.analysis.total > 0
+                  ? `Analyzing ${Math.round((status.analysis.done / status.analysis.total) * 100)}%`
+                  : project.keeperCount > 0
+                    ? `${project.keeperCount} keepers`
+                    : "No keepers yet"
+              }
+              editSub={
+                wf.grouping
+                  ? "Grouping…"
+                  : wf.rows.length > 0
+                    ? wf.rows.every((r) => r.ui === "applied")
+                      ? "All scenes applied"
+                      : `${wf.rows.filter((r) => r.ui === "applied").length} of ${wf.rows.length} scenes`
+                    : null
+              }
+              exportSub={exportPct != null ? `Exporting ${exportPct}%` : exportedCount != null ? `Exported ${exportedCount}` : `${project.keeperCount} photos`}
+              exportPct={exportPct}
+              editDone={wf.rows.length > 0 && wf.rows.every((r) => r.ui === "applied")}
+              onStep={goStep}
+            />
+          ) : undefined
+        }
+        legacyControls={catalogEmpty}
+        plan={project && step === "edit" ? { on: planOpen, onPlan: openPlan } : undefined}
         onImport={importFolder}
         importOptions={importOpts}
         onImportOptions={setImportOpts}
-        onShootType={(t: ShootType) =>
-          void run(async () => {
-            if (projectId != null) {
-              await unwrap(commands.setProjectShootType(projectId, t));
-              await refreshProject();
-            } else {
-              await unwrap(commands.setShootType(t));
-              await status.refreshCatalog();
-            }
-          })
-        }
+        onShootType={onShootTypeChange}
         onAnalyze={analyze}
-        onAutoAnalyze={(v) =>
-          void run(async () => {
-            await unwrap(commands.setAutoAnalyze(v));
-            status.setCatalog((c) => (c ? { ...c, autoAnalyze: v } : c));
-          })
-        }
+        onAutoAnalyze={onAutoAnalyzeChange}
         onDetectScenes={() => {
           setScenesOpen(true);
           void scenes.detect();
@@ -877,7 +1161,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         onWriteXmp={() => void writeXmp()}
         onSaveAllDirty={() => void saveAllDirty()}
         onReadXmp={() => void readXmp()}
-        onExport={openExport}
+        onExport={() => void openExport()}
         onCheatSheet={() => setCheatOpen(true)}
         onModels={() => setModelsOpen(true)}
         onLocate={() => locateFolder()}
@@ -894,11 +1178,15 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       {exportOpen && (
         <ErrorBoundary view="Export" overlay onExit={() => setExportOpen(null)}>
           <ExportDialog
-            selectionIds={exportOpen}
+            selectionIds={exportOpen.sel}
             filteredIds={ids}
+            keeperIds={exportOpen.keepers}
             sampleEntry={(id) => lib.getEntry(id)}
             onClose={() => setExportOpen(null)}
-            onStarted={exportJobs.track}
+            onStarted={(job) => {
+              exportJobs.track(job);
+              if (exportOpen.keepers) void setStep("export");
+            }}
           />
         </ErrorBoundary>
       )}
@@ -915,13 +1203,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           }}
         />
       )}
+      {project && <StyleDialogs wf={wf} fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`} />}
       {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 
-      {mode === "grid" ? (
+      {planOpen ? null : mode === "grid" ? (
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
@@ -940,6 +1229,37 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             capsLock={caps}
             autoAdvance={autoAdvance}
             onAutoAdvance={setAutoAdvance}
+            leading={
+              project ? (
+                <>
+                  <ShootSelect catalog={scopedCatalog} onShootType={onShootTypeChange} />
+                  <AnalyzeSplit
+                    catalog={scopedCatalog}
+                    analysis={status.analysis}
+                    hasImages={ids.length > 0}
+                    detecting={scenes.detecting}
+                    onAnalyze={analyze}
+                    onAutoAnalyze={onAutoAnalyzeChange}
+                    onDetectScenes={() => {
+                      setScenesOpen(true);
+                      void scenes.detect();
+                    }}
+                  />
+                </>
+              ) : undefined
+            }
+            trailing={
+              project && step === "cull" ? (
+                <button
+                  className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600"
+                  data-testid="continue-edit"
+                  onClick={() => goStep("edit")}
+                  title="Group the keepers into scenes and edit one photo per scene"
+                >
+                  Continue to Edit{project.keeperCount > 0 ? ` · ${project.keeperCount} keepers` : ""} <ChevronRight className="size-3.5" />
+                </button>
+              ) : undefined
+            }
             filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
         </>
@@ -957,7 +1277,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         />
       )}
 
-      {scenesOpen && (
+      {scenesOpen && !(project && step === "edit") && (
       <SceneStrip
         api={scenes}
         filterId={query.sceneId ?? null}
@@ -986,6 +1306,34 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           onClearFilters={clearFilters}
         />
         </ErrorBoundary>
+        {planOpen && project && step === "edit" && (
+          <ErrorBoundary view="Plan" overlay onExit={() => setPlanOpen(false)}>
+            <PlanView
+              wf={wf}
+              lib={lib}
+              sceneTimes={(id) => {
+                const sc = scenes.scenes.find((x) => x.id === id);
+                return { start: sc?.startedAtMs ?? null, end: sc?.endedAtMs ?? null };
+              }}
+              focusId={planFocus}
+              onFocus={setPlanFocus}
+              onEdit={(id) => openScene(id)}
+              onReview={reviewFrames}
+              onShowScene={(id) => {
+                setPlanOpen(false);
+                setQuery((q) => ({ ...q, sceneId: id }));
+              }}
+              onChangeRep={(id) => {
+                openScene(id);
+                setNotice("Press Shift+A on the photo you want as the representative");
+              }}
+              onApplyOptions={(id) => setMatchOpen(id)}
+              onBackToCull={() => goStep("cull")}
+              onContinueExport={() => goStep("export")}
+              onRegroup={() => void wf.regroup()}
+            />
+          </ErrorBoundary>
+        )}
         {mode === "develop" && (
           <ErrorBoundary view="Develop" overlay onExit={() => changeMode("grid")}>
           <DevelopView
@@ -1014,6 +1362,55 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               },
             }}
             onLabel={labelPhoto}
+            topSlot={
+              project && step === "edit" ? (
+                <EditContextBar
+                  wf={wf}
+                  rows={wf.rows}
+                  activeId={active ?? null}
+                  fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
+                  onJump={(id) => openScene(id)}
+                  onStepScene={(dir) => stepScene(dir, dir === 1)}
+                  onPlan={openPlan}
+                  onMakeRep={makeRepresentative}
+                  onApplyOptions={(id) => setMatchOpen(id)}
+                  onReview={reviewFrames}
+                  onNextReview={nextReview}
+                />
+              ) : undefined
+            }
+            sceneOnly={
+              project && step === "edit"
+                ? {
+                    on: query.sceneId != null,
+                    toggle: () => {
+                      const row = active != null ? rowOfImage.get(active) : undefined;
+                      setQuery((q) => (q.sceneId != null ? { ...q, sceneId: null } : row ? { ...q, sceneId: row.entry.sceneId } : q));
+                    },
+                  }
+                : undefined
+            }
+            filmBadge={
+              project && step === "edit"
+                ? (fid) => {
+                    const row = rowOfImage.get(fid);
+                    if (!row) return null;
+                    const isRep = row.entry.representativeId === fid;
+                    return (
+                      <>
+                        {isRep && (
+                          <>
+                            <span className="pointer-events-none absolute inset-0 rounded ring-2 ring-inset ring-amber-400" data-testid={`film-rep-${fid}`} />
+                            <span className="pointer-events-none absolute left-0.5 top-4 rounded bg-black/70 px-0.5 text-[9px] font-bold text-amber-400">R</span>
+                          </>
+                        )}
+                        {!isRep && row.review.includes(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-amber-400" data-testid={`film-review-${fid}`}>!</span>}
+                        {!isRep && !row.review.includes(fid) && row.ui === "applied" && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-emerald-400" data-testid={`film-applied-${fid}`}>✓</span>}
+                      </>
+                    );
+                  }
+                : undefined
+            }
           />
           </ErrorBoundary>
         )}
@@ -1049,6 +1446,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             setMatchOpen(null);
             void lib.refresh(attempted.filter((id) => lib.getEntry(id))).catch(reportError);
             setDevEpoch((n) => n + 1);
+            wf.refreshPlan();
             if (changed.length === 0) return setNotice(`Applied Match Scene to 0 of ${plural(attempted.length, "photo")}`);
             push(`Applied Match Scene to ${changed.length} of ${plural(attempted.length, "photo")} (history: Match Scene)`, {
               action: {
