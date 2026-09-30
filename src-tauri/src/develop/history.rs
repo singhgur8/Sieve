@@ -192,6 +192,29 @@ pub fn apply_fields(
     Ok(())
 }
 
+/// Commits a different full adjustments snapshot per image (scene matching), one entry
+/// labelled `label` per changed image. Atomic; never coalesces. Returns the ids that changed
+/// (unchanged values are skipped), in input order.
+pub fn commit_batch(
+    conn: &mut Connection,
+    items: &[(ImageId, ParametricAdjustments)],
+    label: &str,
+) -> AppResult<Vec<ImageId>> {
+    validate_label(label)?;
+    for (_, adj) in items {
+        adj.validate().map_err(AppError::invalid)?;
+    }
+    let tx = conn.transaction()?;
+    let mut changed = Vec::new();
+    for (id, adj) in items {
+        if commit_in(&tx, *id, adj, label, false)? {
+            changed.push(*id);
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Moves the cursor to the entry chosen by `pick` (given entries oldest first and the
 /// cursor index) and returns the resulting state.
 fn move_cursor(

@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { AlertTriangle, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, X } from "lucide-react";
+import { AlertTriangle, Anchor, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, X } from "lucide-react";
 import { convertFileSrc, type RawImageEntry } from "../ipc";
 import { LABEL_COLOR, TAG_SHORT, TAG_STYLE, tagName } from "../lib/format";
 
@@ -38,6 +38,20 @@ export function XmpBadge({ entry }: { entry: RawImageEntry }) {
       </span>
     );
   return null;
+}
+
+export function SceneBadge({ entry, testPrefix = "scene-badge" }: { entry: RawImageEntry; testPrefix?: string }) {
+  if (entry.sceneId == null) return null;
+  return (
+    <span
+      title={entry.isSceneAnchor ? `Scene ${entry.sceneId} anchor` : `Scene ${entry.sceneId}`}
+      data-testid={`${testPrefix}-${entry.id}`}
+      data-anchor={entry.isSceneAnchor}
+      className={`flex items-center gap-0.5 rounded px-1 text-[10px] ${entry.isSceneAnchor ? "bg-amber-800 text-amber-100" : "bg-emerald-950/90 text-emerald-200"}`}
+    >
+      {entry.isSceneAnchor && <Anchor className="size-3" />}S{entry.sceneId}
+    </span>
+  );
 }
 
 export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick }: Props) {
@@ -84,6 +98,7 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
           </div>
           <div className="pointer-events-none absolute right-1 top-1 flex items-center gap-1">
             <XmpBadge entry={entry} />
+            <SceneBadge entry={entry} />
             {entry.burstGroupId != null && (
               <span
                 title={`Burst #${entry.burstGroupId}${entry.isBurstKeeper ? " (keeper)" : ""}`}

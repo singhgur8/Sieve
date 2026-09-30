@@ -87,10 +87,12 @@ export const commands = {
 	/**  Burst groups with members, optionally limited to groups touching `folderId`. */
 	listBurstGroups: (folderId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId })),
 	/**
-	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`
-	 *  (unanalyzed images skipped). Returns the number of images updated.
+	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
+	 *  Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
+	 *  (`pick != unflagged` or `rating != 0`). Atomic; unknown ids -> `not_found`.
+	 *  For undo, take `get_cull_snapshot(ids)` first.
 	 */
-	applySuggestions: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("apply_suggestions", { ids })),
+	applySuggestions: (ids: number[], onlyUnset: boolean) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset })),
 	/**
 	 *  Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
 	 *  edits). Atomic: an unknown id fails with `not_found`.
@@ -216,6 +218,126 @@ export const commands = {
 	cancelExport: (jobId: number) => typedError<null, AppError>(__TAURI_INVOKE("cancel_export", { jobId })),
 	/**  Queued/running jobs first, then recent finished jobs (newest first, max 50). */
 	getExportJobs: () => typedError<ExportJob[], AppError>(__TAURI_INVOKE("get_export_jobs")),
+	/**
+	 *  Groups the images of `folderId` (all folders for `null`) into scenes by capture-time gaps
+	 *  and appearance similarity (`options` `null` = defaults). Replaces the `auto` scenes in scope
+	 *  (and `manual` ones if `replaceManual`); members of kept manual scenes are not regrouped;
+	 *  anchor flags survive regrouping. Blocking until done (first run computes preview features,
+	 *  ~10 ms/image in parallel; later runs reuse them); progress via `sceneProgress {task:
+	 *  "detect"}`. Returns `list_scenes(folderId)`.
+	 */
+	detectScenes: (folderId: number | null, options: {
+	/**  A capture-time gap longer than this always starts a new scene. 1000..=86_400_000 ms. */
+	maxGapMs: number,
+	/**
+	 *  0..=1. Minimum appearance similarity (tone + colour features of the preview) for a frame
+	 *  to stay in the running scene; lower = fewer, larger scenes. 0 = split on time gaps only.
+	 */
+	similarity: number,
+	/**  Also replace manual scenes in scope (default: they and their members are left alone). */
+	replaceManual: boolean,
+} | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("detect_scenes", { folderId, options })),
+	/**  Scenes with a member in `folderId` (all for `null`), in capture order. */
+	listScenes: (folderId: number | null) => typedError<Scene[], AppError>(__TAURI_INVOKE("list_scenes", { folderId })),
+	getScene: (id: number) => typedError<Scene, AppError>(__TAURI_INVOKE("get_scene", { id })),
+	/**
+	 *  New `manual` scene from `imageIds` (non-empty; moved out of their current scenes; scenes
+	 *  left empty are deleted).
+	 */
+	createScene: (imageIds: number[]) => typedError<Scene, AppError>(__TAURI_INVOKE("create_scene", { imageIds })),
+	/**
+	 *  Replaces the members of scene `id` (non-empty; images in other scenes are moved in).
+	 *  The scene becomes `manual`; anchors that stay members are kept.
+	 */
+	setSceneMembers: (id: number, imageIds: number[]) => typedError<Scene, AppError>(__TAURI_INVOKE("set_scene_members", { id, imageIds })),
+	/**  Marks the graded anchors of scene `id`: 0..=2 members (`[]` clears). Keeps the method. */
+	setSceneAnchors: (id: number, anchorIds: number[]) => typedError<Scene, AppError>(__TAURI_INVOKE("set_scene_anchors", { id, anchorIds })),
+	/**  Merges `ids` (>= 2 scenes) into `ids[0]` (`manual`; anchors kept up to 2, in `ids` order). */
+	mergeScenes: (ids: number[]) => typedError<Scene, AppError>(__TAURI_INVOKE("merge_scenes", { ids })),
+	/**
+	 *  Splits scene `id` before member `firstImageId` (capture order; not the first member).
+	 *  Returns `[id, newScene]`, both `manual`; anchors follow their images.
+	 */
+	splitScene: (id: number, firstImageId: number) => typedError<Scene[], AppError>(__TAURI_INVOKE("split_scene", { id, firstImageId })),
+	/**  Deletes scene `id` (its images become unassigned; adjustments untouched). */
+	deleteScene: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("delete_scene", { id })),
+	/**
+	 *  Proposes relative grades for `targetIds` from 1-2 graded `anchorIds` (nothing is saved).
+	 *  Anchors: 1..=2 distinct images; anchors listed in `targetIds` are skipped; duplicates
+	 *  dropped; no targets left or more than `MatchOptions::MAX_TARGETS` -> `invalid_argument`;
+	 *  unknown ids -> `not_found`. Blocking until all previews are ready (renders at 640 px; the
+	 *  first render of an image decodes its RAW); progress via `sceneProgress {task: "match"}`.
+	 *  Result in `targetIds` order.
+	 */
+	matchScene: (anchorIds: number[], targetIds: number[], options: MatchOptions) => typedError<MatchPreview[], AppError>(__TAURI_INVOKE("match_scene", { anchorIds, targetIds, options })),
+	/**
+	 *  Commits scene-match results: one history entry labelled `label` (default "Match Scene")
+	 *  per image whose adjustments change. Atomic (unknown id -> `not_found`, invalid values ->
+	 *  `invalid_argument`, nothing written). Marks sidecars dirty (crs:). Returns the changed ids.
+	 */
+	applySceneMatch: (applications: MatchApplication[], label: string | null) => typedError<number[], AppError>(__TAURI_INVOKE("apply_scene_match", { applications, label })),
+	/**
+	 *  Render-space statistics of image `id` rendered with `adjustments` (`null` = its stored
+	 *  adjustments), whole frame or `region` (oriented, normalized). Same pixels as the editor
+	 *  (LUT included) at 640 px. Used to verify matches (mean luma / neutral within tolerance).
+	 */
+	getRenderStats: (id: number, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+} | null, region: {
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+} | null) => typedError<ImageStats, AppError>(__TAURI_INVOKE("get_render_stats", { id, adjustments, region })),
+	/**
+	 *  Makes `imageId` the keeper of burst `groupId`: it loses `duplicate_burst`, the other
+	 *  members gain it (suppressed/user tag rows are left alone). The choice is pinned, so
+	 *  regrouping keeps it. Kicks a rescore so suggested rating/pick follow the new keeper
+	 *  (`analysisFinished` when done). Unknown group/image -> `not_found`; image not a member ->
+	 *  `invalid_argument`. Returns the updated group.
+	 */
+	setBurstKeeper: (groupId: number, imageId: number) => typedError<BurstGroup, AppError>(__TAURI_INVOKE("set_burst_keeper", { groupId, imageId })),
+	/**
+	 *  Current rating/pick/label of `ids` (in order), to push on a culling undo stack before a
+	 *  change. Unknown ids -> `not_found`.
+	 */
+	getCullSnapshot: (ids: number[]) => typedError<CullSnapshot[], AppError>(__TAURI_INVOKE("get_cull_snapshot", { ids })),
+	/**
+	 *  Writes snapshots back (undo/redo). Atomic: unknown id -> `not_found`, rating > 5 ->
+	 *  `invalid_argument`, nothing written. Changed images become XMP-dirty (auto-sync notified).
+	 *  Returns the ids whose values changed (refetch them with `get_images`).
+	 */
+	restoreCullSnapshot: (snapshots: CullSnapshot[]) => typedError<number[], AppError>(__TAURI_INVOKE("restore_cull_snapshot", { snapshots })),
+	/**  Per-catalog UI preferences (defaults when never set). */
+	getUiPrefs: () => typedError<UiPrefs, AppError>(__TAURI_INVOKE("get_ui_prefs")),
+	/**  Replaces the stored UI preferences (read-modify-write: send the full struct). */
+	setUiPrefs: (prefs: UiPrefs) => typedError<null, AppError>(__TAURI_INVOKE("set_ui_prefs", { prefs })),
+	/**
+	 *  Reveals `path` (file or folder) in Finder, selected. Must be absolute and exist
+	 *  (`invalid_argument` / `not_found`). macOS only (`internal` elsewhere).
+	 */
+	revealInFinder: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_in_finder", { path })),
+	/**
+	 *  "Save all": writes sidecars for every XMP-dirty image of `folderId` (all folders for
+	 *  `null`) now, whether or not auto-sync is on (catalog wins, like `write_xmp`).
+	 */
+	writeXmpAllDirty: (folderId: number | null) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("write_xmp_all_dirty", { folderId })),
 };
 
 /** Events */
@@ -227,6 +349,7 @@ export const events = {
 	exportFinished: makeEvent<ExportFinished>("export-finished"),
 	exportProgress: makeEvent<ExportProgress>("export-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
+	sceneProgress: makeEvent<SceneProgress>("scene-progress"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
 	xmpSynced: makeEvent<XmpSynced>("xmp-synced"),
@@ -348,6 +471,14 @@ export type AppError = {
 	message: string,
 };
 
+/**  Result of `apply_suggestions`. */
+export type ApplySuggestionsResult = {
+	/**  Images whose rating/pick were set from the suggestions. */
+	applied: number,
+	/**  Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated. */
+	skipped: number,
+};
+
 /**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
 export type BitDepth = "8" | "16";
 
@@ -427,6 +558,19 @@ export type CollisionPolicy =
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
 export type ColorLabel = "red" | "yellow" | "green" | "blue" | "purple";
+
+/**
+ *  The user's culling values of one image, for a frontend culling undo stack:
+ *  `get_cull_snapshot` before a change, `restore_cull_snapshot` to undo it.
+ *  Tags are not included (undo a tag change with the inverse `set_user_tag`).
+ */
+export type CullSnapshot = {
+	imageId: number,
+	/**  0..=5. */
+	rating: number,
+	pick: PickFlag,
+	colorLabel: ColorLabel | null,
+};
 
 /**  Granular reason a frame may be culled (or deliberately kept). */
 export type CullTag = "blink" | "missed_focus" | "motion_blur" | 
@@ -809,6 +953,8 @@ export type ImageQuery = {
 	/**  Image's colour label is one of these. */
 	colorLabels: ColorLabel[],
 	burstGroupId: number | null,
+	/**  Only members of this scene. */
+	sceneId?: number | null,
 	/**
 	 *  Hide burst members that are not their group's keeper (groups without a keeper
 	 *  show all members); images outside bursts are unaffected.
@@ -833,6 +979,44 @@ export type ImageSort =
 "quality" | 
 /**  Most stars first; ties in capture order. */
 "rating";
+
+/**
+ *  Measurements of an image rendered through the develop pipeline with given adjustments
+ *  (the same pixels the editor shows, LUT included), long edge `scene::STATS_MAX_EDGE`. The
+ *  basis of scene matching and its acceptance checks.
+ */
+export type ImageStats = {
+	imageId: number,
+	/**  Measured area (oriented, normalized); `null` = whole frame. */
+	region: NormRect | null,
+	/**  Pixel size measured. */
+	width: number,
+	height: number,
+	/**  Mean relative luminance (Rec.709 Y of the linearized sRGB output), 0..=1. */
+	meanLuma: number,
+	/**
+	 *  log2 of the geometric mean luminance (Y floored at 2^-14). Exposure differences in EV
+	 *  are differences of this value.
+	 */
+	logMeanLuma: number,
+	percentiles: LumaPercentiles,
+	/**  Share of pixels with any 8-bit channel >= 254. */
+	clippedHighlights: number,
+	/**  Share of pixels with all 8-bit channels <= 1. */
+	clippedShadows: number,
+	/**  Mean colour of the render. */
+	meanOklab: OklabColor,
+	neutral: NeutralEstimate,
+	/**
+	 *  White balance the measured adjustments resolve to (`as_shot` -> the camera's values);
+	 *  `null` if as-shot and the file has none.
+	 */
+	whiteBalance: WhiteBalanceValues | null,
+	/**  The camera's as-shot white balance (as in `DevelopInfo.asShot`). */
+	asShot: WhiteBalanceValues | null,
+	/**  The adjustments' LUT is missing from the library (measured without it). */
+	lutMissing: boolean,
+};
 
 export type ImportOptions = {
 	recursive: boolean,
@@ -880,6 +1064,15 @@ export type ImportSummary = {
 	sidecarsRead: number,
 };
 
+/**  Relative luminance percentiles (linear, 0..=1) of a rendered image. */
+export type LumaPercentiles = {
+	p1: number,
+	p10: number,
+	p50: number,
+	p90: number,
+	p99: number,
+};
+
 /**  A `.cube` file in the LUT library (`<app_data>/luts/<id>.cube`, `$SIEVE_LUTS`). */
 export type LutInfo = {
 	id: string,
@@ -910,6 +1103,89 @@ export type LutRef = {
 	id: string,
 	/**  Blend amount 0..=100 (100 = full LUT output). */
 	amount: number,
+};
+
+/**  One image's adjustments to commit via `apply_scene_match`. */
+export type MatchApplication = {
+	imageId: number,
+	adjustments: ParametricAdjustments,
+};
+
+/**  `full - base` of the corrected sliders (0 for groups not matched). */
+export type MatchDelta = {
+	/**  EV. */
+	exposure: number,
+	/**  Kelvin (slider units). */
+	temperatureK: number,
+	tint: number,
+	contrast: number,
+	whites: number,
+	blacks: number,
+};
+
+/**
+ *  Parameters of `match_scene`. Relative grading: every target starts from the anchor's
+ *  look (`base`) and gets corrections (`delta`) that cancel measured differences in
+ *  brightness / white point / tonal range, so it renders like the anchor.
+ */
+export type MatchOptions = {
+	/**  Correct `exposure` so the target's rendered brightness matches the anchor's. */
+	matchExposure: boolean,
+	/**
+	 *  Correct temperature/tint so the target's rendered neutral matches the anchor's
+	 *  (the result is always `custom` white balance).
+	 */
+	matchWhiteBalance: boolean,
+	/**  Small `contrast` / `whites` / `blacks` corrections from luminance percentiles. */
+	matchTone: boolean,
+	/**
+	 *  0..=1: share of the correction applied (`adjustments = lerp(base, full, strength)`);
+	 *  0 = the anchor's settings copied verbatim (like Sync Settings).
+	 */
+	strength: number,
+	/**
+	 *  Groups copied from the anchor into `base` (the target keeps its own values for the rest).
+	 *  The groups a `match*` flag corrects are always taken from the anchor.
+	 */
+	copyFields: AdjustmentField[],
+};
+
+/**  Proposed grade for one target of `match_scene` (nothing is saved). */
+export type MatchPreview = {
+	targetId: number,
+	/**
+	 *  Anchor(s) this target was matched to: one, or both when the target lies between two
+	 *  anchors in capture time (blended).
+	 */
+	anchorIds: number[],
+	/**  Weight of `anchorIds[1]` when blended (0..=1), else 0. */
+	anchorWeight: number,
+	/**
+	 *  Strength 0: the target's settings with the anchor's groups copied (white balance
+	 *  resolved to `custom` when matched).
+	 */
+	base: ParametricAdjustments,
+	/**  Strength 1: `base` plus the full correction. */
+	full: ParametricAdjustments,
+	/**
+	 *  `ParametricAdjustments::lerp(base, full, options.strength)`; what `apply_scene_match`
+	 *  should receive unless the UI changes the strength (then use `lerpAdjustments`).
+	 */
+	adjustments: ParametricAdjustments,
+	delta: MatchDelta,
+	/**  The anchor rendered with its own settings (blended when two anchors). */
+	reference: ImageStats,
+	/**  The target rendered with its current (stored) settings. */
+	before: ImageStats,
+	/**  The target rendered with `adjustments`. */
+	predicted: ImageStats,
+	/**
+	 *  At strength 1 the target lands within `scene::TOLERANCE_EV` / `scene::TOLERANCE_AB`
+	 *  of the reference.
+	 */
+	converged: boolean,
+	/**  Human-readable caveats (clamped slider, no neutral found, LUT missing...). */
+	notes: string[],
 };
 
 /**
@@ -946,6 +1222,21 @@ export type MetadataOptions = {
 	creator: string | null,
 };
 
+/**
+ *  Estimated colour of neutral surfaces in a *rendered* image (render space: sRGB/D65).
+ *  A perfectly balanced render has `a = b = 0` (xy = D65 0.3127, 0.3290).
+ */
+export type NeutralEstimate = {
+	/**  CIE 1931 chromaticity of the estimate. */
+	x: number,
+	y: number,
+	/**  Oklab a/b of the estimate (colour cast direction and size). */
+	a: number,
+	b: number,
+	/**  0..=1 share of pixels the estimate is based on; 0 = grey-world fallback (whole frame). */
+	coverage: number,
+};
+
 /**  Point in normalized preview coordinates (see [`NormRect`]). */
 export type NormPoint = {
 	x: number,
@@ -961,6 +1252,13 @@ export type NormRect = {
 	y: number,
 	width: number,
 	height: number,
+};
+
+/**  A colour in Oklab (L 0..=1; a/b ~ -0.4..=0.4, 0 = neutral). */
+export type OklabColor = {
+	l: number,
+	a: number,
+	b: number,
 };
 
 /**  Output sharpening, applied after resizing to the output-encoded pixels. */
@@ -1079,6 +1377,10 @@ export type RawImageEntry = {
 	hasEdits: boolean,
 	/**  Sidecar sync state of the XMP-mapped values (rating, pick, label, tags, develop settings). */
 	xmp: XmpSyncState,
+	/**  Scene (lighting scenario) this image belongs to, if any (Phase 7). */
+	sceneId: number | null,
+	/**  This image is a graded anchor of its scene. */
+	isSceneAnchor: boolean,
 };
 
 /**  How to render a preview. */
@@ -1157,6 +1459,63 @@ export type ResizeOptions = {
 	 */
 	resolutionPpi: number,
 };
+
+/**
+ *  A lighting scenario: consecutive frames shot under the same light, graded together from
+ *  1-2 anchors. An image belongs to at most one scene.
+ */
+export type Scene = {
+	id: number,
+	/**  Folder of all members; `null` if they span folders (manual scenes only). */
+	folderId: number | null,
+	/**  Earliest / latest member capture time (`null` if no member has one). */
+	startedAtMs: number | null,
+	endedAtMs: number | null,
+	/**  Members in capture order (images without a capture time last, by file name). Never empty. */
+	imageIds: number[],
+	/**  Graded reference frames (0..=`Scene::MAX_ANCHORS`), a subset of `imageIds`, in capture order. */
+	anchorIds: number[],
+	method: SceneMethod,
+	createdAtMs: number,
+	updatedAtMs: number,
+};
+
+/**  Parameters of `detect_scenes`. `null` on the wire = `SceneDetectOptions::default()`. */
+export type SceneDetectOptions = {
+	/**  A capture-time gap longer than this always starts a new scene. 1000..=86_400_000 ms. */
+	maxGapMs: number,
+	/**
+	 *  0..=1. Minimum appearance similarity (tone + colour features of the preview) for a frame
+	 *  to stay in the running scene; lower = fewer, larger scenes. 0 = split on time gaps only.
+	 */
+	similarity: number,
+	/**  Also replace manual scenes in scope (default: they and their members are left alone). */
+	replaceManual: boolean,
+};
+
+/**  How a scene's membership was decided. */
+export type SceneMethod = 
+/**  Created by `detect_scenes` and not edited since; replaced by the next detection. */
+"auto" | 
+/**
+ *  Created or edited by the user (`create_scene`, `set_scene_members`, `merge_scenes`,
+ *  `split_scene`); kept by `detect_scenes` unless `replaceManual`.
+ */
+"manual";
+
+/**
+ *  Progress of a running `detect_scenes` (feature extraction over previews) or `match_scene`
+ *  (renders per target). Throttled (~10/s, always ending with `done == total`). Only drives a
+ *  progress bar; the command's result arrives when it resolves.
+ */
+export type SceneProgress = {
+	task: SceneTask,
+	done: number,
+	total: number,
+};
+
+/**  Long-running scene operation reported by the `sceneProgress` event. */
+export type SceneTask = "detect" | "match";
 
 /**
  *  Relative weights of the score components in `QualityScore.overall`.
@@ -1244,6 +1603,15 @@ width: number; height: number } |
 export type TiffCompression = "none" | "lzw" | 
 /**  Deflate (Adobe "ZIP"). */
 "zip";
+
+/**
+ *  Small per-catalog UI preferences. Every field is optional so the struct can grow;
+ *  `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
+ */
+export type UiPrefs = {
+	/**  Folder last chosen in the export dialog (absolute path). */
+	lastExportFolder?: string | null,
+};
 
 /**  White balance. `AsShot` uses the camera's recorded multipliers. */
 export type WhiteBalance = { mode: "as_shot" } | 

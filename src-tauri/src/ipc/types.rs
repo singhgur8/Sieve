@@ -24,6 +24,8 @@ pub type BurstGroupId = i64;
 pub type PresetId = i64;
 /// Catalog row id of an adjustment history entry.
 pub type HistoryEntryId = i64;
+/// Catalog row id of a scene (Phase 7).
+pub type SceneId = i64;
 /// LUT library id: the `.cube` file stem in the LUT directory (`[a-z0-9-]+`).
 pub type LutId = String;
 
@@ -487,6 +489,10 @@ pub struct RawImageEntry {
     pub has_edits: bool,
     /// Sidecar sync state of the XMP-mapped values (rating, pick, label, tags, develop settings).
     pub xmp: XmpSyncState,
+    /// Scene (lighting scenario) this image belongs to, if any (Phase 7).
+    pub scene_id: Option<SceneId>,
+    /// This image is a graded anchor of its scene.
+    pub is_scene_anchor: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +591,20 @@ pub struct HslChannels {
 impl HslChannels {
     fn values(&self) -> [f32; 8] {
         [self.red, self.orange, self.yellow, self.green, self.aqua, self.blue, self.purple, self.magenta]
+    }
+
+    fn lerp(a: &Self, b: &Self, t: f32) -> Self {
+        let l = |x: f32, y: f32| x + (y - x) * t;
+        Self {
+            red: l(a.red, b.red),
+            orange: l(a.orange, b.orange),
+            yellow: l(a.yellow, b.yellow),
+            green: l(a.green, b.green),
+            aqua: l(a.aqua, b.aqua),
+            blue: l(a.blue, b.blue),
+            purple: l(a.purple, b.purple),
+            magenta: l(a.magenta, b.magenta),
+        }
     }
 }
 
@@ -724,6 +744,67 @@ impl ParametricAdjustments {
     /// All values neutral (an unedited image renders identically).
     pub fn is_neutral(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Interpolates `a` (t = 0) -> `b` (t = 1); `t` is clamped to 0..=1. Defines the scene-match
+    /// strength slider (`lerp(base, full, strength)`) and two-anchor blending. Mirrored by
+    /// `lerpAdjustments` in `src/ipc/index.ts`; keep both in sync.
+    /// - Numeric sliders and HSL bands: linear.
+    /// - White balance: both `custom` -> temperature linear in mireds (1e6 / K), tint linear;
+    ///   otherwise the nearer side's value (`t < 0.5` -> `a`).
+    /// - LUT: same id on both sides -> amount linear; otherwise the nearer side's LUT.
+    /// - `processVersion`: `a`'s.
+    pub fn lerp(a: &ParametricAdjustments, b: &ParametricAdjustments, t: f32) -> ParametricAdjustments {
+        let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+        let l = |x: f32, y: f32| x + (y - x) * t;
+        let near_b = t >= 0.5;
+        let white_balance = match (a.white_balance, b.white_balance) {
+            (
+                WhiteBalance::Custom { temperature_k: ta, tint: ia },
+                WhiteBalance::Custom { temperature_k: tb, tint: ib },
+            ) => {
+                let mired = l(1.0e6 / ta, 1.0e6 / tb);
+                WhiteBalance::Custom { temperature_k: (1.0e6 / mired).clamp(2000.0, 50000.0), tint: l(ia, ib) }
+            }
+            (x, y) => {
+                if near_b {
+                    y
+                } else {
+                    x
+                }
+            }
+        };
+        let lut = match (&a.lut, &b.lut) {
+            (Some(x), Some(y)) if x.id == y.id => Some(LutRef { id: x.id.clone(), amount: l(x.amount, y.amount) }),
+            (x, y) => {
+                if near_b {
+                    y.clone()
+                } else {
+                    x.clone()
+                }
+            }
+        };
+        ParametricAdjustments {
+            process_version: a.process_version,
+            white_balance,
+            exposure: l(a.exposure, b.exposure),
+            contrast: l(a.contrast, b.contrast),
+            highlights: l(a.highlights, b.highlights),
+            shadows: l(a.shadows, b.shadows),
+            whites: l(a.whites, b.whites),
+            blacks: l(a.blacks, b.blacks),
+            texture: l(a.texture, b.texture),
+            clarity: l(a.clarity, b.clarity),
+            dehaze: l(a.dehaze, b.dehaze),
+            vibrance: l(a.vibrance, b.vibrance),
+            saturation: l(a.saturation, b.saturation),
+            hsl: HslAdjustments {
+                hue: HslChannels::lerp(&a.hsl.hue, &b.hsl.hue, t),
+                saturation: HslChannels::lerp(&a.hsl.saturation, &b.hsl.saturation, t),
+                luminance: HslChannels::lerp(&a.hsl.luminance, &b.hsl.luminance, t),
+            },
+            lut,
+        }
     }
 }
 
@@ -1019,6 +1100,9 @@ pub struct ImageQuery {
     /// Image's colour label is one of these.
     pub color_labels: Vec<ColorLabel>,
     pub burst_group_id: Option<BurstGroupId>,
+    /// Only members of this scene.
+    #[serde(default)]
+    pub scene_id: Option<SceneId>,
     /// Hide burst members that are not their group's keeper (groups without a keeper
     /// show all members); images outside bursts are unaffected.
     pub collapse_bursts: bool,
@@ -1046,6 +1130,7 @@ impl Default for ImageQuery {
             max_rating: None,
             color_labels: Vec::new(),
             burst_group_id: None,
+            scene_id: None,
             collapse_bursts: false,
             folder_id: None,
             sort: ImageSort::CaptureTime,
@@ -1786,6 +1871,330 @@ pub struct ExportJob {
     pub finished_at_ms: Option<i64>,
 }
 
+// ---------------------------------------------------------------------------
+// Scenes & scene matching (Phase 7)
+// ---------------------------------------------------------------------------
+
+string_enum! {
+    /// How a scene's membership was decided.
+    pub enum SceneMethod {
+        /// Created by `detect_scenes` and not edited since; replaced by the next detection.
+        Auto => "auto",
+        /// Created or edited by the user (`create_scene`, `set_scene_members`, `merge_scenes`,
+        /// `split_scene`); kept by `detect_scenes` unless `replaceManual`.
+        Manual => "manual",
+    }
+}
+
+string_enum! {
+    /// Long-running scene operation reported by the `sceneProgress` event.
+    pub enum SceneTask {
+        Detect => "detect",
+        Match => "match",
+    }
+}
+
+/// A lighting scenario: consecutive frames shot under the same light, graded together from
+/// 1-2 anchors. An image belongs to at most one scene.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Scene {
+    pub id: SceneId,
+    /// Folder of all members; `null` if they span folders (manual scenes only).
+    pub folder_id: Option<FolderId>,
+    /// Earliest / latest member capture time (`null` if no member has one).
+    pub started_at_ms: Option<i64>,
+    pub ended_at_ms: Option<i64>,
+    /// Members in capture order (images without a capture time last, by file name). Never empty.
+    pub image_ids: Vec<ImageId>,
+    /// Graded reference frames (0..=`Scene::MAX_ANCHORS`), a subset of `imageIds`, in capture order.
+    pub anchor_ids: Vec<ImageId>,
+    pub method: SceneMethod,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl Scene {
+    /// At most this many anchors per scene / per `match_scene` call.
+    pub const MAX_ANCHORS: usize = 2;
+}
+
+/// Parameters of `detect_scenes`. `null` on the wire = `SceneDetectOptions::default()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneDetectOptions {
+    /// A capture-time gap longer than this always starts a new scene. 1000..=86_400_000 ms.
+    pub max_gap_ms: u32,
+    /// 0..=1. Minimum appearance similarity (tone + colour features of the preview) for a frame
+    /// to stay in the running scene; lower = fewer, larger scenes. 0 = split on time gaps only.
+    #[specta(type = Number)]
+    pub similarity: f32,
+    /// Also replace manual scenes in scope (default: they and their members are left alone).
+    pub replace_manual: bool,
+}
+
+impl Default for SceneDetectOptions {
+    fn default() -> Self {
+        Self { max_gap_ms: 120_000, similarity: 0.7, replace_manual: false }
+    }
+}
+
+impl SceneDetectOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1000..=86_400_000).contains(&self.max_gap_ms) {
+            return Err(format!("maxGapMs = {} is outside 1000..=86400000", self.max_gap_ms));
+        }
+        if !(self.similarity.is_finite() && (0.0..=1.0).contains(&self.similarity)) {
+            return Err(format!("similarity = {} is outside 0..=1", self.similarity));
+        }
+        Ok(())
+    }
+}
+
+/// Parameters of `match_scene`. Relative grading: every target starts from the anchor's
+/// look (`base`) and gets corrections (`delta`) that cancel measured differences in
+/// brightness / white point / tonal range, so it renders like the anchor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchOptions {
+    /// Correct `exposure` so the target's rendered brightness matches the anchor's.
+    pub match_exposure: bool,
+    /// Correct temperature/tint so the target's rendered neutral matches the anchor's
+    /// (the result is always `custom` white balance).
+    pub match_white_balance: bool,
+    /// Small `contrast` / `whites` / `blacks` corrections from luminance percentiles.
+    pub match_tone: bool,
+    /// 0..=1: share of the correction applied (`adjustments = lerp(base, full, strength)`);
+    /// 0 = the anchor's settings copied verbatim (like Sync Settings).
+    #[specta(type = Number)]
+    pub strength: f32,
+    /// Groups copied from the anchor into `base` (the target keeps its own values for the rest).
+    /// The groups a `match*` flag corrects are always taken from the anchor.
+    pub copy_fields: Vec<AdjustmentField>,
+}
+
+impl Default for MatchOptions {
+    fn default() -> Self {
+        Self {
+            match_exposure: true,
+            match_white_balance: true,
+            match_tone: false,
+            strength: 1.0,
+            copy_fields: AdjustmentField::ALL.to_vec(),
+        }
+    }
+}
+
+impl MatchOptions {
+    /// At most this many targets per `match_scene` call.
+    pub const MAX_TARGETS: usize = 2000;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.strength.is_finite() && (0.0..=1.0).contains(&self.strength)) {
+            return Err(format!("strength = {} is outside 0..=1", self.strength));
+        }
+        Ok(())
+    }
+
+    /// Groups corrected by the enabled `match*` flags.
+    pub fn matched_fields(&self) -> Vec<AdjustmentField> {
+        let mut out = Vec::new();
+        if self.match_white_balance {
+            out.push(AdjustmentField::WhiteBalance);
+        }
+        if self.match_exposure {
+            out.push(AdjustmentField::Exposure);
+        }
+        if self.match_tone {
+            out.extend([AdjustmentField::Contrast, AdjustmentField::Whites, AdjustmentField::Blacks]);
+        }
+        out
+    }
+}
+
+/// Relative luminance percentiles (linear, 0..=1) of a rendered image.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LumaPercentiles {
+    #[specta(type = Number)]
+    pub p1: f32,
+    #[specta(type = Number)]
+    pub p10: f32,
+    #[specta(type = Number)]
+    pub p50: f32,
+    #[specta(type = Number)]
+    pub p90: f32,
+    #[specta(type = Number)]
+    pub p99: f32,
+}
+
+/// A colour in Oklab (L 0..=1; a/b ~ -0.4..=0.4, 0 = neutral).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct OklabColor {
+    #[specta(type = Number)]
+    pub l: f32,
+    #[specta(type = Number)]
+    pub a: f32,
+    #[specta(type = Number)]
+    pub b: f32,
+}
+
+/// Estimated colour of neutral surfaces in a *rendered* image (render space: sRGB/D65).
+/// A perfectly balanced render has `a = b = 0` (xy = D65 0.3127, 0.3290).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NeutralEstimate {
+    /// CIE 1931 chromaticity of the estimate.
+    #[specta(type = Number)]
+    pub x: f32,
+    #[specta(type = Number)]
+    pub y: f32,
+    /// Oklab a/b of the estimate (colour cast direction and size).
+    #[specta(type = Number)]
+    pub a: f32,
+    #[specta(type = Number)]
+    pub b: f32,
+    /// 0..=1 share of pixels the estimate is based on; 0 = grey-world fallback (whole frame).
+    #[specta(type = Number)]
+    pub coverage: f32,
+}
+
+/// Measurements of an image rendered through the develop pipeline with given adjustments
+/// (the same pixels the editor shows, LUT included), long edge `scene::STATS_MAX_EDGE`. The
+/// basis of scene matching and its acceptance checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageStats {
+    pub image_id: ImageId,
+    /// Measured area (oriented, normalized); `null` = whole frame.
+    pub region: Option<NormRect>,
+    /// Pixel size measured.
+    pub width: u32,
+    pub height: u32,
+    /// Mean relative luminance (Rec.709 Y of the linearized sRGB output), 0..=1.
+    #[specta(type = Number)]
+    pub mean_luma: f32,
+    /// log2 of the geometric mean luminance (Y floored at 2^-14). Exposure differences in EV
+    /// are differences of this value.
+    #[specta(type = Number)]
+    pub log_mean_luma: f32,
+    pub percentiles: LumaPercentiles,
+    /// Share of pixels with any 8-bit channel >= 254.
+    #[specta(type = Number)]
+    pub clipped_highlights: f32,
+    /// Share of pixels with all 8-bit channels <= 1.
+    #[specta(type = Number)]
+    pub clipped_shadows: f32,
+    /// Mean colour of the render.
+    pub mean_oklab: OklabColor,
+    pub neutral: NeutralEstimate,
+    /// White balance the measured adjustments resolve to (`as_shot` -> the camera's values);
+    /// `null` if as-shot and the file has none.
+    pub white_balance: Option<WhiteBalanceValues>,
+    /// The camera's as-shot white balance (as in `DevelopInfo.asShot`).
+    pub as_shot: Option<WhiteBalanceValues>,
+    /// The adjustments' LUT is missing from the library (measured without it).
+    pub lut_missing: bool,
+}
+
+/// `full - base` of the corrected sliders (0 for groups not matched).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchDelta {
+    /// EV.
+    #[specta(type = Number)]
+    pub exposure: f32,
+    /// Kelvin (slider units).
+    #[specta(type = Number)]
+    pub temperature_k: f32,
+    #[specta(type = Number)]
+    pub tint: f32,
+    #[specta(type = Number)]
+    pub contrast: f32,
+    #[specta(type = Number)]
+    pub whites: f32,
+    #[specta(type = Number)]
+    pub blacks: f32,
+}
+
+/// Proposed grade for one target of `match_scene` (nothing is saved).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchPreview {
+    pub target_id: ImageId,
+    /// Anchor(s) this target was matched to: one, or both when the target lies between two
+    /// anchors in capture time (blended).
+    pub anchor_ids: Vec<ImageId>,
+    /// Weight of `anchorIds[1]` when blended (0..=1), else 0.
+    #[specta(type = Number)]
+    pub anchor_weight: f32,
+    /// Strength 0: the target's settings with the anchor's groups copied (white balance
+    /// resolved to `custom` when matched).
+    pub base: ParametricAdjustments,
+    /// Strength 1: `base` plus the full correction.
+    pub full: ParametricAdjustments,
+    /// `ParametricAdjustments::lerp(base, full, options.strength)`; what `apply_scene_match`
+    /// should receive unless the UI changes the strength (then use `lerpAdjustments`).
+    pub adjustments: ParametricAdjustments,
+    pub delta: MatchDelta,
+    /// The anchor rendered with its own settings (blended when two anchors).
+    pub reference: ImageStats,
+    /// The target rendered with its current (stored) settings.
+    pub before: ImageStats,
+    /// The target rendered with `adjustments`.
+    pub predicted: ImageStats,
+    /// At strength 1 the target lands within `scene::TOLERANCE_EV` / `scene::TOLERANCE_AB`
+    /// of the reference.
+    pub converged: bool,
+    /// Human-readable caveats (clamped slider, no neutral found, LUT missing...).
+    pub notes: Vec<String>,
+}
+
+/// One image's adjustments to commit via `apply_scene_match`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchApplication {
+    pub image_id: ImageId,
+    pub adjustments: ParametricAdjustments,
+}
+
+// ---------------------------------------------------------------------------
+// UX additions (IPC v8)
+// ---------------------------------------------------------------------------
+
+/// Result of `apply_suggestions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplySuggestionsResult {
+    /// Images whose rating/pick were set from the suggestions.
+    pub applied: u32,
+    /// Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated.
+    pub skipped: u32,
+}
+
+/// The user's culling values of one image, for a frontend culling undo stack:
+/// `get_cull_snapshot` before a change, `restore_cull_snapshot` to undo it.
+/// Tags are not included (undo a tag change with the inverse `set_user_tag`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CullSnapshot {
+    pub image_id: ImageId,
+    /// 0..=5.
+    pub rating: u8,
+    pub pick: PickFlag,
+    pub color_label: Option<ColorLabel>,
+}
+
+/// Small per-catalog UI preferences. Every field is optional so the struct can grow;
+/// `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UiPrefs {
+    /// Folder last chosen in the export dialog (absolute path).
+    pub last_export_folder: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,5 +2310,65 @@ mod tests {
         assert!(with(&|s| s.metadata.copyright = Some("x".repeat(501))).is_err());
         assert_eq!(ExportFormatKind::Tiff.extension(), "tif");
         assert_eq!(base.format.bit_depth(), BitDepth::Eight);
+    }
+
+    #[test]
+    fn lerp_adjustments_semantics() {
+        let a = ParametricAdjustments {
+            exposure: 0.0,
+            contrast: 10.0,
+            white_balance: WhiteBalance::Custom { temperature_k: 4000.0, tint: 0.0 },
+            lut: Some(LutRef { id: "film".into(), amount: 0.0 }),
+            ..Default::default()
+        };
+        let mut b = ParametricAdjustments {
+            exposure: 1.0,
+            contrast: 30.0,
+            white_balance: WhiteBalance::Custom { temperature_k: 8000.0, tint: 10.0 },
+            lut: Some(LutRef { id: "film".into(), amount: 100.0 }),
+            ..Default::default()
+        };
+        b.hsl.hue.red = 20.0;
+        assert_eq!(ParametricAdjustments::lerp(&a, &b, 0.0), a);
+        assert_eq!(ParametricAdjustments::lerp(&a, &b, 1.0), b);
+        let m = ParametricAdjustments::lerp(&a, &b, 0.5);
+        assert_eq!((m.exposure, m.contrast, m.hsl.hue.red), (0.5, 20.0, 10.0));
+        // Mired midpoint of 4000 K (250) and 8000 K (125) = 187.5 mired = 5333.3 K.
+        let WhiteBalance::Custom { temperature_k, tint } = m.white_balance else { panic!() };
+        assert!((temperature_k - 5333.333).abs() < 0.01 && tint == 5.0, "{temperature_k}");
+        assert_eq!(m.lut, Some(LutRef { id: "film".into(), amount: 50.0 }));
+        // Clamped t; mixed WB modes / different LUTs take the nearer side.
+        assert_eq!(ParametricAdjustments::lerp(&a, &b, 7.0), b);
+        let c = ParametricAdjustments { white_balance: WhiteBalance::AsShot, lut: None, ..b.clone() };
+        assert_eq!(ParametricAdjustments::lerp(&a, &c, 0.4).white_balance, a.white_balance);
+        assert_eq!(ParametricAdjustments::lerp(&a, &c, 0.6).lut, None);
+        assert!(ParametricAdjustments::lerp(&a, &b, 0.37).validate().is_ok());
+    }
+
+    #[test]
+    fn scene_options_validate_and_wire_format() {
+        assert!(SceneDetectOptions::default().validate().is_ok());
+        assert!(SceneDetectOptions { max_gap_ms: 10, ..Default::default() }.validate().is_err());
+        assert!(SceneDetectOptions { similarity: 1.5, ..Default::default() }.validate().is_err());
+        let m = MatchOptions::default();
+        assert!(m.validate().is_ok());
+        assert_eq!(
+            m.matched_fields(),
+            vec![AdjustmentField::WhiteBalance, AdjustmentField::Exposure],
+            "tone matching is off by default"
+        );
+        assert!(MatchOptions { strength: -0.1, ..Default::default() }.validate().is_err());
+        assert!(MatchOptions { strength: f32::NAN, ..Default::default() }.validate().is_err());
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["matchWhiteBalance"], true);
+        assert_eq!(json["copyFields"].as_array().unwrap().len(), AdjustmentField::ALL.len());
+        assert_eq!(serde_json::to_value(SceneMethod::Manual).unwrap(), "manual");
+        let q: ImageQuery = serde_json::from_value(serde_json::json!({
+            "includeTags": [], "excludeTags": [], "tagMatch": "any", "picks": [], "minRating": null,
+            "maxRating": null, "colorLabels": [], "burstGroupId": null, "collapseBursts": false,
+            "folderId": null, "sort": "capture_time", "sortDescending": false, "offset": 0, "limit": 10
+        }))
+        .unwrap();
+        assert_eq!(q.scene_id, None, "sceneId may be omitted by older callers");
     }
 }

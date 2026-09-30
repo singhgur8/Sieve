@@ -67,6 +67,14 @@ pub fn dirty_ids(conn: &Connection) -> AppResult<Vec<ImageId>> {
     Ok(ids)
 }
 
+/// Dirty images of `folder` (every folder for `None`), by id.
+pub fn dirty_ids_in(conn: &Connection, folder: Option<FolderId>) -> AppResult<Vec<ImageId>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM images WHERE xmp_dirty = 1 AND (?1 IS NULL OR folder_id = ?1) ORDER BY id")?;
+    let ids = stmt.query_map([folder], |r| r.get(0))?.collect::<Result<Vec<ImageId>, _>>()?;
+    Ok(ids)
+}
+
 /// `(id, raw path, xmp_mtime_ms)` of the folder's images without pending catalog changes.
 pub fn clean_images_in_folder(
     conn: &Connection,

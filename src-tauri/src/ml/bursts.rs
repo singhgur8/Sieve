@@ -1,8 +1,10 @@
 //! Burst grouping: frames shot in quick succession that look alike.
 
+use std::collections::HashSet;
+
 use super::imgproc::hamming;
 use super::{Burst, BurstFrame};
-use crate::ipc::types::{PickFlag, QualityScore};
+use crate::ipc::types::{ImageId, PickFlag, QualityScore};
 
 /// Clusters `frames` (sorted by `captured_at_ms`; sorted here defensively) into chains
 /// where each frame is within `window_ms` of the previous one *and* its pHash is within
@@ -32,6 +34,21 @@ pub fn group_bursts(frames: &[BurstFrame], window_ms: u32, max_hash_distance: u3
     }
     flush(&mut cur, &mut out);
     out
+}
+
+/// Honours user-chosen keepers (`set_burst_keeper`): if any member of `burst` is in `pins`,
+/// the pinned member with the highest `overall` (earliest on ties) becomes the keeper.
+pub fn apply_pins(burst: &mut Burst, pins: &HashSet<ImageId>, overall: impl Fn(ImageId) -> f32) {
+    let mut best: Option<(ImageId, f32)> = None;
+    for &m in burst.members.iter().filter(|m| pins.contains(m)) {
+        let o = overall(m);
+        if best.is_none_or(|(_, b)| o > b) {
+            best = Some((m, o));
+        }
+    }
+    if let Some((id, _)) = best {
+        burst.keeper = id;
+    }
 }
 
 /// Lowers a burst non-keeper's suggestions: never a pick, one star less, and rejected
@@ -78,5 +95,17 @@ mod tests {
         assert_eq!(group_bursts(&frames, 1500, 0), vec![Burst { members: vec![1, 2], keeper: 1 }]);
         assert!(group_bursts(&[], 1500, 10).is_empty());
         assert!(group_bursts(&[f(1, 0, 0, 1.0)], 1500, 10).is_empty());
+    }
+
+    #[test]
+    fn pins_override_keeper() {
+        let overall = |id: ImageId| [0.0, 0.9, 0.2, 0.5, 0.5][id as usize];
+        let mut b = Burst { members: vec![1, 2, 3, 4], keeper: 1 };
+        apply_pins(&mut b, &HashSet::new(), overall);
+        assert_eq!(b.keeper, 1, "no pins: unchanged");
+        apply_pins(&mut b, &HashSet::from([2, 9]), overall);
+        assert_eq!(b.keeper, 2);
+        apply_pins(&mut b, &HashSet::from([2, 3, 4]), overall);
+        assert_eq!(b.keeper, 3, "best pinned, earliest on ties");
     }
 }
