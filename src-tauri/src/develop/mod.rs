@@ -45,8 +45,8 @@ use tauri::http;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect, ParametricAdjustments,
-    ProfileSettings, RenderOptions, RenderSlot, RenderedPreview,
+    CameraCalibration, CropSettings, DevelopInfo, DevelopWarning, DevelopWarningCode, ImageId, NormRect,
+    ParametricAdjustments, ProfileSettings, RenderOptions, RenderSlot, RenderedPreview, WhiteBalance,
 };
 use crate::lut::LutLibrary;
 use crate::profiles::ProfileLibrary;
@@ -126,7 +126,14 @@ struct Entry {
     prepared: Mutex<Vec<(PrepKey, Arc<Prepared>)>>,
     /// Last resolved profile (resolution reads the sidecar when a look is not installed).
     profile: Mutex<Option<(ProfileSettings, Arc<Profile>)>>,
+    /// Uncropped [`pipeline::TONE_GRID`] px source for the local tone context.
+    tone_src: Mutex<Option<Arc<Prepared>>>,
+    /// Last uncropped local tone context and the settings it depends on.
+    tone_ctx: Mutex<Option<(ToneKey, Arc<pipeline::ToneContext>)>>,
 }
+
+/// What the uncropped local tone context depends on besides the source.
+type ToneKey = (WhiteBalance, CameraCalibration, ProfileSettings);
 
 impl Entry {
     fn bytes(&self) -> u64 {
@@ -208,8 +215,23 @@ impl Entry {
         if adjustments.shadows == 0.0 && adjustments.highlights == 0.0 && ls == 0.0 && lh == 0.0 {
             return None;
         }
-        let whole = self.prepared(1, &CropSettings::default(), None, pipeline::TONE_GRID);
-        Some(pipeline::tone_context_prepared(&whole, &self.image, orientation, adjustments, profile))
+        let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
+        let cached = lock(&self.tone_ctx).as_ref().filter(|(k, _)| *k == key).map(|(_, c)| c.clone());
+        let base = match cached {
+            Some(c) => c,
+            None => {
+                let whole = lock(&self.tone_src)
+                    .get_or_insert_with(|| {
+                        Arc::new(source::prepare(&self.image, 1, &CropSettings::default(), None, pipeline::TONE_GRID))
+                    })
+                    .clone();
+                let c = Arc::new(pipeline::tone_context_uncropped(&whole, &self.image, adjustments, profile));
+                *lock(&self.tone_ctx) = Some((key, c.clone()));
+                c
+            }
+        };
+        let (w, h) = (self.image.width, self.image.height);
+        Some((*base).clone().with_crop(&adjustments.crop, w, h, orientation))
     }
 }
 
@@ -330,6 +352,8 @@ impl DevelopCache {
             meta,
             prepared: Mutex::new(Vec::new()),
             profile: Mutex::new(None),
+            tone_src: Mutex::new(None),
+            tone_ctx: Mutex::new(None),
         });
         {
             let mut lru = lock(&self.inner.lru);

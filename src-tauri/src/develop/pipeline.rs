@@ -1197,9 +1197,25 @@ pub fn tone_context_prepared(
     adjustments: &ParametricAdjustments,
     profile: &Profile,
 ) -> ToneContext {
+    tone_context_uncropped(whole, src, adjustments, profile).with_crop(
+        &adjustments.crop,
+        src.width,
+        src.height,
+        orientation,
+    )
+}
+
+/// The context before [`ToneContext::with_crop`]: depends only on the source and the white
+/// balance / calibration / profile of `adjustments` (cacheable across slider changes).
+pub fn tone_context_uncropped(
+    whole: &super::source::Prepared,
+    src: &super::source::LinearImage,
+    adjustments: &ParametricAdjustments,
+    profile: &Profile,
+) -> ToneContext {
     let mut input = RenderInput::simple(whole.width, whole.height, &whole.pixels, &src.color, profile);
     input.quality = Quality::Draft;
-    ToneContext::compute(&input, adjustments).with_crop(&adjustments.crop, src.width, src.height, orientation)
+    ToneContext::compute(&input, adjustments)
 }
 
 /// Block means of log2 luminance and of the dark channel (min RGB) of the working image.
@@ -1395,6 +1411,105 @@ mod tests {
             }
         }
         px
+    }
+
+    /// Grey step edge: left half at `dark`, right half at `bright` (linear, pre-WB).
+    fn step(w: u32, h: u32, dark: f32, bright: f32) -> Vec<u16> {
+        let mut px = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { dark } else { bright };
+                px.push((v / 2.0 * 65535.0) as u16);
+                px.push((v * 65535.0) as u16);
+                px.push((v / 1.5 * 65535.0) as u16);
+            }
+        }
+        px
+    }
+
+    /// Shadows / Highlights are edge-aware: next to an edge a flat area gets nearly the same
+    /// local tone as far from it, while the slider clearly acts. Regression bounds: Camera
+    /// Raw is halo-free on both steps (`tools/acr-oracle/halo_probe.py`), the guided
+    /// adaptation base (best fit to real frames) leaves a small rim that decays within a
+    /// few dozen px (measured worst: 15/255 at 3 px for Shadows +100 on a 3.9 EV step; 7 for
+    /// a user-like Shadows +64 / Highlights -66). A halo-free base (domain transform) fits the
+    /// real frames worse (held-out dE 3.13 vs 2.88), see docs/decisions.md.
+    #[test]
+    fn local_tone_has_no_halo_on_a_step_edge() {
+        let (w, h) = (512u32, 128u32);
+        let c = color();
+        let p = Profile::matrix(BASELINE_EV);
+        for (dark, bright, tol) in [(0.02f32, 0.3f32, 16), (0.004, 0.6, 9)] {
+            let px = step(w, h, dark, bright);
+            let row = |img: &RenderedImage, x: u32| i32::from(img.rgb[((h / 2 * w + x) * 3 + 1) as usize]);
+            let base = render(&RenderInput::simple(w, h, &px, &c, &p), &plain(), None);
+            for (sh, hl) in [(100.0, 0.0), (-100.0, 0.0), (0.0, -100.0), (64.0, -66.0)] {
+                let adj = ParametricAdjustments { shadows: sh, highlights: hl, ..plain() };
+                let img = render(&RenderInput::simple(w, h, &px, &c, &p), &adj, None);
+                // Dark side: 3 px from the edge vs 200 px away; bright side likewise.
+                let (near_d, far_d) = (row(&img, w / 2 - 3), row(&img, w / 2 - 200));
+                let (near_b, far_b) = (row(&img, w / 2 + 2), row(&img, w / 2 + 200));
+                let msg = format!("step {dark}|{bright} S {sh} H {hl}");
+                assert!((near_d - far_d).abs() <= tol, "{msg}: dark side halo {near_d} vs {far_d}");
+                assert!((near_b - far_b).abs() <= tol, "{msg}: bright side halo {near_b} vs {far_b}");
+                // The rim decays away from the edge.
+                assert!((row(&img, w / 2 - 30) - far_d).abs() <= 7, "{msg}: dark rim at 30 px");
+                assert!((row(&img, w / 2 + 30) - far_b).abs() <= 7, "{msg}: bright rim at 30 px");
+                if sh > 0.0 {
+                    assert!(far_d > row(&base, w / 2 - 200), "{msg}: shadows lift the dark side");
+                }
+                if sh < 0.0 {
+                    assert!(far_d < row(&base, w / 2 - 200), "{msg}: negative shadows darken the dark side");
+                }
+                if hl < 0.0 {
+                    assert!(far_b < row(&base, w / 2 + 200), "{msg}: highlights darken the bright side");
+                }
+            }
+        }
+    }
+
+    /// A zoomed region with the whole frame's context renders like the same pixels of the
+    /// whole-frame render (the local tone adapts to the whole image, not the crop).
+    #[test]
+    fn region_uses_the_whole_frame_tone_context() {
+        let (w, h) = (400u32, 200u32);
+        let c = color();
+        let p = Profile::matrix(BASELINE_EV);
+        let px = ramp(w, h);
+        let adj = ParametricAdjustments { shadows: 60.0, highlights: -50.0, ..plain() };
+        let whole = render(&RenderInput::simple(w, h, &px, &c, &p), &adj, None);
+        // Region: the left quarter (dark end of the ramp), same scale.
+        let (rw, rh) = (w / 4, h);
+        let mut rpx = Vec::new();
+        for y in 0..rh {
+            let s = (y * w * 3) as usize;
+            rpx.extend_from_slice(&px[s..s + (rw * 3) as usize]);
+        }
+        let src = super::super::source::LinearImage {
+            width: w,
+            height: h,
+            pixels: px.clone(),
+            color: c.clone(),
+            full_width: w,
+            full_height: h,
+            display_referred: false,
+            source_color: None,
+        };
+        let ctx = tone_context(&src, 1, &adj, &p);
+        let mut input = RenderInput::simple(rw, rh, &rpx, &c, &p);
+        input.view = View { frame_x: 0.0, frame_y: 0.0, frame_w: w as f32, frame_h: h as f32, scale: 1.0 };
+        input.frame_long_edge = w as f32;
+        input.tone = Some(&ctx);
+        let region = render(&input, &adj, None);
+        let mut worst = 0;
+        for y in [10u32, 50, 150] {
+            for x in [5u32, 40, 90] {
+                let a = whole.rgb[((y * w + x) * 3) as usize];
+                let b = region.rgb[((y * rw + x) * 3) as usize];
+                worst = worst.max((i32::from(a) - i32::from(b)).abs());
+            }
+        }
+        assert!(worst <= 3, "region differs from the whole frame by {worst}");
     }
 
     fn run(adj: &ParametricAdjustments, lut: Option<&Lut>) -> RenderedImage {
