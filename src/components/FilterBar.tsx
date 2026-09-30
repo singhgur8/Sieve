@@ -15,13 +15,13 @@ const PICKS: { key: PickFlag; label: string }[] = [
 interface Props {
   query: Query;
   setQuery: (fn: (q: Query) => Query) => void;
-  catalog: CatalogState | null;
-  epoch: number;
+  counts: FilterCounts | null;
   shown: number;
 }
 
-const chip = "rounded px-2 py-0.5 text-xs transition-colors";
+const chip = "whitespace-nowrap rounded px-2 py-0.5 text-xs transition-colors";
 const off = "bg-neutral-800 text-neutral-300 hover:bg-neutral-700";
+const rowClass = "flex h-8 shrink-0 items-center gap-x-3 overflow-x-auto overflow-y-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs";
 
 export function isFiltered(q: Query): boolean {
   return (
@@ -32,13 +32,14 @@ export function isFiltered(q: Query): boolean {
     q.maxRating != null ||
     q.colorLabels.length > 0 ||
     q.collapseBursts ||
-    q.folderId != null
+    q.folderId != null ||
+    q.sceneId != null
   );
 }
 
-export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
+/** Filter counts for the current folder; refreshed whenever the library changes (`epoch`). */
+export function useFilterCounts(folderId: number | null, epoch: number): FilterCounts | null {
   const [counts, setCounts] = useState<FilterCounts | null>(null);
-  const folderId = query.folderId;
   useEffect(() => {
     let stale = false;
     unwrap(commands.getFilterCounts(folderId))
@@ -48,7 +49,13 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
       stale = true;
     };
   }, [folderId, epoch]);
+  return counts;
+}
 
+const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
+
+/** Row 1 of the Library chrome: culling tags, flags and the result count. */
+export function FilterBar({ query, setQuery, counts, shown }: Props) {
   const tagCount = (t: CullTag) => counts?.tags.find((x) => x.tag === t)?.count ?? 0;
   const pickCount = (p: PickFlag) => (counts ? { pick: counts.picked, reject: counts.rejected, unflagged: counts.unflagged }[p] : 0);
 
@@ -59,12 +66,11 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
       if (q.excludeTags.includes(t)) return { ...q, excludeTags: q.excludeTags.filter((x) => x !== t) };
       return { ...q, includeTags: [...q.includeTags, t] };
     });
-  const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
 
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-neutral-800 px-4 py-2 text-xs" data-testid="filter-bar">
-      <Filter className="size-3.5 text-neutral-500" />
-      <div className="flex flex-wrap items-center gap-1" data-testid="filter-tags">
+    <div className={rowClass} data-testid="filter-bar">
+      <Filter className="size-3.5 shrink-0 text-neutral-400" />
+      <div className="flex items-center gap-1" data-testid="filter-tags">
         {ALL_TAGS.map((t) => {
           const inc = query.includeTags.includes(t);
           const exc = query.excludeTags.includes(t);
@@ -75,9 +81,9 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
               data-state={inc ? "include" : exc ? "exclude" : "off"}
               onClick={() => cycleTag(t)}
               title={inc ? "Showing only. Click to exclude." : exc ? "Excluded. Click to clear." : "Click to include, again to exclude"}
-              className={`${chip} ${inc ? TAG_STYLE[t] + " ring-1 ring-white/40" : exc ? "bg-neutral-900 text-neutral-500 line-through ring-1 ring-red-800" : off}`}
+              className={`${chip} ${inc ? TAG_STYLE[t] + " ring-1 ring-white/40" : exc ? "bg-neutral-900 text-neutral-400 line-through ring-1 ring-red-800" : off}`}
             >
-              {tagName(t)} <span className="opacity-60">{tagCount(t)}</span>
+              {tagName(t)} <span className="opacity-70">{tagCount(t)}</span>
             </button>
           );
         })}
@@ -87,8 +93,8 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
           onChange={(e) => setQuery((q) => ({ ...q, tagMatch: e.target.value as Query["tagMatch"] }))}
           className="rounded bg-neutral-800 px-1 py-0.5"
         >
-          <option value="any">any</option>
-          <option value="all">all</option>
+          <option value="any">Match any</option>
+          <option value="all">Match all</option>
         </select>
       </div>
 
@@ -100,13 +106,35 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
             onClick={() => setQuery((q) => ({ ...q, picks: toggle(q.picks, p.key) }))}
             className={`${chip} ${query.picks.includes(p.key) ? "bg-sky-800 text-sky-100" : off}`}
           >
-            {p.label} <span className="opacity-60">{pickCount(p.key)}</span>
+            {p.label} <span className="opacity-70">{pickCount(p.key)}</span>
           </button>
         ))}
       </div>
 
+      <span className="ml-auto flex items-center gap-2 pl-2 text-neutral-300" data-testid="shown-count">
+        {shown}
+        {counts ? ` of ${counts.total}` : ""}
+        {isFiltered(query) && (
+          <button
+            onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
+            className="flex items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700"
+            data-testid="clear-filters"
+          >
+            <RotateCcw className="size-3" />
+            Clear
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** Rating / label / burst / folder filters (row 2 of the Library chrome, left of the view controls). */
+export function FilterExtras({ query, setQuery, counts, catalog }: { query: Query; setQuery: Props["setQuery"]; counts: FilterCounts | null; catalog: CatalogState | null }) {
+  return (
+    <>
       <div className="flex items-center gap-1">
-        <span className="text-neutral-500">Rating</span>
+        <span className="text-neutral-400">Rating</span>
         <select
           aria-label="Minimum rating"
           value={query.minRating ?? ""}
@@ -143,12 +171,12 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
             aria-label={`label ${l}`}
             data-testid={`label-${l}`}
             onClick={() => setQuery((q) => ({ ...q, colorLabels: toggle(q.colorLabels, l) }))}
-            className={`size-4 rounded-full ${LABEL_COLOR[l]} ${query.colorLabels.includes(l) ? "ring-2 ring-white" : "opacity-40 hover:opacity-80"}`}
+            className={`size-3.5 shrink-0 rounded-full ${LABEL_COLOR[l]} ${query.colorLabels.includes(l) ? "ring-2 ring-white" : "opacity-40 hover:opacity-80"}`}
           />
         ))}
       </div>
 
-      <label className="flex items-center gap-1.5 text-neutral-300">
+      <label className="flex items-center gap-1.5 text-neutral-300" title={counts && counts.burstNonKeepers > 0 ? `${counts.burstNonKeepers} burst frames hidden when collapsed` : "Show only the keeper of each burst"}>
         <input
           type="checkbox"
           data-testid="collapse-bursts"
@@ -156,7 +184,7 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
           onChange={(e) => setQuery((q) => ({ ...q, collapseBursts: e.target.checked }))}
         />
         <Layers className="size-3.5" />
-        Collapse bursts{counts && counts.burstNonKeepers > 0 ? ` (${counts.burstNonKeepers} hidden)` : ""}
+        Collapse bursts{counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers} hidden)` : ""}
       </label>
 
       {catalog && catalog.folders.length > 0 && (
@@ -165,7 +193,7 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
           data-testid="folder-select"
           value={query.folderId ?? ""}
           onChange={(e) => setQuery((q) => ({ ...q, folderId: e.target.value === "" ? null : Number(e.target.value) }))}
-          className="max-w-48 rounded bg-neutral-800 px-1 py-0.5"
+          className="max-w-40 rounded bg-neutral-800 px-1 py-0.5"
         >
           <option value="">All folders</option>
           {catalog.folders.map((f) => (
@@ -175,21 +203,37 @@ export function FilterBar({ query, setQuery, catalog, epoch, shown }: Props) {
           ))}
         </select>
       )}
+    </>
+  );
+}
 
-      <span className="ml-auto flex items-center gap-2 text-neutral-400" data-testid="shown-count">
-        {shown}
-        {counts ? ` of ${counts.total}` : ""}
-        {isFiltered(query) && (
-          <button
-            onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
-            className="flex items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700"
-            data-testid="clear-filters"
-          >
-            <RotateCcw className="size-3" />
-            Clear
-          </button>
-        )}
+/** One-line description of the active filters (used by the collapsed summary bar). */
+export function describeFilters(q: Query, sceneNumber?: (id: number) => number): string {
+  const parts: string[] = [];
+  q.includeTags.forEach((t) => parts.push(tagName(t)));
+  q.excludeTags.forEach((t) => parts.push(`no ${tagName(t)}`));
+  q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));
+  if (q.minRating != null || q.maxRating != null) parts.push(`${q.minRating ?? 0}-${q.maxRating ?? 5}★`);
+  q.colorLabels.forEach((l) => parts.push(l));
+  if (q.collapseBursts) parts.push("bursts collapsed");
+  if (q.folderId != null) parts.push("one folder");
+  if (q.sceneId != null) parts.push(`Scene ${sceneNumber?.(q.sceneId) || q.sceneId}`);
+  return parts.join(", ");
+}
+
+/** 28 px summary shown instead of the filter bars outside the Grid. */
+export function FilterSummary({ query, shown, total, sceneNumber, onEdit }: { query: Query; shown: number; total: number | null; sceneNumber: (id: number) => number; onEdit: () => void }) {
+  const filtered = isFiltered(query);
+  return (
+    <div className="flex h-7 shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs text-neutral-300" data-testid="filter-summary">
+      <Filter className="size-3.5 shrink-0 text-neutral-400" />
+      <span className="truncate" data-testid="filter-summary-text">
+        {filtered ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · {shown}
+        {total != null ? ` of ${total}` : ""}
       </span>
+      <button className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" onClick={onEdit} data-testid="edit-filters">
+        Edit filters
+      </button>
     </div>
   );
 }

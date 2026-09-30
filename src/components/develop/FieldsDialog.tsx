@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { AdjustmentField } from "../../ipc";
 import { ALL_ADJUSTMENT_FIELDS } from "../../ipc";
 import { FIELD_LABEL } from "../../lib/adjust";
+import { Dialog } from "../Dialog";
 
 interface Props {
   title: string;
@@ -29,12 +30,20 @@ export function FieldsDialog({ title, confirm, withName, initialName = "", initi
   const ordered = ALL_ADJUSTMENT_FIELDS.filter((f) => fields.has(f));
   const valid = ordered.length > 0 && (!withName || name.trim().length > 0);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" data-testid="fields-dialog" onKeyDown={(e) => e.key === "Escape" && onCancel()}>
-      <div className="w-96 rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl">
+    <Dialog
+      label={title}
+      testid="fields-dialog"
+      overlayClass="z-[60] bg-black/60"
+      className="w-96 rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl"
+      onCancel={onCancel}
+      onConfirm={() => onConfirm(ordered, name.trim())}
+      canConfirm={() => valid}
+    >
+      <div>
         <h2 className="mb-3 text-sm font-semibold">{title}</h2>
         {withName && (
           <input
-            autoFocus
+            data-autofocus
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -54,7 +63,7 @@ export function FieldsDialog({ title, confirm, withName, initialName = "", initi
         <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
           {ALL_ADJUSTMENT_FIELDS.map((f) => (
             <label key={f} className="flex items-center gap-1.5">
-              <input type="checkbox" checked={fields.has(f)} onChange={() => toggle(f)} data-testid={`field-${f}`} />
+              <input type="checkbox" data-autofocus={!withName && f === ALL_ADJUSTMENT_FIELDS[0] ? true : undefined} checked={fields.has(f)} onChange={() => toggle(f)} data-testid={`field-${f}`} />
               {FIELD_LABEL[f]}
             </label>
           ))}
@@ -73,6 +82,6 @@ export function FieldsDialog({ title, confirm, withName, initialName = "", initi
           </button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }

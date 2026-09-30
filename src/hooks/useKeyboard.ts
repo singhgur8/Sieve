@@ -6,7 +6,7 @@ export function isTypingTarget(t: EventTarget | null, key: string): boolean {
   if (t.closest("textarea, select")) return true;
   const input = t.closest("input");
   if (!input) return false;
-  if (input.type === "range") return key.startsWith("Arrow");
+  if (input.type === "range") return key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(key);
   return input.type === "text" || input.type === "number" || input.type === "search";
 }
 

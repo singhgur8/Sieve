@@ -1,8 +1,12 @@
 // Editing state for one image in the Develop module: live adjustments, history, and render streams.
 //
-// Render contract (docs/ipc-changelog.md v5): every input event schedules a `renderPreview` (throttled to
-// one send per animation frame, always with the latest adjustments); results that are `null` or older than
-// the last shown `seq` for their (image, slot) are ignored; `saveAdjustments` runs once on release.
+// Render contract (docs/ipc-changelog.md v5): the backend keeps only the newest render per (image, slot) and
+// answers superseded ones with `null`. Sending one render per input event therefore starves the display during
+// a drag (every render is cancelled by the next). So: at most ONE `renderPreview` is in flight per (image, slot);
+// when it settles and the adjustments changed meanwhile, the latest are sent immediately. While a drag is active
+// the main slot is requested at draft size; on release (or after 150 ms without input) at full quality.
+// Results that are `null` or older than the last shown `seq` for their (image, slot) are ignored;
+// `saveAdjustments` runs once on release.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
@@ -77,47 +81,73 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const adjRef = useRef(adj);
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
-  const dirty = useRef({ main: false, before: false, detail: false });
-  const raf = useRef(0);
+  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false });
+  const inflight = useRef(new Set<string>());
+  const nullStreak = useRef(new Map<string, number>());
+  const draft = useRef(false);
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const chain = useRef<Promise<unknown>>(Promise.resolve());
 
   const enqueue = useCallback((fn: () => Promise<unknown>) => {
     chain.current = chain.current.then(fn).catch((e) => optsRef.current.onError(e));
   }, []);
 
-  const send = useCallback((slot: RenderSlot) => {
+  const pump = useCallback((slot: RenderSlot) => {
     const cur = idRef.current;
     const o = optsRef.current;
-    if (cur == null || o.maxEdge <= 0) return;
-    if (slot === "detail" && !o.region) return;
+    if (cur == null || o.maxEdge <= 0 || !want.current[slot]) return;
+    if (slot === "detail" && !o.region) {
+      want.current.detail = false;
+      return;
+    }
+    const key = `${cur}:${slot}`;
+    if (inflight.current.has(key)) return; // its completion pumps again with the latest adjustments
+    want.current[slot] = false;
+    inflight.current.add(key);
     const a = slot === "before" ? neutralAdjustments() : adjRef.current;
-    const options = { maxEdge: Math.min(8192, Math.max(64, Math.round(o.maxEdge))), slot, region: slot === "detail" ? o.region : null };
+    const full = Math.min(2048, Math.max(64, Math.round(o.maxEdge)));
+    const edge = draft.current && slot === "main" ? Math.max(256, Math.min(1024, Math.round(o.maxEdge / 2))) : full;
+    const options = { maxEdge: Math.min(edge, full), slot, region: slot === "detail" ? o.region : null };
     unwrap(commands.renderPreview(cur, a, options))
       .then((r) => {
-        if (!r || r.imageId !== idRef.current) return; // superseded by the backend / image changed
-        const key = `${r.imageId}:${r.slot}`;
-        if (r.seq <= (lastSeq.current.get(key) ?? -1)) return; // older than what is shown
-        lastSeq.current.set(key, r.seq);
+        if (!r) {
+          // Superseded by another caller: retry a couple of times so the view never stays stale.
+          const n = (nullStreak.current.get(key) ?? 0) + 1;
+          nullStreak.current.set(key, n);
+          if (n <= 3 && idRef.current === cur) want.current[slot] = true;
+          return;
+        }
+        nullStreak.current.delete(key);
+        if (r.imageId !== idRef.current) return; // image changed
+        const k = `${r.imageId}:${r.slot}`;
+        if (r.seq <= (lastSeq.current.get(k) ?? -1)) return; // older than what is shown
+        lastSeq.current.set(k, r.seq);
         const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing };
         setViews((prev) => ({ ...prev, [r.slot]: v }));
         if (r.slot === "main") setHistogram(r.histogram);
       })
-      .catch((e) => optsRef.current.onError(e));
+      .catch((e) => optsRef.current.onError(e))
+      .finally(() => {
+        inflight.current.delete(key);
+        (["main", "before", "detail"] as const).forEach((s) => pump(s));
+      });
   }, []);
 
   const schedule = useCallback(
     (...slots: RenderSlot[]) => {
-      for (const s of slots) dirty.current[s] = true;
-      if (raf.current) return;
-      raf.current = requestAnimationFrame(() => {
-        raf.current = 0;
-        const d = dirty.current;
-        dirty.current = { main: false, before: false, detail: false };
-        (["main", "before", "detail"] as const).forEach((s) => d[s] && send(s));
-      });
+      for (const s of slots) want.current[s] = true;
+      for (const s of slots) pump(s);
     },
-    [send],
+    [pump],
   );
+
+  /** Drag ended (release / idle): request the final full-quality render. */
+  const endDraft = useCallback(() => {
+    clearTimeout(draftTimer.current);
+    if (!draft.current) return;
+    draft.current = false;
+    schedule("main");
+  }, [schedule]);
 
   const setAdjBoth = useCallback((a: ParametricAdjustments) => {
     adjRef.current = a;
@@ -128,13 +158,14 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     const p = pending.current;
     if (!p) return;
     pending.current = null;
+    endDraft();
     const snapshot = adjRef.current;
     enqueue(async () => {
       const h = await unwrap(commands.saveAdjustments(p.id, snapshot, p.label));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
     });
-  }, [enqueue]);
+  }, [enqueue, endDraft]);
 
   // Load on image change; persist a pending edit of the previous image first.
   useEffect(() => {
@@ -176,26 +207,33 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     else setViews((v) => (v.detail ? { ...v, detail: null } : v));
   }, [id, regionKey, schedule]);
 
-  useEffect(() => () => cancelAnimationFrame(raf.current), []);
+  useEffect(() => () => clearTimeout(draftTimer.current), []);
 
-  const edit = useCallback(
-    (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => {
+  const applyEdit = useCallback(
+    (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string, isDraft: boolean) => {
       const cur = idRef.current;
       if (cur == null) return;
       if (pending.current && pending.current.label !== label) commitPending();
       setAdjBoth(mutate(adjRef.current));
       pending.current = { id: cur, label };
+      if (isDraft) {
+        draft.current = true;
+        clearTimeout(draftTimer.current);
+        draftTimer.current = setTimeout(endDraft, 150);
+      }
       schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     },
-    [commitPending, setAdjBoth, schedule],
+    [commitPending, setAdjBoth, schedule, endDraft],
   );
+
+  const edit = useCallback((mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => applyEdit(mutate, label, true), [applyEdit]);
 
   const change = useCallback(
     (mutate: (a: ParametricAdjustments) => ParametricAdjustments, label: string) => {
-      edit(mutate, label);
+      applyEdit(mutate, label, false);
       commitPending();
     },
-    [edit, commitPending],
+    [applyEdit, commitPending],
   );
 
   const applyState = useCallback(

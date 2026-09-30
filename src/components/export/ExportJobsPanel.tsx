@@ -1,14 +1,39 @@
-// Non-blocking export progress cards (top-right, below the top bar).
-import { X } from "lucide-react";
+// Non-blocking export progress cards (bottom-right). A finished job collapses to a 28 px pill after 8 s.
+import { CheckCircle2, FolderSearch, X } from "lucide-react";
 import type { JobView } from "../../hooks/useExportJobs";
 
 interface Props {
   jobs: JobView[];
   onCancel: (id: number) => void;
   onDismiss: (id: number) => void;
+  onReveal: (path: string) => void;
 }
 
-function Card({ job, onCancel, onDismiss }: { job: JobView; onCancel: (id: number) => void; onDismiss: (id: number) => void }) {
+function Pill({ job, onDismiss, onReveal }: { job: JobView; onDismiss: (id: number) => void; onReveal: (path: string) => void }) {
+  const f = job.finished!;
+  return (
+    <div
+      className="flex h-7 items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900/95 px-3 text-xs shadow-xl"
+      data-testid={`export-job-${job.id}`}
+      data-state="pill"
+    >
+      <CheckCircle2 className="size-3.5 text-emerald-400" />
+      <span data-testid="export-pill-text">
+        {f.cancelled ? "Export cancelled" : "Export done"} · {f.succeeded}
+      </span>
+      {job.outputDir && (
+        <button className="flex items-center gap-1 text-sky-300 hover:text-sky-200" onClick={() => onReveal(job.outputDir!)} data-testid="export-reveal">
+          <FolderSearch className="size-3.5" /> Reveal
+        </button>
+      )}
+      <button onClick={() => onDismiss(job.id)} aria-label="Dismiss export" data-testid="export-job-dismiss" className="text-neutral-400 hover:text-neutral-100">
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: (id: number) => void; onDismiss: (id: number) => void; onReveal: (path: string) => void }) {
   const f = job.finished;
   const pct = job.total > 0 ? Math.round((job.done / job.total) * 100) : 0;
   const title = job.presetName ?? "Export";
@@ -48,7 +73,7 @@ function Card({ job, onCancel, onDismiss }: { job: JobView; onCancel: (id: numbe
             {job.total === 0 && " · queued"}
           </p>
           {job.currentFile && (
-            <p className="truncate text-xs text-neutral-500" data-testid="export-current-file">
+            <p className="truncate text-xs text-neutral-400" data-testid="export-current-file">
               {job.currentFile}
             </p>
           )}
@@ -65,11 +90,16 @@ function Card({ job, onCancel, onDismiss }: { job: JobView; onCancel: (id: numbe
             {f.elapsedMs > 0 && ` in ${(f.elapsedMs / 1000).toFixed(1)}s`}
           </p>
           {job.outputDir ? (
-            <p className="break-all font-mono text-neutral-400 select-text" data-testid="export-output-dir">
-              {job.outputDir}
-            </p>
+            <div className="flex items-center gap-2">
+              <p className="min-w-0 flex-1 break-all font-mono text-neutral-400 select-text" data-testid="export-output-dir">
+                {job.outputDir}
+              </p>
+              <button className="flex shrink-0 items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-sky-300 hover:bg-neutral-700" onClick={() => onReveal(job.outputDir!)} data-testid="export-reveal">
+                <FolderSearch className="size-3.5" /> Reveal in Finder
+              </button>
+            </div>
           ) : (
-            <p className="text-neutral-500">Written next to the original RAW files</p>
+            <p className="text-neutral-400">Written next to the original RAW files</p>
           )}
           {f.failed.length > 0 && (
             <ul className="max-h-28 overflow-auto rounded bg-neutral-950 p-1.5 text-red-300" data-testid="export-failures">
@@ -86,13 +116,13 @@ function Card({ job, onCancel, onDismiss }: { job: JobView; onCancel: (id: numbe
   );
 }
 
-export function ExportJobsPanel({ jobs, onCancel, onDismiss }: Props) {
+export function ExportJobsPanel({ jobs, onCancel, onDismiss, onReveal }: Props) {
   if (jobs.length === 0) return null;
   return (
-    <div className="pointer-events-none fixed right-3 top-14 z-40 flex flex-col gap-2" data-testid="export-jobs">
+    <div className="pointer-events-none fixed bottom-24 right-3 z-40 flex flex-col items-end gap-2" data-testid="export-jobs">
       {jobs.map((j) => (
         <div key={j.id} className="pointer-events-auto">
-          <Card job={j} onCancel={onCancel} onDismiss={onDismiss} />
+          {j.finished && j.collapsed ? <Pill job={j} onDismiss={onDismiss} onReveal={onReveal} /> : <Card job={j} onCancel={onCancel} onDismiss={onDismiss} onReveal={onReveal} />}
         </div>
       ))}
     </div>

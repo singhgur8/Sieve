@@ -2,12 +2,15 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, ClipboardCopy, ClipboardPaste, Columns2, RefreshCw, RotateCcw, SplitSquareHorizontal, ZoomIn } from "lucide-react";
-import { commands, convertFileSrc, unwrap, type AdjustmentField, type LutInfo, type NormRect, type ParametricAdjustments, type Preset } from "../../ipc";
+import { ArrowLeft, ClipboardCopy, ClipboardPaste, Columns2, Flag, RefreshCw, RotateCcw, SplitSquareHorizontal, X, ZoomIn } from "lucide-react";
+import { commands, convertFileSrc, unwrap, type LutInfo, type NormRect, type Preset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor } from "../../hooks/useEditor";
-import { SceneBadge } from "../Cell";
+import { SceneBadge, Stars } from "../Cell";
+import { hint } from "../../lib/keymap";
+import { LABEL_COLOR } from "../../lib/format";
+import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
 import { AdjustPanel } from "./AdjustPanel";
 import { LeftPanel } from "./LeftPanel";
 import { FieldsDialog } from "./FieldsDialog";
@@ -18,16 +21,12 @@ export interface DevelopHandle {
   toggleZoom: () => void;
   copy: () => void;
   paste: () => void;
+  sync: () => void;
+  reset: () => void;
+  toggleSplit: () => void;
   undo: () => void;
   redo: () => void;
 }
-
-interface Copied {
-  adjustments: ParametricAdjustments;
-  fields: AdjustmentField[];
-}
-// Copied settings survive leaving and re-entering the Develop module.
-let clipboard: Copied | null = null;
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
 
@@ -52,7 +51,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [luts, setLuts] = useState<LutInfo[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [dialog, setDialog] = useState<Dialog>(null);
-  const [copied, setCopied] = useState<Copied | null>(clipboard);
+  const copied = useClipboard();
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
 
   const { refresh } = lib;
@@ -130,10 +129,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   );
 
   const doPaste = useCallback(() => {
-    if (!clipboard) return onNotice("Nothing copied yet (Cmd+Shift+C)");
+    const c = getClipboard();
+    if (!c) return onNotice("Nothing copied yet (Cmd+Shift+C)");
     const t = targets();
     if (!t.length) return;
-    const c = clipboard;
     void run(async () => {
       await editor.flush();
       await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
@@ -142,13 +141,16 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     });
   }, [targets, run, editor, afterBatch, onNotice]);
 
-  const doReset = () =>
-    void run(async () => {
-      const t = targets();
-      await editor.flush();
-      await unwrap(commands.resetAdjustments(t));
-      await afterBatch(t);
-    });
+  const doReset = useCallback(
+    () =>
+      void run(async () => {
+        const t = targets();
+        await editor.flush();
+        await unwrap(commands.resetAdjustments(t));
+        await afterBatch(t);
+      }),
+    [run, targets, editor, afterBatch],
+  );
 
   const doApplyPreset = (p: Preset) =>
     void run(async () => {
@@ -176,10 +178,13 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       toggleZoom: () => toggleZoom(),
       copy: () => setDialog({ kind: "copy" }),
       paste: doPaste,
+      sync: () => (syncTargets.length > 0 ? setDialog({ kind: "sync" }) : onNotice("Cmd/Shift-click other photos in the filmstrip to sync to them")),
+      reset: doReset,
+      toggleSplit: () => setSplit((v) => !v),
       undo: editor.undo,
       redo: editor.redo,
     }),
-    [toggleZoom, doPaste, editor.undo, editor.redo],
+    [toggleZoom, doPaste, doReset, syncTargets.length, onNotice, editor.undo, editor.redo],
   );
 
   // ---- filmstrip ----
@@ -201,38 +206,48 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-neutral-950" data-testid="develop-view" data-image-id={id ?? ""}>
       <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5 text-neutral-300">
-        <button className={btn()} onClick={onBack} title="Back to Library (G)" data-testid="develop-back">
+        <button className={btn()} onClick={onBack} title={`Back to Library${hint("toGrid")}`} data-testid="develop-back">
           <ArrowLeft className="size-3.5" /> Library
         </button>
-        <span className="text-xs text-neutral-500" data-testid="develop-filename">
+        <span className="text-xs text-neutral-300" data-testid="develop-filename">
           {entry?.fileName ?? ""}
         </span>
+        {entry && (
+          <span className="flex items-center gap-1.5" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
+            {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" aria-label="Picked" />}
+            {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} aria-label="Rejected" />}
+            <Stars n={entry.rating} />
+            {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={entry.colorLabel} />}
+          </span>
+        )}
         <div className="ml-4 flex gap-1">
-          <button className={btn(showBefore)} onClick={() => setShowBefore((v) => !v)} title="Before / after (\)" data-testid="before-toggle">
+          <button className={btn(showBefore)} onClick={() => setShowBefore((v) => !v)} title={`Before / after${hint("before")}`} data-testid="before-toggle">
             <Columns2 className="size-3.5" /> Before
           </button>
-          <button className={btn(split)} onClick={() => setSplit((v) => !v)} title="Split view" data-testid="split-toggle">
+          <button className={btn(split)} onClick={() => setSplit((v) => !v)} title={`Split view${hint("split")}`} data-testid="split-toggle">
             <SplitSquareHorizontal className="size-3.5" /> Split
           </button>
-          <button className={btn(zoom.on)} onClick={() => toggleZoom()} title="Zoom to 100% (Z)" data-testid="zoom-toggle">
+          <button className={btn(zoom.on)} onClick={() => toggleZoom()} title={`Zoom to 100%${hint("zoomDevelop")}`} data-testid="zoom-toggle">
             <ZoomIn className="size-3.5" /> 100%
           </button>
         </div>
         <div className="flex gap-1">
-          <button className={btn()} onClick={() => setDialog({ kind: "copy" })} title="Copy settings (Cmd+Shift+C)" data-testid="copy-settings">
+          <button className={btn()} onClick={() => setDialog({ kind: "copy" })} title={`Copy settings${hint("copy")}`} data-testid="copy-settings">
             <ClipboardCopy className="size-3.5" /> Copy
           </button>
-          <button className={btn()} disabled={!copied} onClick={doPaste} title="Paste settings (Cmd+Shift+V)" data-testid="paste-settings">
+          <button className={btn()} disabled={!copied} onClick={doPaste} title={`Paste settings${hint("paste")}`} data-testid="paste-settings">
             <ClipboardPaste className="size-3.5" /> Paste
           </button>
-          <button className={btn()} disabled={syncTargets.length === 0} onClick={() => setDialog({ kind: "sync" })} title="Sync settings to the other selected photos" data-testid="sync-settings">
-            <RefreshCw className="size-3.5" /> Sync
-          </button>
-          <button className={btn()} onClick={doReset} title="Reset all adjustments" data-testid="reset-all">
+          <span title={syncTargets.length === 0 ? "Cmd/Shift-click other photos in the filmstrip to sync to them" : `Sync settings to the other selected photos${hint("sync")}`}>
+            <button className={`${btn()} disabled:pointer-events-none`} disabled={syncTargets.length === 0} onClick={() => setDialog({ kind: "sync" })} data-testid="sync-settings">
+              <RefreshCw className="size-3.5" /> Sync
+            </button>
+          </span>
+          <button className={btn()} onClick={doReset} title={`Reset all adjustments${hint("reset")}`} data-testid="reset-all">
             <RotateCcw className="size-3.5" /> Reset
           </button>
         </div>
-        <span className="ml-auto text-[11px] tabular-nums text-neutral-600" data-testid="render-ms">
+        <span className="ml-auto text-[11px] tabular-nums text-neutral-400" data-testid="render-ms">
           {editor.main ? `${editor.main.width}x${editor.main.height} · ${Math.round(editor.main.renderMs)} ms` : ""}
         </span>
       </div>
@@ -295,10 +310,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                 data-active={active}
                 data-selected={sel.selected.has(fid)}
                 onClick={(ev) => sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey })}
-                className={`absolute top-2 overflow-hidden rounded bg-neutral-800 ${sel.selected.has(fid) ? "ring-2 ring-sky-500" : ""} ${active ? "outline outline-2 outline-white" : ""}`}
+                className={`absolute top-2 overflow-hidden rounded bg-neutral-800 ${sel.selected.has(fid) ? "ring-2 ring-sky-500" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
                 style={{ left: v.start, width: FILM, height: FILM }}
               >
                 {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${lib.version(fid)}`} alt="" draggable={false} className="size-full object-cover" />}
+                {e && (e.pick !== "unflagged" || e.colorLabel) && (
+                  <span className="pointer-events-none absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
+                    {e.pick === "pick" && <Flag className="size-3 fill-green-500 text-green-500" />}
+                    {e.pick === "reject" && <X className="size-3.5 text-red-500" strokeWidth={3} />}
+                    {e.colorLabel && <span className={`size-2 rounded-full ${LABEL_COLOR[e.colorLabel]}`} />}
+                  </span>
+                )}
+                {e && e.rating > 0 && (
+                  <span className="pointer-events-none absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5 text-[10px] leading-3 text-amber-400" data-testid={`film-rating-${fid}`}>
+                    {e.rating}★
+                  </span>
+                )}
                 {e && e.sceneId != null && (
                   <span className="absolute bottom-0.5 left-0.5">
                     <SceneBadge entry={e} testPrefix="film-scene" />
@@ -317,8 +344,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           confirm="Copy"
           onCancel={() => setDialog(null)}
           onConfirm={(fields) => {
-            clipboard = { adjustments: structuredClone(editor.adj), fields };
-            setCopied(clipboard);
+            setClipboard({ adjustments: structuredClone(editor.adj), fields });
             setDialog(null);
             onNotice(`Copied ${fields.length} setting group${fields.length === 1 ? "" : "s"}`);
           }}

@@ -48,6 +48,8 @@ declare global {
     __ipcLog: MockCall[];
     /** Test hook: delay (ms) before a `render_preview` call with this per-slot sequence number resolves. */
     __mockRenderDelay?: (seq: number, slot: string) => number;
+    /** Render concurrency observed by the mock (max renders awaiting a result at once). */
+    __mockRenderStats?: { inflight: number; maxInflight: number };
     /** Test hook: when true, export jobs only advance through `__mockExportStep`. */
     __mockExportManual?: boolean;
     /** Advances the running mock export job by n files (default 1); finishes it when done. */
@@ -342,7 +344,13 @@ export function installMockBackend(count: number) {
     const seq = (seqs.get(key) ?? 0) + 1;
     seqs.set(key, seq);
     const delay = window.__mockRenderDelay?.(seq, o.slot) ?? 0;
+    const stats = (window.__mockRenderStats ??= { inflight: 0, maxInflight: 0 });
+    stats.inflight++;
+    stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    stats.inflight--;
+    // Like the real backend: only the newest render per (image, slot) is kept; superseded ones resolve to null.
+    if (seqs.get(key) !== seq) return null;
     const q = new URLSearchParams({ v: String(seq), e: a.exposure.toFixed(2), lut: a.lut?.id ?? "", region: o.region ? "1" : "" });
     return {
       imageId: id,
