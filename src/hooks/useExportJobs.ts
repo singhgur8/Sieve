@@ -45,7 +45,8 @@ const fromJob = (j: ExportJob): Partial<JobView> => ({
 
 const COLLAPSE_MS = 8000;
 
-export function useExportJobs(onError: (e: unknown) => void) {
+/** `projectId` scopes the list to that project's jobs (null = every job). */
+export function useExportJobs(onError: (e: unknown) => void, projectId: number | null = null) {
   const [jobs, setJobs] = useState<JobView[]>([]);
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
 
@@ -59,25 +60,57 @@ export function useExportJobs(onError: (e: unknown) => void) {
     });
   }, []);
 
+  // Jobs of this project (started here, or confirmed by `get_export_jobs`) and of other projects (ignored).
+  const mine = useRef(new Set<number>());
+  const foreign = useRef(new Set<number>());
+  const checking = useRef(new Set<number>());
+  const inScope = useCallback((j: ExportJob) => projectId == null || j.projectId == null || j.projectId === projectId, [projectId]);
+
+  /** Runs `fn` when `jobId` belongs to this project; unknown jobs are looked up once (events carry no project). */
+  const ifMine = useCallback(
+    (jobId: number, fn: () => void) => {
+      if (projectId == null || mine.current.has(jobId)) return fn();
+      if (foreign.current.has(jobId) || checking.current.has(jobId)) return;
+      checking.current.add(jobId);
+      unwrap(commands.getExportJobs())
+        .then((list) => {
+          const j = list.find((x) => x.id === jobId);
+          if (!j || inScope(j)) {
+            mine.current.add(jobId);
+            fn();
+          } else foreign.current.add(jobId);
+        })
+        .catch(() => {})
+        .finally(() => checking.current.delete(jobId));
+    },
+    [projectId, inScope],
+  );
+
   useEffect(() => {
     unwrap(commands.getExportJobs())
       .then((list) =>
         list
-          .filter((j) => j.state === "queued" || j.state === "running")
-          .forEach((j) => upsert(j.id, (c) => (c.finished ? {} : { ...fromJob(j), running: true }))),
+          .filter((j) => (j.state === "queued" || j.state === "running") && inScope(j))
+          .forEach((j) => {
+            mine.current.add(j.id);
+            upsert(j.id, (c) => (c.finished ? {} : { ...fromJob(j), running: true }));
+          }),
       )
       .catch(() => {});
     // Progress may arrive before export_images resolves; unknown jobs are created on the fly.
     const unlisten = [
       events.exportProgress.listen((ev) => {
         const p = ev.payload;
-        upsert(p.jobId, (c) =>
-          c.finished ? {} : { total: p.total, done: p.done, failed: p.failed, skipped: p.skipped, currentFile: p.currentFile, running: true },
+        ifMine(p.jobId, () =>
+          upsert(p.jobId, (c) =>
+            c.finished ? {} : { total: p.total, done: p.done, failed: p.failed, skipped: p.skipped, currentFile: p.currentFile, running: true },
+          ),
         );
       }),
       events.exportFinished.listen((ev) => {
         const f = ev.payload;
         f.failed.forEach((x) => noteFailure(x.reason));
+        ifMine(f.jobId, () => {
         upsert(f.jobId, (c) => ({
           finished: f,
           running: false,
@@ -95,6 +128,7 @@ export function useExportJobs(onError: (e: unknown) => void) {
           }, COLLAPSE_MS);
           timers.current.add(t);
         }
+        });
       }),
     ];
     const pending = timers.current;
@@ -102,9 +136,15 @@ export function useExportJobs(onError: (e: unknown) => void) {
       unlisten.forEach((u) => void u.then((fn) => fn()));
       pending.forEach((t) => clearTimeout(t));
     };
-  }, [upsert]);
+  }, [upsert, ifMine, inScope]);
 
-  const track = useCallback((j: ExportJob) => upsert(j.id, (c) => (c.finished ? {} : fromJob(j))), [upsert]);
+  const track = useCallback(
+    (j: ExportJob) => {
+      mine.current.add(j.id);
+      upsert(j.id, (c) => (c.finished ? {} : fromJob(j)));
+    },
+    [upsert],
+  );
 
   const cancel = useCallback(
     async (id: number) => {

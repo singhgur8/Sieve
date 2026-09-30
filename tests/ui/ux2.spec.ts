@@ -673,7 +673,7 @@ test.describe("P2 items", () => {
   });
 
   test("empty catalog hides the filter bar and toolbar; copy mentions JPEG / HEIC", async ({ page }) => {
-    await page.goto("/?mock=0");
+    await page.goto("/?mock=0&scope=all");
     await expect(page.getByTestId("filter-bar")).toHaveCount(0);
     await expect(page.getByTestId("grid-toolbar")).toHaveCount(0);
     await expect(page.getByText("JPEG, HEIC, TIFF, PNG when enabled in Import")).toBeVisible();

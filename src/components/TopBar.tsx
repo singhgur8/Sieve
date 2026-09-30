@@ -1,10 +1,11 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
 import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, Maximize, MoreHorizontal, RefreshCw, ScanSearch, Share, SlidersHorizontal, Layers3 } from "lucide-react";
-import type { CatalogState, ImportOptions, ShootType, XmpStatus } from "../ipc";
+import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
 import { Menu, menuItem } from "./Menu";
+import { ProjectSwitcher } from "./ProjectSwitcher";
 
 const SHOOT_TYPES: ShootType[] = ["wedding", "portrait", "sports", "event", "landscape", "general"];
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -13,6 +14,11 @@ const seg = (on: boolean) => `flex h-7 items-center gap-1 whitespace-nowrap roun
 
 interface Props {
   catalog: CatalogState | null;
+  /** Open project (null = all photos, dev mock only). */
+  project?: Project | null;
+  onHome?: () => void;
+  onOpenProject?: (id: number) => Promise<void>;
+  onSetCover?: (() => void) | null;
   analysis: AnalysisView | null;
   xmp: XmpStatus | null;
   busy: boolean;
@@ -71,10 +77,13 @@ export function TopBar(p: Props) {
   ];
   return (
     <div className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 px-3" data-testid="top-bar">
-      <Aperture className="size-5 shrink-0 text-amber-400" />
-      <h1 className="mr-1 font-semibold tracking-tight">Sieve</h1>
+      <button onClick={p.onHome} disabled={!p.onHome} className="flex items-center gap-2 rounded-md hover:opacity-80 disabled:hover:opacity-100" data-testid="home-button" title="All projects">
+        <Aperture className="size-5 shrink-0 text-amber-400" />
+        <h1 className={`font-semibold tracking-tight `}>Sieve</h1>
+      </button>
+      {p.project && p.onHome && p.onOpenProject && <ProjectSwitcher project={p.project} onHome={p.onHome} onOpenProject={p.onOpenProject} onSetCover={p.onSetCover ?? null} />}
       <div className="flex" data-testid="import-split">
-        <button onClick={p.onImport} disabled={p.busy} className={`${btn} rounded-r-none`} data-testid="import-button" title={`Import a shoot folder${hint("import")}`}>
+        <button onClick={p.onImport} disabled={p.busy} className={`${btn} rounded-r-none`} data-testid="import-button" title={`${p.project ? "Add a folder to this project" : "Import a shoot folder"}${hint("import")}`}>
           <FolderOpen className="size-4" />
           {p.busy ? "Importing…" : "Import"}
         </button>
@@ -104,7 +113,7 @@ export function TopBar(p: Props) {
         </Menu>
       </div>
       <label className="flex items-center gap-1 text-xs text-neutral-400">
-        Shoot
+        <span className="max-[1400px]:hidden">Shoot</span>
         <select
           value={c?.shootType ?? "general"}
           onChange={(e) => p.onShootType(e.target.value as ShootType)}
@@ -180,7 +189,7 @@ export function TopBar(p: Props) {
           title="Write XMP sidecars for every photo with unsaved changes"
         >
           <CloudUpload className="size-3.5" />
-          {dirty} photo{dirty === 1 ? "" : "s"} not saved to XMP{xmp && xmp.failed > 0 ? ` · ${xmp.failed} failed` : ""}
+          {dirty} photo{dirty === 1 ? "" : "s"}<span className="max-[1400px]:hidden"> not saved to XMP</span>{xmp && xmp.failed > 0 ? ` · ${xmp.failed} failed` : ""}
         </button>
       )}
       {dirty === 0 && xmp && xmp.failed > 0 && (

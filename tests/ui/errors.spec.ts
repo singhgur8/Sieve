@@ -94,7 +94,7 @@ test.describe("missing and unreadable files", () => {
 
   test("decode failure shows a cell placeholder with the reason", async ({ page }) => {
     await page.route(/\/mock\/(thumb|preview)\/\d+\.jpg/, (r) => r.fulfill({ contentType: "image/svg+xml", body: "<svg xmlns='http://www.w3.org/2000/svg'/>" }));
-    await page.goto("/?mock=200&errors=1");
+    await page.goto("/?mock=200&scope=all&errors=1");
     const cell = page.getByTestId("thumb-failed-7");
     await expect(cell).toBeVisible();
     await expect(cell).toHaveAttribute("title", /Could not decode \/shoot\/DSC00007\.ARW/);
@@ -107,7 +107,7 @@ test.describe("missing and unreadable files", () => {
 
   test("a cached preview that fails to load shows a placeholder, not a broken image", async ({ page }) => {
     await page.route(/\/mock\/(thumb|preview)\/\d+\.jpg/, (r) => r.abort());
-    await page.goto("/?mock=50");
+    await page.goto("/?mock=50&scope=all");
     await expect(page.getByTestId("thumb-broken").first()).toContainText("Preview unavailable");
     await shot(page, `${P}thumb-broken`);
   });

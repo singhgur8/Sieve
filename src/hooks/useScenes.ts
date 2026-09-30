@@ -24,6 +24,7 @@ export interface ScenesApi {
 
 export function useScenes(
   folderId: number | null,
+  projectId: number | null,
   sceneFilter: number | null,
   lib: Library,
   onError: (e: unknown) => void,
@@ -42,10 +43,10 @@ export function useScenes(
   libRef.current = lib;
 
   const reloadScenes = useCallback(async () => {
-    const list = await unwrap(commands.listScenes(folderId, null));
+    const list = await unwrap(commands.listScenes(folderId, projectId));
     setScenes(list);
     return list;
-  }, [folderId]);
+  }, [folderId, projectId]);
 
   useEffect(() => {
     reloadScenes().catch(onError);
@@ -86,7 +87,7 @@ export function useScenes(
     setDetecting(true);
     setProgress({ task: "detect", done: 0, total: 0 });
     try {
-      const found = await unwrap(commands.detectScenes(folderId, null, null));
+      const found = await unwrap(commands.detectScenes(folderId, projectId, null));
       notify(found.length === 0 ? "No scenes found. Scenes need photos taken close together in similar light; make one from a selection with Scene > New scene from selection." : `Detected ${found.length} scene${found.length === 1 ? "" : "s"}`);
       await sync();
     } catch (e) {
@@ -95,7 +96,7 @@ export function useScenes(
       setDetecting(false);
       setProgress(null);
     }
-  }, [folderId, sync, notify, onError]);
+  }, [folderId, projectId, sync, notify, onError]);
 
   const createFromImages = useCallback(
     (imageIds: number[]) =>

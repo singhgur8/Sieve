@@ -553,7 +553,7 @@ test.describe("P1-8 XMP pill", () => {
 test.describe("P1-9 empty states", () => {
   test("empty catalog shows the import call to action", async ({ page }) => {
     await page.route(/\/mock\/(thumb|preview)\/\d+\.jpg/, (r) => r.fulfill({ contentType: "image/svg+xml", body: "<svg xmlns='http://www.w3.org/2000/svg'/>" }));
-    await page.goto("/?mock=0");
+    await page.goto("/?mock=0&scope=all");
     await expect(page.getByTestId("grid-empty-catalog")).toBeVisible();
     await expect(page.getByTestId("grid-empty-catalog")).toContainText("Import a shoot folder to start");
     await expect(page.getByTestId("grid-empty-catalog")).toContainText("ARW");

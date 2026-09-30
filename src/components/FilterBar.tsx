@@ -40,17 +40,17 @@ export function isFiltered(q: Query): boolean {
 }
 
 /** Filter counts for the current folder; refreshed whenever the library changes (`epoch`). */
-export function useFilterCounts(folderId: number | null, epoch: number): FilterCounts | null {
+export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number): FilterCounts | null {
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   useEffect(() => {
     let stale = false;
-    unwrap(commands.getFilterCounts(folderId, null))
+    unwrap(commands.getFilterCounts(folderId, projectId))
       .then((c) => !stale && setCounts(c))
       .catch(() => {});
     return () => {
       stale = true;
     };
-  }, [folderId, epoch]);
+  }, [folderId, projectId, epoch]);
   return counts;
 }
 

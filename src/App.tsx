@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ColorLabel, type Scene, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
+import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType } from "./ipc";
 import { BASE_QUERY, useLibrary, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -38,8 +38,19 @@ const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8":
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
-export default function App() {
-  const [query, setQuery] = useState<Query>(BASE_QUERY);
+interface AppProps {
+  /** The open project; every query, count, scene list, import, analysis and export job is scoped to it (null = no scope, dev mock only). */
+  project: Project | null;
+  onHome: () => void;
+  onOpenProject: (id: number) => Promise<void>;
+}
+
+export default function App({ project: projectProp, onHome, onOpenProject }: AppProps) {
+  const [project, setProject] = useState(projectProp);
+  const projectId = project?.id ?? null;
+  const [queryState, setQuery] = useState<Query>(BASE_QUERY);
+  // The project scope is applied here, so resetting filters (BASE_QUERY) can never leave the project.
+  const query = useMemo<Query>(() => ({ ...queryState, projectId }), [queryState, projectId]);
   const [mode, setMode] = useState<Mode>("grid");
   const [cmp, setCmp] = useState<CompareState | null>(null);
   const [size, setSize] = useState(200);
@@ -78,10 +89,10 @@ export default function App() {
   const lib = useLibrary(query, reportError);
   reloadRef.current = () => void lib.reload();
   const { ids } = lib;
-  const exportJobs = useExportJobs(reportError);
+  const exportJobs = useExportJobs(reportError, projectId);
   const sel = useSelection(ids);
-  const scenes = useScenes(query.folderId, query.sceneId ?? null, lib, reportError, setNotice);
-  const counts = useFilterCounts(query.folderId, lib.epoch);
+  const scenes = useScenes(query.folderId, projectId, query.sceneId ?? null, lib, reportError, setNotice);
+  const counts = useFilterCounts(query.folderId, projectId, lib.epoch);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
@@ -222,7 +233,7 @@ export default function App() {
         if (a == null) return;
         const entry = lib.getEntry(a);
         if (entry?.burstGroupId != null) {
-          const groups = await unwrap(commands.listBurstGroups(query.folderId, query.projectId ?? null));
+          const groups = await unwrap(commands.listBurstGroups(query.folderId, projectId));
           const g = groups.find((x) => x.id === entry.burstGroupId);
           if (g) {
             b = g.keeperImageId != null && g.keeperImageId !== a ? g.keeperImageId : g.imageIds.find((x) => x !== a);
@@ -243,7 +254,7 @@ export default function App() {
     } catch (e) {
       reportError(e);
     }
-  }, [ids, mode, sel, lib, query.folderId, reportError, setNotice]);
+  }, [ids, mode, sel, lib, query.folderId, projectId, reportError, setNotice]);
 
   const openDevelop = useCallback(() => {
     const target = sel.active ?? ids[0];
@@ -452,6 +463,39 @@ export default function App() {
     [setError, reportError],
   );
 
+  /** The catalog as this project sees it: its folders and shoot type (shoot type is per project since v14). */
+  const catalog = status.catalog;
+  const scopedCatalog = useMemo(
+    () => (catalog && project ? { ...catalog, folders: catalog.folders.filter((f) => f.projectId === project.id), shootType: project.shootType } : catalog),
+    [catalog, project],
+  );
+
+  // Header counts / step follow the library (imports, culling, edits all bump `lib.epoch`).
+  const refreshProject = useCallback(async () => {
+    if (projectId == null) return;
+    try {
+      setProject(await unwrap(commands.getProject(projectId)));
+    } catch (e) {
+      reportError(e);
+    }
+  }, [projectId, reportError]);
+  useEffect(() => {
+    void refreshProject();
+  }, [lib.epoch, refreshProject]);
+
+  const setCover = useCallback(
+    async (imageId: number) => {
+      if (projectId == null) return;
+      try {
+        setProject(await unwrap(commands.setProjectCover(projectId, imageId)));
+        setNotice("Project cover updated");
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    [projectId, reportError, setNotice],
+  );
+
   const importFolder = useCallback(
     () =>
       void run(async () => {
@@ -459,7 +503,7 @@ export default function App() {
         if (typeof path !== "string") return;
         setBusy(true);
         try {
-          const s = await unwrap(commands.importFolder(path, importOptsRef.current, null));
+          const s = await unwrap(commands.importFolder(path, importOptsRef.current, projectId));
           setNotice(`Imported ${s.added} new (${s.skipped} already known, ${s.sidecarsRead} sidecars read${s.companions > 0 ? `, ${s.companions} JPEG pairs` : ""})`);
           await status.refreshCatalog();
           await lib.reload();
@@ -467,7 +511,7 @@ export default function App() {
           setBusy(false);
         }
       }),
-    [run, status, lib, setNotice],
+    [run, status, lib, setNotice, projectId],
   );
 
   /** "Locate folder…": pick the moved folder, relink the catalog folder to it, refresh everything. */
@@ -479,7 +523,7 @@ export default function App() {
           const [first] = await unwrap(commands.listImageIds({ ...query, missingOnly: true, folderId: null, sceneId: null, offset: 0, limit: 1 }));
           if (first != null) folderId = (await unwrap(commands.getImage(first))).folderId;
         }
-        folderId ??= status.catalog?.folders[0]?.id;
+        folderId ??= scopedCatalog?.folders[0]?.id;
         if (folderId == null) return;
         const path = await open({ directory: true, title: "Locate folder" });
         if (typeof path !== "string") return;
@@ -489,7 +533,7 @@ export default function App() {
         await status.refreshCatalog();
         await lib.reset();
       }),
-    [run, lib, query, status, push],
+    [run, lib, query, status, push, scopedCatalog],
   );
 
   const restoreBackup = useCallback(
@@ -508,7 +552,7 @@ export default function App() {
   const analyze = (kind: "pending" | "all") =>
     void run(async () => {
       status.setAnalysis((a) => ({ done: 0, total: a?.total ?? 0, failed: 0, running: true }));
-      await unwrap(commands.analyzeImages({ kind }));
+      await unwrap(commands.analyzeImages(kind === "all" && projectId != null ? { kind: "project", projectId } : { kind }));
     });
 
   const askApplySuggestions = () => {
@@ -554,7 +598,7 @@ export default function App() {
     const entry = id != null ? lib.getEntry(id) : undefined;
     if (id == null || entry?.burstGroupId == null) return setNotice("The active photo is not part of a burst");
     try {
-      const groups = await unwrap(commands.listBurstGroups(query.folderId, query.projectId ?? null));
+      const groups = await unwrap(commands.listBurstGroups(query.folderId, projectId));
       const g = groups.find((x) => x.id === entry.burstGroupId);
       const members = g ? g.imageIds.filter((x) => ids.includes(x)) : [];
       if (members.length === 0) return setNotice("Burst members are hidden by the current filters");
@@ -563,7 +607,7 @@ export default function App() {
     } catch (e) {
       reportError(e);
     }
-  }, [active, lib, query.folderId, ids, sel, reportError, setNotice]);
+  }, [active, lib, query.folderId, projectId, ids, sel, reportError, setNotice]);
 
   const toggleScenes = useCallback(() => {
     if (scenesOpen) {
@@ -744,9 +788,9 @@ export default function App() {
   });
 
   const importActive = status.progress !== null && status.progress.done < status.progress.total;
-  const catalog = status.catalog;
   const running = exportJobs.jobs.filter((j) => j.running);
   const exportPct = running.length ? Math.round((running.reduce((a, j) => a + j.done, 0) / Math.max(1, running.reduce((a, j) => a + j.total, 0))) * 100) : null;
+  const catalogEmpty = project ? project.photoCount === 0 : catalog != null && catalog.imageCount === 0;
   const filtered = isFiltered(query);
   const clearFilters = () => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }));
 
@@ -757,7 +801,11 @@ export default function App() {
         <IssueBanner issue={status.catalogIssue} onDismiss={() => status.setCatalogIssue(null)} onRestore={catalog && catalog.health.backups.length > 0 ? () => setRestoreOpen(true) : undefined} />
       )}
       <TopBar
-        catalog={catalog}
+        catalog={scopedCatalog}
+        project={project}
+        onHome={onHome}
+        onOpenProject={onOpenProject}
+        onSetCover={active != null && project ? () => void setCover(active) : null}
         analysis={status.analysis}
         xmp={status.xmp}
         busy={busy}
@@ -775,8 +823,13 @@ export default function App() {
         onImportOptions={setImportOpts}
         onShootType={(t: ShootType) =>
           void run(async () => {
-            await unwrap(commands.setShootType(t));
-            await status.refreshCatalog();
+            if (projectId != null) {
+              await unwrap(commands.setProjectShootType(projectId, t));
+              await refreshProject();
+            } else {
+              await unwrap(commands.setShootType(t));
+              await status.refreshCatalog();
+            }
           })
         }
         onAnalyze={analyze}
@@ -846,7 +899,7 @@ export default function App() {
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 
       {mode === "grid" ? (
-        catalog != null && catalog.imageCount === 0 ? null : (
+        catalogEmpty ? null : (
         <>
           {filtersOpen ? (
             <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
@@ -864,7 +917,7 @@ export default function App() {
             capsLock={caps}
             autoAdvance={autoAdvance}
             onAutoAdvance={setAutoAdvance}
-            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={catalog} onLocate={() => locateFolder()} /> : null}
+            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
         </>
         )
@@ -904,7 +957,7 @@ export default function App() {
           onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
           onCellDoubleClick={openLoupe}
           onRate={ratePhoto}
-          catalogEmpty={catalog != null && catalog.imageCount === 0}
+          catalogEmpty={catalogEmpty}
           filtered={filtered}
           onImport={importFolder}
           onClearFilters={clearFilters}
