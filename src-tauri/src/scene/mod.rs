@@ -20,6 +20,7 @@
 //!   callback, so Phase 9 (match to an arbitrary reference photo) reuses it unchanged.
 //! - Apply (`apply_scene_match`): `develop::history::commit_batch` (one entry per image).
 
+pub mod color;
 pub mod detect;
 pub mod features;
 pub mod matching;
