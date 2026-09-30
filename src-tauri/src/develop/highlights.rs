@@ -13,6 +13,11 @@
 //! `v_c <- v_c + w_c * (max(v_c, s * chroma_c) - v_c)`, `s` = the pixel's brightness
 //! measured on its unclipped channels (at least what the clipped ones prove).
 //!
+//! Like Camera Raw, the rebuilt colour is then desaturated toward its brightest channel as
+//! the evidence goes: a little with one clipped channel, fully with two or three (measured:
+//! Camera Raw keeps some sky hue where only green clipped, renders two-channel clipped
+//! skies neutral; AZA06509's 43 % blown sky: dE 3.8 -> 2.0).
+//!
 //! The field depends on the image content only (not on the view), so region renders sample
 //! the whole frame's field (`pipeline::ToneContext`).
 
@@ -27,6 +32,9 @@ const GRID: usize = 64;
 /// the chromaticity of nearby highlights.
 const VOTE_LO: f32 = 0.25;
 const VOTE_HI: f32 = 0.6;
+/// Desaturation of rebuilt pixels per clip weight of the most / second-most clipped channel.
+const DESAT_ONE: f32 = 0.3;
+const DESAT_TWO: f32 = 1.0;
 
 /// TEMP experiment knobs (`SIEVE_K="name=v,..."`).
 pub fn knob(name: &str, default: f32) -> f32 {
@@ -214,13 +222,25 @@ fn push_pull(cells: Vec<[f32; 4]>, w: usize, h: usize, full: f32) -> Vec<[f32; 3
 }
 
 /// Reconstructs a white-balanced camera pixel `v` (unclipped; raw fraction `v / mul`) from
-/// its unclipped channels and the local highlight chromaticity `chroma` (sum 1).
+/// its unclipped channels and the local highlight chromaticity `chroma` (sum 1), then
+/// desaturates it by how many channels were clipped.
 #[inline]
 pub fn reconstruct(v: [f32; 3], mul: [f32; 3], chroma: [f32; 3]) -> [f32; 3] {
     let w = [0, 1, 2].map(|c| clip_weight(v[c] / mul[c]));
     if w[0] == 0.0 && w[1] == 0.0 && w[2] == 0.0 {
         return v;
     }
+    let o = rebuild(v, w, chroma);
+    let mut ws = w;
+    ws.sort_by(|a, b| b.total_cmp(a));
+    let d = (DESAT_ONE * ws[0] + DESAT_TWO * ws[1]).min(1.0);
+    let mx = o[0].max(o[1]).max(o[2]);
+    o.map(|c| c + (mx - c) * d)
+}
+
+/// The rebuild step of [`reconstruct`] for clip weights `w`.
+#[inline]
+fn rebuild(v: [f32; 3], w: [f32; 3], chroma: [f32; 3]) -> [f32; 3] {
     let ch = chroma.map(|c| c.max(1e-4));
     // Brightness from the unclipped channels, faded out as the last one clips.
     let (mut num, mut den, mut valid) = (0.0f32, 0.0f32, 0.0f32);
@@ -234,13 +254,10 @@ pub fn reconstruct(v: [f32; 3], mul: [f32; 3], chroma: [f32; 3]) -> [f32; 3] {
     }
     let s_u = if den > 1e-6 { num / den * (valid / 0.05).min(1.0) } else { 0.0 };
     let s = s_u.max(bound);
-    let o = [0, 1, 2].map(|c| {
+    [0, 1, 2].map(|c| {
         let est = (s * ch[c]).max(v[c]);
         v[c] + (est - v[c]) * w[c]
-    });
-    let d = knob("desat", 0.0) * w[0].max(w[1]).max(w[2]);
-    let m = (o[0] + o[1] + o[2]) / 3.0;
-    o.map(|c| c + (m - c) * d)
+    })
 }
 
 #[cfg(test)]
@@ -255,27 +272,37 @@ mod tests {
 
     #[test]
     fn clipped_green_is_rebuilt_from_red_and_blue() {
-        // Sky: chroma r:g:b = 0.25:0.33:0.42, true value 3.0 * chroma; green clipped at 1.
+        // Sky: chroma r:g:b = 0.25:0.33:0.42, true value 3.3 * chroma; only green clipped.
         let chroma = [0.25, 0.33, 0.42];
         let mul = [2.0, 1.0, 1.6];
-        let truth = chroma.map(|c| c * 3.6);
+        let truth = chroma.map(|c| c * 3.3);
         let v = [truth[0], 1.0, truth[2]];
-        let r = reconstruct(v, mul, chroma);
+        let w = [0, 1, 2].map(|c| clip_weight(v[c] / mul[c]));
+        let r = rebuild(v, w, chroma);
         assert!((r[1] - truth[1]).abs() < 1e-3, "{r:?} vs {truth:?}");
         assert_eq!(r[0], v[0]);
         assert_eq!(r[2], v[2]);
+        // Only green clipped: keeps most of the sky's hue (blue > green > red).
+        let full = reconstruct(v, mul, chroma);
+        assert!(full[2] > full[1] && full[1] > full[0], "{full:?}");
+        assert!(full[2] / full[0] > 1.2, "{full:?}");
     }
 
     #[test]
-    fn fully_clipped_pixel_takes_the_local_chroma_without_darkening() {
+    fn fully_clipped_pixel_renders_white_without_darkening() {
         let mul = [2.0, 1.0, 1.5];
         let chroma = [0.25, 0.33, 0.42];
-        let r = reconstruct(mul, mul, chroma);
+        let w = [1.0; 3];
+        // The rebuild alone takes the neighbourhood's hue ...
+        let r = rebuild(mul, w, chroma);
         for c in 0..3 {
             assert!(r[c] >= mul[c] - 1e-6);
         }
-        // Hue of the neighbourhood (blue > green > red).
         assert!(r[2] / r[1] > 1.2 && r[1] / r[0] > 1.2, "{r:?}");
+        // ... but with no channel left the result is neutral at the brightest level.
+        let f = reconstruct(mul, mul, chroma);
+        assert!((f[0] - f[1]).abs() < 1e-5 && (f[1] - f[2]).abs() < 1e-5, "{f:?}");
+        assert!(f[0] >= mul[0] - 1e-6);
     }
 
     #[test]

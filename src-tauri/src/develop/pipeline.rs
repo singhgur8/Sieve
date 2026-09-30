@@ -622,7 +622,53 @@ struct Chain<'a> {
     curve: SqrtTable,
     rgb_curves: [Option<Vec<f32>>; 3],
     grade: Grade,
+    /// Camera Raw's highlight roll-off at the raw clip level (pre-exposure).
+    shoulder: Option<Shoulder>,
     _marker: std::marker::PhantomData<&'a ()>,
+}
+
+/// Highlight roll-off anchored at the raw clip level (pre-exposure scene EV, neutral clip =
+/// 0), measured on real frames: Camera Raw renders near-clip and reconstructed values
+/// `delta(e) = STRENGTH * WIDTH * ln(1 + exp((e - KNEE) / WIDTH))` EV darker than its
+/// exposure / tone model of unclipped data implies (0.04 EV at -1.5, ~0.33 at the clip).
+/// Applied hue-preservingly on the RGB max/min (like the tone curve), so it also
+/// desaturates the brightest colours.
+struct Shoulder {
+    table: SqrtTable,
+    rgb: bool,
+}
+
+impl Shoulder {
+    fn new() -> Self {
+        let (c, k, w) = (highlights::knob("shc", 0.4), highlights::knob("shk", -0.6), highlights::knob("shw", 0.5));
+        let table = SqrtTable::new(LUT_LOG_MAX.exp2(), 4096, move |x| {
+            if x <= 0.0 {
+                return 0.0;
+            }
+            let e = x.log2();
+            let d = c * w * (1.0 + ((e - k) / w).exp()).ln();
+            x * (-d).exp2()
+        });
+        Shoulder { table, rgb: highlights::knob("shrgb", 1.0) > 0.0 }
+    }
+
+    #[inline]
+    fn apply(&self, v: [f32; 3]) -> [f32; 3] {
+        if self.rgb {
+            let [r, g, b] = v;
+            let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+            let (h2, l2) = (self.table.eval(hi), self.table.eval(lo));
+            let map = |c: f32| if hi > lo { l2 + (h2 - l2) * (c - lo) / (hi - lo) } else { h2 };
+            [map(r), map(g), map(b)]
+        } else {
+            let y = dot(PROPHOTO_Y, v);
+            if y <= 0.0 {
+                return v;
+            }
+            let k = self.table.eval(y) / y;
+            v.map(|c| c * k)
+        }
+    }
 }
 
 impl Chain<'_> {
@@ -664,6 +710,9 @@ impl Chain<'_> {
         let mut v = v0.map(|c| c.max(0.0));
         if let Some(t) = self.hsm {
             v = t.apply(v, 1.0);
+        }
+        if let Some(s) = &self.shoulder {
+            v = s.apply(v);
         }
         v = v.map(|c| c * self.exposure_gain);
         if let Some(t) = self.dcp_look {
@@ -962,6 +1011,7 @@ fn develop(
         curve,
         rgb_curves: [luts.red, luts.green, luts.blue],
         grade: Grade::new(&adj.color_grading),
+        shoulder: (!display && highlights::knob("sh", 1.0) > 0.0).then(Shoulder::new),
         _marker: std::marker::PhantomData,
     };
     let lut = Lut3::build(&chain, quality.lut_size());
@@ -1697,6 +1747,7 @@ mod tests {
             ),
             rgb_curves: [None, None, None],
             grade: Grade::new(&adj.color_grading),
+            shoulder: None,
             _marker: std::marker::PhantomData,
         };
         for (n, tol) in [(33, (1.5f32, 6.0f32)), (65, (0.5, 2.0))] {
