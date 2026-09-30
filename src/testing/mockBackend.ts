@@ -47,7 +47,7 @@ export function installMockBackend(count: number) {
     const inBurst = i % 25 < 4;
     const group = Math.floor(i / 25) + 1;
     const tags = TAGS.filter(() => rand() < 0.08).map((tag) => ({ tag, source: "auto" as const, confidence: 0.8, suppressed: false }));
-    if (inBurst && i % 25 !== 1) tags.push({ tag: "duplicate_burst", source: "auto", confidence: 1, suppressed: false });
+    if (inBurst && i % 25 !== 1 && !tags.some((t) => t.tag === "duplicate_burst")) tags.push({ tag: "duplicate_burst", source: "auto", confidence: 1, suppressed: false });
     const overall = rand();
     const entry: RawImageEntry = {
       id,

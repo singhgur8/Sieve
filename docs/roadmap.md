@@ -38,15 +38,15 @@ Conventions
 - [x] **QA gate**.
   - Acceptance: full sample set analyzed; avg < 50 ms/image at preview size; precision ≥ 0.8 for `blink` and `missed_focus` on the labeled set (report recall too); burst groups sensible on spot-check.
 
-## Phase 4 — Culling UI + XMP write
-- [ ] **Contract** (architect): XMP sync commands (`write_xmp`, `read_xmp`, auto-sync setting), keyboard-driven batch ops.
-- [ ] **XMP sidecars** (rust-engine-dev): mapping — reject → `xmp:Rating -1`; stars → `xmp:Rating 0–5`; pick → `xmp:Label "Pick"` (color labels otherwise via `xmp:Label`); auto tags → `lr:hierarchicalSubject` `Sieve|<tag>` + `dc:subject`. Preserve unrelated existing XMP fields; read existing sidecars on import.
-- [ ] **Grid** (frontend-dev): virtualized grid, 5,000+ items at 60 fps, thumbnail sizes, sort.
-- [ ] **Filter bar** (frontend-dev): include/exclude tags (any/all), pick, min rating, burst, folder.
-- [ ] **Loupe + compare** (frontend-dev): single loupe with zoom to 100%, 2-up burst compare, face-crop zoom.
-- [ ] **Keyboard** (frontend-dev): Lightroom keys — P / X / U, 0–5, arrows, Space loupe, C compare, auto-advance.
-- [ ] **UI tests** (frontend-dev): Playwright against Vite dev server with `@tauri-apps/api/mocks`; screenshots saved for orchestrator review.
-- [ ] **QA gate**.
+## Phase 4 — Culling UI + XMP write ✅
+- [x] **Contract** (architect): XMP sync commands (`write_xmp`, `read_xmp`, auto-sync setting), keyboard-driven batch ops.
+- [x] **XMP sidecars** (rust-engine-dev): mapping — reject → `xmp:Rating -1`; stars → `xmp:Rating 0–5`; pick → `xmp:Label "Pick"` (color labels otherwise via `xmp:Label`); auto tags → `lr:hierarchicalSubject` `Sieve|<tag>` + `dc:subject`. Preserve unrelated existing XMP fields; read existing sidecars on import.
+- [x] **Grid** (frontend-dev): virtualized grid, 5,000+ items at 60 fps, thumbnail sizes, sort.
+- [x] **Filter bar** (frontend-dev): include/exclude tags (any/all), pick, min rating, burst, folder.
+- [x] **Loupe + compare** (frontend-dev): single loupe with zoom to 100%, 2-up burst compare, face-crop zoom.
+- [x] **Keyboard** (frontend-dev): Lightroom keys — P / X / U, 0–5, arrows, Space loupe, C compare, auto-advance.
+- [x] **UI tests** (frontend-dev): Playwright against Vite dev server with `@tauri-apps/api/mocks`; screenshots saved for orchestrator review.
+- [x] **QA gate**.
   - Acceptance: Playwright suite passes; `exiftool` reads ratings/labels/keywords from written sidecars on a `test-data/` copy; Lightroom-compatible field names; real app launches and culls sample set end to end.
 
 ## Phase 5 — Editor
@@ -106,3 +106,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 2 complete: own FFI to libraw_r + TurboJPEG, direct ARW/RAF/CR3 container parsing, rayon ingest pipeline (8 threads). QA: 34 tests + 2 real-sample ignored tests pass; 396/396 ARW ready, 0 null capture times; 160.9 files/s; footprint 252 MB (100 files) vs 264 MB (396); EXIF/orientation match exiftool; frontend list + progress + retry, stale-race and cache-bust fixes. Sample folder trimmed to 396 by user. GUI rendering not screenshot-verified (terminal lacks Screen Recording permission); app launches on QA catalog with no runtime errors.
 - 2026-09-29 — Phase 3 Contract: IPC v3 (analyze_images/cancel/status, CullThresholds per shoot type, FaceInfo, BurstGroup, suggestions + apply_suggestions, auto-analyze), migration 0003. Gate: 37 tests, clippy, fmt, build green.
 - 2026-09-29 — Phase 3 complete: SCRFD + 106-pt landmarks (CoreML), OMZ eye-state CNN + FaceMesh V2 head pitch (CPU), per-eye sharpness, bursts (time + pHash), per-shoot-type scoring, analysis worker. Ground truth: 50 sampled + 53 review frames (test-data/labels.json v2). Fix round 1 after held-out precision failed (blink 0.43, missed_focus 0.55). Final (orchestrator re-run): blink P 1.00 R 0.22 (5/0/18), missed_focus P 0.85 R 0.61 (11/2/7), 14.0 ms/image throughput (44 ms single-thread), 396/396 analyzed, 23 bursts; no tagged frames outside labeled sets. Caveat: blink is deliberately conservative (undetermined when signals disagree); recall low.
+- 2026-09-29 — Phase 4 complete: IPC v4 + migration 0004; XMP sidecars via span-preserving quick-xml merge (Rating -1 reject, Label Pick/colors, lr:hierarchicalSubject Sieve|<tag> + dc:subject; crs:/foreign keywords preserved byte-for-byte), newer-wins debounced auto-sync (off by default); virtualized grid (@tanstack/react-virtual), filter bar, loupe/face zoom/2-up compare, Lightroom keys. QA: 94 Rust tests + 5 ignored (exiftool round trip on real ARW copies) pass; Playwright 14/14 (5,000 items, max 66 DOM nodes, 16.7 ms/frame scroll); real app launches on demo catalog with CoreML, no errors. Product renamed LumenRAW -> Sieve (user request). Caveat: real GUI not visually verified by orchestrator (no Screen Recording permission) — covered by Playwright on mock backend.
