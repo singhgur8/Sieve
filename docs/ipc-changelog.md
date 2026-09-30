@@ -388,3 +388,40 @@ Frontend API summary
   warnings. Strength slider recomputes locally with `lerpAdjustments` (no new `matchScene` call).
 - Apply: `applySceneMatch(selected.map(p => ({ imageId: p.targetId, adjustments: lerpAdjustments(p.base, p.full,
   strength) })), null)`; then refresh rows (`getImages`) and history; undo per image via the existing history.
+
+## v8 — 2026-09-29 (UX additions, from `docs/ux-review-1.md` "Needs architect")
+Types (new)
+- `ApplySuggestionsResult { applied, skipped }`.
+- `CullSnapshot { imageId, rating, pick, colorLabel }` (culling undo; tags not included).
+- `UiPrefs { lastExportFolder?: string | null }` (extensible; all fields optional).
+
+Commands
+- BREAKING `apply_suggestions(ids, onlyUnset: boolean) -> ApplySuggestionsResult` (was `(ids) -> number`).
+  `onlyUnset` skips images already flagged (`pick != unflagged`) or rated (`rating != 0`); `skipped` also counts
+  unanalyzed images. XMP notified only when something was applied.
+- New `set_burst_keeper(groupId, imageId) -> BurstGroup`: user-chosen keeper; moves `duplicate_burst`
+  (keeper loses it, other members gain it; suppressed/user rows untouched), pins the choice so regrouping keeps
+  it, notifies XMP sync and kicks a `rescore` (suggestions follow; `analysisFinished` when done).
+  Unknown group/image -> `not_found`; non-member -> `invalid_argument`.
+- New `get_cull_snapshot(ids) -> CullSnapshot[]` and `restore_cull_snapshot(snapshots) -> number[]` (changed ids).
+  Restore is atomic (unknown id / rating > 5 -> nothing written), marks changed images XMP-dirty, notifies sync.
+- New `get_ui_prefs() -> UiPrefs` / `set_ui_prefs(prefs) -> null` (replace whole struct; stored as JSON in
+  `catalog_meta['ui_prefs']`; unreadable JSON reads as defaults).
+- New `reveal_in_finder(path) -> null`: `/usr/bin/open -R <path>` (no shell). Path must be absolute
+  (`invalid_argument`) and exist (`not_found`). No plugin/capability needed.
+- New `write_xmp_all_dirty(folderId | null) -> XmpSyncReport`: writes every XMP-dirty image (catalog wins),
+  regardless of auto-sync. Chosen over an `ImageQuery.xmpDirtyOnly` flag (one call, no id round trip).
+
+Schema (migration `0008_ux.sql`, user_version 8)
+- `burst_keeper_pins (image_id PK -> images ON DELETE CASCADE, pinned_at)`. `ml::worker::rescore_all` applies
+  pins via `ml::bursts::apply_pins` (pinned member with best `overall` becomes keeper).
+
+Who updates what
+- architect (done): types, commands (bodies implemented: thin repo/store code), registration, migration, repo
+  `apply_suggestions`/`cull_snapshot`/`restore_cull_snapshot`/`ui_prefs`/`set_ui_prefs`, `ml::store::{set_burst_keeper,
+  set_duplicate_tag, pinned_keepers}` (+ `write_bursts` now uses `set_duplicate_tag`), `ml::bursts::apply_pins` +
+  its call in `rescore_all`, `xmp::XmpSync::write_dirty` + `xmp::store::dirty_ids_in`, tests for each, bindings,
+  mock backend cases, `App.tsx` call site of `applySuggestions` (passes `false`, reads `.applied`).
+- vision-ml-dev: nothing required; review `apply_pins` in `rescore_all`.
+- rust-engine-dev: nothing required; review `XmpSync::write_dirty`.
+- frontend-dev: build the UX items on these commands (see architecture.md "UX additions (v8)").

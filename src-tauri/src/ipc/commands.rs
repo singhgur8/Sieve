@@ -717,8 +717,10 @@ pub async fn list_burst_groups(catalog: State<'_, Catalog>, folder_id: Option<Fo
     catalog.run(move |c| repo::list_burst_groups(c, folder_id)).await
 }
 
-/// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`
-/// (unanalyzed images skipped). Returns the number of images updated.
+/// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
+/// Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
+/// (`pick != unflagged` or `rating != 0`). Atomic; unknown ids -> `not_found`.
+/// For undo, take `get_cull_snapshot(ids)` first.
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_suggestions(
@@ -726,10 +728,121 @@ pub async fn apply_suggestions(
     catalog: State<'_, Catalog>,
     xmp: State<'_, XmpSync>,
     ids: Vec<ImageId>,
-) -> AppResult<u32> {
-    let updated = catalog.run(move |c| repo::apply_suggestions(c, &ids)).await?;
+    only_unset: bool,
+) -> AppResult<ApplySuggestionsResult> {
+    let result = catalog.run(move |c| repo::apply_suggestions(c, &ids, only_unset)).await?;
+    if result.applied > 0 {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+/// Makes `imageId` the keeper of burst `groupId`: it loses `duplicate_burst`, the other
+/// members gain it (suppressed/user tag rows are left alone). The choice is pinned, so
+/// regrouping keeps it. Kicks a rescore so suggested rating/pick follow the new keeper
+/// (`analysisFinished` when done). Unknown group/image -> `not_found`; image not a member ->
+/// `invalid_argument`. Returns the updated group.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_burst_keeper(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    xmp: State<'_, XmpSync>,
+    group_id: BurstGroupId,
+    image_id: ImageId,
+) -> AppResult<BurstGroup> {
+    let group = catalog
+        .run(move |c| {
+            ml::store::set_burst_keeper(c, group_id, image_id)?;
+            repo::list_burst_groups(c, None)?
+                .into_iter()
+                .find(|g| g.id == group_id)
+                .ok_or_else(|| AppError::not_found(format!("burst group {group_id}")))
+        })
+        .await?;
     xmp.notify(&app);
-    Ok(updated)
+    analysis.start(&app, AnalysisScope::Rescore)?;
+    Ok(group)
+}
+
+// ---------------------------------------------------------------------------
+// Culling undo & UI preferences (v8)
+// ---------------------------------------------------------------------------
+
+/// Current rating/pick/label of `ids` (in order), to push on a culling undo stack before a
+/// change. Unknown ids -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_cull_snapshot(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<Vec<CullSnapshot>> {
+    catalog.run(move |c| repo::cull_snapshot(c, &ids)).await
+}
+
+/// Writes snapshots back (undo/redo). Atomic: unknown id -> `not_found`, rating > 5 ->
+/// `invalid_argument`, nothing written. Changed images become XMP-dirty (auto-sync notified).
+/// Returns the ids whose values changed (refetch them with `get_images`).
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_cull_snapshot(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    snapshots: Vec<CullSnapshot>,
+) -> AppResult<Vec<ImageId>> {
+    let changed = catalog.run(move |c| repo::restore_cull_snapshot(c, &snapshots)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(changed)
+}
+
+/// Per-catalog UI preferences (defaults when never set).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_ui_prefs(catalog: State<'_, Catalog>) -> AppResult<UiPrefs> {
+    catalog.run(|c| repo::ui_prefs(c)).await
+}
+
+/// Replaces the stored UI preferences (read-modify-write: send the full struct).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_ui_prefs(catalog: State<'_, Catalog>, prefs: UiPrefs) -> AppResult<()> {
+    catalog.run(move |c| repo::set_ui_prefs(c, &prefs)).await
+}
+
+/// Reveals `path` (file or folder) in Finder, selected. Must be absolute and exist
+/// (`invalid_argument` / `not_found`). macOS only (`internal` elsewhere).
+#[tauri::command]
+#[specta::specta]
+pub async fn reveal_in_finder(path: String) -> AppResult<()> {
+    blocking(move || reveal(Path::new(&path))).await
+}
+
+fn validate_reveal_path(path: &Path) -> AppResult<()> {
+    if !path.is_absolute() {
+        return Err(AppError::invalid(format!("path must be absolute: {}", path.display())));
+    }
+    if !path.exists() {
+        return Err(AppError::not_found(format!("{} does not exist", path.display())));
+    }
+    Ok(())
+}
+
+fn reveal(path: &Path) -> AppResult<()> {
+    validate_reveal_path(path)?;
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::internal("reveal_in_finder is only supported on macOS"));
+    }
+    // No shell: the path is a single argument. `open -R` returns once Finder has the request.
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .status()
+        .map_err(|e| AppError::internal(format!("open -R: {e}")))?;
+    if !status.success() {
+        return Err(AppError::internal(format!("open -R exited with {status}")));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +865,15 @@ where
 pub async fn write_xmp(xmp: State<'_, XmpSync>, ids: Vec<ImageId>) -> AppResult<XmpSyncReport> {
     let sync = xmp.inner().clone();
     blocking(move || sync.write_images(&ids)).await
+}
+
+/// "Save all": writes sidecars for every XMP-dirty image of `folderId` (all folders for
+/// `null`) now, whether or not auto-sync is on (catalog wins, like `write_xmp`).
+#[tauri::command]
+#[specta::specta]
+pub async fn write_xmp_all_dirty(xmp: State<'_, XmpSync>, folder_id: Option<FolderId>) -> AppResult<XmpSyncReport> {
+    let sync = xmp.inner().clone();
+    blocking(move || sync.write_dirty(folder_id)).await
 }
 
 /// Reads rating/pick/label (and crs: develop settings, see `xmp::crs`) from existing sidecars
@@ -983,4 +1105,21 @@ pub async fn get_render_stats(
     let cache = develop.inner().clone();
     let luts = luts.inner().clone();
     blocking(move || scene::stats::render_stats(&cache, &luts, &input.src, &adjustments, region)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::error::ErrorKind;
+
+    #[test]
+    fn reveal_validates_path() {
+        assert_eq!(validate_reveal_path(Path::new("relative/x.jpg")).unwrap_err().kind, ErrorKind::InvalidArgument);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(validate_reveal_path(&dir.path().join("missing.jpg")).unwrap_err().kind, ErrorKind::NotFound);
+        let file = dir.path().join("a b;$(x).jpg");
+        std::fs::write(&file, b"x").unwrap();
+        validate_reveal_path(&file).unwrap();
+        validate_reveal_path(dir.path()).unwrap();
+    }
 }

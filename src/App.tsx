@@ -437,8 +437,8 @@ export default function App() {
   const applyAll = () =>
     void run(async () => {
       const t = sel.selected.size > 0 ? [...sel.selected] : ids;
-      const n = await unwrap(commands.applySuggestions(t));
-      setNotice(`Applied suggestions to ${n} of ${t.length} photos`);
+      const { applied } = await unwrap(commands.applySuggestions(t, false));
+      setNotice(`Applied suggestions to ${applied} of ${t.length} photos`);
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
     });

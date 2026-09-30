@@ -381,6 +381,20 @@ fn write_images_creates_sidecars_and_clears_dirty() {
 }
 
 #[test]
+fn write_dirty_writes_only_dirty_images_of_the_folder() {
+    let f = Fixture::new(3);
+    let mut conn = f.conn();
+    assert_eq!(f.sync.write_dirty(None).unwrap(), XmpSyncReport::default());
+    repo::set_rating(&mut conn, &[f.ids[0], f.ids[2]], 3).unwrap();
+    assert_eq!(f.sync.write_dirty(Some(2)).unwrap().succeeded, 0, "other folder: nothing");
+    let report = f.sync.write_dirty(Some(1)).unwrap();
+    assert_eq!((report.succeeded, report.failed.len()), (2, 0));
+    assert!(f.sidecar(0).exists() && !f.sidecar(1).exists() && f.sidecar(2).exists());
+    assert!(f.ids.iter().all(|&id| !f.state(id).0));
+    assert_eq!(f.sync.write_dirty(None).unwrap().succeeded, 0, "clean now");
+}
+
+#[test]
 fn unknown_ids_fail_before_touching_files() {
     let f = Fixture::new(2);
     let err = f.sync.write_images(&[f.ids[0], 999]).unwrap_err();

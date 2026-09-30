@@ -87,10 +87,12 @@ export const commands = {
 	/**  Burst groups with members, optionally limited to groups touching `folderId`. */
 	listBurstGroups: (folderId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId })),
 	/**
-	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`
-	 *  (unanalyzed images skipped). Returns the number of images updated.
+	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
+	 *  Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
+	 *  (`pick != unflagged` or `rating != 0`). Atomic; unknown ids -> `not_found`.
+	 *  For undo, take `get_cull_snapshot(ids)` first.
 	 */
-	applySuggestions: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("apply_suggestions", { ids })),
+	applySuggestions: (ids: number[], onlyUnset: boolean) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset })),
 	/**
 	 *  Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
 	 *  edits). Atomic: an unknown id fails with `not_found`.
@@ -303,6 +305,39 @@ export const commands = {
 	width: number,
 	height: number,
 } | null) => typedError<ImageStats, AppError>(__TAURI_INVOKE("get_render_stats", { id, adjustments, region })),
+	/**
+	 *  Makes `imageId` the keeper of burst `groupId`: it loses `duplicate_burst`, the other
+	 *  members gain it (suppressed/user tag rows are left alone). The choice is pinned, so
+	 *  regrouping keeps it. Kicks a rescore so suggested rating/pick follow the new keeper
+	 *  (`analysisFinished` when done). Unknown group/image -> `not_found`; image not a member ->
+	 *  `invalid_argument`. Returns the updated group.
+	 */
+	setBurstKeeper: (groupId: number, imageId: number) => typedError<BurstGroup, AppError>(__TAURI_INVOKE("set_burst_keeper", { groupId, imageId })),
+	/**
+	 *  Current rating/pick/label of `ids` (in order), to push on a culling undo stack before a
+	 *  change. Unknown ids -> `not_found`.
+	 */
+	getCullSnapshot: (ids: number[]) => typedError<CullSnapshot[], AppError>(__TAURI_INVOKE("get_cull_snapshot", { ids })),
+	/**
+	 *  Writes snapshots back (undo/redo). Atomic: unknown id -> `not_found`, rating > 5 ->
+	 *  `invalid_argument`, nothing written. Changed images become XMP-dirty (auto-sync notified).
+	 *  Returns the ids whose values changed (refetch them with `get_images`).
+	 */
+	restoreCullSnapshot: (snapshots: CullSnapshot[]) => typedError<number[], AppError>(__TAURI_INVOKE("restore_cull_snapshot", { snapshots })),
+	/**  Per-catalog UI preferences (defaults when never set). */
+	getUiPrefs: () => typedError<UiPrefs, AppError>(__TAURI_INVOKE("get_ui_prefs")),
+	/**  Replaces the stored UI preferences (read-modify-write: send the full struct). */
+	setUiPrefs: (prefs: UiPrefs) => typedError<null, AppError>(__TAURI_INVOKE("set_ui_prefs", { prefs })),
+	/**
+	 *  Reveals `path` (file or folder) in Finder, selected. Must be absolute and exist
+	 *  (`invalid_argument` / `not_found`). macOS only (`internal` elsewhere).
+	 */
+	revealInFinder: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_in_finder", { path })),
+	/**
+	 *  "Save all": writes sidecars for every XMP-dirty image of `folderId` (all folders for
+	 *  `null`) now, whether or not auto-sync is on (catalog wins, like `write_xmp`).
+	 */
+	writeXmpAllDirty: (folderId: number | null) => typedError<XmpSyncReport, AppError>(__TAURI_INVOKE("write_xmp_all_dirty", { folderId })),
 };
 
 /** Events */
@@ -436,6 +471,14 @@ export type AppError = {
 	message: string,
 };
 
+/**  Result of `apply_suggestions`. */
+export type ApplySuggestionsResult = {
+	/**  Images whose rating/pick were set from the suggestions. */
+	applied: number,
+	/**  Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated. */
+	skipped: number,
+};
+
 /**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
 export type BitDepth = "8" | "16";
 
@@ -515,6 +558,19 @@ export type CollisionPolicy =
 
 /**  Lightroom-compatible colour labels (`xmp:Label`). */
 export type ColorLabel = "red" | "yellow" | "green" | "blue" | "purple";
+
+/**
+ *  The user's culling values of one image, for a frontend culling undo stack:
+ *  `get_cull_snapshot` before a change, `restore_cull_snapshot` to undo it.
+ *  Tags are not included (undo a tag change with the inverse `set_user_tag`).
+ */
+export type CullSnapshot = {
+	imageId: number,
+	/**  0..=5. */
+	rating: number,
+	pick: PickFlag,
+	colorLabel: ColorLabel | null,
+};
 
 /**  Granular reason a frame may be culled (or deliberately kept). */
 export type CullTag = "blink" | "missed_focus" | "motion_blur" | 
@@ -1547,6 +1603,15 @@ width: number; height: number } |
 export type TiffCompression = "none" | "lzw" | 
 /**  Deflate (Adobe "ZIP"). */
 "zip";
+
+/**
+ *  Small per-catalog UI preferences. Every field is optional so the struct can grow;
+ *  `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
+ */
+export type UiPrefs = {
+	/**  Folder last chosen in the export dialog (absolute path). */
+	lastExportFolder?: string | null,
+};
 
 /**  White balance. `AsShot` uses the camera's recorded multipliers. */
 export type WhiteBalance = { mode: "as_shot" } | 

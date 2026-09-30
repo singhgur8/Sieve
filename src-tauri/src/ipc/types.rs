@@ -2159,6 +2159,42 @@ pub struct MatchApplication {
     pub adjustments: ParametricAdjustments,
 }
 
+// ---------------------------------------------------------------------------
+// UX additions (IPC v8)
+// ---------------------------------------------------------------------------
+
+/// Result of `apply_suggestions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplySuggestionsResult {
+    /// Images whose rating/pick were set from the suggestions.
+    pub applied: u32,
+    /// Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated.
+    pub skipped: u32,
+}
+
+/// The user's culling values of one image, for a frontend culling undo stack:
+/// `get_cull_snapshot` before a change, `restore_cull_snapshot` to undo it.
+/// Tags are not included (undo a tag change with the inverse `set_user_tag`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CullSnapshot {
+    pub image_id: ImageId,
+    /// 0..=5.
+    pub rating: u8,
+    pub pick: PickFlag,
+    pub color_label: Option<ColorLabel>,
+}
+
+/// Small per-catalog UI preferences. Every field is optional so the struct can grow;
+/// `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UiPrefs {
+    /// Folder last chosen in the export dialog (absolute path).
+    pub last_export_folder: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
