@@ -410,6 +410,50 @@ impl DevelopCache {
     pub fn cached_bytes(&self) -> u64 {
         lock(&self.inner.lru).map.values().map(|(e, _)| e.bytes()).sum()
     }
+
+    /// Blocking. Renders `adjustments` (already validated) through the same source + pipeline
+    /// as [`Self::render`] and returns the pixels instead of an encoded JPEG: no tickets, no
+    /// latest-wins, nothing stored for the protocol. Used by scene matching / render stats
+    /// (Phase 7), so measurements see exactly what the editor shows. Also returns
+    /// `lut_missing` and the as-shot white balance (as in [`Self::info`]).
+    pub fn render_image(
+        &self,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+        region: Option<NormRect>,
+        max_edge: u32,
+        luts: &LutLibrary,
+    ) -> AppResult<RenderedPixels> {
+        let entry = self.entry(src)?;
+        let prepared = entry.prepared(src.orientation(), region, max_edge);
+        self.evict(src.id);
+        let lut = match &adjustments.lut {
+            Some(l) => luts.load(&l.id)?,
+            None => None,
+        };
+        let lut_missing = adjustments.lut.is_some() && lut.is_none();
+        let input = pipeline::RenderInput {
+            width: prepared.width,
+            height: prepared.height,
+            pixels: &prepared.pixels,
+            color: &entry.image.color,
+            frame_long_edge: prepared.frame_long_edge,
+        };
+        let image = pipeline::render(&input, adjustments, lut.as_deref());
+        let color = &entry.image.color;
+        let as_shot = color.as_shot_mul.map(|m| wb::values_for(m, &color.xyz_to_cam));
+        Ok(RenderedPixels { image, lut_missing, as_shot })
+    }
+}
+
+/// Result of [`DevelopCache::render_image`].
+#[derive(Debug, Clone)]
+pub struct RenderedPixels {
+    /// 8-bit sRGB output, orientation applied (exactly what the preview JPEG encodes).
+    pub image: pipeline::RenderedImage,
+    pub lut_missing: bool,
+    /// Camera as-shot white balance, `None` if the file has none.
+    pub as_shot: Option<crate::ipc::types::WhiteBalanceValues>,
 }
 
 /// URL of a render in the webview. `sieve://localhost/...` on macOS/Linux,

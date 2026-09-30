@@ -137,6 +137,8 @@ export function installMockBackend(count: number) {
       colorLabel: null,
       burstGroupId: inBurst ? group : null,
       isBurstKeeper: inBurst && i % 25 === 1,
+      sceneId: null,
+      isSceneAnchor: false,
       tags,
       quality: {
         overall,
@@ -201,6 +203,7 @@ export function installMockBackend(count: number) {
       if (q.maxRating != null && r.rating > q.maxRating) return false;
       if (q.colorLabels.length && (!r.colorLabel || !q.colorLabels.includes(r.colorLabel))) return false;
       if (q.collapseBursts && r.burstGroupId != null && !r.isBurstKeeper) return false;
+      if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
       return true;
     });
     const key: Record<string, (r: RawImageEntry) => number | string> = {
