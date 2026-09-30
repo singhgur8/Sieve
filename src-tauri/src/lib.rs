@@ -3,19 +3,22 @@ pub mod ingest;
 pub mod ipc;
 pub mod ml;
 pub mod raw;
+pub mod xmp;
 
 use std::path::PathBuf;
 
 use tauri::Manager;
-use tauri_specta::{collect_commands, collect_events, Builder};
+use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
     AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ImportProgress, ThumbnailFailed, ThumbnailReady,
+    XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use ml::{Analysis, AnalysisConfig};
+use xmp::{XmpSync, XmpSyncConfig};
 
 /// Overrides the catalog location (useful for tests and scratch catalogs).
 const CATALOG_ENV: &str = "LUMENRAW_CATALOG";
@@ -55,6 +58,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::get_faces,
             commands::list_burst_groups,
             commands::apply_suggestions,
+            commands::get_images,
+            commands::list_image_ids,
+            commands::get_filter_counts,
+            commands::write_xmp,
+            commands::read_xmp,
+            commands::set_xmp_auto_sync,
+            commands::get_xmp_status,
         ])
         .events(collect_events![
             ImportProgress,
@@ -63,7 +73,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             AnalysisProgress,
             AnalysisReady,
             AnalysisFailed,
-            AnalysisFinished
+            AnalysisFinished,
+            XmpSynced,
+            XmpWriteFailed
         ])
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
@@ -108,12 +120,18 @@ pub fn run() {
             let auto_analyze = catalog.auto_analyze_blocking()?;
             app.manage(catalog);
             app.manage(Ingest::new(config));
-            app.manage(Analysis::new(AnalysisConfig { catalog_path: path, models_dir }));
+            app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
+            app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path }));
+            // Auto tags change during analysis; flush them (if auto-sync is on) once it settles.
+            let handle = app.handle().clone();
+            AnalysisFinished::listen(app.handle(), move |_| handle.state::<XmpSync>().notify(&handle));
             // Resume thumbnails left `pending` (and analysis left undone) by a previous session.
             app.state::<Ingest>().start(app.handle())?;
             if auto_analyze {
                 app.state::<Analysis>().start(app.handle(), AnalysisScope::Pending)?;
             }
+            // Flush sidecar changes left dirty by a previous session (no-op unless auto-sync).
+            app.state::<XmpSync>().notify(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())

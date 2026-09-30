@@ -13,6 +13,7 @@ use super::types::*;
 use crate::db::{self, repo};
 use crate::ingest::{self, Ingest};
 use crate::ml::{self, Analysis};
+use crate::xmp::XmpSync;
 
 /// Managed state: the open catalog.
 pub struct Catalog {
@@ -84,7 +85,7 @@ pub async fn set_burst_window(
 }
 
 /// Registers RAW files under `path` (fast: no decoding; new thumbnails start `pending`),
-/// then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
+/// reads existing XMP sidecars (rating/pick/label) of new or externally changed images, then kicks the background ingest pipeline (and analysis, if `autoAnalyze`) and
 /// returns. Progress arrives as `importProgress` / `thumbnailReady` / `thumbnailFailed`
 /// (and `analysis*`) events.
 #[tauri::command]
@@ -94,11 +95,15 @@ pub async fn import_folder(
     catalog: State<'_, Catalog>,
     ingest: State<'_, Ingest>,
     analysis: State<'_, Analysis>,
+    xmp: State<'_, XmpSync>,
     path: String,
     options: ImportOptions,
 ) -> AppResult<ImportSummary> {
-    let (summary, auto) =
+    let (mut summary, auto) =
         catalog.run(move |c| Ok((repo::import_folder(c, Path::new(&path), &options)?, repo::auto_analyze(c)?))).await?;
+    let sync = xmp.inner().clone();
+    let folder_id = summary.folder_id;
+    summary.sidecars_read = blocking(move || sync.refresh_folder(folder_id)).await?;
     ingest.start(&app)?;
     if auto {
         analysis.start(&app, AnalysisScope::Pending)?;
@@ -145,38 +150,88 @@ pub async fn get_image(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<Ra
     catalog.run(move |c| repo::get_image(c, id)).await
 }
 
+/// Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
+/// edits). Atomic: an unknown id fails with `not_found`.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_rating(catalog: State<'_, Catalog>, ids: Vec<ImageId>, rating: u8) -> AppResult<()> {
-    catalog.run(move |c| repo::set_rating(c, &ids, rating)).await
+pub async fn get_images(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<Vec<RawImageEntry>> {
+    catalog.run(move |c| repo::get_images(c, &ids)).await
+}
+
+/// Every id matching `query` in its sort order, ignoring `offset`/`limit`
+/// (select-all, loupe navigation, batch actions over a filter).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> AppResult<Vec<ImageId>> {
+    catalog.run(move |c| repo::list_image_ids(c, &query)).await
+}
+
+/// Filter-bar facet counts for `folderId` (`null` = whole catalog).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_filter_counts(catalog: State<'_, Catalog>, folder_id: Option<FolderId>) -> AppResult<FilterCounts> {
+    catalog.run(move |c| repo::filter_counts(c, folder_id)).await
+}
+
+// Culling writes. Each marks changed images `xmp.dirty` (DB triggers) and notifies the
+// XMP auto-sync writer (no-op unless `xmpAutoSync`).
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_rating(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    ids: Vec<ImageId>,
+    rating: u8,
+) -> AppResult<()> {
+    catalog.run(move |c| repo::set_rating(c, &ids, rating)).await?;
+    xmp.notify(&app);
+    Ok(())
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_pick(catalog: State<'_, Catalog>, ids: Vec<ImageId>, pick: PickFlag) -> AppResult<()> {
-    catalog.run(move |c| repo::set_pick(c, &ids, pick)).await
+pub async fn set_pick(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    ids: Vec<ImageId>,
+    pick: PickFlag,
+) -> AppResult<()> {
+    catalog.run(move |c| repo::set_pick(c, &ids, pick)).await?;
+    xmp.notify(&app);
+    Ok(())
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn set_color_label(
+    app: AppHandle,
     catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
     ids: Vec<ImageId>,
     label: Option<ColorLabel>,
 ) -> AppResult<()> {
-    catalog.run(move |c| repo::set_color_label(c, &ids, label)).await
+    catalog.run(move |c| repo::set_color_label(c, &ids, label)).await?;
+    xmp.notify(&app);
+    Ok(())
 }
 
 /// Adds (`present = true`) or removes a tag as the user. Removing an auto tag suppresses it.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_user_tag(
+    app: AppHandle,
     catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
     ids: Vec<ImageId>,
     tag: CullTag,
     present: bool,
 ) -> AppResult<()> {
-    catalog.run(move |c| repo::set_user_tag(c, &ids, tag, present)).await
+    catalog.run(move |c| repo::set_user_tag(c, &ids, tag, present)).await?;
+    xmp.notify(&app);
+    Ok(())
 }
 
 /// Stored adjustments, or neutral defaults for an unedited image.
@@ -280,6 +335,67 @@ pub async fn list_burst_groups(catalog: State<'_, Catalog>, folder_id: Option<Fo
 /// (unanalyzed images skipped). Returns the number of images updated.
 #[tauri::command]
 #[specta::specta]
-pub async fn apply_suggestions(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<u32> {
-    catalog.run(move |c| repo::apply_suggestions(c, &ids)).await
+pub async fn apply_suggestions(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    ids: Vec<ImageId>,
+) -> AppResult<u32> {
+    let updated = catalog.run(move |c| repo::apply_suggestions(c, &ids)).await?;
+    xmp.notify(&app);
+    Ok(updated)
+}
+
+// ---------------------------------------------------------------------------
+// XMP sidecars (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Runs blocking file/DB work off the async runtime.
+async fn blocking<T, F>(f: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f).await.map_err(|e| AppError::internal(e.to_string()))?
+}
+
+/// Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
+/// preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
+#[tauri::command]
+#[specta::specta]
+pub async fn write_xmp(xmp: State<'_, XmpSync>, ids: Vec<ImageId>) -> AppResult<XmpSyncReport> {
+    let sync = xmp.inner().clone();
+    blocking(move || sync.write_images(&ids)).await
+}
+
+/// Reads rating/pick/label from existing sidecars of `ids` into the catalog (sidecar wins).
+/// Images without a sidecar are `skipped`; refetch `report.changed`.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_xmp(xmp: State<'_, XmpSync>, ids: Vec<ImageId>) -> AppResult<XmpSyncReport> {
+    let sync = xmp.inner().clone();
+    blocking(move || sync.read_images(&ids)).await
+}
+
+/// Turns automatic (debounced) sidecar writing on/off. Enabling flushes every dirty image.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_xmp_auto_sync(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    enabled: bool,
+) -> AppResult<()> {
+    catalog.run(move |c| repo::set_xmp_auto_sync(c, enabled)).await?;
+    if enabled {
+        xmp.notify(&app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>) -> AppResult<XmpStatus> {
+    let running = xmp.is_running();
+    catalog.run(move |c| repo::xmp_status(c, running)).await
 }

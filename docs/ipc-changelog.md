@@ -106,3 +106,54 @@ Who updates what
 - frontend-dev: listen to `analysis*` events, show progress/cancel, `isBurstKeeper`, suggestions with an
   "apply suggestions" action; thresholds editor and auto-analyze toggle are optional in Phase 3 (Phase 4 UI).
   `DEFAULT_QUERY` unchanged.
+
+## v4 — 2026-09-29 (Phase 4: culling UI + XMP sidecars)
+Types
+- `RawImageEntry.xmp: XmpSyncState { dirty, syncedAtMs, error }`.
+- New `XmpSyncReport { succeeded, skipped, failed: XmpFailure[], changed: number[] }`,
+  `XmpFailure { imageId, reason }`, `XmpStatus { dirty, failed, running, autoSync }`.
+- New `FilterCounts { total, tags: TagCount[], picked, rejected, unflagged, ratings: number[6], burstGroups,
+  burstNonKeepers }`.
+- `CatalogState.xmpAutoSync: boolean`; `ImportSummary.sidecarsRead: number`.
+- `ImageQuery` (BREAKING): `pick: PickFlag | null` replaced by `picks: PickFlag[]` (any of; `[]` = no filter).
+  New `maxRating: number | null`, `colorLabels: ColorLabel[]`, `collapseBursts: boolean` (hide non-keeper burst
+  members), `sortDescending: boolean` (reverses the natural order). `ImageSort` gains `rating` (most stars first).
+  Rating bounds > 5 fail with `invalid_argument`. `DEFAULT_QUERY` in `src/ipc/index.ts` updated.
+
+Commands (new)
+- `get_images(ids) -> RawImageEntry[]` (given order; atomic `not_found`).
+- `list_image_ids(query) -> number[]` (all matches in sort order; offset/limit ignored) — select-all / batch ops.
+- `get_filter_counts(folderId | null) -> FilterCounts`.
+- `write_xmp(ids) -> XmpSyncReport` (catalog wins), `read_xmp(ids) -> XmpSyncReport` (sidecar wins).
+- `set_xmp_auto_sync(enabled) -> null` (enabling flushes dirty images), `get_xmp_status() -> XmpStatus`.
+
+Commands (changed; TS signatures unchanged except via `ImageQuery`)
+- `set_rating`, `set_pick`, `set_color_label`, `set_user_tag`, `apply_suggestions` notify the XMP auto-sync
+  writer after a successful write.
+- `import_folder` reads existing sidecars of new / externally changed images before returning
+  (`sidecarsRead`).
+
+Events
+- New `xmpSynced { written: number[], read: number[] }` (per auto-sync pass) and
+  `xmpWriteFailed { imageId, reason }`.
+
+Schema (migration `0004_xmp.sql`, user_version 4)
+- `images`: `xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`; partial index
+  `idx_images_xmp_dirty`.
+- Triggers `images_xmp_dirty`, `image_tags_xmp_{insert,delete,update}` set `xmp_dirty = 1` and `meta_updated_at`
+  whenever rating/pick/color_label or the set of visible (non-suppressed) tags actually changes, from any writer.
+- `catalog_meta.xmp_auto_sync` (default `'0'`).
+
+Who updates what
+- architect (done): types, events, commands, registration, migration, `XmpSync` managed in `lib.rs` (notified on
+  launch and on `analysisFinished`), repo plumbing (`get_images`, `list_image_ids`, `filter_counts`,
+  `xmp_auto_sync`, `set_xmp_auto_sync`, `xmp_status`, extended `list_images`, `ENTRY_SELECT` cols 43–45) + tests.
+- rust-engine-dev: implement `src-tauri/src/xmp/` — `XmpSync::{notify (debounced auto-sync worker, emits
+  xmpSynced/xmpWriteFailed), write_images, read_images, refresh_folder}` and the sidecar parser/merger, per the
+  mapping and conflict policy in the module docs / `docs/architecture.md`. Keep the xmp module's SQL in `xmp/`.
+  Tests only on tempdirs / `test-data/` copies (never `~/Pictures`); verify with `exiftool`.
+- frontend-dev: migrate `pick` -> `picks`; use `listImageIds` for select-all/batch keyboard ops and loupe
+  navigation, `getImages` to refresh rows after edits/events, `getFilterCounts` for the filter bar; show
+  `entry.xmp` (dirty/error) and an auto-sync toggle (`catalogState.xmpAutoSync`, `setXmpAutoSync`), a
+  "Save metadata" action (`writeXmp(selected)`, Cmd+S) and "Read metadata from file" (`readXmp`); listen to
+  `xmpSynced` / `xmpWriteFailed`.
