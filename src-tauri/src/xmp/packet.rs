@@ -17,6 +17,9 @@ use quick_xml::escape::{escape, unescape};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::crs::{self, PropertyEdit};
+use crate::ipc::types::ParametricAdjustments;
+
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
 pub const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -61,11 +64,17 @@ pub struct SidecarValues {
     pub label: Option<String>,
     pub hierarchical_subjects: Vec<String>,
     pub subjects: Vec<String>,
+    /// Importable develop settings (`crs:` PV2012+, see `crs::decode`).
+    pub develop: Option<ParametricAdjustments>,
+    /// Why the develop settings could not be read (malformed value), if so.
+    pub develop_error: Option<String>,
 }
 
 /// The XMP-mapped state Sieve wants in the sidecar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Desired {
+    /// `crs:` / `sieve:` develop properties to set or remove (empty = leave untouched).
+    pub develop: Vec<PropertyEdit>,
     /// -1 (reject) ..= 5.
     pub rating: i32,
     /// One of [`OWNED_LABELS`], or `None` to remove an owned label.
@@ -89,11 +98,18 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     let list = |ns: &str, local: &str| -> Vec<String> {
         doc.list(ns, local).map(|p| p.items.iter().map(|i| i.value.clone()).collect()).unwrap_or_default()
     };
+    let get = |ns: &str, local: &str| doc.scalars(ns, local).into_iter().next().map(|s| s.value.to_owned());
+    let (develop, develop_error) = match crs::decode(&get) {
+        Ok(d) => (d, None),
+        Err(e) => (None, Some(e)),
+    };
     Ok(SidecarValues {
         rating,
         label,
         hierarchical_subjects: list(NS_LR, "hierarchicalSubject"),
         subjects: list(NS_DC, "subject"),
+        develop,
+        develop_error,
     })
 }
 
@@ -136,6 +152,12 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
         None => ed.remove_scalar_if(NS_XMP, "Label", is_owned_label),
     }
     ed.set_scalar(NS_XMP, "MetadataDate", &want.metadata_date);
+    for edit in &want.develop {
+        match &edit.value {
+            Some(v) => ed.set_scalar(edit.ns, &edit.name, v),
+            None => ed.remove_scalar_if(edit.ns, &edit.name, |_| true),
+        }
+    }
 
     // Keywords: drop every Sieve|* item, then add the wanted ones.
     let wanted_hier: Vec<String> = want.tags.iter().map(|t| format!("{KEYWORD_ROOT}|{t}")).collect();
@@ -513,6 +535,8 @@ fn preferred_prefix(uri: &str) -> &'static str {
         NS_DC => "dc",
         NS_LR => "lr",
         NS_RDF => "rdf",
+        crs::CRS_NS => "crs",
+        crs::SIEVE_NS => "sieve",
         _ => "ns",
     }
 }

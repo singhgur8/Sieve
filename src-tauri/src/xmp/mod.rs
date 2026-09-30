@@ -69,9 +69,10 @@ use tauri::{AppHandle, Runtime};
 use tauri_specta::Event;
 
 use crate::db::{self, repo};
+use crate::develop;
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::events::{XmpSynced, XmpWriteFailed};
-use crate::ipc::types::{ColorLabel, FolderId, ImageId, PickFlag, XmpFailure, XmpSyncReport};
+use crate::ipc::types::{ColorLabel, FolderId, ImageId, ParametricAdjustments, PickFlag, XmpFailure, XmpSyncReport};
 
 use store::ImageRow;
 
@@ -348,13 +349,29 @@ impl XmpSync {
         match action {
             Action::Write => {
                 let tags = store::visible_tags(conn, row.id).map_err(|e| e.message)?;
-                write_sidecar(&path, row, &tags)?;
+                let develop = store::develop_settings(conn, row.id).map_err(|e| e.message)?;
+                write_sidecar(&path, row, &tags, develop.as_ref())?;
                 store::mark_written(conn, row, file_mtime_ms(&path)).map_err(|e| e.message)?;
                 Ok(Outcome::Written)
             }
             Action::Read => {
                 let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 let values = packet::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                if let Some(e) = &values.develop_error {
+                    // Ratings still sync; develop settings stay as they are in the catalog.
+                    eprintln!("{}: develop settings not imported: {e}", path.display());
+                }
+                // Develop settings first: the history commit re-fires the dirty trigger,
+                // which `apply_read` then clears.
+                let mut develop_changed = false;
+                if let Some(adj) = &values.develop {
+                    let current = repo::get_adjustments(conn, row.id).map_err(|e| e.message)?;
+                    if *adj != current {
+                        develop::history::commit(conn, row.id, adj, develop::history::LABEL_READ_XMP)
+                            .map_err(|e| e.message)?;
+                        develop_changed = true;
+                    }
+                }
                 let (rating, pick, label) = catalog_values(&values, row.rating);
                 let changed = store::apply_read(conn, row.id, rating, pick, label, file_mtime_ms(&path))
                     .map_err(|e| e.message)?;
@@ -364,11 +381,12 @@ impl XmpSync {
                     let tags = store::visible_tags(conn, row.id).map_err(|e| e.message)?;
                     if !same_tags(&values, &tags) {
                         let fresh = store::load(conn, row.id).map_err(|e| e.message)?.ok_or("image vanished")?;
-                        write_sidecar(&path, &fresh, &tags)?;
+                        let develop = store::develop_settings(conn, row.id).map_err(|e| e.message)?;
+                        write_sidecar(&path, &fresh, &tags, develop.as_ref())?;
                         store::mark_written(conn, &fresh, file_mtime_ms(&path)).map_err(|e| e.message)?;
                     }
                 }
-                Ok(Outcome::Read { changed })
+                Ok(Outcome::Read { changed: changed || develop_changed })
             }
         }
     }
@@ -407,10 +425,16 @@ fn file_mtime_ms(path: &Path) -> Option<i64> {
 }
 
 /// Catalog -> sidecar values (module-doc mapping).
-fn desired(row: &ImageRow, tags: &[String]) -> Desired {
+fn desired(row: &ImageRow, tags: &[String], develop: Option<&ParametricAdjustments>) -> Desired {
     let rating = if row.pick == PickFlag::Reject { -1 } else { i32::from(row.rating.min(5)) };
     let label = if row.pick == PickFlag::Pick { Some("Pick") } else { row.color_label.map(label_name) };
-    Desired { rating, label, tags: tags.to_vec(), metadata_date: iso8601_utc(SystemTime::now()) }
+    Desired {
+        rating,
+        label,
+        tags: tags.to_vec(),
+        metadata_date: iso8601_utc(SystemTime::now()),
+        develop: develop.map(crs::encode).unwrap_or_default(),
+    }
 }
 
 /// Sidecar -> catalog `(rating, pick, colorLabel)`. `current_rating` is kept for rejects.
@@ -452,14 +476,20 @@ fn parse_label(s: &str) -> Option<ColorLabel> {
 
 /// Merges the catalog state into the sidecar (creating it if missing) and replaces it
 /// atomically (`<name>.xmp.tmp`, fsync, rename).
-fn write_sidecar(path: &Path, row: &ImageRow, tags: &[String]) -> Result<(), String> {
+fn write_sidecar(
+    path: &Path,
+    row: &ImageRow,
+    tags: &[String],
+    develop: Option<&ParametricAdjustments>,
+) -> Result<(), String> {
     let shown = path.display();
     let existing = match fs::read(path) {
         Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| format!("{shown}: sidecar is not UTF-8"))?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{shown}: {e}")),
     };
-    let merged = packet::merge(existing.as_deref(), &desired(row, tags)).map_err(|e| format!("{shown}: {e}"))?;
+    let merged =
+        packet::merge(existing.as_deref(), &desired(row, tags, develop)).map_err(|e| format!("{shown}: {e}"))?;
     write_atomic(path, merged.as_bytes()).map_err(|e| format!("{shown}: {e}"))
 }
 

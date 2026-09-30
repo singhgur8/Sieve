@@ -29,6 +29,7 @@ const TJPARAM_JPEGHEIGHT: c_int = 6;
 const TJPARAM_FASTDCT: c_int = 10;
 const TJPARAM_MAXPIXELS: c_int = 24;
 const TJPF_RGB: c_int = 0;
+const TJSAMP_444: c_int = 0;
 const TJSAMP_420: c_int = 2;
 const TJERR_WARNING: c_int = 0;
 
@@ -232,12 +233,28 @@ pub fn encode_rgb_with<T>(
     quality: u8,
     sink: impl FnOnce(&[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
+    encode_rgb_sub(pixels, width, height, quality, false, sink)
+}
+
+/// Encodes interleaved RGB as a 4:4:4 JPEG (no chroma subsampling; editor previews).
+pub fn encode_rgb_444(pixels: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    encode_rgb_sub(pixels, width, height, quality, true, |bytes| Ok(bytes.to_vec()))
+}
+
+fn encode_rgb_sub<T>(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    full_chroma: bool,
+    sink: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
     if width == 0 || height == 0 || pixels.len() < width as usize * height as usize * 3 {
         return Err("TurboJPEG encode: bad buffer".into());
     }
     with_handle(&COMPRESSOR, TJINIT_COMPRESS, |tj| {
         tj.set(TJPARAM_QUALITY, quality.clamp(1, 100) as c_int)?;
-        tj.set(TJPARAM_SUBSAMP, TJSAMP_420)?;
+        tj.set(TJPARAM_SUBSAMP, if full_chroma { TJSAMP_444 } else { TJSAMP_420 })?;
         tj.set(TJPARAM_FASTDCT, 1)?;
         let mut buf: *mut c_uchar = std::ptr::null_mut();
         let mut size: usize = 0;

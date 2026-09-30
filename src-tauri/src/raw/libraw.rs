@@ -38,6 +38,134 @@ extern "C" {
     fn libraw_close(lr: *mut LibrawData);
     fn libraw_strerror(errorcode: c_int) -> *const c_char;
     fn libraw_version() -> *const c_char;
+    fn libraw_unpack(lr: *mut LibrawData) -> c_int;
+    fn libraw_dcraw_process(lr: *mut LibrawData) -> c_int;
+    fn libraw_dcraw_make_mem_image(lr: *mut LibrawData, errc: *mut c_int) -> *mut ProcessedImage;
+    // native/libraw_shim.c
+    fn sieve_lr_set_linear(lr: *mut LibrawData, half_size: c_int);
+    fn sieve_lr_get_color(lr: *mut LibrawData, out: *mut ShimColor);
+}
+
+/// Mirror of `sieve_lr_color_t` in `native/libraw_shim.c`.
+#[repr(C)]
+#[derive(Default)]
+struct ShimColor {
+    cam_mul: [f32; 4],
+    pre_mul: [f32; 4],
+    rgb_cam: [[f32; 4]; 3],
+    cam_xyz: [[f32; 3]; 4],
+    black: c_uint,
+    maximum: c_uint,
+    width: c_int,
+    height: c_int,
+    flip: c_int,
+    colors: c_int,
+    filters: c_uint,
+}
+
+/// Colour metadata of a RAW as LibRaw sees it (read right after `open_file`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorData {
+    /// As-shot white balance multipliers (R, G, B, G2); zeros if unrecorded.
+    pub cam_mul: [f32; 4],
+    /// Daylight multipliers derived from the colour matrix.
+    pub pre_mul: [f32; 4],
+    /// White-balanced camera RGB -> linear sRGB (D65); rows sum to 1.
+    pub rgb_cam: [[f32; 3]; 3],
+    /// XYZ (D65-referred Adobe `ColorMatrix`) -> camera RGB; zeros if unknown.
+    pub cam_xyz: [[f32; 3]; 3],
+    /// Full-size output dimensions (before rotation).
+    pub width: u32,
+    pub height: u32,
+    /// LibRaw's orientation code (0, 3, 5, 6).
+    pub flip: i32,
+    pub colors: i32,
+    /// CFA pattern code (9 = X-Trans).
+    pub filters: u32,
+}
+
+/// Linear 16-bit camera RGB (no white balance, black-subtracted, white level = 65535),
+/// interleaved RGB, not rotated.
+#[derive(Debug, Clone)]
+pub struct LinearRgb16 {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u16>,
+    pub color: ColorData,
+}
+
+/// Decodes `path` with LibRaw into linear camera RGB (`half_size`: one pixel per CFA quad).
+pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| "path contains NUL".to_owned())?;
+    let h = Handle::new()?;
+    // SAFETY: h.0 is a live handle; c_path outlives the call.
+    let rc = unsafe { libraw_open_file(h.0, c_path.as_ptr()) };
+    if rc != 0 {
+        return Err(err(rc));
+    }
+    let mut c = ShimColor::default();
+    // SAFETY: file opened; the shim only reads/writes plain fields of the live handle.
+    unsafe {
+        sieve_lr_get_color(h.0, &mut c);
+        sieve_lr_set_linear(h.0, c_int::from(half_size));
+    }
+    // SAFETY: opened above.
+    let rc = unsafe { libraw_unpack(h.0) };
+    if rc != 0 {
+        return Err(err(rc));
+    }
+    // SAFETY: unpacked above.
+    let rc = unsafe { libraw_dcraw_process(h.0) };
+    if rc != 0 {
+        return Err(err(rc));
+    }
+    let mut code: c_int = 0;
+    // SAFETY: processed above; the buffer is freed with dcraw_clear_mem below.
+    let img = unsafe { libraw_dcraw_make_mem_image(h.0, &mut code) };
+    if img.is_null() {
+        return Err(err(code));
+    }
+    // SAFETY: img is non-null; `data` holds `data_size` bytes allocated by LibRaw.
+    let result = unsafe {
+        let r = &*img;
+        let (w, hgt) = (r.width as usize, r.height as usize);
+        if r.typ != LIBRAW_IMAGE_BITMAP || r.colors != 3 || r.bits != 16 {
+            Err(format!("LibRaw: unexpected develop image (type {}, {} colors, {} bits)", r.typ, r.colors, r.bits))
+        } else if (r.data_size as usize) < w * hgt * 6 {
+            Err("LibRaw: short develop image".to_owned())
+        } else {
+            let mut pixels = vec![0u16; w * hgt * 3];
+            std::ptr::copy_nonoverlapping(
+                std::ptr::addr_of!(r.data).cast::<u8>(),
+                pixels.as_mut_ptr().cast::<u8>(),
+                pixels.len() * 2,
+            );
+            Ok(LinearRgb16 { width: w as u32, height: hgt as u32, pixels, color: color_data(&c) })
+        }
+    };
+    // SAFETY: img came from dcraw_make_mem_image and is freed once.
+    unsafe { libraw_dcraw_clear_mem(img) };
+    result
+}
+
+fn color_data(c: &ShimColor) -> ColorData {
+    let mut rgb_cam = [[0.0; 3]; 3];
+    let mut cam_xyz = [[0.0; 3]; 3];
+    for i in 0..3 {
+        rgb_cam[i].copy_from_slice(&c.rgb_cam[i][..3]);
+        cam_xyz[i] = c.cam_xyz[i];
+    }
+    ColorData {
+        cam_mul: c.cam_mul,
+        pre_mul: c.pre_mul,
+        rgb_cam,
+        cam_xyz,
+        width: c.width.max(0) as u32,
+        height: c.height.max(0) as u32,
+        flip: c.flip,
+        colors: c.colors,
+        filters: c.filters,
+    }
 }
 
 /// LibRaw version string, e.g. "0.21.4-Release".
