@@ -73,12 +73,35 @@ Conventions
 - [ ] **QA gate**.
   - Acceptance: matched frames' mean luma and WB within tolerance of the anchor on sample scenes.
 
+## Phase 7b — Real-world parity (user request 2026-09-29)
+Sample set: `/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal` (45 GB; 537 ARW, 231 CR3, 79 RAF, 39 JPG, 394 user-edited
+Lightroom XMPs). **Read-only** — never write sidecars there (auto-sync stays off; verify no file changes before/after);
+copy subsets into `test-data/` for anything that writes.
+- [ ] **Slider responsiveness** (frontend-dev; rust-engine-dev if needed): no starvation while dragging — at most one
+  render in flight per slot, send latest values when it lands; draft-size renders (~1024 px) while dragging, full
+  quality on release/idle. Acceptance: preview visibly tracks a continuous drag (Playwright with delayed mock renders
+  proves intermediate frames are shown; real bench of drag sequences reports frames shown/sec).
+- [ ] **Non-RAW sources** (architect → rust-engine-dev, frontend-dev): import and edit JPEG/HEIC/TIFF/PNG (and
+  camera JPEG siblings of RAWs, grouped or listed per user setting): ingest/thumbnail/EXIF, develop from decoded sRGB→
+  linear, XMP sidecars for JPEG edits (Lightroom writes `<name>.xmp` for RAW, embedded/sidecar for JPEG — decide),
+  export.
+- [ ] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): support the crs fields this user's
+  edits rely on — parametric + point tone curve (incl. RGB curves), color grading / split toning, camera calibration
+  (primary hue/sat, shadow tint), sharpening, luminance/color noise reduction, vignette/grain if used; read them from
+  existing XMPs and render them. Adobe Looks/profiles (LookTable) are proprietary: record and warn, approximate only
+  if feasible. Masks are Phase 11.
+- [ ] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
+  (X-Trans + Bayer)/CR3/JPG thumbnails + EXIF + develop + export correct; user XMP ratings + develop settings imported;
+  throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
+  side-by-side of Sieve renders of the user's edits for visual parity review.
+- [ ] **QA gate**.
+
 ## Phase 8 — Hardening + packaging
 - [ ] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
 - [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
 - [ ] Error states, empty states, crash-safe catalog writes.
 - [ ] `pnpm tauri build` → `.app` / `.dmg`; smoke-test the bundle.
-- [ ] Final report in `docs/final-report.md`: what works, known gaps, how to use.
+- [ ] Final report in `docs/final-report.md`: what works, known gaps, how to use; end with the Phase 11 (masking / AI selection) scope + effort estimate and a recommendation (user request).
 
 ---
 
@@ -92,6 +115,17 @@ Requested 2026-09-29. User provides a reference photo B (any source/JPEG) and a 
   2. **Custom LUT**: bake the fitted transform into a `.cube` (33³ or 65³) saved to a user LUT library, reusable via the Phase 5 LUT slot.
 - Evaluation: ΔE between graded A and B on matched regions; side-by-side UI with strength slider.
 - Depends on: Phase 5 (render engine, LUT support), Phase 7 (relative grading math).
+
+### Phase 10 — Personal style learning / auto-edit (user request 2026-09-29)
+Learn the user's editing style from their Lightroom XMPs (e.g. 394 edited frames in the Jasmit Natalie Proposal set:
+consistent parametric curve, split toning, calibration, NR) and propose full edits for new shoots, per scene/lighting.
+Approach sketch: features from the develop-source stats (Phase 7) + scene context → predict ParametricAdjustments
+(gradient-boosted trees or small MLP on-device), refined with Phase 7 relative matching; evaluate by ΔE vs the
+user's own renders on held-out shoots. Depends on Phase 7b parity (so predicted settings render like Lightroom).
+
+### Phase 11 — Local adjustments & AI masking (scope estimate to be reported at the end of the run)
+Lightroom-style masks: brush, linear/radial gradients, luminance/color range, and AI Select Subject / Sky /
+Background / People (face/skin/eyes/lips). 95 mask groups appear in the user's sample XMPs (`crs:MaskGroupBasedCorrections`).
 
 ### Other ideas
 - Windows build (DirectML EP) — needs a Windows machine to test.
