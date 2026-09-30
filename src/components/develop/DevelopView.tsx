@@ -315,7 +315,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       const tool = action === "maskBrush" || action === "maskLinear" || action === "maskRadial" || action === "maskColor" || action === "maskLuminance";
       if (tool) {
         // Lightroom: the tool key opens Masking and starts the tool in one go (a running crop is discarded first).
-        if (cropRef.current) setCropTool(null);
+        if (cropRef.current) {
+          cropRef.current = null; // the checks below run before React re-renders
+          setCropTool(null);
+        }
         setPicking(false);
         if (!m.open) m.setOpen(true);
       } else if (!m.open) {

@@ -134,6 +134,7 @@ export function CropBar({ crop }: { crop: CropApi }) {
         <input
           type="range"
           className="sieve-range h-3 w-40 cursor-pointer"
+          style={{ background: "linear-gradient(#525252, #525252) center / 100% 2px no-repeat" }}
           min={-45}
           max={45}
           step={0.1}

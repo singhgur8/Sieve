@@ -71,7 +71,7 @@ test.describe("develop", () => {
 
     await expect.poll(async () => (await saves(page)).length).toBe(1);
     const [save] = await saves(page);
-    expect(save.args.label).toBe("Exposure");
+    expect(save.args.label).toMatch(/^Exposure [+-]\d/); // history labels carry the value (UX2 P2-5)
     expect(save.args.id).toBe(1);
     const finalValue = Number(await slider.inputValue());
     expect(finalValue).toBeGreaterThan(1);
@@ -95,7 +95,7 @@ test.describe("develop", () => {
     await expect(page.getByTestId("slider-value-contrast")).toHaveText("0");
     await expect.poll(async () => (await saves(page)).length).toBe(1);
     const [save] = await saves(page);
-    expect(save.args.label).toBe("Contrast");
+    expect(save.args.label).toBe("Contrast 0");
     expect(save.args.adjustments.contrast).toBe(0);
     // Double-clicking the slider itself also resets.
     await setSlider(page, "shadows", -30);
@@ -252,7 +252,7 @@ test.describe("develop", () => {
     expect((await saves(page))[0].args.adjustments.whiteBalance).toEqual({ mode: "custom", temperatureK: 5200, tint: 8 });
     await setSlider(page, "tint", 40);
     const last = (await saves(page)).pop()!;
-    expect(last.args.label).toBe("Tint");
+    expect(last.args.label).toMatch(/^Tint [+-]?\d/);
     expect(last.args.adjustments.whiteBalance).toMatchObject({ mode: "custom", tint: 40, temperatureK: 5200 });
     await page.getByTestId("wb-as-shot").click();
     await expect(page.getByTestId("slider-value-tint")).toHaveText("+8");

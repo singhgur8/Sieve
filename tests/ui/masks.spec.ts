@@ -99,7 +99,7 @@ test.describe("masks", () => {
     await setSlider(page, "mask-exposure", 1.5);
     await expect(page.getByTestId("slider-value-mask-exposure")).toHaveText("+1.50");
     await expect.poll(async () => (await lastAdj(page)).masks[0]?.adjustments.exposure).toBe(1.5);
-    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Mask: Subject 1 Exposure");
+    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toMatch(/^Mask: Subject 1 Exposure [+-]\d/);
     expect(((await saved(page)).at(-1)!.args.adjustments as Adj).masks[0].adjustments.exposure).toBe(1.5);
 
     // Double-click resets to the default (0).
@@ -474,7 +474,7 @@ test.describe("masks", () => {
     for (const k of ["sky", "people"]) {
       const b = page.getByTestId(`mask-create-${k}`);
       await expect(b).toBeDisabled();
-      await expect(b).toHaveAttribute("title", new RegExp(`Not available: mock: ${k} model not installed`));
+      await expect(b).toHaveAttribute("title", new RegExp(`is not available: mock: ${k} model not installed`));
     }
     // Mock default: no object / landscape model either.
     await expect(page.getByTestId("mask-create-object")).toBeDisabled();
@@ -559,7 +559,7 @@ test.describe("masks", () => {
     expect(sh.samples[1].area.width).toBeGreaterThan(0.05);
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("mask-color-settings")).toBeVisible();
-    await expect(page.getByTestId("mask-color-samples")).toHaveText("2 of 5 samples");
+    await expect(page.getByTestId("mask-color-samples")).toHaveAttribute("data-count", "2");
     await setSlider(page, "mask-color-amount", 80);
     await expect.poll(async () => (await lastAdj(page)).masks[2].components[0].shape.amount).toBe(80);
     await page.getByTestId("mask-color-remove-sample").click();
@@ -589,7 +589,7 @@ test.describe("masks", () => {
     await openMasks(page);
     await createSubject(page);
     await setSlider(page, "mask-exposure", 2);
-    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Mask: Subject 1 Exposure");
+    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toMatch(/^Mask: Subject 1 Exposure [+-]\d/);
     await page.keyboard.press("Meta+z");
     await expect.poll(async () => (await lastAdj(page)).masks[0]?.adjustments.exposure).toBe(0);
     await expect(page.getByTestId("slider-value-mask-exposure")).toHaveText("0.00");
@@ -608,10 +608,7 @@ test.describe("masks", () => {
     await createSubject(page);
     await setSlider(page, "mask-exposure", 1);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("develop-view")).toHaveCount(0); // nothing to cancel: Esc left Develop
-    await page.getByTestId("cell-1").dblclick().catch(() => {});
-    await page.keyboard.press("d");
-    await expect(page.getByTestId("develop-view")).toBeVisible();
+    await expect(page.getByTestId("develop-view")).toBeVisible(); // UX2 P0-1: Esc never leaves Develop
     await page.getByTestId("copy-settings").click();
     const dlg = page.getByTestId("fields-dialog");
     await expect(dlg).toBeVisible();
@@ -658,13 +655,10 @@ test.describe("masks", () => {
 
   test("keys: K stays the burst keeper in Compare; mask keys need the Masks panel; cheat sheet lists them", async ({ page }) => {
     await openDevelop(page, 1);
-    await page.keyboard.press("k");
+    // UX2 P1-1: the tool key opens the Masks panel and starts the tool in one go.
     await expect(page.getByTestId("mask-layer")).toHaveCount(0);
-    await page.keyboard.press("m");
-    await expect(page.getByTestId("mask-capture")).toHaveCount(0);
-    await page.keyboard.press("Shift+W");
-    await expect(page.getByTestId("masks-panel")).toBeVisible();
     await page.keyboard.press("k");
+    await expect(page.getByTestId("masks-panel")).toBeVisible();
     await expect(page.getByTestId("mask-capture")).toBeVisible();
     await page.keyboard.press("Enter"); // Enter finishes the tool
     await expect(page.getByTestId("mask-capture")).toHaveCount(0);
@@ -674,7 +668,7 @@ test.describe("masks", () => {
     await page.keyboard.press("Shift+W");
     await page.keyboard.press("k");
     await page.keyboard.press("r");
-    await expect(page.getByTestId("crop-badge")).toBeVisible();
+    await expect(page.getByTestId("crop-bar")).toBeVisible();
     await expect(page.getByTestId("mask-layer")).toHaveCount(0);
     await page.keyboard.press("Escape");
     await page.keyboard.press("?");

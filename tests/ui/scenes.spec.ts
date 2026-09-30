@@ -31,7 +31,7 @@ test.describe("scenes", () => {
 
     await clearCalls(page);
     await page.getByTestId("scene-chip-2").click();
-    await expect(page.getByTestId("selection-count")).toContainText("40 photos");
+    await expect(page.getByTestId("selection-count")).toContainText("40 of 200");
     await expect(page.getByTestId("cell-41")).toBeVisible();
     await expect(page.getByTestId("cell-1")).toHaveCount(0);
     const q = (await calls(page, "list_image_ids")).at(-1)!.args.query as { sceneId: number };
@@ -259,7 +259,7 @@ test.describe("scenes", () => {
 
     // Delete the filtered scene; the filter falls back to all photos.
     await page.getByTestId("scene-chip-8").click();
-    await expect(page.getByTestId("selection-count")).toContainText("2 photos");
+    await expect(page.getByTestId("selection-count")).toContainText("2 of 200");
     await clearCalls(page);
     await (await sceneItem(page, "scene-delete")).click();
     await expect(page.getByTestId("scene-chip-8")).toHaveCount(0);

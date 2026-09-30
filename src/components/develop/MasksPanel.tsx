@@ -45,23 +45,23 @@ export function MasksPanel({ masks }: Props) {
   const selComp = sel?.components.find((c) => c.id === masks.selComp) ?? null;
   const compact = masks.groups.length > 0;
   return (
-    <div className="flex h-full flex-col overflow-hidden px-3" data-testid="masks-panel" data-compact={compact}>
+    <div className="flex h-full flex-col overflow-hidden px-2" data-testid="masks-panel" data-compact={compact}>
       <div className="shrink-0 py-2">
-        <div className={`flex items-center justify-between ${compact ? "" : "mb-1"}`}>
+        <div className="mb-1 flex items-center justify-between">
           <h2 className="text-[11px] font-semibold uppercase tracking-wide text-neutral-300">{compact ? "Create" : "Create new mask"}</h2>
-          {compact && (
-            <div className="flex items-center gap-1" data-testid="mask-create">
-              {CREATE_ORDER.map((k) => (
-                <CreateButton key={k} kind={k} masks={masks} icon />
-              ))}
-            </div>
-          )}
           {masks.needsUpdate > 0 && (
             <button className="flex items-center gap-1 rounded bg-amber-900/70 px-2 py-0.5 text-[11px] text-amber-100 hover:bg-amber-800" onClick={() => void masks.updateAll()} data-testid="mask-update-all" title="Compute the AI selections that are missing for this photo">
               <RefreshCw className="size-3" /> Update {masks.needsUpdate}
             </button>
           )}
         </div>
+        {compact && (
+          <div className="flex items-center gap-0.5" data-testid="mask-create">
+            {CREATE_ORDER.map((k) => (
+              <CreateButton key={k} kind={k} masks={masks} icon />
+            ))}
+          </div>
+        )}
         {!compact && (
           <div className="grid grid-cols-2 gap-1" data-testid="mask-create">
             {CREATE_ORDER.map((k) => (
@@ -231,7 +231,7 @@ function GroupRow({ g, masks }: { g: MaskGroup; masks: MasksApi }) {
             {g.name || "Mask"}
           </button>
         )}
-        {single && !on && st === "needs_update" && <span className="rounded bg-amber-900/70 px-1 text-[10px] text-amber-100" data-testid={`mask-group-update-${g.id}`}>update</span>}
+        {single && !on && st === "needs_update" && <span className="rounded bg-amber-900/70 px-1 text-[10px] text-amber-100" data-testid={`mask-comp-update-${g.components[0].id}`}>update</span>}
         {single && !on && unsupported && <span className="rounded bg-neutral-700 px-1 text-[10px]">not rendered</span>}
         <Menu
           trigger={<MoreHorizontal className="size-4" />}
