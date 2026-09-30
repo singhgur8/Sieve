@@ -102,4 +102,32 @@ mod tests {
             .unwrap();
         assert_eq!(exposure, 1.0);
     }
+
+    #[test]
+    fn v6_export_tables_enforce_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("cat.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                 file_size, file_mtime_ms, imported_at)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 'bayer', 1, 0, 0);
+             INSERT INTO export_presets (name, settings_json, created_at, updated_at) VALUES ('Web', '{}', 0, 0);
+             INSERT INTO export_jobs (id, state, settings_json, total, created_at) VALUES (1, 'queued', '{}', 1, 0);
+             INSERT INTO export_items (job_id, seq, image_id) VALUES (1, 0, 1);",
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO export_presets (name, settings_json, created_at, updated_at) VALUES ('WEB', '{}', 0, 0)",
+            [],
+        );
+        assert!(dup.is_err(), "preset names are unique case-insensitively");
+        assert!(conn.execute("UPDATE export_jobs SET state = 'bogus'", []).is_err());
+        assert!(conn.execute("UPDATE export_items SET status = 'bogus'", []).is_err());
+        let status: String = conn.query_row("SELECT status FROM export_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "pending");
+        conn.execute("DELETE FROM export_jobs WHERE id = 1", []).unwrap();
+        let items: i64 = conn.query_row("SELECT COUNT(*) FROM export_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(items, 0);
+    }
 }
