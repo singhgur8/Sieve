@@ -86,3 +86,10 @@ declare global {
     __ipcLog: { cmd: string; args: Record<string, unknown> }[];
   }
 }
+
+/** Opens a Develop right-panel section (Basic is open by default; the others start closed). */
+export async function openSection(page: Page, id: string) {
+  const sec = page.getByTestId(`section-${id}`);
+  if ((await sec.getAttribute("data-open")) !== "true") await page.getByTestId(`section-toggle-${id}`).click();
+  await expect(sec).toHaveAttribute("data-open", "true");
+}

@@ -244,6 +244,11 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   return parts.join(", ");
 }
 
+/** "Filtered: ... · 12 of 340" / "No filters · 340" (collapsed summary bar and the Develop filmstrip header). */
+export function filterSummaryText(query: Query, shown: number, total: number | null, sceneNumber: (id: number) => number): string {
+  return `${isFiltered(query) ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · ${shown}${total != null ? ` of ${total}` : ""}`;
+}
+
 /** 28 px summary shown instead of the filter bars outside the Grid. */
 export function FilterSummary({ query, shown, total, sceneNumber, onEdit }: { query: Query; shown: number; total: number | null; sceneNumber: (id: number) => number; onEdit: () => void }) {
   const filtered = isFiltered(query);

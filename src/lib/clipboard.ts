@@ -5,6 +5,8 @@ import type { AdjustmentField, ParametricAdjustments } from "../ipc";
 export interface Copied {
   adjustments: ParametricAdjustments;
   fields: AdjustmentField[];
+  /** File name of the photo the settings came from (tooltips and toasts). */
+  fromName?: string;
 }
 
 let current: Copied | null = null;

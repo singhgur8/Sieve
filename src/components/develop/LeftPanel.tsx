@@ -1,98 +1,299 @@
-import { useState } from "react";
-import { Redo2, Save, Trash2, Undo2 } from "lucide-react";
+// Develop left panel: Navigator, Presets, Snapshots, History and the sticky Copy… / Paste bar (docs/ux-spec-8b.md 5.3).
+import { useRef, useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
 import { hint } from "../../lib/keymap";
-import type { AdjustmentHistory, Preset } from "../../ipc";
+import type { AdjustmentHistory, NormRect, Preset } from "../../ipc";
+import type { Copied } from "../../lib/clipboard";
+import { useSnapshots, usePresetGroups } from "../../hooks/useDevelopV14";
+import { Menu, menuItem } from "../Menu";
+import type { Zoom } from "./Viewer";
+
+const GROUPS_KEY = "sieve.presetGroups.v1";
+
+function loadGroups(): Record<string, boolean> {
+  try {
+    const v = JSON.parse(localStorage.getItem(GROUPS_KEY) ?? "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
 
 interface Props {
   presets: Preset[];
   history: AdjustmentHistory | null;
+  imageId: number | null;
   onApplyPreset: (p: Preset) => void;
   onSavePreset: () => void;
   onDeletePreset: (p: Preset) => void;
   onUndo: () => void;
   onRedo: () => void;
   onGoto: (entryId: number) => void;
-  /** Photos a preset / reset would hit (> 1 shows a "-> n" hint). */
+  /** Photos a preset / reset / paste would hit (> 1 shows a "-> n" hint). */
   targetCount?: number;
+  /** Navigator: the photo as currently rendered, the zoom state and the region visible at 100%. */
+  navUrl: string | null;
+  zoom: Zoom;
+  region: NormRect | null;
+  onZoom: (z: Zoom) => void;
+  /** Copy… (Alt held: copy with the remembered fields, no dialog). */
+  onCopy: (alt: boolean) => void;
+  onPaste: () => void;
+  copied: Copied | null;
 }
 
-export function LeftPanel({ presets, history, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1 }: Props) {
-  const [confirming, setConfirming] = useState<number | null>(null);
-  const entries = history ? [...history.entries].reverse() : [];
+function Section({ id, title, defaultOpen = true, action, children }: { id: string; title: string; defaultOpen?: boolean; action?: ReactNode; children: ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="flex h-full flex-col overflow-y-auto text-xs" data-testid="left-panel">
-      <section className="border-b border-neutral-800 px-3 py-2">
-        <div className="mb-1 flex items-center justify-between">
-          <h3 className="font-semibold uppercase tracking-wide text-neutral-300">Presets</h3>
-          <button className="flex items-center gap-1 text-sky-400 hover:text-sky-300" onClick={onSavePreset} data-testid="preset-save" title="Save current settings as a preset">
-            <Save className="size-3.5" /> Save
-          </button>
-        </div>
-        {presets.length === 0 && <p className="text-neutral-400">No presets yet. Save the current settings with Save.</p>}
-        <ul data-testid="preset-list">
-          {presets.map((p) => (
-            <li key={p.id} className="group flex items-center justify-between rounded px-1.5 py-1 hover:bg-neutral-800">
-              <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
-                {p.name}
+    <section className="border-b border-neutral-800 px-3 py-2" data-testid={`section-${id}`} data-open={open}>
+      <div className="flex items-center justify-between">
+        <button className="flex items-center gap-1 font-semibold uppercase tracking-wide text-neutral-300" aria-expanded={open} onClick={() => setOpen(!open)} data-testid={`section-toggle-${id}`}>
+          {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          {title}
+        </button>
+        {action}
+      </div>
+      {open && <div className="mt-1">{children}</div>}
+    </section>
+  );
+}
+
+export function LeftPanel({ presets, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onCopy, onPaste, copied }: Props) {
+  const [confirming, setConfirming] = useState<number | null>(null);
+  const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>(loadGroups);
+  const lib = usePresetGroups(presets);
+  const snaps = useSnapshots(imageId);
+  const entries = history ? [...history.entries].reverse() : [];
+  const toggleGroup = (id: string, now: boolean) => {
+    const next = { ...groupOpen, [id]: !now };
+    setGroupOpen(next);
+    try {
+      localStorage.setItem(GROUPS_KEY, JSON.stringify(next));
+    } catch {
+      /* not remembered */
+    }
+  };
+  const pasteTitle = copied
+    ? `Paste ${copied.fields.length} settings${copied.fromName ? ` from ${copied.fromName.replace(/\.[^.]+$/, "")}` : ""} to ${targetCount} photo${targetCount === 1 ? "" : "s"}${hint("paste")}`
+    : `Copy settings first${hint("copy")}`;
+
+  return (
+    <div className="flex h-full flex-col text-xs" data-testid="left-panel">
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <Section
+          id="navigator"
+          title="Navigator"
+          action={
+            <span className="flex gap-2 text-[11px]">
+              <button className={!zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => zoom.on && onZoom({ on: false, cx: 0.5, cy: 0.5 })} data-testid="nav-fit" aria-pressed={!zoom.on}>
+                FIT
               </button>
-              {targetCount > 1 && (
-                <span className="invisible mr-1 shrink-0 text-sky-300 group-hover:visible" data-testid={`preset-hint-${p.id}`}>
-                  → {targetCount}
-                </span>
-              )}
-              {confirming === p.id ? (
-                <span className="flex shrink-0 items-center gap-1">
+              <button className={zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => !zoom.on && onZoom({ on: true, cx: 0.5, cy: 0.5 })} data-testid="nav-100" aria-pressed={zoom.on}>
+                100%
+              </button>
+            </span>
+          }
+        >
+          <Navigator url={navUrl} zoom={zoom} region={region} onZoom={onZoom} />
+        </Section>
+
+        <Section
+          id="presets"
+          title="Presets"
+          action={
+            <Menu trigger={<Plus className="size-3.5" />} triggerClass="text-neutral-400 hover:text-white" triggerTestId="preset-add" title="Add presets" align="right">
+              {(close) => (
+                <>
                   <button
-                    className="rounded bg-red-900 px-1.5 py-0.5 text-red-100 hover:bg-red-800"
-                    data-testid={`preset-delete-confirm-${p.id}`}
+                    className={menuItem}
+                    role="menuitem"
+                    data-testid="preset-save"
                     onClick={() => {
-                      setConfirming(null);
-                      onDeletePreset(p);
+                      close();
+                      onSavePreset();
                     }}
                   >
-                    Delete
+                    Create Preset… <span className="ml-auto text-neutral-400">{(hint("savePreset").match(/\((.*)\)/) ?? [])[1]}</span>
                   </button>
-                  <button className="text-neutral-400 hover:text-white" data-testid={`preset-delete-cancel-${p.id}`} onClick={() => setConfirming(null)}>
-                    Keep
+                  <button className={menuItem} role="menuitem" data-testid="preset-import" disabled={!lib.canImport} title={lib.canImport ? undefined : "Importing preset folders needs the v14 library (not wired yet)"} onClick={() => { close(); lib.importFolder?.(); }}>
+                    Import Presets &amp; Profiles…
                   </button>
-                </span>
-              ) : (
-                <button className="invisible text-neutral-400 hover:text-red-400 group-hover:visible" onClick={() => setConfirming(p.id)} data-testid={`preset-delete-${p.id}`} title="Delete preset">
-                  <Trash2 className="size-3.5" />
-                </button>
+                </>
               )}
-            </li>
-          ))}
-        </ul>
-      </section>
-      <section className="px-3 py-2">
-        <div className="mb-1 flex items-center justify-between">
-          <h3 className="font-semibold uppercase tracking-wide text-neutral-300">History</h3>
-          <div className="flex gap-2">
-            <button disabled={!history?.canUndo} onClick={onUndo} title={`Undo${hint("undoAdj")}`} data-testid="undo" className="text-neutral-400 hover:text-white disabled:opacity-30">
-              <Undo2 className="size-4" />
-            </button>
-            <button disabled={!history?.canRedo} onClick={onRedo} title={`Redo${hint("redoAdj")}`} data-testid="redo" className="text-neutral-400 hover:text-white disabled:opacity-30">
-              <Redo2 className="size-4" />
-            </button>
+            </Menu>
+          }
+        >
+          {presets.length === 0 && <p className="text-neutral-400">No presets yet. Save one with + or import a Lightroom presets folder.</p>}
+          <div data-testid="preset-list">
+            {lib.groups.filter((g) => g.presets.length > 0 || g.kind === "imported").map((g) => {
+              const open = groupOpen[g.id] ?? g.kind === "user";
+              return (
+                <div key={g.id} data-testid={`preset-group-${g.id}`} data-open={open}>
+                  <button className="flex h-6 w-full items-center gap-1 text-left text-neutral-300 hover:text-white" aria-expanded={open} onClick={() => toggleGroup(g.id, open)} data-testid={`preset-group-toggle-${g.id}`}>
+                    {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+                    {g.kind === "user" ? <User className="size-3 text-neutral-400" /> : <Folder className="size-3 text-neutral-400" />}
+                    <span className="min-w-0 flex-1 truncate">{g.name}</span>
+                    <span className="text-neutral-400">{g.presets.length}</span>
+                  </button>
+                  {open && (
+                    <ul>
+                      {g.presets.map((p) => (
+                        <li key={p.id} className="group flex h-6 items-center justify-between rounded pl-5 pr-1 hover:bg-neutral-800">
+                          <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
+                            {p.name}
+                          </button>
+                          {targetCount > 1 && (
+                            <span className="invisible mr-1 shrink-0 text-sky-300 group-hover:visible" data-testid={`preset-hint-${p.id}`}>
+                              → {targetCount}
+                            </span>
+                          )}
+                          {confirming === p.id ? (
+                            <span className="flex shrink-0 items-center gap-1">
+                              <button
+                                className="rounded bg-red-900 px-1.5 py-0.5 text-red-100 hover:bg-red-800"
+                                data-testid={`preset-delete-confirm-${p.id}`}
+                                onClick={() => {
+                                  setConfirming(null);
+                                  onDeletePreset(p);
+                                }}
+                              >
+                                Delete
+                              </button>
+                              <button className="text-neutral-400 hover:text-white" data-testid={`preset-delete-cancel-${p.id}`} onClick={() => setConfirming(null)}>
+                                Keep
+                              </button>
+                            </span>
+                          ) : (
+                            <button className="invisible text-neutral-400 hover:text-red-400 group-hover:visible" onClick={() => setConfirming(p.id)} data-testid={`preset-delete-${p.id}`} title="Delete preset">
+                              <Trash2 className="size-3.5" />
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              );
+            })}
           </div>
-        </div>
-        {entries.length === 0 && <p className="text-neutral-400">No edits yet. Each change you make is listed here.</p>}
-        <ul data-testid="history-list">
-          {entries.map((e) => (
-            <li key={e.id}>
-              <button
-                className={`w-full truncate rounded px-1.5 py-1 text-left ${history?.currentEntryId === e.id ? "bg-sky-900/60 text-sky-100" : "text-neutral-400 hover:bg-neutral-800"}`}
-                data-testid={`history-${e.id}`}
-                data-current={history?.currentEntryId === e.id}
-                onClick={() => onGoto(e.id)}
-              >
-                {e.label}
+        </Section>
+
+        <Section
+          id="snapshots"
+          title="Snapshots"
+          defaultOpen={false}
+          action={
+            <button className="text-neutral-400 hover:text-white disabled:opacity-40" disabled={!snaps.supported} title={snaps.supported ? "New snapshot (Cmd+N)" : "Snapshots need backend support (not wired yet)"} data-testid="snapshot-add">
+              <Plus className="size-3.5" />
+            </button>
+          }
+        >
+          {snaps.items.length === 0 && <p className="text-neutral-400">No snapshots. Save the current look with + (Cmd+N).</p>}
+          <ul data-testid="snapshot-list">
+            {snaps.items.map((s) => (
+              <li key={s.id} className="h-6 truncate px-1 leading-6">
+                {s.name}
+              </li>
+            ))}
+          </ul>
+        </Section>
+
+        <Section
+          id="history"
+          title="History"
+          action={
+            <div className="flex gap-2">
+              <button disabled={!history?.canUndo} onClick={onUndo} title={`Undo${hint("undoAdj")}`} data-testid="undo" className="text-neutral-400 hover:text-white disabled:opacity-30">
+                <Undo2 className="size-4" />
               </button>
-            </li>
-          ))}
-        </ul>
-      </section>
+              <button disabled={!history?.canRedo} onClick={onRedo} title={`Redo${hint("redoAdj")}`} data-testid="redo" className="text-neutral-400 hover:text-white disabled:opacity-30">
+                <Redo2 className="size-4" />
+              </button>
+            </div>
+          }
+        >
+          {entries.length === 0 && <p className="text-neutral-400">No edits yet. Each change you make is listed here.</p>}
+          <ul data-testid="history-list">
+            {entries.map((e) => (
+              <li key={e.id}>
+                <button
+                  className={`w-full truncate rounded px-1.5 py-1 text-left ${history?.currentEntryId === e.id ? "bg-sky-900/60 text-sky-100" : "text-neutral-400 hover:bg-neutral-800"}`}
+                  data-testid={`history-${e.id}`}
+                  data-current={history?.currentEntryId === e.id}
+                  onClick={() => onGoto(e.id)}
+                >
+                  {e.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      </div>
+
+      <div className="flex h-9 shrink-0 gap-2 border-t border-neutral-800 px-3 py-1" data-testid="left-bar">
+        <button
+          className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700"
+          onClick={(e) => onCopy(e.altKey)}
+          title={`Copy settings… (Alt: copy with the remembered fields, no dialog)${hint("copy")}`}
+          data-testid="copy-settings"
+        >
+          <ClipboardCopy className="size-3.5" /> Copy…
+        </button>
+        <button className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40" disabled={!copied} onClick={onPaste} title={pasteTitle} data-testid="paste-settings">
+          <ClipboardPaste className="size-3.5" /> Paste
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Photo preview fitted in width x 2/3; at 100% a rectangle marks the visible region and click / drag pans. */
+function Navigator({ url, zoom, region, onZoom }: { url: string | null; zoom: Zoom; region: NormRect | null; onZoom: (z: Zoom) => void }) {
+  const box = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+  const [aspect, setAspect] = useState(1.5);
+  const pan = (e: React.PointerEvent) => {
+    const r = box.current?.getBoundingClientRect();
+    if (!r || !zoom.on) return;
+    onZoom({ on: true, cx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), cy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) });
+  };
+  // The frame (3:2) is filled by the image at its own aspect: percentages keep the region overlay exact.
+  const wPct = aspect >= 1.5 ? 100 : (aspect / 1.5) * 100;
+  const hPct = aspect >= 1.5 ? (1.5 / aspect) * 100 : 100;
+  return (
+    <div className="relative aspect-[3/2] w-full overflow-hidden bg-neutral-950" data-testid="navigator">
+      {url ? (
+        <div
+          ref={box}
+          className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 ${zoom.on ? "cursor-crosshair" : ""}`}
+          style={{ width: `${wPct}%`, height: `${hPct}%` }}
+          onPointerDown={(e) => {
+            dragging.current = true;
+            e.currentTarget.setPointerCapture(e.pointerId);
+            pan(e);
+          }}
+          onPointerMove={(e) => dragging.current && pan(e)}
+          onPointerUp={() => (dragging.current = false)}
+        >
+          <img
+            src={url}
+            alt=""
+            draggable={false}
+            className="block size-full select-none"
+            data-testid="navigator-img"
+            onLoad={(e) => e.currentTarget.naturalHeight > 0 && setAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight)}
+          />
+          {zoom.on && region && (
+            <div
+              className="pointer-events-none absolute border border-white"
+              style={{ left: `${region.x * 100}%`, top: `${region.y * 100}%`, width: `${region.width * 100}%`, height: `${region.height * 100}%`, boxShadow: "0 0 0 999px rgb(0 0 0 / 0.4)" }}
+              data-testid="navigator-region"
+            />
+          )}
+        </div>
+      ) : (
+        <span className="absolute inset-0 flex items-center justify-center text-neutral-400">No preview</span>
+      )}
     </div>
   );
 }

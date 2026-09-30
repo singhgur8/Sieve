@@ -17,6 +17,7 @@ async function openDevelop(page: Page, id = 1) {
 async function openSection(page: Page, id: string) {
   if ((await page.getByTestId(`section-${id}`).getAttribute("data-open")) !== "true") await page.getByTestId(`section-toggle-${id}`).click();
   await expect(page.getByTestId(`section-${id}`)).toHaveAttribute("data-open", "true");
+  await page.getByTestId(`section-${id}`).scrollIntoViewIfNeeded();
 }
 
 async function setSlider(page: Page, id: string, value: number) {
@@ -31,6 +32,7 @@ const lastSave = async (page: Page) => (await saved(page)).pop()!;
 
 /** Client position of a curve coordinate (0..255) inside the curve editor. */
 async function curveXY(page: Page, x: number, y: number) {
+  await page.getByTestId("curve-svg").scrollIntoViewIfNeeded();
   const b = (await page.getByTestId("curve-svg").boundingBox())!;
   const view = 255 + 16;
   return { x: b.x + ((x + 8) / view) * b.width, y: b.y + ((255 - y + 8) / view) * b.height };
@@ -215,7 +217,9 @@ test.describe("profile browser", () => {
     await page.getByTestId("profile-item-Camera Standard").click();
     await expect.poll(async () => (await lastSave(page))?.adjustments.profile.cameraProfile).toBe("Camera Standard");
     expect((await lastSave(page)).adjustments.profile.look).toBeNull();
+    await page.getByTestId("profile-browser-close").click(); // Esc / Close returns to the sections
     await expect(page.getByTestId("profile-current")).toHaveText("Camera Standard");
+    await page.getByTestId("profile-browse").click();
 
     await page.getByTestId("look-item-AAAA0000000000000000000000000001").click();
     await expect.poll(async () => (await lastSave(page)).adjustments.profile.look?.name).toBe("Vintage 01");
@@ -291,7 +295,7 @@ test.describe("detail, effects, calibration, black and white", () => {
     await expect(page.getByTestId("hsl-tabs")).toHaveCount(0);
     await setSlider(page, "bw-red", 40);
     await expect.poll(async () => (await lastSave(page)).adjustments.blackAndWhite.mixer.red).toBe(40);
-    await expect(page.getByTestId("section-toggle-hsl")).toContainText("Black & White");
+    await expect(page.getByTestId("section-toggle-hsl")).toContainText("B&W");
     await shot(page, "6x-parity-05-bw");
   });
 
@@ -302,11 +306,11 @@ test.describe("detail, effects, calibration, black and white", () => {
     await expect(page.getByTestId("section-basic")).toHaveAttribute("data-open", "false");
     await expect(page.getByTestId("slider-exposure")).toHaveCount(0);
     // Remembered across a reload of the page (localStorage).
-    const stored = await page.evaluate(() => localStorage.getItem("sieve.develop.sections"));
+    const stored = await page.evaluate(() => localStorage.getItem("sieve.develop.sections.v2"));
     expect(JSON.parse(stored!)).toMatchObject({ basic: false, "tone-curve": true });
     await page.getByTestId("section-toggle-detail").click({ modifiers: ["Alt"] });
     await expect(page.getByTestId("section-detail")).toHaveAttribute("data-open", "true");
-    for (const id of ["basic", "tone-curve", "hsl", "profile", "crop"]) await expect(page.getByTestId(`section-${id}`)).toHaveAttribute("data-open", "false");
+    for (const id of ["basic", "tone-curve", "hsl", "color-grading", "effects", "calibration"]) await expect(page.getByTestId(`section-${id}`)).toHaveAttribute("data-open", "false");
   });
 });
 
@@ -351,7 +355,7 @@ test.describe("crop tool", () => {
     expect(s.adjustments.crop.right).toBeLessThanOrEqual(1);
     // The render of the cropped frame follows (mock: aspect changes).
     await expect.poll(async () => (await calls(page, "render_preview")).filter((c) => c.args.options.slot === "main").pop()!.args.adjustments.crop.enabled).toBe(true);
-    await expect(page.getByTestId("crop-status")).toContainText("Cropped");
+    await expect(page.getByTestId("tool-crop-dot")).toBeVisible(); // the strip marks a cropped photo
 
     // Esc cancels: the first Esc only leaves the tool (Develop stays open), nothing is saved.
     await clearCalls(page);
@@ -395,9 +399,13 @@ test.describe("crop tool", () => {
     await expect.poll(async () => (await saved(page)).length).toBe(1);
     expect((await lastSave(page)).adjustments.crop.enabled).toBe(true);
 
-    await page.getByTestId("crop-remove").click();
+    // Remove the crop: open the tool, Reset to the full frame, Done.
+    await page.getByTestId("tool-crop").click();
+    await expect(page.getByTestId("crop-panel")).toHaveAttribute("data-active", "true");
+    await page.getByTestId("crop-reset").click();
+    await page.getByTestId("crop-done").click();
     await expect.poll(async () => (await lastSave(page)).adjustments.crop.enabled).toBe(false);
-    await expect(page.getByTestId("crop-status")).toHaveText("Not cropped");
+    await expect(page.getByTestId("tool-crop-dot")).toHaveCount(0);
 
     // A full-frame commit with no angle stores no crop at all.
     await clearCalls(page);

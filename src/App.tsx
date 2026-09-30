@@ -8,7 +8,7 @@ import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useCullUndo } from "./hooks/useCullUndo";
 import { TopBar } from "./components/TopBar";
-import { FilterBar, FilterExtras, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
+import { FilterBar, FilterExtras, filterSummaryText, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
 import { LoupeLayer, type CompareState, type LoupeHandle } from "./components/LoupeLayer";
@@ -60,7 +60,6 @@ export default function App() {
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
   const [caps, setCaps] = useState(false);
-  const devPanels = usePanels("develop");
   const loupePanels = usePanels("loupe");
   const lastUndone = useRef<"cull" | "adj">("adj");
   const colsRef = useRef({ cols: 1, page: 1 });
@@ -347,6 +346,24 @@ export default function App() {
   const ratePhoto = useCallback(
     (id: number, rating: number) => {
       void mutate(`Rate ${what([id])} ${rating}★`, [id], (e) => ({ ...e, rating }), () => unwrap(commands.setRating([id], rating)));
+    },
+    [mutate, what],
+  );
+
+  /** Flag / X click on the Develop toolbar: flags that photo only; clicking its current flag clears it. */
+  const flagPhoto = useCallback(
+    (id: number, flag: "pick" | "reject") => {
+      const pick: PickFlag = lib.getEntry(id)?.pick === flag ? "unflagged" : flag;
+      const name = { pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick];
+      void mutate(`${name} ${what([id])}`, [id], (e) => ({ ...e, pick }), () => unwrap(commands.setPick([id], pick)));
+    },
+    [lib, mutate, what],
+  );
+
+  /** Color label menu on the Develop toolbar (null clears). */
+  const labelPhoto = useCallback(
+    (id: number, label: ColorLabel | null) => {
+      void mutate(`Label ${what([id])} ${label ?? "none"}`, [id], (e) => ({ ...e, colorLabel: label }), () => unwrap(commands.setColorLabel([id], label)));
     },
     [mutate, what],
   );
@@ -714,6 +731,8 @@ export default function App() {
         return;
       case "sync":
         return develop.current?.sync();
+      case "syncQuiet":
+        return develop.current?.sync(true);
       case "reset":
         return develop.current?.reset();
       case "maskPanel":
@@ -868,7 +887,7 @@ export default function App() {
           />
         </>
         )
-      ) : (mode === "develop" && devPanels.chrome) || (mode === "loupe" && loupePanels.chrome) ? null : (
+      ) : mode === "develop" || (mode === "loupe" && loupePanels.chrome) ? null : (
         <FilterSummary
           query={query}
           shown={ids.length}
@@ -929,6 +948,15 @@ export default function App() {
             onMakeSelect={makeSelect}
             onToggleCompare={() => (cmp ? setCmp(null) : void enterCompare())}
             onRate={ratePhoto}
+            onFlag={flagPhoto}
+            filterSummary={{
+              text: filterSummaryText(query, ids.length, counts?.total ?? null, scenes.number),
+              onEdit: () => {
+                changeMode("grid");
+                setFiltersOpen(true);
+              },
+            }}
+            onLabel={labelPhoto}
           />
           </ErrorBoundary>
         )}

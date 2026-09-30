@@ -84,7 +84,7 @@ test.describe("masks", () => {
     const ai = await calls(page, "compute_ai_mask");
     expect(ai).toHaveLength(1);
     expect(ai[0].args.request).toMatchObject({ target: { kind: "subject" }, referencePoint: null, force: false });
-    await expect(page.getByTestId("panel-tab-masks")).toContainText("(1)");
+    await expect(page.getByTestId("tool-masking")).toHaveAttribute("data-count", "1");
     const rows = page.locator('[data-testid^="mask-comp-"][data-kind="ai"]');
     await expect(rows).toHaveCount(1);
     await expect(rows.first()).toContainText("Subject 1");
@@ -627,7 +627,7 @@ test.describe("masks", () => {
     await page.getByTestId("paste-settings").click();
     await expect.poll(async () => (await calls(page, "paste_settings")).length).toBe(1);
     expect(((await calls(page, "paste_settings"))[0].args.fields as string[]).includes("masks")).toBe(false);
-    await page.getByTestId("panel-tab-masks").click();
+    if ((await page.getByTestId("tool-masking").getAttribute("aria-pressed")) !== "true") await page.getByTestId("tool-masking").click();
     await expect(page.getByTestId("mask-empty")).toBeVisible();
 
     // Now explicitly include Masking: the group arrives without digests and needs an update.

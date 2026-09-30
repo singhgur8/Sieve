@@ -51,8 +51,10 @@ test.describe("layout targets", () => {
       if (vp.height === 800) expect(viewer.height).toBeGreaterThanOrEqual(560);
       expect(share).toBeGreaterThanOrEqual(0.7);
       await shot(page, `5x-ux-develop-${vp.tag}`);
-      // Outside the Grid the filters collapse to a 28 px summary.
-      expect((await page.getByTestId("filter-summary").boundingBox())!.height).toBe(28);
+      // Develop has no filter row: the summary lives in the 22 px filmstrip header.
+      expect((await page.getByTestId("filmstrip-header").boundingBox())!.height).toBe(22);
+      await expect(page.getByTestId("filter-summary")).toHaveCount(0);
+      await expect(page.getByTestId("filter-summary-text")).toBeVisible();
     });
   }
 
@@ -439,7 +441,8 @@ test.describe("P1-10 cheat sheet and keymap", () => {
     await expect(page.getByTestId("before-toggle")).toHaveAttribute("title", "Before / after (\\)");
     await expect(page.getByTestId("split-toggle")).toHaveAttribute("title", "Split view (Y)");
     await expect(page.getByTestId("reset-all")).toHaveAttribute("title", "Reset all adjustments (Cmd+Shift+R)");
-    await expect(page.getByTestId("sync-settings").locator("xpath=..")).toHaveAttribute("title", /Cmd\/Shift-click other photos in the filmstrip/);
+    await expect(page.getByTestId("previous-settings")).toHaveAttribute("title", "No previous photo yet");
+    await expect(page.getByTestId("paste-settings")).toHaveAttribute("title", "Copy settings first (Cmd+Shift+C)");
   });
 
   test("Develop keys: Y split, Cmd+Shift+R reset, E to Loupe, Cmd+Shift+S sync hint", async ({ page }) => {

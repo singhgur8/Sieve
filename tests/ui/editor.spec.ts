@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { calls, clearCalls, openApp, shot } from "./helpers";
+import { calls, clearCalls, openApp, openSection, shot } from "./helpers";
 
 async function openDevelop(page: Page, id = 1) {
   await openApp(page, 200);
@@ -43,7 +43,7 @@ test.describe("develop", () => {
     await expect(page.getByTestId("develop-view")).toHaveCount(0);
     await page.getByTestId("mode-develop").click();
     await expect(page.getByTestId("develop-view")).toBeVisible();
-    await page.getByTestId("develop-back").click();
+    await page.getByTestId("mode-grid").click();
     await expect(page.getByTestId("develop-view")).toHaveCount(0);
   });
 
@@ -79,7 +79,7 @@ test.describe("develop", () => {
     expect(exps[exps.length - 1]).toBeCloseTo(finalValue, 2);
     await expect(page.getByTestId("history-list")).toContainText("Exposure");
     await expect(page.getByTestId("view-main")).toHaveAttribute("src", new RegExp(`e=${finalValue.toFixed(2)}`));
-    await expect(page.getByTestId("render-ms")).toContainText("ms");
+    await expect(page.getByTestId("viewer-toolbar")).toHaveAttribute("data-render-ms", /^\d+$/);
     await shot(page, "2x-editor-02-exposure");
 
     // The filmstrip shows the edited badge after the library refresh.
@@ -164,14 +164,16 @@ test.describe("develop", () => {
   test("sync settings to a multi-selection and reset", async ({ page }) => {
     await openDevelop(page);
     await setSlider(page, "vibrance", 35);
-    await expect(page.getByTestId("sync-settings")).toBeDisabled();
+    await expect(page.getByTestId("sync-settings")).toHaveCount(0); // one photo: Previous instead of Sync…
+    await expect(page.getByTestId("previous-settings")).toBeVisible();
     await page.getByTestId("film-1").click({ modifiers: ["Meta"] });
     await page.getByTestId("film-2").click({ modifiers: ["Meta"] });
     await page.getByTestId("film-3").click({ modifiers: ["Meta"] });
     // Meta-toggling image 1 off would change the active image; active is the last click. Re-activate 1.
     await page.getByTestId("film-1").click({ modifiers: ["Meta"] });
     await expect(page.getByTestId("develop-view")).toHaveAttribute("data-image-id", "1");
-    await expect(page.getByTestId("sync-settings")).toBeEnabled();
+    await expect(page.getByTestId("sync-settings")).toBeVisible();
+    await expect(page.getByTestId("reset-all")).toHaveText(/Reset \(\d+\)/);
     await clearCalls(page);
     await page.getByTestId("sync-settings").click();
     await page.getByTestId("fields-confirm").click();
@@ -190,6 +192,7 @@ test.describe("develop", () => {
     await openDevelop(page);
     await setSlider(page, "exposure", 1.25);
     await setSlider(page, "saturation", -20);
+    await page.getByTestId("preset-add").click();
     await page.getByTestId("preset-save").click();
     await page.getByTestId("preset-name").fill("Warm Look");
     await page.getByTestId("fields-confirm").click();
@@ -220,9 +223,11 @@ test.describe("develop", () => {
 
   test("LUT picker sets lut {id, amount}; import adds and selects a LUT", async ({ page }) => {
     await openDevelop(page);
-    await expect(page.getByTestId("lut-select").locator("option")).toHaveCount(3); // None + 2
+    await page.getByTestId("profile-browse").click();
+    await expect(page.getByTestId("profile-browser")).toBeVisible();
+    await expect(page.locator('[data-testid^="lut-item-"]')).toHaveCount(2);
     await clearCalls(page);
-    await page.getByTestId("lut-select").selectOption("film-warm");
+    await page.getByTestId("lut-item-film-warm").click();
     await expect.poll(async () => (await saves(page)).length).toBe(1);
     let [save] = await saves(page);
     expect(save.args.label).toBe("LUT");
@@ -238,8 +243,8 @@ test.describe("develop", () => {
     await page.getByTestId("lut-import").click();
     await expect.poll(async () => (await calls(page, "import_lut")).length).toBe(1);
     expect((await calls(page, "import_lut"))[0].args.path).toMatch(/\.cube$/);
-    await expect(page.getByTestId("lut-select")).toHaveValue("moody-blue");
-    await page.getByTestId("lut-select").selectOption("");
+    await expect(page.getByTestId("lut-item-moody-blue")).toHaveClass(/bg-sky-800/);
+    await page.getByTestId("lut-remove").click();
     await expect(page.getByTestId("slider-lut-amount")).toHaveCount(0);
     const lastSave = (await saves(page)).pop()!;
     expect(lastSave.args.adjustments.lut).toBeNull();
@@ -247,14 +252,14 @@ test.describe("develop", () => {
 
   test("white balance mode: Custom seeds from as-shot, Temp edit switches to custom", async ({ page }) => {
     await openDevelop(page);
-    await page.getByTestId("wb-custom").click();
+    await page.getByTestId("wb-select").selectOption("custom");
     await expect.poll(async () => (await saves(page)).length).toBe(1);
     expect((await saves(page))[0].args.adjustments.whiteBalance).toEqual({ mode: "custom", temperatureK: 5200, tint: 8 });
     await setSlider(page, "tint", 40);
     const last = (await saves(page)).pop()!;
     expect(last.args.label).toMatch(/^Tint [+-]?\d/);
     expect(last.args.adjustments.whiteBalance).toMatchObject({ mode: "custom", tint: 40, temperatureK: 5200 });
-    await page.getByTestId("wb-as-shot").click();
+    await page.getByTestId("wb-select").selectOption("as_shot");
     await expect(page.getByTestId("slider-value-tint")).toHaveText("+8");
   });
 
@@ -285,6 +290,7 @@ test.describe("develop", () => {
 
   test("Color Mixer edits a band and section reset clears it", async ({ page }) => {
     await openDevelop(page);
+    await openSection(page, "hsl");
     await setSlider(page, "hsl-hue-blue", 30);
     expect((await saves(page)).pop()!.args.adjustments.hsl.hue.blue).toBe(30);
     await page.getByTestId("hsl-tab-luminance").click();
