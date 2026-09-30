@@ -29,7 +29,8 @@ def args_for(groups, sets=()):
     for g in groups:
         if g == "curve":
             for t in LINEAR:
-                a += ["-XMP-crs:%s=0, 0" % t, "-XMP-crs:%s+=255, 255" % t]
+                # Repeated `-TAG=v` in one command builds a new list (`+=` would append).
+                a += ["-XMP-crs:%s=0, 0" % t, "-XMP-crs:%s=255, 255" % t]
             g = "pcurve"
         for t in Z[g]:
             a.append("-XMP-crs:%s=0" % t)

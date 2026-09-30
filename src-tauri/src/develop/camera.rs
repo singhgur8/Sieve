@@ -142,16 +142,17 @@ fn neutral_of_multipliers(mul: [f32; 3]) -> Option<[f64; 3]> {
 
 /// White point (xy) and camera neutral (max 1) of a white balance setting.
 fn white(color: &ColorInfo, d: &Dcp, wbs: &WhiteBalance) -> ((f64, f64), [f64; 3]) {
+    let cc = color.calibration.map(f64::from);
     match *wbs {
         WhiteBalance::AsShot => {
             let n = neutral_of_multipliers(color.as_shot()).unwrap_or([1.0; 3]);
-            (d.neutral_to_xy(n), n)
+            (d.neutral_to_xy(n, cc), n)
         }
         WhiteBalance::Custom { temperature_k, tint } => {
             let t = f64::from(temperature_k.clamp(wb::MIN_TEMP, wb::MAX_TEMP));
             let n = f64::from(tint.clamp(wb::MIN_TINT, wb::MAX_TINT));
             let xy = wb::xy_for(t, n);
-            (xy, d.xy_to_neutral(xy))
+            (xy, d.xy_to_neutral(xy, cc))
         }
     }
 }
@@ -167,7 +168,7 @@ pub fn color_setup(color: &ColorInfo, profile: &Profile, wbs: &WhiteBalance, cal
         }
     };
     let (xy, neutral) = white(color, d, wbs);
-    let (to_pcs, g) = d.camera_to_pcs(xy, neutral);
+    let (to_pcs, g) = d.camera_to_pcs(xy, neutral, color.calibration.map(f64::from));
     // Matrix on white-balanced values: camera = diag(neutral) * w.
     let mut m_w = to_pcs;
     for row in m_w.iter_mut() {
@@ -196,7 +197,7 @@ pub fn as_shot_values(color: &ColorInfo, profile: &Profile) -> Option<WhiteBalan
     match &profile.dcp {
         Some(d) => {
             let n = neutral_of_multipliers(mul)?;
-            let (x, y) = d.neutral_to_xy(n);
+            let (x, y) = d.neutral_to_xy(n, color.calibration.map(f64::from));
             let (t, tint) = wb::temp_tint_for(x, y);
             Some(WhiteBalanceValues {
                 temperature_k: (t as f32).clamp(wb::MIN_TEMP, wb::MAX_TEMP),
@@ -222,6 +223,7 @@ mod tests {
                 [-0.969_266, 1.876_010_8, 0.041_556],
                 [0.055_643_4, -0.204_025_9, 1.057_225_2],
             ],
+            calibration: [1.0; 3],
         }
     }
 

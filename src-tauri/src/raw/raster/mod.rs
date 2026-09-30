@@ -485,7 +485,7 @@ pub fn to_linear_image(img: RasterImage) -> LinearImage {
         width: img.width,
         height: img.height,
         pixels: img.pixels,
-        color: ColorInfo { as_shot_mul: Some([1.0; 3]), daylight_mul: [1.0; 3], rgb_cam, xyz_to_cam },
+        color: ColorInfo { as_shot_mul: Some([1.0; 3]), daylight_mul: [1.0; 3], rgb_cam, xyz_to_cam, calibration: [1.0; 3] },
         full_width: img.full_width,
         full_height: img.full_height,
         display_referred: true,

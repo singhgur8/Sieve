@@ -44,6 +44,7 @@ extern "C" {
     // native/libraw_shim.c
     fn sieve_lr_set_linear(lr: *mut LibrawData, half_size: c_int);
     fn sieve_lr_get_color(lr: *mut LibrawData, out: *mut ShimColor);
+    fn sieve_lr_set_white(lr: *mut LibrawData, white: c_uint);
     fn sieve_lr_copy_rgb16(lr: *mut LibrawData, out: *mut u16, cap: usize, w: *mut c_int, h: *mut c_int) -> c_int;
 }
 
@@ -65,6 +66,9 @@ struct ShimColor {
     model: [c_char; 64],
     fuji_expo_shift: f32,
     dng_baseline_exposure: f32,
+    linear_max: c_uint,
+    wb_daylight: [c_int; 4],
+    wb_d65: [c_int; 4],
 }
 
 impl Default for ShimColor {
@@ -104,6 +108,10 @@ pub struct ColorData {
     /// Fujifilm `RawExposureBias` (EV; 0 if none) and a DNG's `BaselineExposure`.
     pub fuji_expo_shift: f32,
     pub dng_baseline_exposure: f32,
+    /// Camera white-balance presets (R, G, B, G2 coefficients; zeros if absent): Daylight
+    /// (EXIF light source 1) and D65 (21).
+    pub wb_daylight: [i32; 4],
+    pub wb_d65: [i32; 4],
 }
 
 /// Linear 16-bit camera RGB (no white balance, black-subtracted, white level = 65535),
@@ -135,6 +143,10 @@ pub fn decode_linear(path: &Path, half_size: bool) -> Result<LinearRgb16, String
     let rc = unsafe { libraw_unpack(h.0) };
     if rc != 0 {
         return Err(err(rc));
+    }
+    if let Some(white) = adobe_white_level(&c) {
+        // SAFETY: unpacked handle; sets a processing parameter only.
+        unsafe { sieve_lr_set_white(h.0, white) };
     }
     // SAFETY: unpacked above.
     let rc = unsafe { libraw_dcraw_process(h.0) };
@@ -211,6 +223,16 @@ fn decode_linear_mem_image(path: &Path, half_size: bool) -> Result<Vec<u16>, Str
     }
 }
 
+/// White level Adobe's raw pipeline uses when it differs from LibRaw's: for Canon, Camera
+/// Raw / DNG Converter clip at the sensor's highlight linearity limit (e.g. 13660 for the
+/// EOS M6 Mark II, LibRaw's `linear_max`) rather than the ADC maximum, so the same raw
+/// value is ~0.3 EV brighter there. Other makes keep LibRaw's level (Sony's linearity
+/// limit, 15360, is *not* what Adobe uses; its DNGs keep 16383).
+fn adobe_white_level(c: &ShimColor) -> Option<c_uint> {
+    let canon = c_name(&c.make).eq_ignore_ascii_case("canon");
+    (canon && c.linear_max > 1024 && c.linear_max < c.maximum).then_some(c.linear_max)
+}
+
 fn color_data(c: &ShimColor) -> ColorData {
     let mut rgb_cam = [[0.0; 3]; 3];
     let mut cam_xyz = [[0.0; 3]; 3];
@@ -232,6 +254,8 @@ fn color_data(c: &ShimColor) -> ColorData {
         model: c_name(&c.model),
         fuji_expo_shift: if c.fuji_expo_shift.is_finite() { c.fuji_expo_shift } else { 0.0 },
         dng_baseline_exposure: if c.dng_baseline_exposure.is_finite() { c.dng_baseline_exposure } else { 0.0 },
+        wb_daylight: c.wb_daylight,
+        wb_d65: c.wb_d65,
     }
 }
 

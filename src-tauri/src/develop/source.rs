@@ -29,6 +29,10 @@ pub struct ColorInfo {
     pub rgb_cam: [[f32; 3]; 3],
     /// XYZ -> camera RGB (LibRaw `cam_xyz`, Adobe `ColorMatrix`), for temperature/tint.
     pub xyz_to_cam: [[f32; 3]; 3],
+    /// Per-unit camera calibration (DNG `CameraCalibration`, diagonal R, G, B): this
+    /// camera's RGB = diag(calibration) * the reference unit's the colour matrices describe.
+    /// `[1; 3]` when unknown. See [`camera_calibration`].
+    pub calibration: [f32; 3],
 }
 
 impl ColorInfo {
@@ -101,7 +105,53 @@ pub fn color_info(c: &libraw::ColorData) -> ColorInfo {
             xyz_to_cam = mat_mul(&cam_rgb, &srgb_from_xyz).map(|r| r.map(|v| v as f32));
         }
     }
-    ColorInfo { as_shot_mul: normalized_mul(c.cam_mul), daylight_mul, rgb_cam: c.rgb_cam, xyz_to_cam }
+    ColorInfo {
+        as_shot_mul: normalized_mul(c.cam_mul),
+        daylight_mul,
+        rgb_cam: c.rgb_cam,
+        xyz_to_cam,
+        calibration: camera_calibration(c),
+    }
+}
+
+/// Per-model reference white-balance preset of Adobe's camera calibration: Camera Raw /
+/// DNG Converter compensate unit-to-unit sensor variation with
+/// `CameraCalibration = diag(K / preset)` (G = 1), where `preset` is the camera's own
+/// white-balance preset for a fixed light (normalized to G) and `K` a per-model constant.
+/// Measured from Adobe DNG Converter 17.5 conversions (`tools/acr-oracle/cc_probe.py`;
+/// two EOS M6 Mark II frames with different daylight presets confirm the form exactly).
+/// (make, model, preset light source (EXIF code), K red, K blue).
+const CALIBRATION_REFERENCE: &[(&str, &str, u8, f32, f32)] = &[
+    ("Sony", "ILCE-7M4", 1, 2.354_37, 1.599_60),
+    ("Canon", "EOS M6 Mark II", 1, 1.756_93, 1.599_58),
+    ("Fujifilm", "X-M5", 21, 2.036_36, 1.652_27),
+];
+
+/// Adobe's per-unit camera calibration for a raw file (see [`CALIBRATION_REFERENCE`]);
+/// `[1; 3]` for other cameras or when the preset is missing.
+pub fn camera_calibration(c: &libraw::ColorData) -> [f32; 3] {
+    let Some(&(_, _, light, kr, kb)) = CALIBRATION_REFERENCE
+        .iter()
+        .find(|(make, model, ..)| c.make.eq_ignore_ascii_case(make) && c.model.eq_ignore_ascii_case(model))
+    else {
+        return [1.0; 3];
+    };
+    let p = match light {
+        1 => c.wb_daylight,
+        21 => c.wb_d65,
+        _ => return [1.0; 3],
+    };
+    if p[0] <= 0 || p[1] <= 0 || p[2] <= 0 {
+        return [1.0; 3];
+    }
+    let g = p[1] as f32;
+    let cc = [kr * g / p[0] as f32, 1.0, kb * g / p[2] as f32];
+    // Guard against misparsed presets: real calibrations are within a few percent.
+    if cc.iter().all(|v| (0.8..1.25).contains(v)) {
+        cc
+    } else {
+        [1.0; 3]
+    }
 }
 
 /// What the colour pipeline needs to know about a decoded source besides its pixels.
@@ -569,6 +619,7 @@ mod tests {
                 daylight_mul: [1.0; 3],
                 rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 xyz_to_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                calibration: [1.0; 3],
             },
             full_width: w * 2,
             full_height: h * 2,

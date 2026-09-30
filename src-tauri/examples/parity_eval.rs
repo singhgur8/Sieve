@@ -348,10 +348,11 @@ fn main() {
         let warn: Vec<&str> = profile.warnings.iter().map(|w| w.code.as_str()).collect();
         let look = adj.profile.look.as_ref().map_or("-".to_owned(), |l| l.name.clone());
         let mut line = format!(
-            "{stem}: {}x{} base {:.2} profile {:?} look {look} dcp {} {} | total {:.0} ms render {render_ms:.0} ms {}{}",
+            "{stem}: {}x{} base {:.2} cc {:.4?} profile {:?} look {look} dcp {} {} | total {:.0} ms render {render_ms:.0} ms {}{}",
             out.width,
             out.height,
             profile.baseline_ev,
+            img.color.calibration,
             adj.profile.camera_profile.as_deref().unwrap_or("-"),
             profile.dcp.is_some(),
             if adj.crop.enabled { format!("crop {:.2}deg", adj.crop.angle) } else { String::new() },
@@ -375,6 +376,14 @@ fn main() {
         });
         if let Some(r) = &refimg {
             let r = resize(r, sieve.w, sieve.h);
+            if std::env::var_os("SIEVE_DUMP").is_some() {
+                // Lossless copies for offline analysis (tools/acr-oracle).
+                for (img, tag) in [(&r, "ref"), (&sieve, "sieve")] {
+                    let mut ppm = format!("P6\n{} {}\n255\n", img.w, img.h).into_bytes();
+                    ppm.extend_from_slice(&img.px);
+                    std::fs::write(out_dir.join(format!("{stem}.{tag}.ppm")), ppm).unwrap();
+                }
+            }
             let (a, b) = (box3(&sieve), box3(&r));
             let mut d: Vec<f64> = a.iter().zip(&b).step_by(3).map(|(p, q)| de2000(lab(*p), lab(*q))).collect();
             let mean = d.iter().sum::<f64>() / d.len() as f64;

@@ -44,6 +44,7 @@ fn main() {
         daylight_mul: [1.0; 3],
         rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         xyz_to_cam: m,
+        calibration: [1.0; 3],
     };
     let profile = Profile::matrix(0.0);
     let input = pipeline::RenderInput::simple(w, h, &px, &color, &profile);
