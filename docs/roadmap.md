@@ -111,6 +111,7 @@ copy subsets into `test-data/` for anything that writes.
   (preview + export), within the slider latency budget.
 - [ ] **Masking UI** (frontend-dev): Lightroom-style masks panel, brush with size/feather/flow/auto-mask, gradient
   handles, AI select buttons, overlay visualization, keyboard shortcuts (O overlay, K brush, M linear, Shift+M radial).
+- [ ] **Mask pipeline integration** (rust-engine-dev, after 7b pipeline lands): call the develop/masks seam from develop/pipeline.rs + mod.rs (preview + export; export computes missing AI mattes first); adapt apply_group_blends to the pipeline's working space (linear ProPhoto vs Rec.2020 stub); lib.rs `XmpSync::with_mask_cache(mask_cache)` (architect-approved) so Lightroom mattes are cached on read; DevelopCache::info reports ai_mask_needs_update; launch catch-up for masks_pending_import; render the user's 50 masked frames and compare with/without masks.
 - [ ] **Masking polish** (frontend-dev + rust-engine-dev): per-mask tone curve editor, reorder groups/components, overlay rendered for the visible region at 100% zoom, verify crop-angle sign + gradient geometry against real renders, luminance eyedropper via backend sample (not canvas).
 - [ ] **QA gate**: the user's 50 AI subject masks (Adaptive: Subject presets; mattes embedded as JPEG XL in crs:Table_*) import and render like Lightroom (decoded mattes); new brush/gradient/range/AI masks work end to end; round trip preserves Lightroom mask data byte-for-byte when unchanged.
 
