@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release --example mask_render -- --out DIR [--folder DIR] [--size PX]
-//!     [--limit N] [--reference DIR]
+//!     [--limit N] [--reference DIR] [--reference-nomask DIR] [--only-ref] [--xmp-dir DIR]
 //! ```
 //! `--reference` = folder with `<stem>.ref.jpg` Camera Raw renders (the full-size preview of
 //! a DNG made by Adobe DNG Converter from the RAW + sidecar, `tools/acr-oracle/dng_list.sh`).
@@ -268,6 +268,20 @@ fn local_effect(a: &Img, b: &Img, sel: &dyn Fn(usize) -> bool) -> ([f64; 3], f64
     (d.map(|v| v / n.max(1.0)), (va / vb.max(1e-9)).sqrt())
 }
 
+/// Mean Lab distance, over `sel`, between the local effects `a - a0` (Sieve) and `b - b0`
+/// (Camera Raw): how well the masks' effect matches, independent of the global difference.
+fn effect_error(a: &Img, a0: &Img, b: &Img, b0: &Img, sel: &dyn Fn(usize) -> bool) -> f64 {
+    let (pa, pa0, pb, pb0) = (box3(a), box3(a0), box3(b), box3(b0));
+    let (mut s, mut n) = (0.0f64, 0.0f64);
+    for i in (0..pa.len()).step_by(3).filter(|&i| sel(i)) {
+        let (la, la0, lb, lb0) = (lab(pa[i]), lab(pa0[i]), lab(pb[i]), lab(pb0[i]));
+        let d: f64 = (0..3).map(|c| ((la[c] - la0[c]) - (lb[c] - lb0[c])).powi(2)).sum();
+        s += d.sqrt();
+        n += 1.0;
+    }
+    s / n.max(1.0)
+}
+
 /// (ACR in-mask dLab, ACR contrast ratio, Sieve dLab, Sieve contrast ratio).
 type Effect = ([f64; 3], f64, [f64; 3], f64);
 
@@ -281,7 +295,14 @@ fn main() {
     let limit: usize = arg("--limit").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let reference = arg("--reference").map(PathBuf::from);
     let reference_nomask = arg("--reference-nomask").map(PathBuf::from);
+    // Only frames with a Camera Raw reference (fast calibration loops).
+    let only_ref = args.iter().any(|a| a == "--only-ref");
+    // Sidecars from this folder (`<stem>.xmp`, e.g. `local_variants` output) instead of the
+    // RAWs' own.
+    let xmp_dir = arg("--xmp-dir").map(PathBuf::from);
     let mut effects = Vec::new();
+    let mut floors: Vec<f64> = Vec::new();
+    let mut eff_errs: Vec<f64> = Vec::new();
     std::fs::create_dir_all(&out_dir).expect("output dir");
     let lib = ProfileLibrary::shared();
     lib.warm();
@@ -299,14 +320,20 @@ fn main() {
         if n >= limit {
             break;
         }
-        let sidecar = xmp::sidecar_path(path);
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let sidecar = match &xmp_dir {
+            Some(d) => d.join(format!("{stem}.xmp")),
+            None => xmp::sidecar_path(path),
+        };
         let Ok(text) = std::fs::read_to_string(&sidecar) else { continue };
         let Ok(Some(read)) = xmp::masks::read(&text) else { continue };
         if read.groups.is_empty() {
             continue;
         }
+        if only_ref && !reference.as_ref().is_some_and(|d| d.join(format!("{stem}.ref.jpg")).is_file()) {
+            continue;
+        }
         n += 1;
-        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let format = raw::format_from_extension(path).unwrap();
         let mut adj = xmp::packet::parse_for(&text, format)
             .ok()
@@ -428,6 +455,11 @@ fn main() {
                 Some(resize(&if same { r } else { orient(&r, o) }, wi.w, wi.h))
             });
             if let Some(r0) = &r0 {
+                let (floor, _, _) = delta_e(&wo, r0, &inside);
+                let eff = effect_error(&wi, &wo, r, r0, &inside);
+                line += &format!(" | in-mask floor (no masks both) {floor:.2} effect error {eff:.2}");
+                floors.push(floor);
+                eff_errs.push(eff);
                 let (acr, acr_c) = local_effect(r, r0, &inside);
                 let (sv, sv_c) = local_effect(&wi, &wo, &inside);
                 line += &format!(
@@ -449,6 +481,14 @@ fn main() {
             avg(|r| r.1),
             avg(|r| r.2),
             avg(|r| r.3)
+        );
+    }
+    if !floors.is_empty() {
+        let k = floors.len() as f64;
+        println!(
+            "FLOOR in-mask dE with no masks on either side: {:.2}; local effect error (Lab) {:.3}",
+            floors.iter().sum::<f64>() / k,
+            eff_errs.iter().sum::<f64>() / k
         );
     }
     if !effects.is_empty() {

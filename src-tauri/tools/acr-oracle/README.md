@@ -43,3 +43,23 @@ Sources are only read (never write under `~/Pictures`).
 Refit after changing the adaptation filter: build `parity_eval`, run
 `SIEVE_DUMP_EV=1 SIEVE_DUMP=1 ./eval.sh $P2/fit-list.txt neutral`, re-dump the sweep variants
 (`dump_variants.py ... nS+50,...,nH-100`), then `python3 fit2.py --write`.
+
+## Local (mask) sliders (Phase 8)
+
+Isolated Camera Raw responses of single local sliders on the 10 `mask-render` reference
+frames, with a geometric mask both renderers evaluate identically:
+
+1. `cargo run --release --example local_variants -- --reference test-data/mask-render/ref --out test-data/mask-polish/varxmp`
+   writes each frame's sidecar (read in place) with its masks replaced by one radial mask
+   carrying one slider (`temp-20`, `temp+40`, `temp-60`, `tint+-30`, `clar-20/-60`,
+   `tex-15/-60`, `contr-16/+30`, `expo+50`).
+2. `XMP_FILE=test-data/mask-polish/varxmp/<v>/STEM.xmp python3 mask_variants.py r-<v> <all local names>`
+   renders them with DNG Converter (AI masks cannot be varied: DNG Converter drops an edited
+   AI mask).
+3. `mask_render --xmp-dir test-data/mask-polish/varxmp/<v> --reference test-data/mask-polish/var/r-<v> --reference-nomask test-data/mask-render/ref-nomask --only-ref`
+   prints per frame the in-mask dE, the *floor* (Sieve vs Camera Raw with no masks on either
+   side: the global pipeline's share) and the *local effect error* (Lab distance between the
+   two renderers' mask-minus-no-mask differences), plus mean effect dLab / micro-contrast.
+
+The fitted constants live in `src/develop/local.rs` (`LOCAL_TEMP_WARM/COOL`, `LOCAL_TINT*`,
+`LOCAL_*_CURVE`).

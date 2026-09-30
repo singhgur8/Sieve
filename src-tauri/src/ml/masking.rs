@@ -431,7 +431,17 @@ impl Segmenter {
         }
         let source = self.source(src, preview_path, &fingerprint)?;
         let t_source = started.elapsed();
-        let input = SegmentInput { width: source.width, height: source.height, rgb: &source.rgb, orientation: 1 };
+        // Select Sky runs on the upright image (the network is trained on upright photos; on
+        // a sideways sensor frame it half-selects the sky). Other models see the sensor frame.
+        let o = match request.target {
+            AiTarget::Sky => src.orientation.filter(|o| (2..=8).contains(o)).unwrap_or(1),
+            _ => 1,
+        };
+        let upright = (o != 1).then(|| orient_pixels(&source.rgb, source.width as usize, source.height as usize, 3, o));
+        let input = match &upright {
+            Some((rgb, w, h)) => SegmentInput { width: *w as u32, height: *h as u32, rgb, orientation: o },
+            None => SegmentInput { width: source.width, height: source.height, rgb: &source.rgb, orientation: 1 },
+        };
         let seg_request = SegmentRequest {
             target: orient_target(&request.target, input.orientation),
             reference_point: request.reference_point.map(|p| orient_point(p, input.orientation)),
@@ -606,6 +616,24 @@ pub fn unorient_matte(m: AlphaMask, orientation: u8) -> AlphaMask {
     AlphaMask { width: w as u32, height: h as u32, bounds: unorient_rect(m.bounds, orientation), data }
 }
 
+/// Sensor-frame interleaved pixels (`channels` per pixel) -> displayed frame for EXIF
+/// `orientation` (inverse of `refine::unorient_pixels`). Returns the pixels and their size.
+pub fn orient_pixels(px: &[u8], w: usize, h: usize, channels: usize, orientation: u8) -> (Vec<u8>, usize, usize) {
+    if !(2..=8).contains(&orientation) {
+        return (px[..w * h * channels].to_vec(), w, h);
+    }
+    let (dw, dh) = if orientation >= 5 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; dw * dh * channels];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = oriented_index(x, y, w, h, orientation);
+            let (s, d) = ((y * w + x) * channels, (dy * dw + dx) * channels);
+            out[d..d + channels].copy_from_slice(&px[s..s + channels]);
+        }
+    }
+    (out, dw, dh)
+}
+
 /// Sensor-frame matte -> oriented frame (inverse of [`unorient_matte`]; tests, overlays).
 pub fn orient_matte(m: &AlphaMask, orientation: u8) -> AlphaMask {
     if !(2..=8).contains(&orientation) {
@@ -635,3 +663,5 @@ pub fn coverage(m: &AlphaMask) -> f32 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_sky;

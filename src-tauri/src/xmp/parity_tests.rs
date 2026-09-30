@@ -25,6 +25,7 @@ fn develop_write(adj: &ParametricAdjustments, look_source: Option<&str>) -> Desi
         metadata_date: DATE.into(),
         seqs,
         profile: Some(ProfileWrite { settings: adj.profile.clone(), look_source: look_source.map(Arc::from) }),
+        format: None,
     }
 }
 
@@ -156,11 +157,14 @@ fn curves_are_replaced_created_and_named() {
     let out = merge(Some(&out), &develop_write(&adj, None)).unwrap();
     assert!(out.contains("crs:ToneCurveName2012=\"Linear\""));
     assert_eq!(parse(&out).unwrap().develop.unwrap().tone_curve, adj.tone_curve);
-    // A new packet gets all four Seqs (Lightroom's layout).
+    // A new packet only gets the non-identity Seqs (absent reads as identity).
     let fresh = merge(None, &develop_write(&adj, None)).unwrap();
-    for (name, _) in crs::CRS_CURVES {
-        assert!(fresh.contains(&format!("<crs:{name}>\n")), "{name}: {fresh}");
+    let p = &adj.tone_curve.point;
+    for ((name, _), curve) in crs::CRS_CURVES.iter().zip([&p.master, &p.red, &p.green, &p.blue]) {
+        let identity = crate::ipc::types::PointCurves::is_identity(curve);
+        assert_eq!(fresh.contains(&format!("<crs:{name}>\n")), !identity, "{name}: {fresh}");
     }
+    assert!(!fresh.contains("ToneCurveName2012"), "{fresh}");
     assert_eq!(parse(&fresh).unwrap().develop.unwrap().tone_curve, adj.tone_curve);
 }
 

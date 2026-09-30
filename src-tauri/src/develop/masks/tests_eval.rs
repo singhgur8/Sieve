@@ -325,6 +325,92 @@ fn luminance_and_color_ranges_read_the_guide() {
     assert!(at(&s, 400, 159, 2) > 0.0 && at(&s, 400, 159, 2) < 1.0, "edges are smoothed: {}", at(&s, 400, 159, 2));
 }
 
+/// Smoothness follows image edges (guided filter): a selection bounded by a strong edge stays
+/// crisp at the edge while a hard luminance threshold inside a flat noisy area is softened;
+/// no rectangular blocks (a box blur spreads a lone selected pixel into a square).
+#[test]
+fn range_smoothing_is_edge_aware_and_block_free() {
+    let (w, h) = (200u32, 40u32);
+    let g = geom(w, h);
+    // Dark left half (L 20), bright right half (L 80), plus one bright pixel on the left.
+    let lab =
+        guide_lab(w, h, |x, y| if x >= 100 || (x == 40 && y == 20) { [80.0, 0.0, 0.0] } else { [20.0, 0.0, 0.0] });
+    let guide = RangeGuide { width: w, height: h, lab: &lab };
+    let lum = |smoothness: f32| {
+        comp(
+            1,
+            MaskShape::Luminance(LuminanceRange {
+                feather_low: 0.5,
+                low: 0.5,
+                high: 1.0,
+                feather_high: 1.0,
+                smoothness,
+            }),
+        )
+    };
+    let s = evaluate_component(&lum(100.0), &g, 1, &NoMattes, Some(&guide)).unwrap();
+    assert!(
+        at(&s, w, 98, 5) < 0.05 && at(&s, w, 101, 5) > 0.95,
+        "edge kept: {} {}",
+        at(&s, w, 98, 5),
+        at(&s, w, 101, 5)
+    );
+    // The isolated pixel does not grow into a square plateau.
+    let plateau = (35..46).flat_map(|x| (15..26).map(move |y| (x, y))).filter(|&(x, y)| at(&s, w, x, y) > 0.2).count();
+    assert!(plateau <= 1, "{plateau} px around the lone pixel");
+    // Hard edge (empty feather): a one-L* ramp outside the range, full weight inside.
+    let r = LuminanceRange { feather_low: 0.5, low: 0.5, high: 1.0, feather_high: 1.0, smoothness: 0.0 };
+    assert_eq!(luminance_weight(0.5, &r), 1.0);
+    assert!(close(luminance_weight(0.495, &r), 0.5, 1e-4));
+    assert_eq!(luminance_weight(0.489, &r), 0.0);
+}
+
+/// The overlay guide resamples in linear light: enlarging interpolates (no 2x2 duplicates),
+/// shrinking averages.
+#[test]
+fn overlay_guide_resamples_smoothly() {
+    // 4x1 ramp of sRGB values -> 8x1.
+    let rgb: Vec<u8> = [0u8, 80, 160, 240].iter().flat_map(|&v| [v, v, v]).collect();
+    let up = guide_from_srgb8(&rgb, 4, 1, 8, 1);
+    let l: Vec<f32> = up.iter().map(|p| p[0]).collect();
+    for k in 1..8 {
+        assert!(l[k] >= l[k - 1], "monotone {l:?}");
+    }
+    let distinct = l.windows(2).filter(|p| (p[0] - p[1]).abs() > 1e-3).count();
+    assert!(distinct >= 5, "interpolated, not duplicated: {l:?}");
+    let down = guide_from_srgb8(&rgb, 4, 1, 2, 1);
+    let mid = |a: u8, b: u8| {
+        let lin = |v: u8| {
+            let x = f32::from(v) / 255.0;
+            if x <= 0.04045 {
+                x / 12.92
+            } else {
+                ((x + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        linear_srgb_to_lab((lin(a) + lin(b)) / 2.0, (lin(a) + lin(b)) / 2.0, (lin(a) + lin(b)) / 2.0)[0]
+    };
+    assert!(close(down[0][0], mid(0, 80), 0.05) && close(down[1][0], mid(160, 240), 0.05), "{down:?}");
+    // Same size: exact.
+    assert_eq!(
+        guide_from_srgb8(&rgb, 4, 1, 4, 1)[2],
+        linear_srgb_to_lab(
+            {
+                let x: f32 = 160.0 / 255.0;
+                ((x + 0.055) / 1.055).powf(2.4)
+            },
+            {
+                let x: f32 = 160.0 / 255.0;
+                ((x + 0.055) / 1.055).powf(2.4)
+            },
+            {
+                let x: f32 = 160.0 / 255.0;
+                ((x + 0.055) / 1.055).powf(2.4)
+            },
+        )
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Combining and groups
 // ---------------------------------------------------------------------------
