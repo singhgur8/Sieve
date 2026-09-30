@@ -9,20 +9,15 @@
 //! the Library's hot queries: `list_image_ids` (the grid's id list), `get_images` of a
 //! 120-id chunk (the grid's row fetch), `list_images` pages, and `get_filter_counts`,
 //! each for the whole catalog and one folder under several filters/sorts.
-//! `--plans` prints `EXPLAIN QUERY PLAN` of the main statements. `--indexes` first applies
-//! [`PROPOSED_INDEXES`] (the Phase 8 migration proposal) to the catalog.
+//! `--plans` prints `EXPLAIN QUERY PLAN` of the main statements (the filter-bar indexes of
+//! migration 0011 should appear: `idx_images_folder_pick_rating`, `idx_image_tags_live`,
+//! `idx_images_missing`). 1% of the images are flagged missing (IPC v13).
 
 use std::time::Instant;
 
 use rusqlite::Connection;
 use sieve_lib::db::{self, repo};
 use sieve_lib::ipc::types::{CullTag, ImageQuery, ImageSort, PickFlag, TagMatch};
-
-/// Indexes proposed for migration 0011 (architect-owned); measured with `--indexes`.
-const PROPOSED_INDEXES: &str = "
-    CREATE INDEX IF NOT EXISTS idx_images_folder_pick_rating ON images(folder_id, pick, rating);
-    CREATE INDEX IF NOT EXISTS idx_image_tags_live ON image_tags(tag, image_id) WHERE suppressed = 0;
-    ANALYZE;";
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -90,7 +85,8 @@ fn populate(conn: &Connection, n: i64) {
          WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < {n})
          INSERT INTO adjustments (image_id, params_json, process_version, updated_at)
          SELECT x, '{{\"exposure\":0.5}}', 1, 0 FROM s WHERE x % 10 = 0;
-         UPDATE images SET xmp_dirty = 0;"
+         UPDATE images SET xmp_dirty = 0;
+         UPDATE images SET missing_since_ms = 1700000000000 WHERE id % 100 = 0;"
     ))
     .unwrap();
     conn.execute_batch("COMMIT; ANALYZE;").unwrap();
@@ -115,7 +111,7 @@ fn plans(conn: &Connection) {
        ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id");
     q("SELECT i.id, i.captured_at_ms, i.file_name, i.rating, NULL FROM images i
        WHERE i.id NOT IN (SELECT image_id FROM image_tags WHERE suppressed = 0 AND tag IN ('blink', 'missed_focus'))");
-    q("SELECT pick, rating, COUNT(*) FROM images GROUP BY pick, rating");
+    q("SELECT pick, rating, COUNT(*) FROM images GROUP BY folder_id, pick, rating");
     q("SELECT pick, rating, COUNT(*) FROM images WHERE folder_id = 3 GROUP BY pick, rating");
     q("SELECT tag, COUNT(*) FROM image_tags WHERE suppressed = 0 GROUP BY tag ORDER BY tag");
     q("SELECT tag, COUNT(*) FROM image_tags
@@ -123,19 +119,19 @@ fn plans(conn: &Connection) {
     q("SELECT COUNT(DISTINCT i.burst_group_id),
               COALESCE(SUM(b.keeper_image_id IS NOT NULL AND b.keeper_image_id <> i.id), 0)
        FROM images i JOIN burst_groups b ON b.id = i.burst_group_id");
+    q("SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL");
+    q("SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL AND folder_id = 3");
 }
 
 fn main() {
     let mut n: i64 = 50_000;
     let mut keep: Option<String> = None;
     let mut show_plans = false;
-    let mut indexes = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--keep" => keep = args.next(),
             "--plans" => show_plans = true,
-            "--indexes" => indexes = true,
             v => n = v.parse().expect("image count"),
         }
     }
@@ -145,9 +141,6 @@ fn main() {
     let conn = db::open(&path).unwrap();
     if fresh {
         populate(&conn, n);
-    }
-    if indexes {
-        conn.execute_batch(PROPOSED_INDEXES).unwrap();
     }
     if show_plans {
         plans(&conn);
@@ -178,6 +171,7 @@ fn main() {
             ImageQuery { exclude_tags: vec![CullTag::Blink, CullTag::MissedFocus], ..base.clone() },
         ),
         ("all, collapse bursts", ImageQuery { collapse_bursts: true, ..base.clone() }),
+        ("all, missing", ImageQuery { missing_only: true, ..base.clone() }),
         (
             "folder, collapse, >=1 star",
             ImageQuery { folder_id: folder, collapse_bursts: true, min_rating: Some(1), ..base.clone() },

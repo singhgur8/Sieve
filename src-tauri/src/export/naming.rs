@@ -231,6 +231,7 @@ mod tests {
             is_scene_anchor: false,
             companion_path: None,
             develop_warnings: Vec::new(),
+            missing_since_ms: None,
             tags: Vec::new(),
             quality: None,
             has_edits: false,

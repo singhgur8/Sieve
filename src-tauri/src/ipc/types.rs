@@ -551,6 +551,11 @@ pub struct RawImageEntry {
     /// when none / never read. Editor-time warnings (Adobe Look, source colour) are in
     /// `DevelopInfo.warnings` (Phase 7b).
     pub develop_warnings: Vec<DevelopWarning>,
+    /// Unix ms when the original was first found missing at its `path` (moved, renamed,
+    /// drive disconnected) by a render, develop info, export, sidecar write, thumbnail
+    /// extraction or re-import; `null` = present (or not checked since). Cleared by the next
+    /// successful access, a re-import that finds it, or `relocate_folder` (IPC v13).
+    pub missing_since_ms: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,6 +2092,9 @@ pub struct ImageQuery {
     /// Hide burst members that are not their group's keeper (groups without a keeper
     /// show all members); images outside bursts are unaffected.
     pub collapse_bursts: bool,
+    /// Only images whose original is missing (`missingSinceMs` set; IPC v13).
+    #[serde(default)]
+    pub missing_only: bool,
     pub folder_id: Option<FolderId>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
@@ -2113,6 +2121,7 @@ impl Default for ImageQuery {
             burst_group_id: None,
             scene_id: None,
             collapse_bursts: false,
+            missing_only: false,
             folder_id: None,
             sort: ImageSort::CaptureTime,
             sort_descending: false,
@@ -2206,6 +2215,8 @@ pub struct FilterCounts {
     pub burst_groups: u32,
     /// Burst members hidden by `ImageQuery.collapseBursts`.
     pub burst_non_keepers: u32,
+    /// Images whose original is missing (`ImageQuery.missingOnly`; IPC v13).
+    pub missing: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -2227,6 +2238,65 @@ pub struct CatalogState {
     /// Sidecars are written automatically after rating/pick/label/tag changes
     /// (`set_xmp_auto_sync`). Default off.
     pub xmp_auto_sync: bool,
+    /// Integrity of the catalog as found at launch, and its backups (IPC v13).
+    pub health: CatalogHealth,
+}
+
+string_enum! {
+    /// Catalog state found by the launch check (`db` module docs).
+    pub enum CatalogHealthStatus {
+        /// Healthy (or the check was skipped after a clean shutdown).
+        Ok => "ok",
+        /// The integrity check failed: the catalog was opened read-only; every write fails
+        /// with `catalog_read_only`. Restore a backup (`restore_catalog_backup`).
+        ReadOnly => "read_only",
+        /// The file was not a database: it was moved aside and a new, empty catalog was
+        /// created. A backup can be restored (`restore_catalog_backup`).
+        Replaced => "replaced",
+    }
+}
+
+/// `CatalogState.health` (IPC v13).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogHealth {
+    pub status: CatalogHealthStatus,
+    /// User-facing explanation and remedy; `null` when `ok`.
+    pub message: Option<String>,
+    /// Automatic backups (`<catalog>.bak-N`), newest first.
+    pub backups: Vec<CatalogBackup>,
+    /// A backup was staged by `restore_catalog_backup`; it replaces the catalog at the next
+    /// launch ("Relaunch to finish"). Changes made until then are lost.
+    pub restore_pending: bool,
+}
+
+impl Default for CatalogHealth {
+    fn default() -> Self {
+        Self { status: CatalogHealthStatus::Ok, message: None, backups: Vec::new(), restore_pending: false }
+    }
+}
+
+/// One automatic catalog backup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogBackup {
+    /// 1 = newest; the argument of `restore_catalog_backup`.
+    pub index: u32,
+    pub path: String,
+    /// When the backup was taken (file modification time).
+    pub created_at_ms: i64,
+    pub size_bytes: u64,
+}
+
+/// Result of `relocate_folder` (IPC v13).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RelocateResult {
+    /// Images of the folder found in the new location (paths repointed, missing flag
+    /// cleared).
+    pub matched: u32,
+    /// Images not found there: their path is unchanged and they are flagged missing.
+    pub still_missing: u32,
 }
 
 /// Snapshot of thumbnail/metadata extraction, so the UI can restore its progress

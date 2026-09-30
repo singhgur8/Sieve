@@ -647,3 +647,65 @@ Who updates what
   restores an in-flight download's progress state.
 - vision-ml-dev (small): the unavailable reason in `Segmenter::available` still says "run
   scripts/fetch-models.sh"; in the app the remedy is the download button (suggest "model file X not installed").
+
+## v13 — 2026-09-30 (Phase 8 hardening: missing originals, catalog health, error kinds)
+All changes are additive (no field removed or renamed). Schema v11 (`migrations/0011_hardening.sql`).
+
+Types
+- `RawImageEntry.missingSinceMs: number | null` — unix ms when the original was first found missing at `path`
+  (render / develop info / WB picker / export / sidecar write / thumbnail extraction / re-import). Cleared by the
+  next successful access, a re-import that finds the file, or `relocate_folder`.
+- `ImageQuery.missingOnly?: boolean` (default `false`) — only images with `missingSinceMs` set.
+- `FilterCounts.missing: number` — images with `missingSinceMs` set in the scope.
+- `CatalogState.health: CatalogHealth`:
+  `CatalogHealth { status: CatalogHealthStatus ("ok" | "read_only" | "replaced"), message: string | null,
+  backups: CatalogBackup[], restorePending: boolean }`,
+  `CatalogBackup { index: number (1 = newest), path: string, createdAtMs: number, sizeBytes: number }`.
+  `message` is user-facing (null when `ok`). `restorePending` (not in the original request) = a backup is staged
+  and will replace the catalog at the next launch.
+- `RelocateResult { matched: number, stillMissing: number }`.
+- `ErrorKind` += `"file_missing" | "disk_full" | "read_only" | "decode_failed" | "catalog_read_only"`. The sites
+  that produced these situations switch kind, messages unchanged: missing original was `not_found` -> `file_missing`;
+  disk full was `io` (or `database` for catalog writes) -> `disk_full`; read-only volume / permission denied was
+  `io` -> `read_only`; decoder failure on an existing original was `io` -> `decode_failed`; write to a damaged
+  catalog was `database` -> `catalog_read_only`. `not_found` now only means "no such catalog row".
+- `AiCapability.reason` for missing mask models is now "AI masking models are not installed. Download them from
+  the Masks panel (~560 MB)." (was "model file X not installed (run scripts/fetch-models.sh)").
+
+Commands
+- `relocate_folder(folderId, newPath) -> RelocateResult` (TS `commands.relocateFolder(folderId, newPath)`):
+  repoints a folder and its images (old relative path first, then unique file name anywhere under `newPath`),
+  clears their missing flags, forgets their develop sources and re-queues thumbnails that failed as missing.
+  Unfound images keep their path and are flagged (`stillMissing`). Errors, nothing changed: `not_found` (folder),
+  `invalid_argument` (not a folder / already another catalog folder / none of the photos found).
+- `restore_catalog_backup(index) -> CatalogHealth` (TS `commands.restoreCatalogBackup(index)`): stages
+  `backups[index]` (`db::stage_restore`, backup must pass `quick_check`); the next launch swaps it in. Errors:
+  `not_found` (no such backup), `invalid_argument` (backup damaged). The UI says "Relaunch to finish".
+
+Behaviour
+- Clean-shutdown marker: `<catalog>.clean` written on app exit, removed by the next launch, which then skips
+  `quick_check` (a crash leaves no marker, so it checks).
+- Migration 0011: `idx_images_folder_pick_rating`, partial `idx_image_tags_live`, `images.missing_since_ms`,
+  partial `idx_images_missing`. `grid_bench --plans`: all three used; `get_filter_counts(all)` 7.0 ms at 50k.
+
+Who updates what
+- architect (done): types, schema, commands + registration, bodies (repo `relocate_folder` / `set_original_missing`
+  / `note_access_failure`, `db::health_state` / `mark_clean_shutdown`, error-kind switch in `raw::access` /
+  `db::explain_error` / export, missing hooks in ingest/xmp/export/develop commands, masking reason), Rust tests,
+  bindings, mock backend, `tests/ui/hardening.spec.ts`, docs. rust-engine-dev owns the bodies from here.
+- frontend-dev:
+  1. Missing originals: badge on grid cells / loupe when `missingSinceMs != null`; a "Missing" facet in the filter
+     bar driven by `FilterCounts.missing` (hidden when 0) that sets `ImageQuery.missingOnly`; on a `file_missing`
+     error from render / develop info, show the message with a "Locate folder…" action.
+  2. "Locate folder…" (folder context menu and the missing banner): pick a directory, call
+     `relocateFolder(folderId, path)`, toast "Found N photos" (+ "M still missing"), then refetch catalog state,
+     filter counts and visible rows; show `invalid_argument` messages inline.
+  3. Catalog health: when `health.status !== "ok"` show a persistent banner with `health.message` and a
+     "Restore backup…" dialog listing `health.backups` (date from `createdAtMs`, size); on confirm
+     `restoreCatalogBackup(index)` then show "Relaunch to finish" (also whenever `health.restorePending`).
+  4. Map new error kinds to remedies: `disk_full` (free space / choose another destination), `read_only` (choose a
+     writable location), `decode_failed` (file damaged / unsupported), `catalog_read_only` (open the restore dialog).
+  Mock: `?missing=5` flags images 1–5 missing (render / develop info fail with `file_missing`); `relocateFolder`
+  finds everything unless the path contains `empty` (error) or `partial` (first missing image stays missing);
+  `?health=read_only|replaced` (read_only refuses rating/pick/label/adjustment writes with `catalog_read_only`);
+  three mock backups; `restoreCatalogBackup` sets `restorePending`.

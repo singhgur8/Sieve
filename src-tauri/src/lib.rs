@@ -138,6 +138,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::model_downloads_status,
             commands::download_models,
             commands::cancel_model_download,
+            commands::relocate_folder,
+            commands::restore_catalog_backup,
         ])
         .events(collect_events![
             ImportProgress,
@@ -305,8 +307,18 @@ pub fn run() {
             app.state::<XmpSync>().notify(app.handle());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Clean shutdown: the next launch skips the catalog integrity check (see `db`).
+            if let tauri::RunEvent::Exit = event {
+                if let Some(catalog) = app.try_state::<Catalog>() {
+                    if let Err(e) = db::mark_clean_shutdown(&catalog.path) {
+                        eprintln!("catalog {}: clean-shutdown marker: {}", catalog.path.display(), e.message);
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

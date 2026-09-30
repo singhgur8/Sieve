@@ -431,6 +431,25 @@ export const commands = {
 	 *  (`cancelled: true`) follows.
 	 */
 	cancelModelDownload: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_model_download")),
+	/**
+	 *  Points folder `folderId` at `newPath` (the shoot was moved, renamed or its drive mounted
+	 *  elsewhere). Each image is found at its path relative to the old folder, else by file
+	 *  name anywhere under `newPath`; found images are repointed and their missing flag
+	 *  cleared, the others stay flagged missing (`stillMissing`). Errors (nothing changed):
+	 *  `not_found` for an unknown folder; `invalid_argument` when `newPath` is not a folder, is
+	 *  already another catalog folder, or holds none of the folder's photos. Develop sources
+	 *  of the moved images are forgotten, and thumbnails that failed because the file was
+	 *  missing are re-extracted. Refetch `get_catalog_state` / the visible rows afterwards.
+	 */
+	relocateFolder: (folderId: number, newPath: string) => typedError<RelocateResult, AppError>(__TAURI_INVOKE("relocate_folder", { folderId, newPath })),
+	/**
+	 *  Stages automatic backup `index` (`CatalogState.health.backups[].index`, 1 = newest) to
+	 *  replace the catalog at the next launch; the current catalog is kept aside as
+	 *  `<catalog>.corrupt-<ms>`. The UI tells the user to relaunch; changes made before the
+	 *  relaunch are lost. Returns the updated health (`restorePending: true`). Errors:
+	 *  `not_found` (no such backup), `invalid_argument` (the backup is damaged too).
+	 */
+	restoreCatalogBackup: (index: number) => typedError<CatalogHealth, AppError>(__TAURI_INVOKE("restore_catalog_backup", { index })),
 };
 
 /** Events */
@@ -522,7 +541,10 @@ export type AiCapability = {
 	available: boolean,
 	/**  Model id when available. */
 	model: string | null,
-	/**  Why not (e.g. "model file sky.onnx not installed"), when unavailable. */
+	/**
+	 *  Why not, user-facing (e.g. "AI masking models are not installed. Download them from
+	 *  the Masks panel (~560 MB)."), when unavailable.
+	 */
 	reason: string | null,
 };
 
@@ -834,6 +856,45 @@ export type CaptureMeta = {
 	lens: string | null,
 };
 
+/**  One automatic catalog backup. */
+export type CatalogBackup = {
+	/**  1 = newest; the argument of `restore_catalog_backup`. */
+	index: number,
+	path: string,
+	/**  When the backup was taken (file modification time). */
+	createdAtMs: number,
+	sizeBytes: number,
+};
+
+/**  `CatalogState.health` (IPC v13). */
+export type CatalogHealth = {
+	status: CatalogHealthStatus,
+	/**  User-facing explanation and remedy; `null` when `ok`. */
+	message: string | null,
+	/**  Automatic backups (`<catalog>.bak-N`), newest first. */
+	backups: CatalogBackup[],
+	/**
+	 *  A backup was staged by `restore_catalog_backup`; it replaces the catalog at the next
+	 *  launch ("Relaunch to finish"). Changes made until then are lost.
+	 */
+	restorePending: boolean,
+};
+
+/**  Catalog state found by the launch check (`db` module docs). */
+export type CatalogHealthStatus = 
+/**  Healthy (or the check was skipped after a clean shutdown). */
+"ok" | 
+/**
+ *  The integrity check failed: the catalog was opened read-only; every write fails
+ *  with `catalog_read_only`. Restore a backup (`restore_catalog_backup`).
+ */
+"read_only" | 
+/**
+ *  The file was not a database: it was moved aside and a new, empty catalog was
+ *  created. A backup can be restored (`restore_catalog_backup`).
+ */
+"replaced";
+
 export type CatalogState = {
 	catalogPath: string,
 	imageCount: number,
@@ -855,6 +916,8 @@ export type CatalogState = {
 	 *  (`set_xmp_auto_sync`). Default off.
 	 */
 	xmpAutoSync: boolean,
+	/**  Integrity of the catalog as found at launch, and its backups (IPC v13). */
+	health: CatalogHealth,
 };
 
 /**  JPEG chroma subsampling. `444` keeps full colour resolution (larger files). */
@@ -1105,7 +1168,27 @@ export type EffectsAdjustments = {
 	grain: Grain,
 };
 
-export type ErrorKind = "not_found" | "invalid_argument" | "io" | "database" | "internal";
+/**
+ *  Error category. The `message` is always user-facing; the kind lets the UI pick a
+ *  remedy (IPC v13 added the file/volume/catalog kinds; earlier they were `not_found` /
+ *  `io` / `database` with the same messages).
+ */
+export type ErrorKind = 
+/**  A catalog row (image, preset, job, ...) does not exist. */
+"not_found" | "invalid_argument" | "io" | "database" | "internal" | 
+/**
+ *  An original is not at its catalogued path (moved, renamed, drive disconnected).
+ *  The image is flagged `RawImageEntry.missingSinceMs`; `relocate_folder` fixes it.
+ */
+"file_missing" | 
+/**  The destination volume is out of space (export, sidecar, catalog write). */
+"disk_full" | 
+/**  The destination volume is read-only or the folder is not writable. */
+"read_only" | 
+/**  The original exists but could not be decoded (damaged, still copying, unsupported). */
+"decode_failed" | 
+/**  The catalog is damaged and was opened read-only (`CatalogState.health`). */
+"catalog_read_only";
 
 /**  What the export engine can do here (`get_export_capabilities`). */
 export type ExportCapabilities = {
@@ -1342,6 +1425,8 @@ export type FilterCounts = {
 	burstGroups: number,
 	/**  Burst members hidden by `ImageQuery.collapseBursts`. */
 	burstNonKeepers: number,
+	/**  Images whose original is missing (`ImageQuery.missingOnly`; IPC v13). */
+	missing: number,
 };
 
 export type FolderEntry = {
@@ -1454,6 +1539,8 @@ export type ImageQuery = {
 	 *  show all members); images outside bursts are unaffected.
 	 */
 	collapseBursts: boolean,
+	/**  Only images whose original is missing (`missingSinceMs` set; IPC v13). */
+	missingOnly?: boolean,
 	folderId: number | null,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
@@ -2376,6 +2463,24 @@ export type RawImageEntry = {
 	 *  `DevelopInfo.warnings` (Phase 7b).
 	 */
 	developWarnings: DevelopWarning[],
+	/**
+	 *  Unix ms when the original was first found missing at its `path` (moved, renamed,
+	 *  drive disconnected) by a render, develop info, export, sidecar write, thumbnail
+	 *  extraction or re-import; `null` = present (or not checked since). Cleared by the next
+	 *  successful access, a re-import that finds it, or `relocate_folder` (IPC v13).
+	 */
+	missingSinceMs: number | null,
+};
+
+/**  Result of `relocate_folder` (IPC v13). */
+export type RelocateResult = {
+	/**
+	 *  Images of the folder found in the new location (paths repointed, missing flag
+	 *  cleared).
+	 */
+	matched: number,
+	/**  Images not found there: their path is unchanged and they are flagged missing. */
+	stillMissing: number,
 };
 
 /**  How to render a preview. */

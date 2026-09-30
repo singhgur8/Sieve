@@ -63,6 +63,11 @@ use super::refine::{oriented_index, unorient_pixels};
 
 /// Long edge of the image the models see (sensor frame).
 pub const SOURCE_EDGE: u32 = 2048;
+
+/// `AiCapability.reason` when a family's model files are missing (the remedy in the app is
+/// the Masks panel's download button, IPC v12).
+pub const MODELS_NOT_INSTALLED: &str =
+    "AI masking models are not installed. Download them from the Masks panel (~560 MB).";
 /// Decoded model inputs kept in memory (most recent images).
 pub const SOURCE_CACHE: usize = 2;
 
@@ -312,13 +317,11 @@ impl Segmenter {
                 f => format!("no model for {}", f.as_str()),
             });
         };
-        match m.required.iter().find(|p| !p.is_file()) {
-            Some(p) => Err(format!(
-                "model file {} not installed (run scripts/fetch-models.sh)",
-                p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
-            )),
-            None => Ok(m),
+        // User-facing (`AiCapability.reason`): the remedy is the in-app download (IPC v12).
+        if m.required.iter().any(|p| !p.is_file()) {
+            return Err(MODELS_NOT_INSTALLED.to_owned());
         }
+        Ok(m)
     }
 
     /// Which families can be computed now (model files present), one entry per

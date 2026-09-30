@@ -385,6 +385,8 @@ mod tests {
         assert_eq!((stats.done, stats.failed), (1, 1));
         let failed = rec.failed.lock().unwrap();
         assert!(failed[0].reason.starts_with(crate::raw::access::MISSING_PREFIX), "{}", failed[0].reason);
+        // IPC v13: flagged missing in the catalog.
+        assert!(repo::get_image(&conn, 1).unwrap().missing_since_ms.is_some());
     }
 
     #[derive(Default)]

@@ -1,14 +1,29 @@
 use serde::Serialize;
 use specta::Type;
 
+/// Error category. The `message` is always user-facing; the kind lets the UI pick a
+/// remedy (IPC v13 added the file/volume/catalog kinds; earlier they were `not_found` /
+/// `io` / `database` with the same messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
+    /// A catalog row (image, preset, job, ...) does not exist.
     NotFound,
     InvalidArgument,
     Io,
     Database,
     Internal,
+    /// An original is not at its catalogued path (moved, renamed, drive disconnected).
+    /// The image is flagged `RawImageEntry.missingSinceMs`; `relocate_folder` fixes it.
+    FileMissing,
+    /// The destination volume is out of space (export, sidecar, catalog write).
+    DiskFull,
+    /// The destination volume is read-only or the folder is not writable.
+    ReadOnly,
+    /// The original exists but could not be decoded (damaged, still copying, unsupported).
+    DecodeFailed,
+    /// The catalog is damaged and was opened read-only (`CatalogState.health`).
+    CatalogReadOnly,
 }
 
 /// Error returned by every command. Serialized as `{ kind, message }`.

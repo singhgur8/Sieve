@@ -7,7 +7,9 @@
 //!   (rare) checkpoints use `F_FULLFSYNC`, so Apple drives' volatile caches cannot reorder
 //!   them. Every multi-row write is one transaction (or savepoint).
 //! - The first [`open`] of a catalog in a process ([`health`] tracks it) runs
-//!   `PRAGMA quick_check`. A healthy catalog is backed up (`VACUUM INTO`, atomic) to
+//!   `PRAGMA quick_check`, unless the previous session shut down cleanly: the app writes
+//!   `<catalog>.clean` on exit ([`mark_clean_shutdown`]) and the first open removes it, so
+//!   only a crash / kill / power loss (no marker) costs the check at the next launch. A healthy catalog is backed up (`VACUUM INTO`, atomic) to
 //!   `<catalog>.bak-1` (newest) .. `.bak-3` before any migration and at most once a day
 //!   ([`BACKUP_INTERVAL_MS`]).
 //! - A damaged catalog is opened **read-only** (writes fail with an explanation, see
@@ -81,20 +83,20 @@ pub fn read_only_message(path: &Path, reason: &str) -> String {
 }
 
 /// Actionable wording for a `database` error of the catalog at `path`: a damaged catalog
-/// (read-only, see [`health`]) says how to restore a backup; a full or failing disk says
-/// so. Other errors pass through unchanged.
+/// (read-only, see [`health`]) says how to restore a backup (`catalog_read_only`); a full
+/// or failing disk says so (`disk_full`). Other errors pass through unchanged.
 pub fn explain_error(path: &Path, e: AppError) -> AppError {
     if e.kind != ErrorKind::Database {
         return e;
     }
     if let CatalogHealth::ReadOnly { reason } = health(path) {
-        return AppError::new(e.kind, read_only_message(path, &reason));
+        return AppError::new(ErrorKind::CatalogReadOnly, read_only_message(path, &reason));
     }
     let m = e.message.to_ascii_lowercase();
     // SQLITE_FULL, or SQLITE_IOERR (what a full disk produces on a WAL append).
     if m.contains("database or disk is full") || m.contains("disk i/o error") {
         return AppError::new(
-            e.kind,
+            ErrorKind::DiskFull,
             format!(
                 "The change could not be saved to the catalog ({}): the disk holding {} is full or unavailable. \
                  Free up space (or reconnect the drive) and try again; earlier changes are intact.",
@@ -139,12 +141,15 @@ fn open_read_only(path: &Path) -> AppResult<Connection> {
 
 /// Integrity check, pending-restore application and backups for the first open.
 fn check_on_first_open(path: &Path) -> CatalogHealth {
-    apply_staged_restore(path);
+    let restored = apply_staged_restore(path);
+    // Consumed by every first open, so only a clean exit of *this* session writes it again.
+    let clean = std::fs::remove_file(clean_shutdown_marker(path)).is_ok() && !restored;
     let exists = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
     if !exists {
         return CatalogHealth::Ok;
     }
-    match integrity(path) {
+    let checked = if clean && has_sqlite_header(path) { Ok(None) } else { integrity(path) };
+    match checked {
         Ok(None) => {}
         Ok(Some(problem)) => {
             eprintln!("catalog {}: integrity check failed: {problem}", path.display());
@@ -178,6 +183,29 @@ fn check_on_first_open(path: &Path) -> CatalogHealth {
         }
     }
     CatalogHealth::Ok
+}
+
+/// `<catalog>.clean`: written on a clean app exit, removed by the next first [`open`].
+pub fn clean_shutdown_marker(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.clean", path.display()))
+}
+
+/// Records a clean shutdown (call on app exit, after the last write): the next launch skips
+/// `quick_check`. Never written for a catalog opened read-only (damaged), which must be
+/// checked again.
+pub fn mark_clean_shutdown(path: &Path) -> AppResult<()> {
+    if let CatalogHealth::ReadOnly { .. } = health(path) {
+        return Ok(());
+    }
+    std::fs::write(clean_shutdown_marker(path), now_ms().to_string())?;
+    Ok(())
+}
+
+/// The file starts with the SQLite magic (cheap sanity check for the clean-shutdown path).
+fn has_sqlite_header(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 16];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"SQLite format 3\0"
 }
 
 fn is_not_a_database(e: &rusqlite::Error) -> bool {
@@ -294,11 +322,11 @@ pub fn stage_restore(path: &Path, index: usize) -> AppResult<PathBuf> {
 }
 
 /// Swaps a staged restore into place: the current catalog (and its WAL) is kept as
-/// `<catalog>.corrupt-<ms>` (never deleted).
-fn apply_staged_restore(path: &Path) {
+/// `<catalog>.corrupt-<ms>` (never deleted). True if a restore was attempted.
+fn apply_staged_restore(path: &Path) -> bool {
     let staged = staged_restore_path(path);
     if !staged.exists() {
-        return;
+        return false;
     }
     let aside = aside_path(path);
     for suffix in ["", "-wal", "-shm"] {
@@ -306,7 +334,7 @@ fn apply_staged_restore(path: &Path) {
         if from.exists() {
             if let Err(e) = std::fs::rename(&from, format!("{}{suffix}", aside.display())) {
                 eprintln!("catalog restore: cannot move {} aside: {e}", from.display());
-                return;
+                return true;
             }
         }
     }
@@ -314,6 +342,43 @@ fn apply_staged_restore(path: &Path) {
         Ok(()) => eprintln!("catalog restored from backup; previous catalog kept as {}", aside.display()),
         Err(e) => eprintln!("catalog restore failed: {e}"),
     }
+    true
+}
+
+/// `CatalogState.health` of the catalog at `path` (IPC v13): the launch check's result with
+/// a user-facing message, the backups and whether a restore is staged.
+pub fn health_state(path: &Path) -> crate::ipc::types::CatalogHealth {
+    use crate::ipc::types::{CatalogBackup, CatalogHealth as Dto, CatalogHealthStatus as Status};
+    let backups: Vec<CatalogBackup> = list_backups(path)
+        .into_iter()
+        .map(|b| CatalogBackup {
+            index: b.index as u32,
+            path: b.path.display().to_string(),
+            created_at_ms: b.modified_ms,
+            size_bytes: b.size_bytes,
+        })
+        .collect();
+    let (status, message) = match health(path) {
+        CatalogHealth::Ok => (Status::Ok, None),
+        CatalogHealth::ReadOnly { reason } => (Status::ReadOnly, Some(read_only_message(path, &reason))),
+        CatalogHealth::Replaced { moved_to, reason } => {
+            let hint = if backups.is_empty() {
+                "No backup exists; re-import your folders (ratings, flags and edits saved to XMP sidecars are read \
+                 back)."
+            } else {
+                "Restore a backup to get your catalog back, or re-import your folders."
+            };
+            (
+                Status::Replaced,
+                Some(format!(
+                    "The catalog file was unreadable ({reason}) and was moved to {}; a new, empty catalog was \
+                     created. {hint}",
+                    moved_to.display()
+                )),
+            )
+        }
+    };
+    Dto { status, message, backups, restore_pending: staged_restore_path(path).exists() }
 }
 
 /// Runs `f` atomically inside a savepoint: nests inside an open transaction (then it is
@@ -476,9 +541,18 @@ mod tests {
         assert!(msg.contains("read-only") && msg.contains(".bak-1"), "{msg}");
         let explained = explain_error(&path, AppError::from(err));
         assert_eq!(explained.message, msg, "command errors carry the restore hint");
+        assert_eq!(explained.kind, ErrorKind::CatalogReadOnly);
+        let h = health_state(&path);
+        assert_eq!(h.status, crate::ipc::types::CatalogHealthStatus::ReadOnly);
+        assert_eq!((h.message.as_deref(), h.backups.len(), h.restore_pending), (Some(msg.as_str()), 1, false));
+        assert_eq!(h.backups[0].index, 1);
+        // Never marked clean while damaged (the next launch must check again).
+        mark_clean_shutdown(&path).unwrap();
+        assert!(!clean_shutdown_marker(&path).exists());
         let other = dir.path().join("other.sqlite");
         let full = explain_error(&other, AppError::new(ErrorKind::Database, "database or disk is full"));
         assert!(full.message.contains("is full or unavailable"), "{}", full.message);
+        assert_eq!(full.kind, ErrorKind::DiskFull);
         assert_eq!(explain_error(&other, AppError::invalid("x")).message, "x");
         // The damaged file is never backed up over the good backups.
         assert_eq!(list_backups(&path).len(), 1);
@@ -486,6 +560,7 @@ mod tests {
 
         // Restore: staged now, applied by the next launch; the damaged file is kept aside.
         stage_restore(&path, 1).unwrap();
+        assert!(health_state(&path).restore_pending);
         forget_health(&path);
         let conn = open(&path).unwrap();
         assert_eq!(health(&path), CatalogHealth::Ok);
@@ -510,6 +585,9 @@ mod tests {
         let conn = open(&path).unwrap();
         let CatalogHealth::Replaced { moved_to, .. } = health(&path) else { panic!("expected replaced") };
         assert!(moved_to.exists());
+        let h = health_state(&path);
+        assert_eq!(h.status, crate::ipc::types::CatalogHealthStatus::Replaced);
+        assert!(h.message.unwrap().contains("No backup exists"));
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(v as usize, schema::MIGRATIONS.len());
         // The fresh (empty) catalog never rotates older backups away.
@@ -517,6 +595,37 @@ mod tests {
         forget_health(&path);
         drop(open(&path).unwrap());
         assert!(list_backups(&path).is_empty());
+    }
+
+    #[test]
+    fn clean_shutdown_marker_skips_the_check_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        seeded(&path, 3000);
+        backup(&path).unwrap();
+        mark_clean_shutdown(&path).unwrap();
+        assert!(clean_shutdown_marker(&path).exists());
+        // Damage the file: with the marker, the next launch trusts it (no quick_check) ...
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        for b in &mut bytes[mid..mid + 16384] {
+            *b = 0x5A;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert_eq!(health(&path), CatalogHealth::Ok);
+        assert!(!clean_shutdown_marker(&path).exists(), "the first open consumes the marker");
+        // ... and the launch after an unclean exit (no marker) checks again.
+        forget_health(&path);
+        drop(open(&path).unwrap());
+        assert!(matches!(health(&path), CatalogHealth::ReadOnly { .. }));
+        // A non-database file is never trusted, marker or not.
+        let junk = dir.path().join("junk.sqlite");
+        std::fs::write(&junk, vec![0x42u8; 8192]).unwrap();
+        std::fs::write(clean_shutdown_marker(&junk), "1").unwrap();
+        drop(open(&junk).unwrap());
+        assert!(matches!(health(&junk), CatalogHealth::Replaced { .. }));
     }
 
     #[test]
