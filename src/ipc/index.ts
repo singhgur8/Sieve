@@ -1,5 +1,6 @@
 // Typed backend access. Components import from here, never from `@tauri-apps/api` directly.
 export * from "./bindings";
+export { convertFileSrc } from "@tauri-apps/api/core";
 
 import type { AppError, ImageQuery } from "./bindings";
 

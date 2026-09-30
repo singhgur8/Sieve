@@ -2,10 +2,10 @@
 // The virtualized grid / loupe replace this in Phase 4.
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { AlertTriangle, Aperture, FolderOpen, ImageOff, Loader2, RotateCw } from "lucide-react";
 import {
   commands,
+  convertFileSrc,
   DEFAULT_QUERY,
   events,
   unwrap,
