@@ -135,6 +135,14 @@ the user asked for "auto edit based on what the model thinks I like".
   returning adjustments; per-folder workflow step state (cull / edit / export) and per-scene edit anchors (chosen
   representative, edited flag, applied flag); style-model commands (train from catalog/XMPs, status, predict);
   XMP auto-sync default on for new catalogs/folders.
+- [ ] **Projects + home page** (architect → rust-engine-dev, frontend-dev; user request 2026-09-30): a project = one
+  shoot with its source folder(s) on disk, name, cover photo, shoot type, workflow step, created/last-opened dates. The
+  app opens on a Projects home page (cards: cover, name, path, photo/keeper/edited counts, step, last opened; sort and
+  search); "New project" = pick folder → name (defaults to folder name) → import; open / rename / remove from catalog
+  (never deletes files) / reveal in Finder / locate moved folder. Inside a project, Library, Develop, filters, scenes,
+  counts and export only see that project's photos; a project switcher in the TopBar returns home or jumps to another.
+  Existing catalogs migrate one project per imported root folder. Acceptance: two projects imported, switching shows
+  only each project's photos, counts right, relaunch reopens the home page, removing a project leaves files intact.
 - [ ] **Preset & profile library** (rust-engine-dev + frontend-dev): "Import presets & profiles…" takes a whole folder
   (recursive); items appear in every project under their folder groups (Develop left panel "Presets", profile browser
   next to Profile); applying a preset sets only the keys it contains (Lightroom semantics); creative profiles apply
