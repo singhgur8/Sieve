@@ -80,6 +80,32 @@ pub fn read_only_message(path: &Path, reason: &str) -> String {
     format!("The catalog is damaged ({reason}) and was opened read-only, so changes cannot be saved. {hint}")
 }
 
+/// Actionable wording for a `database` error of the catalog at `path`: a damaged catalog
+/// (read-only, see [`health`]) says how to restore a backup; a full or failing disk says
+/// so. Other errors pass through unchanged.
+pub fn explain_error(path: &Path, e: AppError) -> AppError {
+    if e.kind != ErrorKind::Database {
+        return e;
+    }
+    if let CatalogHealth::ReadOnly { reason } = health(path) {
+        return AppError::new(e.kind, read_only_message(path, &reason));
+    }
+    let m = e.message.to_ascii_lowercase();
+    // SQLITE_FULL, or SQLITE_IOERR (what a full disk produces on a WAL append).
+    if m.contains("database or disk is full") || m.contains("disk i/o error") {
+        return AppError::new(
+            e.kind,
+            format!(
+                "The change could not be saved to the catalog ({}): the disk holding {} is full or unavailable. \
+                 Free up space (or reconnect the drive) and try again; earlier changes are intact.",
+                e.message,
+                path.display()
+            ),
+        );
+    }
+    e
+}
+
 /// Opens (creating if needed) the catalog at `path` and brings it to the latest schema.
 /// The first call per catalog in this process also checks integrity and backs it up (see
 /// the module docs); a damaged catalog yields a read-only connection instead of an error.
@@ -432,6 +458,12 @@ mod tests {
         assert!(err.to_string().contains("readonly") || err.to_string().contains("read-only"), "{err}");
         let msg = read_only_message(&path, &reason);
         assert!(msg.contains("read-only") && msg.contains(".bak-1"), "{msg}");
+        let explained = explain_error(&path, AppError::from(err));
+        assert_eq!(explained.message, msg, "command errors carry the restore hint");
+        let other = dir.path().join("other.sqlite");
+        let full = explain_error(&other, AppError::new(ErrorKind::Database, "database or disk is full"));
+        assert!(full.message.contains("is full or unavailable"), "{}", full.message);
+        assert_eq!(explain_error(&other, AppError::invalid("x")).message, "x");
         // The damaged file is never backed up over the good backups.
         assert_eq!(list_backups(&path).len(), 1);
         drop(conn);

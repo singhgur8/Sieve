@@ -129,7 +129,7 @@ pub fn exif_dirs(path: &Path) -> Result<tiff::ExifDirs, String> {
     if !format.is_raw() {
         return raster::exif_dirs(path, format);
     }
-    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     match format {
         RawFormat::Arw => tiff::Tiff::new(&src)?.exif_dirs(),
         RawFormat::Raf => raf::exif_dirs(&src),
@@ -215,7 +215,7 @@ pub fn extract(path: &Path, format: RawFormat, jpeg_buf: &mut Vec<u8>) -> Result
     if !format.is_raw() {
         return raster::extract(path, format, jpeg_buf);
     }
-    let src = FileSource::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let src = FileSource::open(path).map_err(|e| crate::raw::access::io_message(path, "read", &e))?;
     let (builder, parse_err, jpeg) = match parse_container(&src, format) {
         Ok(c) => {
             let best = best_jpeg(&src, &c.jpegs);

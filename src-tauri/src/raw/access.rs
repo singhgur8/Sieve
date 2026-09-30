@@ -98,9 +98,20 @@ pub fn decode_failed(path: &Path, detail: &str) -> AppError {
     )
 }
 
+/// Tests: pretend the volume under a directory prefix has this many bytes free.
+#[cfg(test)]
+pub(crate) static FREE_BYTES_OVERRIDE: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Free bytes available to this user on the volume holding `dir` (`None` if unknown).
 pub fn available_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if let Some((_, v)) =
+        FREE_BYTES_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| dir.starts_with(p))
+    {
+        return Some(*v);
+    }
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: statvfs fills a zeroed struct we own; `c` is a valid NUL-terminated path.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };

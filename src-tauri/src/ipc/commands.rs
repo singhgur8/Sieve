@@ -61,23 +61,7 @@ impl Catalog {
 /// Database errors get an actionable message: a damaged catalog (opened read-only, see
 /// `db::health`) says how to restore a backup; a full disk says so.
 fn explain_catalog_error(path: &Path, e: AppError) -> AppError {
-    if e.kind != super::error::ErrorKind::Database {
-        return e;
-    }
-    if let db::CatalogHealth::ReadOnly { reason } = db::health(path) {
-        return AppError::new(e.kind, db::read_only_message(path, &reason));
-    }
-    let m = e.message.to_ascii_lowercase();
-    if m.contains("database or disk is full") {
-        return AppError::new(
-            e.kind,
-            format!(
-                "The catalog could not be saved: the disk holding {} is full. Free up space and try again.",
-                path.display()
-            ),
-        );
-    }
-    e
+    db::explain_error(path, e)
 }
 
 #[tauri::command]

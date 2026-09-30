@@ -247,6 +247,11 @@ impl Exporter {
     /// Blocking; called once at startup. Marks jobs left `queued`/`running` by a previous
     /// session as `interrupted` (finished_at = now). Must not fail startup on a fresh catalog.
     pub fn recover_interrupted(&self) -> AppResult<()> {
+        // A damaged catalog is read-only (`db::health`): nothing to recover, and failing
+        // here would stop the app from starting at all.
+        if matches!(db::health(&self.config.catalog_path), db::CatalogHealth::ReadOnly { .. }) {
+            return Ok(());
+        }
         let conn = self.open()?;
         conn.execute(
             "UPDATE export_jobs SET state = 'interrupted', finished_at = ?1 WHERE state IN ('queued', 'running')",
@@ -1212,6 +1217,69 @@ mod tests {
         assert_eq!(t.map(|i| (i.width, i.height, i.bit_depth)).unwrap(), (200, 100, 16));
         #[cfg(not(target_os = "macos"))]
         let _ = t;
+    }
+
+    /// Phase 8 error states: a missing original fails its item with an actionable message
+    /// (the rest of the job runs); a full destination fails the item before writing and the
+    /// remaining items fail fast with the same reason; nothing partial is left behind.
+    #[test]
+    fn missing_originals_and_full_disk_fail_cleanly() {
+        use crate::ingest::{run_until_idle, IngestConfig, IngestSink};
+        use crate::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
+        use crate::raw::raster::tests::fixtures;
+        struct Quiet;
+        impl IngestSink for Quiet {
+            fn ready(&self, _: ThumbnailReady) {}
+            fn failed(&self, e: ThumbnailFailed) {
+                panic!("{}", e.reason)
+            }
+            fn progress(&self, _: ImportProgress) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 1..=6 {
+            std::fs::write(src.join(format!("IMG_{i}.JPG")), fixtures::camera_jpeg(320, 240, 1, None)).unwrap();
+        }
+        let catalog = dir.path().join("cat.sqlite");
+        {
+            let mut conn = db::open(&catalog).unwrap();
+            let opts = ImportOptions { recursive: false, include_non_raw: true, pair_jpeg_with_raw: true };
+            assert_eq!(repo::import_folder(&mut conn, &src, &opts).unwrap().added, 6);
+        }
+        let cfg = IngestConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") };
+        run_until_idle(&cfg, &Quiet, &std::sync::atomic::AtomicBool::new(true)).unwrap();
+        let ex = Exporter::new(
+            ExportConfig { catalog_path: catalog, memory_budget_mb: Some(1024) },
+            LutLibrary::new(dir.path().join("luts")),
+        );
+        let sink = Arc::new(Sink::default());
+
+        // Missing original: that item fails, the other one exports.
+        std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
+        let out = dir.path().join("out");
+        ex.enqueue_with(sink.clone(), vec![1, 2], settings(&out), None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        let fin = lock(&sink.finished)[0].clone();
+        assert_eq!(fin.succeeded, 1);
+        assert_eq!(fin.failed.len(), 1);
+        assert!(fin.failed[0].reason.starts_with(access::MISSING_PREFIX), "{}", fin.failed[0].reason);
+
+        // Full disk: nothing written, every item fails with the disk message.
+        let full = dir.path().join("full");
+        access::FREE_BYTES_OVERRIDE.lock().unwrap().push((full.clone(), 64 * 1024));
+        ex.enqueue_with(sink.clone(), vec![1, 3, 4, 5, 6], settings(&full), None).unwrap();
+        assert!(ex.wait_idle(Duration::from_secs(60)));
+        let fin = lock(&sink.finished)[1].clone();
+        assert_eq!((fin.succeeded, fin.failed.len()), (0, 5));
+        for f in &fin.failed {
+            assert!(f.reason.contains("Not enough disk space"), "{}", f.reason);
+        }
+        assert_eq!(std::fs::read_dir(full.join("Web")).unwrap().count(), 0, "no partial files");
+        let jobs = ex.jobs().unwrap();
+        let job = jobs.iter().find(|j| j.failed == 5).unwrap();
+        assert_eq!((job.done, job.state), (5, ExportJobState::Completed), "items and counters agree");
+        access::FREE_BYTES_OVERRIDE.lock().unwrap().clear();
     }
 
     /// Phase 7c: an export of an image with an AI mask that has no matte yet computes it with

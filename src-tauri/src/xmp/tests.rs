@@ -425,6 +425,38 @@ fn read_images_applies_sidecar_values() {
     assert!(f.sync.read_images(&f.ids[..1]).unwrap().changed.is_empty());
 }
 
+/// Phase 8 error states: a read-only folder and a moved RAW fail per file with actionable
+/// messages (no orphan sidecar, catalog stays dirty, nothing else is affected).
+#[test]
+fn read_only_folder_and_missing_raw_are_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new(3);
+    let mut conn = f.conn();
+    repo::set_rating(&mut conn, &f.ids, 4).unwrap();
+    // Moved RAW: no sidecar is created next to where it used to be.
+    fs::remove_file(f.dir.path().join("shoot/DSC0001.ARW")).unwrap();
+    let report = f.sync.write_images(&f.ids[..2]).unwrap();
+    assert_eq!((report.succeeded, report.failed.len()), (1, 1));
+    assert!(report.failed[0].reason.starts_with(crate::raw::access::MISSING_PREFIX), "{}", report.failed[0].reason);
+    assert!(!f.sidecar(1).exists());
+    let (dirty, _, _, err) = f.state(f.ids[1]);
+    assert!(dirty && err.is_some(), "stays dirty, error recorded");
+
+    // Read-only folder (e.g. a locked card or a share without write access).
+    let shoot = f.dir.path().join("shoot");
+    fs::set_permissions(&shoot, fs::Permissions::from_mode(0o555)).unwrap();
+    let report = f.sync.write_images(&f.ids[2..]).unwrap();
+    fs::set_permissions(&shoot, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(report.failed.len(), 1);
+    let reason = &report.failed[0].reason;
+    assert!(reason.contains("permission denied") || reason.contains("read-only"), "{reason}");
+    assert!(!f.sidecar(2).exists());
+    assert!(f.state(f.ids[2]).0, "still dirty: retried by the next sync");
+    // Once writable again, the retry succeeds.
+    assert_eq!(f.sync.write_images(&f.ids[2..]).unwrap().succeeded, 1);
+    assert_eq!(f.state(f.ids[2]).3, None);
+}
+
 #[test]
 fn unparsable_sidecar_is_reported_and_not_clobbered() {
     let f = Fixture::new(1);

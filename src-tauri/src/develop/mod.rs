@@ -1075,6 +1075,51 @@ mod tests {
         assert!(url.ends_with("/render/42/detail?v=7"), "{url}");
     }
 
+    /// Phase 8 error states: renders of a moved original / an undecodable file fail with
+    /// actionable messages (no panic, nothing cached), and the decode lock is released.
+    #[test]
+    fn missing_and_undecodable_originals_have_actionable_errors() {
+        use crate::ipc::error::ErrorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let luts = LutLibrary::new(dir.path().join("luts"));
+        let opts = RenderOptions { max_edge: 512, slot: RenderSlot::Main, region: None };
+        let adj = ParametricAdjustments::default();
+
+        let gone = SourceImage { id: 1, path: dir.path().join("DSC0001.ARW"), orientation: None };
+        let e = cache.render(cache.ticket(1, RenderSlot::Main), &gone, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert!(e.message.starts_with(crate::raw::access::MISSING_PREFIX), "{}", e.message);
+        assert_eq!(cache.info(&gone).unwrap_err().kind, ErrorKind::NotFound);
+
+        let junk = dir.path().join("DSC0002.ARW");
+        std::fs::write(&junk, b"II*\0not a raw at all").unwrap();
+        let bad = SourceImage { id: 2, path: junk, orientation: None };
+        let e = cache.render(cache.ticket(2, RenderSlot::Main), &bad, &adj, &opts, &luts).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Io);
+        assert!(e.message.starts_with("Could not decode") && e.message.contains("damaged"), "{}", e.message);
+        assert_eq!(cache.cached_count(), 0);
+        assert!(lock(&cache.inner.decoding).is_empty(), "decode locks released on failure");
+    }
+
+    #[test]
+    fn remembered_sources_are_bounded_and_forgotten() {
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let src = |id: ImageId| SourceImage { id, path: PathBuf::from(format!("/x/{id}.arw")), orientation: Some(6) };
+        assert_eq!(cache.source(1), None);
+        cache.remember_source(src(1));
+        cache.remember_source(src(2));
+        assert_eq!(cache.source(1), Some(src(1)));
+        cache.forget_sources(Some(&[1]));
+        assert_eq!((cache.source(1), cache.source(2)), (None, Some(src(2))));
+        cache.forget_sources(None);
+        assert_eq!(cache.source(2), None);
+        for id in 0..(MAX_SOURCES as i64 + 10) {
+            cache.remember_source(src(id));
+        }
+        assert!(lock(&cache.sources).len() <= MAX_SOURCES);
+    }
+
     fn get(cache: &DevelopCache, uri: &str) -> http::Response<Vec<u8>> {
         let req = http::Request::builder().uri(uri).body(Vec::new()).unwrap();
         handle_protocol(cache, &req)

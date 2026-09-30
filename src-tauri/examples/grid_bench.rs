@@ -202,6 +202,32 @@ fn main() {
     let (fc_folder, _) = time(runs, || repo::filter_counts(&conn, folder).unwrap());
     println!("get_filter_counts(all)       {fc_all:>10.2}   total {}", c.total);
     println!("get_filter_counts(folder)    {fc_folder:>10.2}");
-    worst = worst.max(chunk_ms).max(fc_all).max(fc_folder);
+    let (cs, _) = time(runs, || repo::catalog_state(&conn, "x", "y").unwrap());
+    println!("get_catalog_state            {cs:>10.2}");
+    worst = worst.max(chunk_ms).max(fc_all).max(fc_folder).max(cs);
     println!("worst median: {worst:.2} ms (target < 20 ms)");
+
+    // Crash-safety costs at this size: startup integrity check + backup, and per-commit
+    // latency of single-row transactions per `synchronous` mode (ingest commits per image).
+    let size_mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / (1 << 20) as f64;
+    let t = Instant::now();
+    let ok = db::integrity(&path).unwrap();
+    println!("quick_check ({size_mb:.0} MB): {:.0} ms ({ok:?})", t.elapsed().as_secs_f64() * 1000.0);
+    let t = Instant::now();
+    let b = db::backup(&path).unwrap();
+    println!("backup (VACUUM INTO): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    let _ = std::fs::remove_file(b);
+    for (mode, fullfsync) in [("NORMAL", false), ("FULL", false), ("FULL", true)] {
+        conn.pragma_update(None, "synchronous", mode).unwrap();
+        conn.pragma_update(None, "fullfsync", fullfsync).unwrap();
+        let t = Instant::now();
+        for id in 1..=500 {
+            conn.execute("UPDATE images SET rating = (rating + 1) % 6 WHERE id = ?1", [id]).unwrap();
+        }
+        println!(
+            "synchronous={mode}{}: {:.3} ms/commit",
+            if fullfsync { " + fullfsync" } else { "" },
+            t.elapsed().as_secs_f64() * 1000.0 / 500.0
+        );
+    }
 }
