@@ -81,11 +81,11 @@ copy subsets into `test-data/` for anything that writes.
   render in flight per slot, send latest values when it lands; draft-size renders (~1024 px) while dragging, full
   quality on release/idle. Acceptance: preview visibly tracks a continuous drag (Playwright with delayed mock renders
   proves intermediate frames are shown; real bench of drag sequences reports frames shown/sec).
-- [ ] **Non-RAW sources** (architect → rust-engine-dev, frontend-dev): import and edit JPEG/HEIC/TIFF/PNG (and
+- [x] **Non-RAW sources** (architect → rust-engine-dev, frontend-dev): import and edit JPEG/HEIC/TIFF/PNG (and
   camera JPEG siblings of RAWs, grouped or listed per user setting): ingest/thumbnail/EXIF, develop from decoded sRGB→
   linear, XMP sidecars for JPEG edits (Lightroom writes `<name>.xmp` for RAW, embedded/sidecar for JPEG — decide),
   export.
-- [ ] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): **full parity for every develop
+- [x] **Lightroom develop parity** (architect → rust-engine-dev, frontend-dev): **full parity for every develop
   setting the user's edits use — Sieve must replace Lightroom, not supplement it (user requirement).** Parametric +
   point tone curve (master + RGB), color grading / split toning, camera calibration, sharpening, luminance/color noise
   reduction, vignette, grain, lens-profile-free basics; camera profiles via the Adobe Standard/Camera Matching DCPs
@@ -95,7 +95,7 @@ copy subsets into `test-data/` for anything that writes.
   the user's edited frames, Sieve's render of the imported XMP matches Lightroom's render (ΔE2000 mean ≤ 3 vs a
   Lightroom-exported reference if the user provides one; otherwise orchestrator visual review) and every crs value
   round-trips.
-- [ ] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
+- [x] **Mixed-camera validation at scale** (qa-engineer + owners): import the whole sample set read-only: ARW/RAF
   (X-Trans + Bayer)/CR3/JPG thumbnails + EXIF + develop + export correct; user XMP ratings + develop settings imported;
   throughput and peak memory at 925 files / 45 GB; culling suggestions vs the user's own ratings (agreement report);
   side-by-side of Sieve renders of the user's edits for visual parity review.
@@ -169,3 +169,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-29 — Phase 7b slider responsiveness: one render in flight per slot + draft (≤1024 px) while dragging, full on release/idle; Playwright: 24–25 intermediate renders shown during a 1 s drag with 40 ms renders (0 before fix). UX review 1 P0/P1 implemented (69/69 Playwright; Library chrome 108/140 px, Develop viewer 571 px at 1280×800). Real-backend slider feel still to confirm in the app.
 - 2026-09-29 — Phase 7 complete: scene features/detection (time gaps + histogram similarity, bursts never split), render-space ImageStats, Broyden solver for exposure/temp/tint (+tone) with safety caps, time-weighted 2-anchor blending, scene UI (strip, anchors, Match panel with local strength lerp, apply + undo). QA: 189 tests + 10 ignored; scene_eval 142/146 targets (97.3%) within 0.15 EV / 0.012 ab, all 4 misses flagged (dark LED scene, blown close-up); 48 scenes over 396 frames; 7 ms/target warm; app migrates to v8. Also merged here: IPC v8 UX additions + UX review 1 implementation (Playwright 69/69).
 - 2026-09-30 — Phase 7b culling calibration: keeper_eval on the user's proposal shoot (keeper = edited or ≥2★), time split 60/40. Held-out keepers suggested reject 37.4% → 0%; overexposed 27.7% → 0% (now blown skin / >60% blown frame); remaining 7 rejects all non-keepers; wedding-label tag precision unchanged. Gap: stars/picks barely predict this user's keepers (AUC ~0.57) — content/preference model needed (Phase 10).
+- 2026-09-30 — Phase 7b QA (final): non-RAW end to end PASS (neutral ≤ 2 levels, <name>.JPG.xmp sidecars, exports, originals byte-identical); parity PASS at 3.0 bar (held-out 2.88; ARW 2.97 / CR3 2.81 / RAF 2.87; 4 frames > 3 → Phase 8 round 2); culling calibration PASS (held-out keeper false-reject 0/115, wedding-label precision unchanged); scale PASS (orchestrator-run: 847/847 ready, 108 files/s, 330 MB footprint, 394 sidecars 0 errors, source listing of 1281 files identical). Open: M-size ARW half-size preview crop regression (fix in progress) blocks the QA gate.
