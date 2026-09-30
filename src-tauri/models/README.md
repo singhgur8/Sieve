@@ -13,6 +13,8 @@ The script exits non-zero (and deletes the partial download) on any checksum mis
 |---|---|---|---|
 | `det_10g.onnx` | SCRFD-10GF face detector with 5-point keypoints (insightface `buffalo_l`) | 16,923,827 B | `5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91` |
 | `2d106det.onnx` | 106-point 2D face landmarks (insightface `buffalo_l`), used for EAR blink detection | 5,030,888 B | `f001b856447c413801ef5c42091ed0cd516fcd21f2d6b79635b1e733a7109dbf` |
+| `open_closed_eye.onnx` | Eye-state CNN (OpenVINO OMZ `open-closed-eye-0001`, Apache-2.0) | 46,164 B | `4daa100034482525a26c9afb9297c16580a531189e66e3d2b2ac7d32becfd593` |
+| `face_landmarks_detector_1x3x256x256.onnx` | MediaPipe FaceMesh V2, 478 3D landmarks (Apache-2.0; PINTO ONNX export) for head pose | 4,955,225 B | `70fe4e14169ca084b03b8103077a4051296e07939a19c1fdfd1f18b3792b4048` |
 
 Source: HuggingFace mirror `public-data/insightface`, pinned to revision
 `33c1063c49c785b7652d3fd529f86fa4f149392b`:
@@ -141,13 +143,38 @@ The engine (`ml/metrics.rs`) uses the 3-vertical variant per eye; blink = the *m
 lip 62, inner lower lip 60. `mouth_open = |62-60| / |52-61|` (laughing >= ~0.25). Points 52-71 are the
 mouth, 72-86 the nose, 0-32 the jaw contour.
 
+## `open_closed_eye.onnx` — eye-state CNN (blink round 2)
+
+OpenVINO Open Model Zoo `open-closed-eye-0001` (Apache-2.0, 46 KB, MRL eye dataset). Source:
+`https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/open-closed-eye-0001/open_closed_eye.onnx`
+(OMZ `model.yml` SHA-384 `2615bce5...cba27` matches). Input `input.1` `[1,3,32,32]`, `(x - 127) / 255`;
+we feed grey (MRL is IR) replicated to 3 channels, crop = 2.2 x eye width around the eye corners in the
+upright landmark crop. Output `[1,2,1,1]` softmax. **The OMZ docs say `[open, closed]`, but on our
+previews index 1 is ~1.0 for clearly open eyes**, so index 1 = open. Caveats: it flips between 0 and 1 as
+the crop size changes and calls a lowered gaze "closed"; used only as one of several agreeing signals.
+
+## `face_landmarks_detector_1x3x256x256.onnx` — MediaPipe FaceMesh V2 (blink round 2)
+
+478 3D landmarks incl. iris (Apache-2.0, MediaPipe Face Landmarker v2), ONNX export from PINTO_model_zoo
+#410 (`resources.tar.gz`, file extracted and checksum-verified by the fetch script). Input `input_12`
+`[1,3,256,256]` RGB in `[0,1]`, crop = upright eye-aligned face box x1.5 (same as the 106-pt model).
+Output 0 `Identity` `[1,1,1,1434]` = (x, y, z) in crop pixels. Used for **3D head pose**: rigid fit
+(Horn's quaternion method) of the 468 vertices to MediaPipe's canonical face model
+(`ml/canonical_face.rs`, Apache-2.0) — pitch > 15° (face turned down) makes closed-looking eyes
+"undetermined". CoreML (MLProgram) fails to compile this export ("Required param 'pad' is missing"), so
+it runs on CPU, and only for frontal faces whose EAR < 0.3.
+
+Tried and rejected for the closed-vs-downcast problem (no separation on the labeled faces): lid-arc /
+brow / lower-lid geometry from the 106-pt model, FaceMesh iris position, MediaPipe Blendshape V2
+(`eyeBlink*` vs `eyeLookDown*`, driven by the same landmarks), a 5-keypoint pitch proxy.
+
 ## Rust integration (measured)
 
-`ml/models.rs` builds both sessions with `ort` 2.0.0-rc.13 (ORT 1.28 static), CoreML MLProgram +
-`with_static_input_shapes(true)` + the dimension overrides above; both run on CoreML. Full per-image
-analysis of a 2048 px preview (decode, detector at 640, landmarks per face, sharpness, pHash):
-27.7 ms single-thread, 9.9 ms/image throughput with the 4-thread analysis pool (M3 Max, release);
-CPU EP fallback 86 ms/image.
+`ml/models.rs` builds the detector and 106-pt sessions with `ort` 2.0.0-rc.13 (ORT 1.28 static),
+CoreML MLProgram + `with_static_input_shapes(true)` + the dimension overrides above (both run on
+CoreML); the eye CNN and FaceMesh run on CPU. Full per-image analysis of a 2048 px preview (M3 Max,
+release, 396 sample previews): 43 ms single-thread, 13.7 ms/image throughput with the 4-thread pool.
+(Round 1 without eye CNN / FaceMesh: 27.7 / 9.9 ms; CPU EP fallback for everything ~86 ms/image.)
 
 ---
 

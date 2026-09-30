@@ -164,6 +164,36 @@ pub fn eye_sharpness(s: &imgproc::DirSharpness) -> f32 {
     s.min.min(0.25 + s.texture / 20.0).clamp(0.0, 1.0)
 }
 
+/// Side of the square eye crop fed to the eye-state CNN, in eye widths (corner to
+/// corner). MRL-style crops include lids and some brow/cheek.
+pub const EYE_BOX: f32 = 2.2;
+/// Tight per-eye crops count for sharpness only with at least this much detail (mean
+/// |gradient|, luma levels/px); flat or tiny crops give meaningless ratios.
+pub const TIGHT_EYE_MIN_TEXTURE: f32 = 5.0;
+
+/// Head pose / FaceMesh EAR are measured only for faces whose more-open eye has an EAR
+/// below this (possible blinks). Any `blinkEar` above it cannot produce a blink.
+pub const POSE_EAR_GATE: f32 = 0.3;
+
+/// FaceMesh eye contour points for the 6-point EAR: corners p1/p4, upper p2/p3,
+/// lower p6/p5 (MediaPipe topology; image-left and image-right eye).
+const MESH_EYE_A: [usize; 6] = [33, 160, 158, 133, 153, 144];
+const MESH_EYE_B: [usize; 6] = [362, 385, 387, 263, 373, 380];
+
+/// 6-point EAR on FaceMesh landmarks: (|p2-p6| + |p3-p5|) / (2 |p1-p4|).
+pub fn mesh_ear(mesh: &[[f32; 3]], [p1, p2, p3, p4, p5, p6]: [usize; 6]) -> Option<f32> {
+    let d = |a: usize, b: usize| dist([mesh[a][0], mesh[a][1]], [mesh[b][0], mesh[b][1]]);
+    let width = d(p1, p4);
+    (width >= 1.0).then(|| (d(p2, p6) + d(p3, p5)) / (2.0 * width))
+}
+
+/// The detector box reaches (or crosses) the frame edge: the face is cut off by the
+/// frame (detail shots, jewellery close-ups), so it is not the focus subject.
+pub fn truncated(b: &[f32; 4], w: usize, h: usize) -> bool {
+    let tol = 0.01 * (b[3] - b[1]).max(1.0);
+    b[0] <= tol || b[1] <= tol || b[2] >= w as f32 - tol || b[3] >= h as f32 - tol
+}
+
 fn face_metrics(
     models: &mut Models,
     rgb: &[u8],
@@ -196,12 +226,19 @@ fn face_metrics(
         eye_texture: 0.0,
         anisotropy: 0.0,
         frontal: false,
+        truncated: truncated(&det.bbox, w, h),
+        eye_open_prob: None,
+        head_pitch: None,
+        head_yaw: None,
+        mesh_ear: None,
+        face_luma: 0.0,
+        mouth_width: None,
     };
     if !measured {
         return Ok(f);
     }
 
-    let (pts, _) = models.landmarks(rgb, w, h, det)?;
+    let (pts, crop) = models.landmarks(rgb, w, h, det)?;
     f.ear_left = ear(&pts, 0);
     f.ear_right = ear(&pts, EYE_B_OFFSET);
     f.ear = match (f.ear_left, f.ear_right) {
@@ -209,9 +246,48 @@ fn face_metrics(
         (a, b) => a.or(b),
     };
     f.mouth_open = mouth_open(&pts);
+    let eye_span = dist(pts[EYE_A.0[0]], pts[EYE_A.0[1] + EYE_B_OFFSET]).max(1.0);
+    f.mouth_width = Some(dist(pts[MOUTH_CORNERS[0]], pts[MOUTH_CORNERS[1]]) / eye_span);
+    let k = (iod / TARGET_IOD).round().max(1.0) as usize;
+
+    // FaceMesh V2 (3D head pose + an independent EAR), only for possible blinks: frontal
+    // faces whose more-open eye is below POSE_EAR_GATE. Keeps the per-image cost low.
+    let ear_open =
+        f.ear_left.into_iter().chain(f.ear_right).fold(None, |m: Option<f32>, e| Some(m.map_or(e, |m| m.max(e))));
+    if iod / bh >= FRONTAL_MIN && ear_open.is_some_and(|e| e < POSE_EAR_GATE) {
+        let (mesh, _) = models.face_mesh(rgb, w, h, det)?;
+        let pose = super::pose::head_pose(&mesh);
+        f.head_pitch = Some(pose.pitch);
+        f.head_yaw = Some(pose.yaw);
+        f.mesh_ear = match (mesh_ear(&mesh, MESH_EYE_A), mesh_ear(&mesh, MESH_EYE_B)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    // Per eye: CNN eye state and tight-crop sharpness.
+    let (mut open_max, mut tight_best) = (0.0f32, 0.0f32);
+    for off in [0, EYE_B_OFFSET] {
+        let (a, b) = (pts[EYE_A.0[0] + off], pts[EYE_A.0[1] + off]);
+        let ew = dist(a, b).max(1.0);
+        let c = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        open_max = open_max.max(models.eye_open(rgb, w, h, &crop, c, ew * EYE_BOX)?);
+        // Tight box around the eye contour, in source pixels.
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for i in 33..43 {
+            let (x, y) = crop.apply(pts[i + off][0], pts[i + off][1]);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let side = (x1 - x0).max(y1 - y0).max(4.0);
+        let s =
+            imgproc::dir_sharpness(&region(rgb, w, h, [(x0 + x1) / 2.0, (y0 + y1) / 2.0], side * 0.75, side * 0.75, k));
+        if s.texture >= TIGHT_EYE_MIN_TEXTURE {
+            tight_best = tight_best.max(s.min);
+        }
+    }
+    f.eye_open_prob = Some(open_max);
 
     // Sharpness: eye region (both eyes + lids) and whole face, normalized scale.
-    let k = (iod / TARGET_IOD).round().max(1.0) as usize;
     let vertical = u[1].abs() > std::f32::consts::FRAC_1_SQRT_2;
     let (ex, ey) = if vertical { (0.55 * iod, 1.0 * iod) } else { (1.0 * iod, 0.55 * iod) };
     let eyes = region(rgb, w, h, mid, ex, ey, k);
@@ -221,9 +297,10 @@ fn face_metrics(
     let face_s = imgproc::dir_sharpness(&face);
     f.eye_texture = eye_s.texture;
     f.face_sharpness = face_s.mean;
+    f.face_luma = face.px.iter().sum::<f32>() / face.px.len().max(1) as f32 / 255.0;
     f.anisotropy = face_s.anisotropy().max(eye_s.anisotropy());
     f.frontal = f.ear.is_some() && iod / bh >= FRONTAL_MIN;
-    f.sharpness = if f.frontal { eye_sharpness(&eye_s) } else { face_s.mean };
+    f.sharpness = if f.frontal { eye_sharpness(&eye_s).max(tight_best) } else { face_s.mean };
     Ok(f)
 }
 

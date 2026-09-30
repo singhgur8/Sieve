@@ -22,10 +22,20 @@ FORCE=0
 HF_REPO="https://huggingface.co/public-data/insightface/resolve"
 HF_REV="33c1063c49c785b7652d3fd529f86fa4f149392b"
 
-# name|url
+# OpenVINO Open Model Zoo `open-closed-eye-0001` (Apache-2.0, 46 KB eye-state CNN).
+# The OMZ model.yml pins SHA-384 2615bce5...cba27 for this exact file.
+OMZ_EYE="https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/open-closed-eye-0001/open_closed_eye.onnx"
+
+# MediaPipe FaceMesh V2 landmarks (Apache-2.0), ONNX export from PINTO_model_zoo #410
+# (shipped only inside an 18 MB tarball; the extracted file is checksum-verified).
+PINTO_MESH="https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz"
+
+# name|url[|member inside a .tar.gz at url]
 MODELS=(
   "det_10g.onnx|$HF_REPO/$HF_REV/models/buffalo_l/det_10g.onnx"
   "2d106det.onnx|$HF_REPO/$HF_REV/models/buffalo_l/2d106det.onnx"
+  "open_closed_eye.onnx|$OMZ_EYE"
+  "face_landmarks_detector_1x3x256x256.onnx|$PINTO_MESH|face_landmarks_detector_1x3x256x256.onnx"
 )
 
 die() { echo "fetch-models: ERROR: $*" >&2; exit 1; }
@@ -49,8 +59,7 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 mkdir -p "$MODELS_DIR"
 
 for entry in "${MODELS[@]}"; do
-  name="${entry%%|*}"
-  url="${entry#*|}"
+  IFS='|' read -r name url member <<< "$entry"
   dest="$MODELS_DIR/$name"
   want="$(expected_sha "$name")"
   [[ -n "$want" ]] || die "no checksum for $name in $CHECKSUMS"
@@ -67,8 +76,17 @@ for entry in "${MODELS[@]}"; do
   echo "download $name"
   tmp="$dest.part"
   rm -f "$tmp"
-  curl --fail --location --retry 3 --retry-delay 2 --show-error --progress-bar \
-    -o "$tmp" "$url" || { rm -f "$tmp"; die "download failed: $url"; }
+  if [[ -n "${member:-}" ]]; then
+    work="$(mktemp -d)"
+    curl --fail --location --retry 3 --retry-delay 2 --show-error --progress-bar \
+      -o "$work/archive.tar.gz" "$url" || { rm -rf "$work"; die "download failed: $url"; }
+    tar -xzf "$work/archive.tar.gz" -C "$work" "$member" || { rm -rf "$work"; die "$member not found in $url"; }
+    mv -f "$work/$member" "$tmp"
+    rm -rf "$work"
+  else
+    curl --fail --location --retry 3 --retry-delay 2 --show-error --progress-bar \
+      -o "$tmp" "$url" || { rm -f "$tmp"; die "download failed: $url"; }
+  fi
 
   have="$(sha256_of "$tmp")"
   if [[ "$have" != "$want" ]]; then
