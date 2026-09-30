@@ -370,6 +370,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           return;
         case "maskDelete":
           return m.deleteSelected();
+        case "maskMoveUp":
+          return m.moveSelected(-1);
+        case "maskMoveDown":
+          return m.moveSelected(1);
       }
     },
     [],
@@ -588,7 +592,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             inset={cropTool ? CROP_INSET : 0}
             rotate={cropTool ? previewRotation(cropTool.angle, orientation) : 0}
           />
-          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} onError={onError} />}
+          {masks.open && !cropTool && <MaskLayer masks={masks} editor={editor} id={id} frame={frame} box={box} region={zoom.on ? region : null} onError={onError} />}
           {masks.open && masks.tool && !cropTool && (
             <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="mask-tool-badge" data-tool={masks.tool.kind}>
               {TOOL_HELP[masks.tool.kind]}

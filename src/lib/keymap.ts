@@ -63,6 +63,8 @@ export type ActionId =
   | "maskFeather"
   | "maskAuto"
   | "maskDelete"
+  | "maskMoveUp"
+  | "maskMoveDown"
   | "selectBurst"
   | "selectAll"
   | "selectNone"
@@ -183,6 +185,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "maskFeather", group: "Masks", label: "Brush feather less / more", chords: [c("[", { shift: true }), c("]", { shift: true }), c("{", { shift: "any" }), c("}", { shift: "any" })], modes: ["develop"], display: ["Shift+[ / Shift+]"], where: "Develop, brush active" },
   { id: "maskAuto", group: "Masks", label: "Toggle brush auto mask", chords: [c("a")], modes: ["develop"], display: ["A"], where: "Develop, brush active" },
   { id: "maskDelete", group: "Masks", label: "Delete the selected mask component (Enter / Esc: finish the tool)", chords: [c("Delete"), c("Backspace")], modes: ["develop"], display: ["Delete"], where: "Develop, Masks panel open" },
+  { id: "maskMoveUp", group: "Masks", label: "Move the selected mask (or its component) up in the stack", chords: [c("ArrowUp", { alt: true })], modes: ["develop"], display: ["Alt+Up"], where: "Develop, Masks panel open" },
+  { id: "maskMoveDown", group: "Masks", label: "Move the selected mask (or its component) down in the stack", chords: [c("ArrowDown", { alt: true })], modes: ["develop"], display: ["Alt+Down"], where: "Develop, Masks panel open" },
 
   // ---- app ----
   { id: "saveXmp", group: "App", label: "Save metadata (XMP)", chords: [c("s", { mod: true })], modes: ALL, display: ["Cmd+S"], where: "Everywhere" },
