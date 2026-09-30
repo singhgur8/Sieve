@@ -549,13 +549,12 @@ pub fn load_source(src: &SourceImage, preview_path: Option<&Path>) -> AppResult<
     let decoded = source::decode_half_size(&src.path);
     match decoded {
         Ok(img) => {
-            let prep = source::prepare(&img, 1, None, SOURCE_EDGE);
+            let crop = crate::ipc::types::CropSettings::default();
+            let prep = source::prepare(&img, 1, &crop, None, SOURCE_EDGE);
+            let profile = crate::develop::camera::Profile::matrix(0.0);
             let input = pipeline::RenderInput {
-                width: prep.width,
-                height: prep.height,
-                pixels: &prep.pixels,
-                color: &img.color,
                 frame_long_edge: prep.frame_long_edge,
+                ..pipeline::RenderInput::simple(prep.width, prep.height, &prep.pixels, &img.color, &profile)
             };
             let out = pipeline::render(&input, &ParametricAdjustments::default(), None);
             Ok(SourcePixels { width: out.width, height: out.height, rgb: out.rgb })
