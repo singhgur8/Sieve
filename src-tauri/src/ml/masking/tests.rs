@@ -183,7 +183,8 @@ fn capabilities_follow_model_files() {
     assert_eq!(get(AiTargetKind::Subject).model.as_deref(), Some("stub@1"));
     let sky = get(AiTargetKind::Sky);
     assert!(!sky.available && sky.model.is_none());
-    assert!(sky.reason.unwrap().contains("sky.onnx"), "reason names the missing file");
+    // User-facing: points at the in-app download (IPC v13), not a developer script.
+    assert_eq!(sky.reason.as_deref(), Some(super::MODELS_NOT_INSTALLED));
     let land = get(AiTargetKind::Landscape);
     assert!(!land.available && land.reason.unwrap().contains("landscape"));
     assert!(!get(AiTargetKind::Object).available);

@@ -17,6 +17,7 @@ src-tauri/
   migrations/0008_ux.sql       v8: burst_keeper_pins (user-chosen burst keepers)
   migrations/0009_parity_sources.sql v9: images.format CHECK += jpeg/heic/tiff/png (in place), companion_path, develop_warnings
   migrations/0010_masks.sql    v10: mask_cache (AI mattes), images.masks_pending_import
+  migrations/0011_hardening.sql v11: filter-bar indexes, images.missing_since_ms (+ partial index)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -182,6 +183,8 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `model_downloads_status` / `modelDownloadsStatus` (v12) | – | `ModelDownloadStatus` (groups + installed files + `downloading`) |
 | `download_models` / `downloadModels` (v12) | `group: string` (`MODEL_GROUP_SEGMENTATION`) | `null` (background; `invalid_argument` if unknown / already downloading) |
 | `cancel_model_download` / `cancelModelDownload` (v12) | – | `null` (no-op when idle) |
+| `relocate_folder` / `relocateFolder` (v13) | `folderId: number, newPath: string` | `RelocateResult` (`{matched, stillMissing}`; `invalid_argument` if none found) |
+| `restore_catalog_backup` / `restoreCatalogBackup` (v13) | `index: number` (1 = newest) | `CatalogHealth` (`restorePending: true`; applied at next launch) |
 
 `set_shoot_type`, `set_burst_window` and `set_cull_thresholds` (for the current shoot type) kick a `rescore`;
 `import_folder` / `regenerate_thumbnails` kick `pending` analysis when `autoAnalyze` is on.
@@ -199,6 +202,12 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `modelDownloadFinished {group,ok,cancelled,error}` (v12).
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
+
+Error kinds (`AppError.kind`; the `message` is always user-facing): `not_found` (catalog row), `invalid_argument`,
+`io`, `database`, `internal`, and since v13 `file_missing` (original not at its path), `disk_full`, `read_only`
+(volume read-only / no permission), `decode_failed` (original exists but cannot be decoded), `catalog_read_only`
+(damaged catalog, see Catalog health). Per-file failures in reports (`XmpFailure`, `ExportFailure`,
+`thumbnailFailed`) stay plain strings; a missing original's reason starts with `Original file is missing`.
 
 ### Wire conventions
 - Struct fields `camelCase`; enum values `snake_case` strings, identical to the DB column values.
@@ -659,7 +668,7 @@ migrations tracked by `PRAGMA user_version`.
 |---|---|
 | `catalog_meta` | `shoot_type`, `burst_window_ms`, `auto_analyze`, `xmp_auto_sync`, `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `folders` | imported roots |
-| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet) |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
@@ -675,6 +684,32 @@ migrations tracked by `PRAGMA user_version`.
 | `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`) |
 | `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
 | `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
+
+Filter-bar indexes (schema v11, `0011_hardening.sql`): `idx_images_folder_pick_rating (folder_id, pick, rating)`
+(whole-catalog `get_filter_counts` groups by it: ~7 ms at 50k images, `examples/grid_bench.rs --plans`),
+partial `idx_image_tags_live (tag, image_id) WHERE suppressed = 0` (tag counts / filters), partial
+`idx_images_missing (folder_id) WHERE missing_since_ms IS NOT NULL` (`missing` facet / `missingOnly`).
+
+### Missing originals (v13)
+`images.missing_since_ms` (`RawImageEntry.missingSinceMs`) = when an access first found the original gone.
+Set (keeping the first time) by: `render_preview` / `get_develop_info` / `sample_white_balance` failing with
+`file_missing` (command layer, `note_if_missing`), export items failing with a missing reason (`export`), sidecar
+writes (`xmp::store::mark_failed`), thumbnail extraction (`repo::record_extraction`) and a re-import of the folder
+(`repo::import_folder` stats every catalogued file of the folder). Cleared by: a successful extraction, sidecar
+write or export, `get_develop_info` while the file is back, a re-import that finds it, and `relocate_folder`.
+Helpers: `repo::set_original_missing`, `repo::note_access_failure` (reason-prefix based). `relocate_folder`
+(`repo::relocate_folder`, atomic) finds each image at its old relative path under the new root, else by unique
+file name anywhere below it; it refuses a root holding none of the photos or one that is another catalog folder,
+forgets the moved images' develop sources and re-queues thumbnails that had failed as missing.
+
+### Catalog health (v13)
+`CatalogState.health` = `db::health_state(path)`: the launch check's result (`ok` / `read_only` / `replaced`, see
+the `db` module docs), a user-facing message, `<catalog>.bak-1..3` and whether a restore is staged
+(`<catalog>.restore`, written by `restore_catalog_backup` = `db::stage_restore`; swapped in by the next launch's
+first open, the replaced file kept as `.corrupt-<ms>`). Clean shutdown: `RunEvent::Exit` (lib.rs) writes
+`<catalog>.clean` (`db::mark_clean_shutdown`, never for a read-only catalog); the next first open removes it and,
+if it was present, the file has the SQLite header and no restore was applied, skips `quick_check` (124 ms at
+50k images). Backups follow the usual rules either way.
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

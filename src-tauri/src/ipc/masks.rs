@@ -919,7 +919,8 @@ pub struct AiCapability {
     pub available: bool,
     /// Model id when available.
     pub model: Option<String>,
-    /// Why not (e.g. "model file sky.onnx not installed"), when unavailable.
+    /// Why not, user-facing (e.g. "AI masking models are not installed. Download them from
+    /// the Masks panel (~560 MB)."), when unavailable.
     pub reason: Option<String>,
 }
 

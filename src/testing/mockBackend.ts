@@ -18,7 +18,10 @@ import type {
   DevelopWarning,
   LookProfileInfo,
   BurstGroup,
+  CatalogBackup,
+  CatalogHealth,
   CatalogState,
+  RelocateResult,
   CullSnapshot,
   CullTag,
   UiPrefs,
@@ -311,6 +314,7 @@ export function installMockBackend(count: number) {
       // Every 9th frame has a camera JPEG sibling; every 10th carries Lightroom masks (unsupported).
       companionPath: id % 9 === 0 ? `/shoot/DSC${String(id).padStart(5, "0")}.JPG` : null,
       developWarnings: id % 10 === 0 ? [{ code: "masks_unsupported", detail: "2 mask groups" }] : [],
+      missingSinceMs: null,
       tags,
       quality: {
         overall,
@@ -343,6 +347,47 @@ export function installMockBackend(count: number) {
   for (let i = 3; i < count; i += 40) rows[i].xmp = { dirty: true, syncedAtMs: null, error: null };
   void rand;
 
+  // ---- Phase 8 hardening (v13): `?missing=N` flags images 1..N missing; `?health=read_only|replaced` ----
+  const params = new URLSearchParams(location.search);
+  const missingCount = Math.min(count, Math.max(0, Number(params.get("missing") ?? 0) || 0));
+  for (let i = 0; i < missingCount; i++) rows[i].missingSinceMs = base + 3_600_000;
+  const healthParam = params.get("health");
+  const mockBackups: CatalogBackup[] = [1, 2, 3].map((index) => ({
+    index,
+    path: `/mock/catalog.sqlite.bak-${index}`,
+    createdAtMs: base - index * 86_400_000,
+    sizeBytes: 48_000_000 - index * 1_000_000,
+  }));
+  let health: CatalogHealth =
+    healthParam === "read_only"
+      ? {
+          status: "read_only",
+          message:
+            "The catalog is damaged (database disk image is malformed) and was opened read-only, so changes cannot be saved. Quit Sieve and restore the backup /mock/catalog.sqlite.bak-1 (newest of 3), or copy it over /mock/catalog.sqlite.",
+          backups: mockBackups,
+          restorePending: false,
+        }
+      : healthParam === "replaced"
+        ? {
+            status: "replaced",
+            message:
+              "The catalog file was unreadable (file is not a database) and was moved to /mock/catalog.sqlite.corrupt-1; a new, empty catalog was created. Restore a backup to get your catalog back, or re-import your folders.",
+            backups: mockBackups,
+            restorePending: false,
+          }
+        : { status: "ok", message: null, backups: mockBackups, restorePending: false };
+  const missingMessage = (r: RawImageEntry) =>
+    `Original file is missing or was moved: ${r.path}. Reconnect the drive or move the file back, then try again.`;
+  /** Like the backend: a damaged (read-only) catalog refuses writes. */
+  const guardWrite = () => {
+    if (health.status === "read_only") throw { kind: "catalog_read_only", message: health.message };
+  };
+  /** Like the backend: renders / develop info of a missing original fail with `file_missing`. */
+  const guardOriginal = (id: number) => {
+    const r = byId.get(id);
+    if (r?.missingSinceMs != null) throw { kind: "file_missing", message: missingMessage(r) };
+  };
+
   let catalog: CatalogState = {
     catalogPath: "/mock/catalog.sqlite",
     imageCount: count,
@@ -356,6 +401,7 @@ export function installMockBackend(count: number) {
     cacheDir: "/mock/cache",
     autoAnalyze: true,
     xmpAutoSync: false,
+    health,
   };
 
   const byId = new Map(rows.map((r) => [r.id, r]));
@@ -376,6 +422,7 @@ export function installMockBackend(count: number) {
       if (q.colorLabels.length && (!r.colorLabel || !q.colorLabels.includes(r.colorLabel))) return false;
       if (q.collapseBursts && r.burstGroupId != null && !r.isBurstKeeper) return false;
       if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
+      if (q.missingOnly && r.missingSinceMs == null) return false;
       return true;
     });
     const key: Record<string, (r: RawImageEntry) => number | string> = {
@@ -404,6 +451,7 @@ export function installMockBackend(count: number) {
       ratings,
       burstGroups: new Set(scope.map((r) => r.burstGroupId).filter((g) => g != null)).size,
       burstNonKeepers: scope.filter((r) => r.burstGroupId != null && !r.isBurstKeeper).length,
+      missing: scope.filter((r) => r.missingSinceMs != null).length,
     };
   }
 
@@ -765,18 +813,21 @@ export function installMockBackend(count: number) {
         case "get_xmp_status":
           return { dirty: rows.filter((r) => r.xmp.dirty).length, failed: 0, running: false, autoSync: catalog.xmpAutoSync };
         case "set_pick":
+          guardWrite();
           ids.forEach((i) => {
             const r = byId.get(i);
             if (r) r.pick = args.pick as PickFlag;
           });
           return null;
         case "set_rating":
+          guardWrite();
           ids.forEach((i) => {
             const r = byId.get(i);
             if (r) r.rating = args.rating as number;
           });
           return null;
         case "set_color_label":
+          guardWrite();
           ids.forEach((i) => {
             const r = byId.get(i);
             if (r) r.colorLabel = args.label as RawImageEntry["colorLabel"];
@@ -863,6 +914,7 @@ export function installMockBackend(count: number) {
         case "get_adjustments":
           return getAdj(args.id as number);
         case "save_adjustments":
+          guardWrite();
           commit(args.id as number, args.adjustments as ParametricAdjustments, args.label as string);
           return historyDto(args.id as number);
         case "get_history":
@@ -880,6 +932,7 @@ export function installMockBackend(count: number) {
           return jump(args.id as number, h.entries.findIndex((e) => e.id === args.entryId));
         }
         case "get_develop_info": {
+          guardOriginal(args.id as number);
           const look = completeAdjustments(getAdj(args.id as number)).profile.look;
           const warnings: DevelopWarning[] = [...(byId.get(args.id as number)?.developWarnings ?? [])];
           if (look && !MOCK_LOOKS.find((l) => l.uuid === look.uuid)?.available) warnings.push({ code: "look_unavailable", detail: look.name });
@@ -973,7 +1026,41 @@ export function installMockBackend(count: number) {
         case "cancel_model_download":
           if (modelRun) modelRun.cancelled = true;
           return null;
+        // Phase 8 hardening (v13). Relocate finds every photo unless the path contains "empty"
+        // (none found: nothing changes) or "partial" (the first missing image stays missing).
+        case "relocate_folder": {
+          guardWrite();
+          const folderId = args.folderId as number;
+          const newPath = String(args.newPath ?? "").replace(/\/+$/, "");
+          const folder = catalog.folders.find((f) => f.id === folderId);
+          if (!folder) throw { kind: "not_found", message: `folder ${folderId}` };
+          if (!newPath.startsWith("/")) throw { kind: "invalid_argument", message: `${newPath}: not a folder` };
+          const members = rows.filter((r) => r.folderId === folderId);
+          if (newPath.includes("empty"))
+            throw { kind: "invalid_argument", message: `None of the ${members.length} photos of ${folder.path} were found in ${newPath}. Choose the folder the shoot was moved to.` };
+          const keepMissing = newPath.includes("partial") ? members.find((r) => r.missingSinceMs != null) : undefined;
+          const result: RelocateResult = { matched: 0, stillMissing: 0 };
+          for (const r of members) {
+            if (r === keepMissing) {
+              result.stillMissing++;
+              continue;
+            }
+            r.path = `${newPath}/${r.fileName}`;
+            r.missingSinceMs = null;
+            result.matched++;
+          }
+          catalog = { ...catalog, folders: catalog.folders.map((f) => (f.id === folderId ? { ...f, path: newPath } : f)) };
+          return result;
+        }
+        case "restore_catalog_backup": {
+          const b = health.backups.find((x) => x.index === args.index);
+          if (!b) throw { kind: "not_found", message: `backup /mock/catalog.sqlite.bak-${String(args.index)} does not exist` };
+          health = { ...health, restorePending: true };
+          catalog = { ...catalog, health };
+          return health;
+        }
         case "render_preview":
+          guardOriginal(args.id as number);
           return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);
         case "paste_settings":
           return batch(ids, "Paste Settings", (a) => copyFields(a, args.adjustments as ParametricAdjustments, args.fields as AdjustmentField[]));

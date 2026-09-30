@@ -731,6 +731,8 @@ mod tests {
             s.capabilities().ai.into_iter().find(|c| c.kind == AiTargetKind::Subject).map(|c| c.available)
         };
         assert_eq!(subject(&segmenter), Some(false));
+        let reason = segmenter.capabilities().ai.into_iter().find(|c| c.kind == AiTargetKind::Subject).unwrap().reason;
+        assert_eq!(reason.as_deref(), Some(crate::ml::masking::MODELS_NOT_INSTALLED), "points at the download button");
         // What a finished download leaves behind: the verified file under its final name.
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("birefnet_lite.onnx"), b"stand-in").unwrap();

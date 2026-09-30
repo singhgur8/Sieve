@@ -634,6 +634,12 @@ impl Exporter {
                                         &[&job.id, &item.seq, &path.to_string_lossy().into_owned()],
                                     ),
                                     (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
+                                    // Exported from the original: it is present (IPC v13).
+                                    (
+                                        "UPDATE images SET missing_since_ms = NULL
+                                         WHERE id = ?1 AND missing_since_ms IS NOT NULL",
+                                        &[&item.entry.id],
+                                    ),
                                 ]);
                             }
                             Err(Failure::Cancelled) => continue,
@@ -649,6 +655,13 @@ impl Exporter {
                                     ),
                                     (COUNTERS, &[&job.id, &live.succeeded, &live.failed, &live.skipped]),
                                 ]);
+                                if access::is_missing_message(&reason) {
+                                    db(
+                                        "UPDATE images SET missing_since_ms = ?2
+                                         WHERE id = ?1 AND missing_since_ms IS NULL",
+                                        &[&item.entry.id, &now_ms()],
+                                    );
+                                }
                                 failures.push(ExportFailure {
                                     image_id: item.entry.id,
                                     file_name: item.entry.file_name.clone(),
@@ -915,7 +928,7 @@ fn output_dir(settings: &ExportSettings) -> AppResult<Option<PathBuf>> {
 
 /// Creates `dir` and checks it is writable.
 fn ensure_writable_dir(dir: &Path) -> AppResult<()> {
-    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, access::io_message(dir, "write", &e));
+    let io = |e: std::io::Error| access::io_error(dir, "write", &e);
     std::fs::create_dir_all(dir).map_err(io)?;
     let probe = dir.join(format!(".sieve-write-test-{}", std::process::id()));
     std::fs::write(&probe, b"").map_err(io)?;
@@ -1250,7 +1263,7 @@ mod tests {
         let cfg = IngestConfig { catalog_path: catalog.clone(), cache_dir: dir.path().join("cache") };
         run_until_idle(&cfg, &Quiet, &std::sync::atomic::AtomicBool::new(true)).unwrap();
         let ex = Exporter::new(
-            ExportConfig { catalog_path: catalog, memory_budget_mb: Some(1024) },
+            ExportConfig { catalog_path: catalog.clone(), memory_budget_mb: Some(1024) },
             LutLibrary::new(dir.path().join("luts")),
         );
         let sink = Arc::new(Sink::default());
@@ -1264,6 +1277,9 @@ mod tests {
         assert_eq!(fin.succeeded, 1);
         assert_eq!(fin.failed.len(), 1);
         assert!(fin.failed[0].reason.starts_with(access::MISSING_PREFIX), "{}", fin.failed[0].reason);
+        // IPC v13: the missing original is flagged, the exported one is not.
+        let missing = |id| repo::get_image(&db::open(&catalog).unwrap(), id).unwrap().missing_since_ms.is_some();
+        assert!(missing(2) && !missing(1));
 
         // Full disk: nothing written, every item fails with the disk message.
         let full = dir.path().join("full");
