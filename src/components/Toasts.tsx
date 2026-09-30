@@ -15,11 +15,13 @@ export interface Toast {
   message: string;
   kind: "info" | "error";
   action?: ToastAction;
+  /** Second button shown before `action` (e.g. Review next to Undo). */
+  secondary?: ToastAction;
 }
 
 export interface ToastApi {
   toasts: Toast[];
-  push: (message: string, opts?: { action?: ToastAction; kind?: "info" | "error" }) => number;
+  push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; kind?: "info" | "error" }) => number;
   dismiss: (id: number) => void;
 }
 
@@ -35,11 +37,11 @@ export function useToasts(): ToastApi {
   }, []);
 
   const push = useCallback(
-    (message: string, opts: { action?: ToastAction; kind?: "info" | "error" } = {}) => {
+    (message: string, opts: { action?: ToastAction; secondary?: ToastAction; kind?: "info" | "error" } = {}) => {
       const id = next.current++;
       const kind = opts.kind ?? "info";
       // A new message replaces plain older ones; toasts carrying an action (Undo) stay until they expire.
-      setToasts((all) => [...all.filter((t) => t.action).slice(-1), { id, message, kind, action: opts.action }]);
+      setToasts((all) => [...all.filter((t) => t.action).slice(-1), { id, message, kind, action: opts.action, secondary: opts.secondary }]);
       if (kind === "info") timers.current.set(id, setTimeout(() => dismiss(id), opts.action ? 8000 : 4000));
       return id;
     },
@@ -109,6 +111,18 @@ export function Toasts({ api, error, onDismissError, onLocate }: { api: ToastApi
         >
           <span className="min-w-0 break-words">{t.message}</span>
           <span className="flex shrink-0 items-center gap-2">
+            {t.secondary && (
+              <button
+                className="rounded bg-neutral-700 px-2 py-0.5 text-xs font-medium text-neutral-100 hover:bg-neutral-600"
+                data-testid={t.secondary.testid ?? "toast-secondary"}
+                onClick={() => {
+                  t.secondary?.onClick();
+                  api.dismiss(t.id);
+                }}
+              >
+                {t.secondary.label}
+              </button>
+            )}
             {t.action && (
               <button
                 className="rounded bg-sky-800 px-2 py-0.5 text-xs font-medium text-sky-100 hover:bg-sky-700"

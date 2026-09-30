@@ -41,6 +41,13 @@ export type ActionId =
   | "keeper"
   | "keeperSet"
   | "anchor"
+  | "stepCull"
+  | "stepEdit"
+  | "stepExport"
+  | "nextScene"
+  | "prevScene"
+  | "applyScene"
+  | "autoEdit"
   | "before"
   | "split"
   | "crop"
@@ -137,8 +144,17 @@ export const KEYMAP: KeyDef[] = [
   { id: "keeperSet", group: "Culling", label: "Make the active photo its burst keeper", chords: [c("k", { shift: true })], modes: ALL, display: ["Shift+K"], where: "Everywhere" },
   { id: "undoCull", group: "Culling", label: "Undo culling change", chords: [c("z", { mod: true })], modes: LIB, display: ["Cmd+Z"], where: "Outside Develop" },
   { id: "redoCull", group: "Culling", label: "Redo culling change", chords: [c("z", { mod: true, shift: true })], modes: LIB, display: ["Cmd+Shift+Z"], where: "Outside Develop" },
-  { id: "anchor", group: "Scenes", label: "Toggle scene anchor", chords: [c("a", { shift: true })], modes: ALL, display: ["Shift+A"], where: "Everywhere" },
+  { id: "anchor", group: "Scenes", label: "Toggle scene anchor / make representative", chords: [c("a", { shift: true })], modes: ALL, display: ["Shift+A"], where: "Edit step: make representative; elsewhere: toggle anchor" },
   { id: "selectBurst", group: "Scenes", label: "Select the active photo's burst", chords: [c("b", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+B"], where: "Everywhere" },
+
+  // ---- workflow (steps of a project) ----
+  { id: "stepCull", group: "Workflow", label: "Step 1: Cull", chords: [c("1", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+1"], where: "Project open" },
+  { id: "stepEdit", group: "Workflow", label: "Step 2: Edit (again: Plan)", chords: [c("2", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+2"], where: "Project open" },
+  { id: "stepExport", group: "Workflow", label: "Step 3: Export keepers", chords: [c("3", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+3"], where: "Project open" },
+  { id: "nextScene", group: "Workflow", label: "Next scene to edit (or next frame to review)", chords: [c("n")], modes: ["grid", "develop"], display: ["N"], where: "Edit step: Plan, Develop" },
+  { id: "prevScene", group: "Workflow", label: "Previous scene", chords: [c("n", { shift: true })], modes: ["grid", "develop"], display: ["Shift+N"], where: "Edit step: Plan, Develop" },
+  { id: "applyScene", group: "Workflow", label: "Apply to scene", chords: [c("Enter", { mod: true, shift: true })], modes: ["grid", "develop"], display: ["Cmd+Shift+Enter"], where: "Edit step: Plan, Develop" },
+  { id: "autoEdit", group: "Workflow", label: "Auto edit (my style)", chords: [c("u", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+U"], where: "Edit step: Plan, Develop" },
 
   // ---- navigation ----
   { id: "navH", group: "Navigate", label: "Previous / next photo (Compare: the candidate; Grid: Shift extends)", chords: [c("ArrowLeft", { shift: "any" }), c("ArrowRight", { shift: "any" })], modes: ALL, display: ["Left / Right"], where: "Everywhere" },
@@ -222,6 +238,7 @@ function chordMatches(ch: Chord, e: KeyboardEvent): boolean {
   if (ch.key.length === 1) {
     // With Option held macOS types a different character; the physical key still identifies letters.
     if (ch.alt && /^[a-z]$/.test(ch.key)) return e.code === `Key${ch.key.toUpperCase()}`;
+    if (ch.alt && /^[0-9]$/.test(ch.key)) return e.code === `Digit${ch.key}`;
     return e.key.toLowerCase() === ch.key;
   }
   return e.key === ch.key;

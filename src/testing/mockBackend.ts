@@ -54,6 +54,10 @@ import type {
   KeeperRule,
   Project,
   SceneEditEntry,
+  SceneApplyOptions,
+  SceneApplyOutcome,
+  ApplyScenesResult,
+  EditBatchResult,
   ShootType,
   StyleGroup,
   StyleModelStatus,
@@ -61,7 +65,7 @@ import type {
   StyleProfile,
   WorkflowStep,
 } from "../ipc";
-import { isKeeperValues } from "../ipc";
+import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY } from "../ipc";
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
 const LABELS = [null, null, null, "red", "yellow", "green", "blue", "purple"] as const;
@@ -215,6 +219,8 @@ declare global {
     __mockExportStep?: (n?: number) => void;
     /** Test hook: ms per progress step of mock `detect_scenes` / `match_scene` (default 30). */
     __mockSceneDelay?: number;
+    /** Makes get_edit_plan fail (plan error state). */
+    __mockFailPlan?: boolean;
     /** Test hook: ms `compute_ai_mask` takes in the mock (default 250). */
     __mockAiDelay?: number;
     /** Test hook: ms per progress step of mock `download_models` (10 steps per file; default 40). */
@@ -474,7 +480,7 @@ export function installMockBackend(count: number) {
     if (!p) throw { kind: "not_found", message: `project ${id}` };
     return p;
   };
-  const keeper = (r: RawImageEntry) => isKeeperValues(catalog.keeperRule, r.pick, r.rating, r.quality?.suggestedPick);
+  const keeper = (r: RawImageEntry) => params.get("nokeepers") !== "1" && isKeeperValues(catalog.keeperRule, r.pick, r.rating, r.quality?.suggestedPick);
   function projectDto(p: MockProject): Project {
     const photos = rows.filter((r) => p.folderIds.includes(r.folderId));
     const ranked = [...photos].sort(
@@ -523,12 +529,14 @@ export function installMockBackend(count: number) {
   // ---- style library, workflow, style model (v14) ----
   const styleGroups: StyleGroup[] = [];
   let styleSeq = 100;
+  // `?style=ready` = a trained model, `?style=learnable` = untrained with enough edited photos, default = too few edits.
+  const styleParam = params.get("style");
   let styleModel: StyleModelStatus = {
-    state: "untrained",
+    state: styleParam === "ready" ? "ready" : "untrained",
     modelVersion: "style-mock@1",
-    trainedAtMs: null,
-    trainingExamples: 0,
-    availableExamples: 0,
+    trainedAtMs: styleParam === "ready" ? Date.now() - 86_400_000 : null,
+    trainingExamples: styleParam === "ready" ? 394 : 0,
+    availableExamples: styleParam === "ready" || styleParam === "learnable" ? 394 : 0,
     minExamples: 20,
     progress: null,
     error: null,
@@ -767,6 +775,105 @@ export function installMockBackend(count: number) {
   };
 
 
+
+  // ---- edit plan / apply-to-scene / style batches (v14) ----
+  const sceneRep = new Map<number, number>();
+  const sceneApplied = new Map<number, { at: number; snaps: Map<number, string> }>();
+  const batches = new Map<number, { label: string; items: { id: number; before: string; after: string }[]; undone: boolean; sceneIds: number[] }>();
+  let batchSeq = 0;
+  const STYLE_FIELDS: AdjustmentField[] = ["exposure", "contrast", "highlights", "shadows", "vibrance"];
+  const styleAdj = (a: ParametricAdjustments): ParametricAdjustments => ({ ...a, exposure: 0.3, contrast: 10, highlights: -25, shadows: 20, vibrance: 12 });
+  const repOf = (scKeepers: RawImageEntry[], sceneId: number) => {
+    const chosen = sceneRep.get(sceneId);
+    const picked = chosen != null ? scKeepers.find((r) => r.id === chosen) : undefined;
+    return { rep: picked ?? [...scKeepers].sort((a, b) => (b.quality?.overall ?? 0) - (a.quality?.overall ?? 0))[0], user: !!picked };
+  };
+  const lastEditAt = (id: number) => {
+    const h = hists.get(id);
+    return h && h.cursor > 0 ? h.entries[h.cursor].createdAtMs : null;
+  };
+  function planEntries(keepers: RawImageEntry[]): SceneEditEntry[] {
+    const out: SceneEditEntry[] = [];
+    for (const sc of scenes) {
+      const ks = keepers.filter((r) => r.sceneId === sc.id);
+      if (!ks.length) continue;
+      const { rep, user } = repOf(ks, sc.id);
+      const applied = sceneApplied.get(sc.id);
+      const editedAt = rep.hasEdits ? lastEditAt(rep.id) : null;
+      const status: SceneEditEntry["status"] = applied ? (editedAt != null && editedAt > applied.at ? "outdated" : "applied") : rep.hasEdits ? "edited" : "to_edit";
+      out.push({
+        sceneId: sc.id,
+        imageIds: ks.map((r) => r.id),
+        memberCount: sc.imageIds.length,
+        representativeId: rep.id,
+        representativeSource: user ? "user" : "auto",
+        representativeReason: user ? "Chosen by you" : "Best-scored keeper of this scene",
+        edited: rep.hasEdits,
+        editedAtMs: editedAt,
+        appliedAtMs: applied?.at ?? null,
+        status,
+      });
+    }
+    return out;
+  }
+  /** Commits `fn` on every image as one undoable batch (only images that change are recorded). */
+  function recordBatch(label: string, ids: number[], fn: (a: ParametricAdjustments) => ParametricAdjustments, sceneIds: number[] = []): EditBatchResult {
+    const items: { id: number; before: string; after: string }[] = [];
+    for (const id of ids) {
+      const before = JSON.stringify(getAdj(id));
+      commit(id, fn(getAdj(id)), label);
+      const after = JSON.stringify(getAdj(id));
+      if (before !== after) items.push({ id, before, after });
+    }
+    if (items.length === 0) return { batchId: null, label, changedIds: [] };
+    const batchId = ++batchSeq;
+    batches.set(batchId, { label, items, undone: false, sceneIds });
+    return { batchId, label, changedIds: items.map((i) => i.id) };
+  }
+  async function applyScenes(sceneIds: number[], o: SceneApplyOptions, label: string): Promise<ApplyScenesResult> {
+    const items: { id: number; before: string; after: string }[] = [];
+    const outcomes: SceneApplyOutcome[] = [];
+    const plans = sceneIds.map((sid) => {
+      const sc = sceneOf(sid);
+      const ks = rows.filter((r) => r.sceneId === sid && (o.includeNonKeepers || keeper(r)));
+      const { rep } = repOf(ks.filter(keeper), sid);
+      if (!rep) throw { kind: "invalid_argument", message: `scene ${sid} has no keepers` };
+      if (!rep.hasEdits) throw { kind: "invalid_argument", message: "The representative has no edits yet. Edit it first." };
+      return { sc, rep, prev: sceneApplied.get(sid), targets: ks.filter((r) => r.id !== rep.id) };
+    });
+    await progress("apply", plans.reduce((n, p) => n + p.targets.length, 0));
+    for (const { sc, rep, prev, targets } of plans) {
+      const changedIds: number[] = [];
+      const skippedIds: number[] = [];
+      const notConvergedIds: number[] = [];
+      const snaps = new Map<number, string>();
+      for (const t of targets) {
+        const cur = JSON.stringify(getAdj(t.id));
+        if (o.skipUserEdited && prev?.snaps.has(t.id) && prev.snaps.get(t.id) !== cur) {
+          skippedIds.push(t.id);
+          continue;
+        }
+        const pv = solveMock([rep.id], t.id, o.matchOptions);
+        if (!pv.converged) notConvergedIds.push(t.id);
+        commit(t.id, pv.adjustments, label);
+        const after = JSON.stringify(getAdj(t.id));
+        snaps.set(t.id, after);
+        if (after !== cur) {
+          changedIds.push(t.id);
+          items.push({ id: t.id, before: cur, after });
+        }
+      }
+      sceneApplied.set(sc.id, { at: Date.now(), snaps });
+      outcomes.push({ sceneId: sc.id, representativeId: rep.id, changedIds, skippedIds, notConvergedIds, notes: [] });
+    }
+    let batchId: number | null = null;
+    if (items.length > 0) {
+      batchId = ++batchSeq;
+      batches.set(batchId, { label, items, undone: false, sceneIds });
+    }
+    return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, scenes: outcomes };
+  }
+
   // ---- scenes (v7) emulation ----
   let scenes: Scene[] = [];
   let sceneId = 0;
@@ -815,7 +922,7 @@ export function installMockBackend(count: number) {
       sc.imageIds = sc.imageIds.filter((i) => !imageIds.includes(i));
     });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  async function progress(task: "detect" | "match", total: number) {
+  async function progress(task: "detect" | "match" | "apply", total: number) {
     const steps = 4;
     for (let k = 1; k <= steps; k++) {
       await sleep(window.__mockSceneDelay ?? 30);
@@ -1545,33 +1652,41 @@ export function installMockBackend(count: number) {
         case "get_edit_plan": {
           const pid = args.projectId as number;
           requireProject(pid);
+          if (window.__mockFailPlan) throw { kind: "internal", message: "Could not read the scenes (mock)" };
           const keepers = rows.filter((r) => inScope(r, null, pid) && keeper(r));
-          const entries: SceneEditEntry[] = [];
-          for (const sc of scenes) {
-            const ks = keepers.filter((r) => r.sceneId === sc.id);
-            if (!ks.length) continue;
-            const rep = [...ks].sort((a, b) => (b.quality?.overall ?? 0) - (a.quality?.overall ?? 0))[0];
-            entries.push({
-              sceneId: sc.id,
-              imageIds: ks.map((r) => r.id),
-              memberCount: sc.imageIds.length,
-              representativeId: rep.id,
-              representativeSource: "auto",
-              representativeReason: "Best-scored keeper of this scene",
-              edited: rep.hasEdits,
-              editedAtMs: null,
-              appliedAtMs: null,
-              status: rep.hasEdits ? "edited" : "to_edit",
-            });
-          }
           const plan: EditPlan = {
             projectId: pid,
             keeperRule: catalog.keeperRule,
             keeperIds: keepers.map((r) => r.id),
             unassignedKeeperIds: keepers.filter((r) => r.sceneId == null).map((r) => r.id),
-            scenes: entries,
+            scenes: planEntries(keepers),
           };
           return plan;
+        }
+        case "set_scene_representative": {
+          const sc = sceneOf(args.sceneId as number);
+          const img = args.imageId as number | null;
+          if (img == null) sceneRep.delete(sc.id);
+          else {
+            const r = byId.get(img);
+            if (!r || !sc.imageIds.includes(img) || !keeper(r)) throw { kind: "invalid_argument", message: `image ${img} is not a keeper of scene ${sc.id}` };
+            sceneRep.set(sc.id, img);
+          }
+          const e = planEntries(rows.filter((r) => r.sceneId === sc.id && keeper(r))).find((x) => x.sceneId === sc.id);
+          if (!e) throw { kind: "not_found", message: `scene ${sc.id} has no keepers` };
+          return e;
+        }
+        case "apply_scene_edit": {
+          const o = (args.options as SceneApplyOptions | null) ?? (DEFAULT_APPLY as unknown as SceneApplyOptions);
+          return applyScenes([args.sceneId as number], o, "Apply to Scene");
+        }
+        case "apply_all_edited_scenes": {
+          const pid = args.projectId as number;
+          requireProject(pid);
+          const o = (args.options as SceneApplyOptions | null) ?? (DEFAULT_APPLY as unknown as SceneApplyOptions);
+          const keepers = rows.filter((r) => inScope(r, null, pid) && keeper(r));
+          const due = planEntries(keepers).filter((e) => e.status === "edited" || e.status === "outdated").map((e) => e.sceneId);
+          return applyScenes(due, o, "Apply to Scene");
         }
         case "list_styles": {
           const user: StylePreset[] = presets.map((p) => ({
@@ -1648,27 +1763,55 @@ export function installMockBackend(count: number) {
           return { temperatureK: 5350, tint: 6 };
         case "style_model_status":
           return styleModel;
-        case "train_style_model":
-          styleModel = { ...styleModel, state: "failed", error: "Edit at least 20 photos first" };
-          void emit("style-model-finished", { ok: false, cancelled: false, error: styleModel.error, status: styleModel });
+        case "train_style_model": {
+          if (styleModel.availableExamples < styleModel.minExamples) {
+            styleModel = { ...styleModel, state: "failed", error: "Edit at least 20 photos first" };
+            void emit("style-model-finished", { ok: false, cancelled: false, error: styleModel.error, status: styleModel });
+            return null;
+          }
+          styleModel = { ...styleModel, state: "training", progress: 0, error: null };
+          void (async () => {
+            for (let k = 1; k <= 4; k++) {
+              await sleep(window.__mockSceneDelay ?? 30);
+              styleModel = { ...styleModel, progress: k / 4 };
+              void emit("style-model-progress", { phase: "fitting", done: k * 100, total: 400 });
+            }
+            styleModel = { ...styleModel, state: "ready", progress: null, trainedAtMs: Date.now(), trainingExamples: styleModel.availableExamples };
+            void emit("style-model-finished", { ok: true, cancelled: false, error: null, status: styleModel });
+          })();
           return null;
+        }
         case "cancel_style_training":
           return null;
         case "predict_style":
-        case "apply_style_prediction":
-          throw { kind: "invalid_argument", message: "No style model yet: edit at least 20 photos, then train." };
+        case "apply_style_prediction": {
+          if (styleModel.state !== "ready") throw { kind: "invalid_argument", message: "No style model yet: edit at least 20 photos, then train." };
+          const ids = args.imageIds as number[];
+          if (cmd === "predict_style") return ids.map((imageId) => ({ imageId, adjustments: styleAdj(getAdj(imageId)), fields: STYLE_FIELDS, confidence: 0.8, notes: [] }));
+          return recordBatch("Auto Edit (My Style)", ids, (a) => styleAdj(a));
+        }
         case "paste_previous":
           return batch(
             (args.targetIds as number[]).filter((i) => i !== args.previousId),
             "Paste from Previous",
             (a) => copyFields(a, getAdj(args.previousId as number), (args.fields as AdjustmentField[] | null) ?? DEFAULT_PASTE_PREVIOUS),
           );
-        case "undo_edit_batch":
-          return { restoredIds: [], skippedIds: [] };
-        case "set_scene_representative":
-        case "apply_scene_edit":
-        case "apply_all_edited_scenes":
-          throw { kind: "internal", message: `${cmd} is not emulated by the mock backend yet` };
+        case "undo_edit_batch": {
+          const b = batches.get(args.batchId as number);
+          if (!b) throw { kind: "not_found", message: `batch ${args.batchId}` };
+          if (b.undone) throw { kind: "invalid_argument", message: "batch already undone" };
+          b.undone = true;
+          const restoredIds: number[] = [];
+          const skippedIds: number[] = [];
+          for (const it of b.items) {
+            if (JSON.stringify(getAdj(it.id)) === it.after) {
+              commit(it.id, JSON.parse(it.before) as ParametricAdjustments, `Undo ${b.label}`);
+              restoredIds.push(it.id);
+            } else skippedIds.push(it.id);
+          }
+          b.sceneIds.forEach((sid) => sceneApplied.delete(sid));
+          return { restoredIds, skippedIds };
+        }
         case "get_render_stats":
           return mockStats(args.id as number, 0.5, 0.01);
         case "plugin:dialog|open":

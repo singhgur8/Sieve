@@ -25,6 +25,8 @@ interface Props {
   selectionIds: number[];
   /** Everything in the current filter. */
   filteredIds: number[];
+  /** Export step: the project's keepers. Adds a first scope "Keepers (N)", selected by default. */
+  keeperIds?: number[];
   sampleEntry: (id: number) => RawImageEntry | undefined;
   onClose: () => void;
   onStarted: (job: ExportJob) => void;
@@ -89,12 +91,12 @@ function NumInput({ id, value, min, max, step, onChange, width = "w-24" }: { id:
   );
 }
 
-export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, onStarted }: Props) {
+export function ExportDialog({ selectionIds, filteredIds, keeperIds, sampleEntry, onClose, onStarted }: Props) {
   const [presets, setPresets] = useState<ExportPreset[]>([]);
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [draft, setDraft] = useState<ExportSettings>(DEFAULT_SETTINGS);
-  const [scope, setScope] = useState<"selection" | "filtered">(selectionIds.length <= 1 && filteredIds.length > selectionIds.length ? "filtered" : "selection");
+  const [scope, setScope] = useState<"selection" | "filtered" | "keepers">(keeperIds ? "keepers" : selectionIds.length <= 1 && filteredIds.length > selectionIds.length ? "filtered" : "selection");
   const [prefs, setPrefs] = useState<UiPrefs>({});
   const editorRef = useRef<HTMLDivElement>(null);
   const [saveName, setSaveName] = useState("");
@@ -104,7 +106,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
   const [busy, setBusy] = useState(false);
   const templateRef = useRef<HTMLInputElement>(null);
 
-  const baseIds = scope === "selection" ? selectionIds : filteredIds;
+  const baseIds = scope === "keepers" && keeperIds ? keeperIds : scope === "selection" ? selectionIds : filteredIds;
   // Rejects in the scope (looked up in chunks; skipped by default so a client delivery never contains them).
   const [rejected, setRejected] = useState<Set<number>>(new Set());
   const [skipRejected, setSkipRejected] = useState(true);
@@ -337,7 +339,7 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
     >
       <>
         <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-2.5">
-          <h2 className="font-semibold">Export</h2>
+          <h2 className="font-semibold" data-testid="export-title">{keeperIds ? `Export ${keeperIds.length} keepers` : "Export"}</h2>
           <button onClick={onClose} aria-label="Close" data-testid="export-close" className="text-neutral-400 hover:text-neutral-100">
             <X className="size-4" />
           </button>
@@ -674,7 +676,13 @@ export function ExportDialog({ selectionIds, filteredIds, sampleEntry, onClose, 
 
         <footer className="flex flex-wrap items-center gap-3 border-t border-neutral-800 px-4 py-2.5">
           <div className="flex items-center gap-3 text-sm" data-testid="export-scope">
-            {selectionIds.length !== filteredIds.length && (
+            {keeperIds && (
+              <label className="flex items-center gap-1.5">
+                <input type="radio" name="export-scope" checked={scope === "keepers"} onChange={() => setScope("keepers")} data-testid="export-scope-keepers" />
+                Keepers ({keeperIds.length})
+              </label>
+            )}
+            {(keeperIds || selectionIds.length !== filteredIds.length) && (
               <>
                 <label className="flex items-center gap-1.5">
                   <input type="radio" name="export-scope" checked={scope === "selection"} onChange={() => setScope("selection")} data-testid="export-scope-selection" />

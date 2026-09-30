@@ -102,6 +102,12 @@ interface Props {
   onLabel?: (id: number, label: ColorLabel | null) => void;
   /** Filter summary shown in the filmstrip header (Develop has no separate filter row). */
   filterSummary?: { text: string; onEdit: () => void };
+  /** Edit step: the context bar shown above the workspace. */
+  topSlot?: React.ReactNode;
+  /** Edit step: per-cell filmstrip markers (representative ring, applied check, needs-a-look). */
+  filmBadge?: (id: number) => React.ReactNode;
+  /** Edit step: "This scene only" chip in the filmstrip header. */
+  sceneOnly?: { on: boolean; toggle: () => void };
 }
 
 const COLOR_LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
@@ -141,7 +147,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -836,6 +842,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-neutral-950" data-testid="develop-view" data-image-id={id ?? ""}>
+      {topSlot}
       {compare && !panels.chrome && (
         <CompareBar
           focus={compare.focus}
@@ -970,6 +977,17 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           <div className="flex h-[22px] shrink-0 items-center gap-3 overflow-hidden whitespace-nowrap border-t border-neutral-800 bg-neutral-900 px-3 text-[11px] text-neutral-400" data-testid="filmstrip-header">
             <span>{filmIdx >= 0 ? `${filmIdx + 1} of ${lib.ids.length}` : `${lib.ids.length} photos`}</span>
             {sel.selected.size > 1 && <span className="text-sky-300">{sel.selected.size} selected</span>}
+            {sceneOnly && (
+              <button
+                className={`shrink-0 rounded px-1.5 ${sceneOnly.on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 text-neutral-200 hover:bg-neutral-700"}`}
+                aria-pressed={sceneOnly.on}
+                onClick={sceneOnly.toggle}
+                title="Show only the photos of this scene (Shift+S)"
+                data-testid="scene-only"
+              >
+                This scene only
+              </button>
+            )}
             {filterSummary && (
               <>
                 <span className="ml-auto min-w-0 truncate" data-testid="filter-summary-text">
@@ -988,7 +1006,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             marked={compare ? new Set([compare.b]) : undefined}
             onPick={(fid, ev) => (compare ? onCandidate?.(fid) : sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey }))}
             onRate={onRate}
-            badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : undefined}
+            badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : filmBadge}
             cellW={filmCell}
             cellH={filmCell}
             height={filmCell + 8}

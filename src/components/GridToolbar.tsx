@@ -27,6 +27,10 @@ interface Props {
   onAutoAdvance: (v: boolean) => void;
   /** Rating / label / burst / folder filters, shown to the left. */
   filters?: ReactNode;
+  /** Project open: shoot type and Analyze (moved out of the TopBar). */
+  leading?: ReactNode;
+  /** Pinned at the right edge, never scrolled away ("Continue to Edit"). */
+  trailing?: ReactNode;
 }
 
 const seg = (on: boolean) => `flex items-center gap-1 rounded px-2 py-1 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
@@ -34,10 +38,13 @@ const seg = (on: boolean) => `flex items-center gap-1 rounded px-2 py-1 text-xs 
 /** Library-only row: extra filters plus thumbnail size, sort and auto-advance. */
 export function GridToolbar(p: Props) {
   return (
+    <div className="flex h-8 shrink-0 items-center border-b border-neutral-800" data-testid="grid-toolbar-row">
     <div
-      className="flex h-8 shrink-0 items-center gap-x-3 overflow-x-auto overflow-y-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs text-neutral-300"
+      className="flex h-full min-w-0 flex-1 items-center gap-x-3 overflow-x-auto overflow-y-hidden whitespace-nowrap px-3 text-xs text-neutral-300"
       data-testid="grid-toolbar"
     >
+      {p.leading}
+      {p.leading && <span className="mx-1 h-4 w-px shrink-0 bg-neutral-700" />}
       {p.filters}
       <span className="mx-1 h-4 w-px shrink-0 bg-neutral-700" />
       <label className="flex items-center gap-1.5">
@@ -75,6 +82,8 @@ export function GridToolbar(p: Props) {
       <span className="ml-auto pl-2" data-testid="selection-count">
         {p.catalogTotal != null && p.catalogTotal !== p.total ? `${p.total} of ${p.catalogTotal}` : `${p.total} photos`} · {p.selectedCount} selected
       </span>
+    </div>
+    {p.trailing && <div className="flex shrink-0 items-center px-3">{p.trailing}</div>}
     </div>
   );
 }
