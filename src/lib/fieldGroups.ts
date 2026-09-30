@@ -64,9 +64,12 @@ export const FIELD_COLUMNS: FieldNode[][] = [
   [leaf("masks", "Masking"), leaf("crop", "Crop")],
 ];
 
+/** Fields that have a checkbox in the dialog (the v14 subset fields and `process_version` have none). */
+export const DISPLAYED_FIELDS: AdjustmentField[] = FIELD_COLUMNS.flat().flatMap((n) => (n.kind === "leaf" ? [n.field] : n.children.map((c) => c.field)));
+
 /** Fields of the photo that differ from its neutral settings ("Check Modified"). */
 export function modifiedFields(adj: ParametricAdjustments, defaults: ParametricAdjustments): AdjustmentField[] {
-  return ALL_ADJUSTMENT_FIELDS.filter((f) => !sameAdjustments(copyFields(defaults, adj, [f]), defaults));
+  return DISPLAYED_FIELDS.filter((f) => !sameAdjustments(copyFields(defaults, adj, [f]), defaults));
 }
 
 export const COPY_FIELDS_KEY = "sieve.copyFields.v1";

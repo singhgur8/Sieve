@@ -1,8 +1,7 @@
 // Develop module: filmstrip + viewer (before/after, split, 100% detail) + presets/history + adjustment sliders.
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
-import { commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type LutInfo, type NormRect, type ParametricAdjustments, type Preset } from "../../ipc";
+import { applyAutoTone, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor, type Editor } from "../../hooks/useEditor";
@@ -15,7 +14,6 @@ import type { CompareState } from "../LoupeLayer";
 import { Filmstrip } from "../Filmstrip";
 import { setPanelHidden, usePanels } from "../../lib/panels";
 import { dispToSensor, screenToDisp } from "../../lib/maskGeom";
-import { copyFields, FIELD_LABEL } from "../../lib/adjust";
 import { hint, type ActionId } from "../../lib/keymap";
 import { useMasks } from "../../hooks/useMasks";
 import { MasksPanel } from "./MasksPanel";
@@ -24,7 +22,9 @@ import { PeoplePicker } from "./PeoplePicker";
 import type { Frame } from "../../lib/maskGeom";
 import { formatShutter, LABEL_COLOR, trimNum } from "../../lib/format";
 import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
-import { AdjustPanel } from "./AdjustPanel";
+import { AdjustPanel, type AutoApi } from "./AdjustPanel";
+import { useHoverPreview, useStyleLibrary } from "../../hooks/useDevelopV14";
+import { Dialog } from "../Dialog";
 import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
 import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
@@ -69,6 +69,9 @@ export interface DevelopHandle {
   faceZoom: (dir: 1 | -1) => void;
   pastePrevious: () => void;
   savePreset: () => void;
+  /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
+  autoTone: () => void;
+  autoWb: () => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -146,8 +149,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [showBefore, setShowBefore] = useState(false);
   const [split, setSplit] = useState(false);
   const [splitPos, setSplitPos] = useState(0.5);
-  const [luts, setLuts] = useState<LutInfo[]>([]);
-  const [presets, setPresets] = useState<Preset[]>([]);
+  const styles = useStyleLibrary(onError);
+  const [importReport, setImportReport] = useState<ImportStyleReport | null>(null);
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoWb, setAutoWb] = useState<{ id: number; t: number; tint: number } | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [cropTool, setCropTool] = useState<CropTool | null>(null);
   const cropRef = useRef<CropTool | null>(null);
@@ -270,14 +275,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   const toggleZoom = useCallback((at?: { x: number; y: number }) => cropRef.current || setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
 
-  // Presets and LUTs.
-  const loadPresets = useCallback(() => unwrap(commands.listPresets()).then(setPresets).catch(onError), [onError]);
-  const loadLuts = useCallback(() => unwrap(commands.listLuts()).then(setLuts).catch(onError), [onError]);
-  useEffect(() => {
-    void loadPresets();
-    void loadLuts();
-  }, [loadPresets, loadLuts]);
-
   // Warm the develop cache for filmstrip neighbours.
   useEffect(() => {
     if (id == null) return;
@@ -386,7 +383,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [run, targets, editor, afterBatch, onUndoToast, undoBatch],
   );
 
-  const doApplyPreset = (p: Preset) =>
+  const doApplyPreset = (p: { id: number; name: string }) =>
     void run(async () => {
       const t = targets();
       await editor.flush();
@@ -406,23 +403,89 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     () =>
       void run(async () => {
         const from = getPreviousPhoto();
-        if (from == null || from === id) return onNotice("No previous photo to paste from");
-        const src = await unwrap(commands.getAdjustments(from));
-        const fields = (Object.keys(FIELD_LABEL) as (keyof typeof FIELD_LABEL)[]).filter((f) => f !== "crop" && (f as string) !== "masks");
-        editor.change((a) => copyFields(a, src, fields), "Paste Settings");
-        onNotice("Pasted settings from the previous photo");
+        const t = targets();
+        if (from == null || t.every((x) => x === from)) return onNotice("No previous photo to paste from");
+        await editor.flush();
+        const before = await heads(t);
+        await unwrap(commands.pastePrevious(t, from, null));
+        await afterBatch(t);
+        const msg = `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`;
+        if (!before) return onNotice(msg);
+        const after = await heads(t);
+        const changed = t.filter((x) => x !== from && after?.get(x) !== before.get(x));
+        if (changed.length === 0) return onNotice(`${msg} (no change)`);
+        onUndoToast(msg, undoBatch(changed, "paste from previous"));
       }),
-    [run, id, editor, onNotice],
+    [run, targets, editor, heads, afterBatch, lib, onNotice, onUndoToast, undoBatch],
   );
 
-  const importLut = () =>
-    void run(async () => {
-      const path = await open({ title: "Import .cube LUT", filters: [{ name: "Cube LUT", extensions: ["cube"] }] });
-      if (typeof path !== "string") return;
-      const l = await unwrap(commands.importLut(path));
-      await loadLuts();
-      editor.change((a) => ({ ...a, lut: { id: l.id, amount: 100 } }), "LUT");
-    });
+  // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
+  const runAuto = useCallback(
+    async (what: "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+      if (id == null || autoBusy) return;
+      setAutoBusy(true);
+      try {
+        await editor.flush();
+        const cur = editor.adj;
+        if (what === "tone" || what === "key") {
+          const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
+          editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
+        } else {
+          const w = await unwrap(commands.autoWhiteBalance(id, cur));
+          editor.change(
+            (a) => {
+              const as = info?.asShot ?? { temperatureK: w.temperatureK, tint: w.tint };
+              const base = a.whiteBalance.mode === "custom" ? a.whiteBalance : { temperatureK: as.temperatureK, tint: as.tint };
+              const next = what === "wb" ? { temperatureK: w.temperatureK, tint: w.tint } : what === "temp" ? { temperatureK: w.temperatureK, tint: base.tint } : { temperatureK: base.temperatureK, tint: w.tint };
+              return { ...a, whiteBalance: { mode: "custom", ...next } };
+            },
+            label ?? "Auto White Balance",
+          );
+          if (what === "wb") setAutoWb({ id, t: w.temperatureK, tint: w.tint });
+        }
+      } catch (e) {
+        onError(e);
+      } finally {
+        setAutoBusy(false);
+      }
+    },
+    [id, autoBusy, editor, info, onError],
+  );
+  const wbNow = editor.adj.whiteBalance;
+  const auto: AutoApi = {
+    busy: autoBusy,
+    tone: () => void runAuto("tone"),
+    wb: () => void runAuto("wb"),
+    slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
+    wbIsAuto: !!autoWb && autoWb.id === id && wbNow.mode === "custom" && wbNow.temperatureK === autoWb.t && wbNow.tint === autoWb.tint,
+  };
+  const autoRef = useRef(auto);
+  autoRef.current = auto;
+
+  // ---- style library: import, removal, hover previews ----
+  const importStyles = useCallback(async () => {
+    const r = await styles.importFolder();
+    if (!r) return;
+    const groups = r.groupIds.length;
+    onNotice(`Imported ${r.presets} preset${r.presets === 1 ? "" : "s"} in ${groups} group${groups === 1 ? "" : "s"} and ${r.profiles} profile${r.profiles === 1 ? "" : "s"}${r.skipped.length ? ` · ${r.skipped.length} file${r.skipped.length === 1 ? "" : "s"} skipped` : ""}`);
+    if (r.skipped.length > 0) setImportReport(r);
+  }, [styles, onNotice]);
+  const edgeFor = useCallback((to: "navigator" | "viewer") => (to === "navigator" ? 480 : maxEdge), [maxEdge]);
+  const hover = useHoverPreview(id, edgeFor);
+  const hoverPreset = useCallback(
+    (p: StylePreset | null) => {
+      if (!p || id == null) return hover.stop();
+      hover.start(p.name, "navigator", async () => unwrap(commands.resolvePreset(id, p.id, editor.adj)));
+    },
+    [hover, id, editor.adj],
+  );
+  const profileHover = useMemo(
+    () => ({
+      start: (label: string, adj: ParametricAdjustments) => hover.start(label, "viewer", async () => adj),
+      stop: hover.stop,
+    }),
+    [hover],
+  );
 
   const maskKey = useCallback(
     (action: ActionId, e: KeyboardEvent) => {
@@ -594,6 +657,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       faceZoom,
       pastePrevious,
       savePreset: () => setDialog({ kind: "preset" }),
+      autoTone: () => autoRef.current.tone(),
+      autoWb: () => autoRef.current.wb(),
     }),
     [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
@@ -632,6 +697,14 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   );
   const activeLayers = (
     <>
+      {hover.preview?.to === "viewer" && (
+        <div className="pointer-events-none absolute inset-0 z-10" data-testid="hover-preview">
+          <img src={hover.preview.url} alt="" className="size-full object-contain" draggable={false} />
+          <span className="absolute left-2 top-2 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="hover-preview-label">
+            Preview: {hover.preview.label}
+          </span>
+        </div>
+      )}
           {health && !editor.main && entry && (
         <OriginalUnavailable
           health={health}
@@ -779,7 +852,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         {!panels.left && (
           <aside className="w-56 shrink-0 border-r border-neutral-800 min-[1600px]:w-60" data-testid="left-aside">
             <LeftPanel
-              presets={presets}
+              groups={styles.groups}
+              importing={styles.importing}
+              onImport={() => void importStyles()}
+              onRemoveGroup={(g: StyleGroup) => void styles.removeGroup(g.id)}
+              onHoverPreset={hoverPreset}
+              navPreview={hover.preview?.to === "navigator" ? hover.preview : null}
               history={editor.history}
               imageId={id}
               onApplyPreset={doApplyPreset}
@@ -787,7 +865,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               onDeletePreset={(p) =>
                 void run(async () => {
                   await unwrap(commands.deletePreset(p.id));
-                  await loadPresets();
+                  await styles.reload();
                 })
               }
               onUndo={editor.undo}
@@ -854,8 +932,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             <div className="min-h-0 flex-1">
               <AdjustPanel
                 editor={editor}
-                luts={luts}
-                onImportLut={importLut}
+                styleVersion={styles.version}
+                importing={styles.importing}
+                onImportStyles={() => void importStyles()}
+                hover={profileHover}
+                auto={auto}
                 imageId={id}
                 onError={onError}
                 crop={cropApi}
@@ -917,6 +998,26 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         </>
       )}
 
+      {importReport && (
+        <Dialog label="Import report" testid="import-report" className="w-[460px] max-w-full rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl" onCancel={() => setImportReport(null)} onConfirm={() => setImportReport(null)}>
+          <h2 className="mb-1 text-sm font-semibold">Import report</h2>
+          <p className="mb-2 text-xs text-neutral-300">
+            Imported {importReport.presets} presets and {importReport.profiles} profiles. {importReport.skipped.length} files were skipped:
+          </p>
+          <ul className="max-h-56 overflow-y-auto rounded bg-neutral-950 p-2 text-xs" data-testid="import-skipped">
+            {importReport.skipped.map((k) => (
+              <li key={k.path} className="py-0.5">
+                <span className="text-neutral-200">{k.path.split("/").pop()}</span> <span className="text-neutral-400">{k.reason}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3 flex justify-end">
+            <button data-autofocus className="rounded bg-neutral-800 px-3 py-1 text-xs hover:bg-neutral-700" onClick={() => setImportReport(null)} data-testid="import-report-close">
+              Close
+            </button>
+          </div>
+        </Dialog>
+      )}
       {masks.picker && id != null && (
         <PeoplePicker imageId={id} thumbUrl={thumbUrl} caps={masks.caps} onCreate={(pt, parts, name) => void masks.createPeople(pt, parts, name)} onCancel={masks.closePicker} onError={onError} />
       )}
@@ -958,7 +1059,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             setDialog(null);
             void run(async () => {
               await unwrap(commands.savePreset(null, name, editor.adj, fields));
-              await loadPresets();
+              await styles.reload();
             });
           }}
         />

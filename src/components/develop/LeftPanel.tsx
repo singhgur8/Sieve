@@ -1,10 +1,10 @@
 // Develop left panel: Navigator, Presets, Snapshots, History and the sticky Copy… / Paste bar (docs/ux-spec-8b.md 5.3).
 import { useRef, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
+import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Loader2, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
 import { hint } from "../../lib/keymap";
-import type { AdjustmentHistory, NormRect, Preset } from "../../ipc";
+import type { AdjustmentHistory, NormRect, StyleGroup, StylePreset } from "../../ipc";
 import type { Copied } from "../../lib/clipboard";
-import { useSnapshots, usePresetGroups } from "../../hooks/useDevelopV14";
+import { useSnapshots } from "../../hooks/useDevelopV14";
 import { Menu, menuItem } from "../Menu";
 import type { Zoom } from "./Viewer";
 
@@ -20,12 +20,20 @@ function loadGroups(): Record<string, boolean> {
 }
 
 interface Props {
-  presets: Preset[];
+  /** Style library groups (User Presets first, then one per imported folder). */
+  groups: StyleGroup[];
+  importing: boolean;
+  onImport: () => void;
+  onRemoveGroup: (g: StyleGroup) => void;
+  /** Hover on a preset row (null = left); the parent renders the preview after a 150 ms dwell. */
+  onHoverPreset: (p: StylePreset | null) => void;
+  /** Hover preview shown in the Navigator instead of the photo (label `Preview: <name>`). */
+  navPreview: { url: string; label: string } | null;
   history: AdjustmentHistory | null;
   imageId: number | null;
-  onApplyPreset: (p: Preset) => void;
+  onApplyPreset: (p: StylePreset) => void;
   onSavePreset: () => void;
-  onDeletePreset: (p: Preset) => void;
+  onDeletePreset: (p: StylePreset) => void;
   onUndo: () => void;
   onRedo: () => void;
   onGoto: (entryId: number) => void;
@@ -58,13 +66,15 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   );
 }
 
-export function LeftPanel({ presets, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onCopy, onPaste, copied }: Props) {
+export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onCopy, onPaste, copied }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>(loadGroups);
-  const lib = usePresetGroups(presets);
+  const [removingGroup, setRemovingGroup] = useState<number | null>(null);
+  const shown = groups.filter((g) => g.presets.length > 0);
+  const total = groups.reduce((n, g) => n + g.presets.length, 0);
   const snaps = useSnapshots(imageId);
   const entries = history ? [...history.entries].reverse() : [];
-  const toggleGroup = (id: string, now: boolean) => {
+  const toggleGroup = (id: number, now: boolean) => {
     const next = { ...groupOpen, [id]: !now };
     setGroupOpen(next);
     try {
@@ -94,60 +104,115 @@ export function LeftPanel({ presets, history, imageId, onApplyPreset, onSavePres
             </span>
           }
         >
-          <Navigator url={navUrl} zoom={zoom} region={region} onZoom={onZoom} />
+          <Navigator url={navPreview?.url ?? navUrl} label={navPreview?.label ?? null} zoom={zoom} region={region} onZoom={onZoom} />
         </Section>
 
         <Section
           id="presets"
           title="Presets"
           action={
-            <Menu trigger={<Plus className="size-3.5" />} triggerClass="text-neutral-400 hover:text-white" triggerTestId="preset-add" title="Add presets" align="right">
-              {(close) => (
-                <>
-                  <button
-                    className={menuItem}
-                    role="menuitem"
-                    data-testid="preset-save"
-                    onClick={() => {
-                      close();
-                      onSavePreset();
-                    }}
-                  >
-                    Create Preset… <span className="ml-auto text-neutral-400">{(hint("savePreset").match(/\((.*)\)/) ?? [])[1]}</span>
-                  </button>
-                  <button className={menuItem} role="menuitem" data-testid="preset-import" disabled={!lib.canImport} title={lib.canImport ? undefined : "Importing preset folders needs the v14 library (not wired yet)"} onClick={() => { close(); lib.importFolder?.(); }}>
-                    Import Presets &amp; Profiles…
-                  </button>
-                </>
+            <span className="flex items-center gap-1.5">
+              {importing && (
+                <span className="flex items-center gap-1 text-[11px] text-neutral-400" data-testid="preset-importing">
+                  <Loader2 className="size-3 animate-spin" /> Importing…
+                </span>
               )}
-            </Menu>
+              <Menu trigger={<Plus className="size-3.5" />} triggerClass="text-neutral-400 hover:text-white" triggerTestId="preset-add" title="Add presets" align="right">
+                {(close) => (
+                  <>
+                    <button
+                      className={menuItem}
+                      role="menuitem"
+                      data-testid="preset-save"
+                      onClick={() => {
+                        close();
+                        onSavePreset();
+                      }}
+                    >
+                      Create Preset… <span className="ml-auto text-neutral-400">{(hint("savePreset").match(/\((.*)\)/) ?? [])[1]}</span>
+                    </button>
+                    <button
+                      className={menuItem}
+                      role="menuitem"
+                      data-testid="preset-import"
+                      disabled={importing}
+                      onClick={() => {
+                        close();
+                        onImport();
+                      }}
+                    >
+                      Import Presets &amp; Profiles…
+                    </button>
+                  </>
+                )}
+              </Menu>
+            </span>
           }
         >
-          {presets.length === 0 && <p className="text-neutral-400">No presets yet. Save one with + or import a Lightroom presets folder.</p>}
+          {total === 0 && (
+            <div className="text-neutral-400" data-testid="preset-empty">
+              <p>No presets yet. Save one with + or import a Lightroom presets folder.</p>
+              <button className="mt-1 text-sky-400 hover:text-sky-300" onClick={onImport} data-testid="preset-import-link">
+                Import presets &amp; profiles…
+              </button>
+            </div>
+          )}
           <div data-testid="preset-list">
-            {lib.groups.filter((g) => g.presets.length > 0 || g.kind === "imported").map((g) => {
+            {shown.map((g) => {
               const open = groupOpen[g.id] ?? g.kind === "user";
               return (
-                <div key={g.id} data-testid={`preset-group-${g.id}`} data-open={open}>
-                  <button className="flex h-6 w-full items-center gap-1 text-left text-neutral-300 hover:text-white" aria-expanded={open} onClick={() => toggleGroup(g.id, open)} data-testid={`preset-group-toggle-${g.id}`}>
-                    {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-                    {g.kind === "user" ? <User className="size-3 text-neutral-400" /> : <Folder className="size-3 text-neutral-400" />}
-                    <span className="min-w-0 flex-1 truncate">{g.name}</span>
-                    <span className="text-neutral-400">{g.presets.length}</span>
-                  </button>
+                <div key={g.id} data-testid={`preset-group-${g.id}`} data-open={open} data-kind={g.kind}>
+                  <div className="group/g flex h-6 items-center">
+                    <button className="flex h-6 min-w-0 flex-1 items-center gap-1 text-left text-neutral-300 hover:text-white" aria-expanded={open} onClick={() => toggleGroup(g.id, open)} data-testid={`preset-group-toggle-${g.id}`} title={g.sourcePath ?? g.name}>
+                      {open ? <ChevronDown className="size-3 shrink-0" /> : <ChevronRight className="size-3 shrink-0" />}
+                      {g.kind === "user" ? <User className="size-3 shrink-0 text-neutral-400" /> : <Folder className="size-3 shrink-0 text-neutral-400" />}
+                      <span className="min-w-0 flex-1 truncate">{g.name}</span>
+                      <span className="text-neutral-400">{g.presets.length}</span>
+                    </button>
+                    {g.kind === "imported" && removingGroup !== g.id && (
+                      <button className="invisible ml-1 text-neutral-400 hover:text-red-400 group-hover/g:visible" onClick={() => setRemovingGroup(g.id)} title="Remove group from Sieve" data-testid={`preset-group-remove-${g.id}`}>
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {removingGroup === g.id && (
+                    <div className="mb-1 rounded bg-neutral-900 p-2 text-[11px] text-neutral-300" data-testid={`preset-group-confirm-${g.id}`}>
+                      Presets are removed from Sieve only; the files are not touched.
+                      <div className="mt-1 flex gap-2">
+                        <button
+                          className="rounded bg-red-900 px-1.5 py-0.5 text-red-100 hover:bg-red-800"
+                          data-testid={`preset-group-remove-confirm-${g.id}`}
+                          onClick={() => {
+                            setRemovingGroup(null);
+                            onRemoveGroup(g);
+                          }}
+                        >
+                          Remove group
+                        </button>
+                        <button className="text-neutral-400 hover:text-white" onClick={() => setRemovingGroup(null)}>
+                          Keep
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {open && (
                     <ul>
                       {g.presets.map((p) => (
-                        <li key={p.id} className="group flex h-6 items-center justify-between rounded pl-5 pr-1 hover:bg-neutral-800">
+                        <li key={p.id} className="group flex h-6 items-center justify-between rounded pl-5 pr-1 hover:bg-neutral-800" onMouseEnter={() => onHoverPreset(p)} onMouseLeave={() => onHoverPreset(null)}>
                           <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
                             {p.name}
                           </button>
+                          {p.warnings.length > 0 && (
+                            <span className="mr-1 shrink-0 rounded bg-neutral-800 px-1 text-[10px] text-neutral-400" title={p.warnings.join("\n")} data-testid={`preset-partial-${p.id}`}>
+                              partial
+                            </span>
+                          )}
                           {targetCount > 1 && (
                             <span className="invisible mr-1 shrink-0 text-sky-300 group-hover:visible" data-testid={`preset-hint-${p.id}`}>
                               → {targetCount}
                             </span>
                           )}
-                          {confirming === p.id ? (
+                          {g.kind !== "user" ? null : confirming === p.id ? (
                             <span className="flex shrink-0 items-center gap-1">
                               <button
                                 className="rounded bg-red-900 px-1.5 py-0.5 text-red-100 hover:bg-red-800"
@@ -248,7 +313,7 @@ export function LeftPanel({ presets, history, imageId, onApplyPreset, onSavePres
 }
 
 /** Photo preview fitted in width x 2/3; at 100% a rectangle marks the visible region and click / drag pans. */
-function Navigator({ url, zoom, region, onZoom }: { url: string | null; zoom: Zoom; region: NormRect | null; onZoom: (z: Zoom) => void }) {
+function Navigator({ url, label, zoom, region, onZoom }: { url: string | null; label: string | null; zoom: Zoom; region: NormRect | null; onZoom: (z: Zoom) => void }) {
   const box = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
   const [aspect, setAspect] = useState(1.5);
@@ -283,6 +348,11 @@ function Navigator({ url, zoom, region, onZoom }: { url: string | null; zoom: Zo
             data-testid="navigator-img"
             onLoad={(e) => e.currentTarget.naturalHeight > 0 && setAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight)}
           />
+          {label && (
+            <span className="pointer-events-none absolute bottom-0.5 left-0.5 max-w-full truncate rounded bg-black/70 px-1 text-[10px] text-neutral-100" data-testid="navigator-preview-label">
+              Preview: {label}
+            </span>
+          )}
           {zoom.on && region && (
             <div
               className="pointer-events-none absolute border border-white"

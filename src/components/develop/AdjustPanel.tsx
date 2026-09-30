@@ -2,7 +2,7 @@
 // Profile, WB, Tone with Auto, Presence), Tone Curve, HSL / Color, Color Grading, Detail, Effects, Calibration, bottom bar.
 import { useState, type ReactNode } from "react";
 import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History } from "lucide-react";
-import type { AdjustmentField, LutInfo } from "../../ipc";
+import type { AdjustmentField } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
 import {
   BANDS,
@@ -20,13 +20,13 @@ import {
   PRESENCE_FIELDS,
   tempToPos,
   type HslKind,
+  type SimpleKey,
   type SliderDef,
 } from "../../lib/adjust";
-import { useAutoAdjust } from "../../hooks/useDevelopV14";
 import { Slider } from "./Slider";
 import { HistogramView } from "./Histogram";
 import { Section, seg } from "./fields";
-import { ProfileBrowser, ProfileRow, useProfileCatalog } from "./ProfilePanel";
+import { ProfileBrowser, ProfileRow, useProfileCatalog, type ProfileHover } from "./ProfilePanel";
 import { ToneCurvePanel } from "./ToneCurvePanel";
 import { ColorGradingPanel } from "./ColorGradingPanel";
 import { CalibrationPanel, DetailPanel, EffectsPanel } from "./DetailPanels";
@@ -45,10 +45,25 @@ export interface BottomBar {
   onReset: () => void;
 }
 
+/** Lightroom's Auto buttons (Tone, WB, Shift+double-click on a slider), driven by DevelopView (v14 `auto_tone` / `auto_white_balance`). */
+export interface AutoApi {
+  busy: boolean;
+  tone: () => void;
+  wb: () => void;
+  /** Shift+double-click: auto for one slider (temp / tint use the white balance, the rest `auto_tone` with that key). */
+  slider: (key: "temp" | "tint" | SimpleKey) => void;
+  /** The white balance is the one Auto produced (the WB select reads "Auto" until Temp / Tint are touched). */
+  wbIsAuto: boolean;
+}
+
 interface Props {
   editor: Editor;
-  luts: LutInfo[];
-  onImportLut: () => void;
+  /** Bumped when the style library changed (imports): the profile lists re-read. */
+  styleVersion: number;
+  importing: boolean;
+  onImportStyles: () => void;
+  hover: ProfileHover;
+  auto: AutoApi;
   imageId: number | null;
   onError: (e: unknown) => void;
   crop: CropApi;
@@ -72,12 +87,12 @@ const SubHead = ({ children, action }: { children: string; action?: ReactNode })
 
 const stripBtn = (on: boolean) => `relative flex size-7 items-center justify-center rounded ${on ? "bg-sky-800 text-sky-100" : "text-neutral-300 hover:bg-neutral-800"}`;
 
-export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
+const AUTO_KEYS: SimpleKey[] = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "vibrance", "saturation"];
+
+export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
-  const [autoBusy, setAutoBusy] = useState(false);
-  const auto = useAutoAdjust();
-  const catalog = useProfileCatalog(imageId, onError);
+  const catalog = useProfileCatalog(imageId, onError, styleVersion);
   const resetFields = (fields: AdjustmentField[], label: string) => change((a) => copyFields(a, editor.defaults, fields), label);
   /** Some field of the section differs from its default (section dot). */
   const dirty = (fields: AdjustmentField[]) => !sameAdjustments(copyFields(adj, editor.defaults, fields), adj);
@@ -96,6 +111,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
       onInput={(v) => edit((a) => ({ ...a, [d.key]: v }), d.label)}
       onCommit={commit}
       onReset={() => change((a) => ({ ...a, [d.key]: editor.defaults[d.key] }), d.label)}
+      onAuto={AUTO_KEYS.includes(d.key) ? () => auto.slider(d.key) : undefined}
     />
   );
 
@@ -110,26 +126,6 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
       (a) => ({ ...a, whiteBalance: t === asShot.temperatureK && ti === asShot.tint ? { mode: "as_shot" } : { mode: "custom", temperatureK: t, tint: ti } }),
       label,
     );
-
-  /** v14 adapter: one history entry per auto action; the controls stay disabled until the commands are wired. */
-  const runAuto = async (what: "tone" | "wb") => {
-    if (imageId == null || !auto.supported) return;
-    setAutoBusy(true);
-    try {
-      await editor.flush();
-      if (what === "tone" && auto.autoTone) {
-        const t = await auto.autoTone(imageId, adj);
-        change((a) => ({ ...a, ...t }), "Auto Tone");
-      } else if (what === "wb" && auto.autoWhiteBalance) {
-        const w = await auto.autoWhiteBalance(imageId, adj);
-        change((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } }), "White Balance: Auto");
-      }
-    } catch (e) {
-      onError(e);
-    } finally {
-      setAutoBusy(false);
-    }
-  };
 
   return (
     <div className="flex h-full flex-col" data-testid="adjust-panel">
@@ -160,7 +156,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
         <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" data-testid="adjust-scroll">
           <CropPanel crop={crop} />
           {browser.open ? (
-            <ProfileBrowser editor={editor} catalog={catalog} luts={luts} onImportLut={onImportLut} onClose={() => browser.setOpen(false)} />
+            <ProfileBrowser editor={editor} catalog={catalog} importing={importing} onImport={onImportStyles} hover={hover} onClose={() => browser.setOpen(false)} />
           ) : (
             <>
               <Section id="basic" dirty={dirty(BASIC_ALL)} title="Basic" onReset={() => resetFields(BASIC_ALL, "Reset Basic")}>
@@ -182,27 +178,25 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
                     className={`flex size-6 shrink-0 items-center justify-center rounded ${picker.active ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`}
                     data-testid="wb-picker"
                     aria-pressed={picker.active}
-                    title={`White balance picker${hint("wbPicker")}`}
+                    title={`White balance picker${hint("wbPicker")}; Auto white balance${hint("autoWb")}`}
                     onClick={picker.toggle}
                   >
                     <Pipette className="size-3.5" />
                   </button>
                   <select
                     className="h-6 min-w-0 flex-1 rounded bg-neutral-800 px-1.5 text-xs"
-                    value={wb.mode === "as_shot" ? "as_shot" : "custom"}
+                    value={wb.mode === "as_shot" ? "as_shot" : auto.wbIsAuto ? "auto" : "custom"}
                     aria-label="White balance"
                     data-testid="wb-select"
                     onChange={(e) => {
                       const v = e.target.value;
                       if (v === "as_shot") change((a) => ({ ...a, whiteBalance: { mode: "as_shot" } }), "White Balance");
                       else if (v === "custom") change((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: asShot.temperatureK, tint: asShot.tint } }), "White Balance");
-                      else void runAuto("wb");
+                      else auto.wb();
                     }}
                   >
                     <option value="as_shot">As Shot</option>
-                    <option value="auto" disabled={!auto.supported}>
-                      {auto.supported ? "Auto" : "Auto (needs v14)"}
-                    </option>
+                    <option value="auto">Auto</option>
                     <option value="custom">Custom</option>
                   </select>
                 </div>
@@ -225,6 +219,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
                   onInput={(p) => setWb(posToTemp(p), tint, "Temp")}
                   onCommit={commit}
                   onReset={() => resetWb(asShot.temperatureK, tint, "Temp")}
+                  onAuto={() => auto.slider("temp")}
                   disabled={!wbReady}
                 />
                 <Slider
@@ -239,18 +234,19 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop,
                   onInput={(v) => setWb(temp, v, "Tint")}
                   onCommit={commit}
                   onReset={() => resetWb(temp, asShot.tint, "Tint")}
+                  onAuto={() => auto.slider("tint")}
                   disabled={!wbReady}
                 />
                 <SubHead
                   action={
                     <button
                       className="flex h-5 items-center gap-1 rounded bg-neutral-800 px-2 text-[11px] hover:bg-neutral-700 disabled:opacity-40"
-                      disabled={!auto.supported || autoBusy}
-                      onClick={() => void runAuto("tone")}
-                      title={auto.supported ? "Auto (Cmd+U)" : "Auto (Cmd+U): needs the v14 backend, not wired yet"}
+                      disabled={auto.busy}
+                      onClick={auto.tone}
+                      title={`Auto${hint("autoTone")}`}
                       data-testid="auto-tone"
                     >
-                      {autoBusy && <Loader2 className="size-3 animate-spin" />} Auto
+                      {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto
                     </button>
                   }
                 >

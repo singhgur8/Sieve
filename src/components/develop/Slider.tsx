@@ -24,6 +24,8 @@ interface Props {
   onCommit: () => void;
   /** Double-click on the label or thumb. */
   onReset: () => void;
+  /** Shift+double-click on the label or thumb: Lightroom's per-slider Auto (sliders that have one). */
+  onAuto?: () => void;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -47,6 +49,7 @@ export const Slider = memo(function Slider({
   onInput,
   onCommit,
   onReset,
+  onAuto,
 }: Props) {
   const shown = display ? display(value) : `${value > 0 && min < 0 ? "+" : ""}${value.toFixed(digits)}`;
   // Bipolar sliders are neutral at their centre / zero; 0-based ones at their minimum.
@@ -65,6 +68,7 @@ export const Slider = memo(function Slider({
     // Select once when editing starts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing === null]);
+  const dbl = (e: React.MouseEvent) => (e.shiftKey && onAuto ? onAuto() : onReset());
   const done = useRef(true);
   const startEdit = () => {
     if (disabled) return;
@@ -90,8 +94,8 @@ export const Slider = memo(function Slider({
     <div className="flex h-6 items-center gap-2" data-testid={`slider-row-${id}`} data-changed={changed}>
       <span
         className={`w-[72px] shrink-0 cursor-default select-none truncate text-xs ${changed ? "text-neutral-100" : "text-neutral-300"}`}
-        onDoubleClick={onReset}
-        title={`${label} (double-click to reset)`}
+        onDoubleClick={dbl}
+        title={`${label} (double-click to reset${onAuto ? ", Shift+double-click for auto" : ""})`}
         data-testid={`slider-label-${id}`}
       >
         {label}
@@ -117,7 +121,7 @@ export const Slider = memo(function Slider({
           onPointerUp={onCommit}
           onKeyUp={(e) => (e.key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(e.key)) && onCommit()}
           onBlur={onCommit}
-          onDoubleClick={disabled ? undefined : onReset}
+          onDoubleClick={disabled ? undefined : dbl}
         />
       </div>
       {editing !== null ? (

@@ -639,7 +639,7 @@ test.describe("P2 items", () => {
     await clearCalls(page);
     await page.keyboard.press("Meta+Alt+v");
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("+1.25");
-    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Paste Settings");
+    await expect(page.getByTestId("history-list")).toContainText("Paste from Previous");
     // Plain Cmd+V-style keys are unaffected: Alt without the chord does nothing.
     await page.keyboard.press("Meta+Shift+n");
     await expect(page.getByTestId("preset-name")).toBeVisible();

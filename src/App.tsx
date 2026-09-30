@@ -733,6 +733,10 @@ export default function App() {
         return develop.current?.sync();
       case "syncQuiet":
         return develop.current?.sync(true);
+      case "autoTone":
+        return develop.current?.autoTone();
+      case "autoWb":
+        return develop.current?.autoWb();
       case "reset":
         return develop.current?.reset();
       case "maskPanel":

@@ -221,7 +221,7 @@ test.describe("develop", () => {
     await expect(page.getByText("No presets yet")).toBeVisible();
   });
 
-  test("LUT picker sets lut {id, amount}; import adds and selects a LUT", async ({ page }) => {
+  test("LUT profiles set lut {id, amount 0..200}; picking another profile removes the LUT", async ({ page }) => {
     await openDevelop(page);
     await page.getByTestId("profile-browse").click();
     await expect(page.getByTestId("profile-browser")).toBeVisible();
@@ -240,14 +240,18 @@ test.describe("develop", () => {
     expect(save.args.adjustments.lut).toEqual({ id: "film-warm", amount: 60 });
     await shot(page, "2x-editor-06-lut");
 
-    await page.getByTestId("lut-import").click();
-    await expect.poll(async () => (await calls(page, "import_lut")).length).toBe(1);
-    expect((await calls(page, "import_lut"))[0].args.path).toMatch(/\.cube$/);
-    await expect(page.getByTestId("lut-item-moody-blue")).toHaveClass(/bg-sky-800/);
-    await page.getByTestId("lut-remove").click();
+    // v14: Amount goes up to 200.
+    await setSlider(page, "lut-amount", 150);
+    await expect.poll(async () => (await saves(page)).pop()?.args.adjustments.lut.amount).toBe(150);
+    await page.getByTestId("lut-item-teal-orange").click();
+    await expect(page.getByTestId("lut-item-teal-orange")).toHaveClass(/bg-sky-800/);
+    expect((await saves(page)).pop()!.args.adjustments.lut).toEqual({ id: "teal-orange", amount: 100 });
+    // A camera profile replaces the LUT.
+    await page.getByTestId("profile-item-Camera Standard").click();
     await expect(page.getByTestId("slider-lut-amount")).toHaveCount(0);
     const lastSave = (await saves(page)).pop()!;
     expect(lastSave.args.adjustments.lut).toBeNull();
+    expect(lastSave.args.adjustments.profile.cameraProfile).toBe("Camera Standard");
   });
 
   test("white balance mode: Custom seeds from as-shot, Temp edit switches to custom", async ({ page }) => {

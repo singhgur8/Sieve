@@ -103,9 +103,9 @@ test.describe("panel layout", () => {
     await expect(page.getByTestId("zoom-toggle")).toHaveAttribute("data-zoom", "100");
     await page.getByTestId("zoom-fit").click();
     await expect(page.getByTestId("navigator-region")).toHaveCount(0);
-    // The preset + menu: Create Preset… works, Import is disabled until the v14 library is wired.
+    // The preset + menu: Create Preset…
     await page.getByTestId("preset-add").click();
-    await expect(page.getByTestId("preset-import")).toBeDisabled();
+    await expect(page.getByTestId("preset-import")).toBeEnabled();
     await page.getByTestId("preset-save").click();
     await expect(page.getByTestId("fields-dialog")).toBeVisible();
     await expect(page.getByRole("dialog")).toContainText("New Develop Preset");
@@ -284,11 +284,16 @@ test.describe("copy / paste / previous / sync shortcuts", () => {
     await clearCalls(page);
     await page.getByTestId("previous-settings").click();
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("+0.75");
-    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Paste Settings");
+    // v14 `paste_previous(targetIds, previousId, null)` (everything but masks), one history entry.
+    const [pp] = await calls(page, "paste_previous");
+    expect(pp.args).toMatchObject({ targetIds: [2], previousId: 1, fields: null });
+    await expect(page.getByTestId("history-list")).toContainText("Paste from Previous");
     await page.getByTestId("film-3").click();
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("0.00");
+    await clearCalls(page);
     await page.keyboard.press("Meta+Alt+v");
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("+0.75");
+    expect((await calls(page, "paste_previous"))[0].args).toMatchObject({ targetIds: [3], previousId: 2 });
   });
 
   test("a multi-selection turns Previous into Sync…; Cmd+Alt+S and Alt-click sync without the dialog; Reset shows the count", async ({ page }) => {
@@ -360,3 +365,129 @@ for (const vp of [
     await expect(page.getByTestId("develop-view")).toBeVisible();
   });
 }
+
+test.describe("style library and auto (IPC v14)", () => {
+  test("Presets panel: folder import makes a group, apply calls apply_preset, hover previews in the Navigator, group removal", async ({ page }) => {
+    await openDevelop(page);
+    await expect(page.getByTestId("preset-empty")).toContainText("No presets yet. Save one with + or import a Lightroom presets folder.");
+    await clearCalls(page);
+    await page.getByTestId("preset-import-link").click();
+    await expect.poll(async () => (await calls(page, "import_style_folder")).length).toBe(1);
+    expect((await calls(page, "import_style_folder"))[0].args.path).toBe("/mock/export/Smith Wedding");
+    await expect(page.getByTestId("notice").last()).toContainText("Imported 2 presets in 1 group and 0 profiles");
+    const group = page.locator('[data-testid^="preset-group-"][data-kind="imported"]');
+    await expect(group).toHaveCount(1);
+    await expect(group).toContainText("Smith Wedding");
+    await expect(group).toHaveAttribute("data-open", "false"); // imported groups start closed
+    await group.locator('[data-testid^="preset-group-toggle-"]').click();
+    await expect(group).toHaveAttribute("data-open", "true");
+    expect(JSON.parse((await page.evaluate(() => localStorage.getItem("sieve.presetGroups.v1")))!)).toMatchObject({});
+
+    // Hover (150 ms dwell): resolve_preset + a render on the navigator slot, label in the Navigator; leaving restores.
+    const first = group.locator("li button").first();
+    await clearCalls(page);
+    await first.hover();
+    await expect(page.getByTestId("navigator-preview-label")).toContainText("Preview: Smith Wedding 01");
+    expect((await calls(page, "resolve_preset")).length).toBeGreaterThan(0);
+    expect((await calls(page, "render_preview")).some((c) => (c.args.options as { slot: string }).slot === "navigator" && (c.args.options as { maxEdge: number }).maxEdge === 480)).toBe(true);
+    await page.mouse.move(700, 400);
+    await expect(page.getByTestId("navigator-preview-label")).toHaveCount(0);
+    // A quick pass over the row does not render anything.
+    await clearCalls(page);
+    await first.hover();
+    await page.mouse.move(700, 400);
+    await page.waitForTimeout(300);
+    expect((await calls(page, "resolve_preset")).length).toBe(0);
+
+    await clearCalls(page);
+    await first.click();
+    await expect.poll(async () => (await calls(page, "apply_preset")).length).toBe(1);
+    expect((await calls(page, "apply_preset"))[0].args.ids).toEqual([1]);
+
+    await shot(page, "develop-layout-presets-group");
+    await group.locator('[data-testid^="preset-group-toggle-"]').hover();
+    await group.locator('[data-testid^="preset-group-remove-"]').first().click();
+    await expect(page.getByText("Presets are removed from Sieve only; the files are not touched.")).toBeVisible();
+    await page.locator('[data-testid^="preset-group-remove-confirm-"]').click();
+    await expect.poll(async () => (await calls(page, "remove_style_group")).length).toBe(1);
+    await expect(group).toHaveCount(0);
+  });
+
+  test("Profile Browser: hover previews in the main viewer, LUT groups, import from the footer", async ({ page }) => {
+    await openDevelop(page);
+    await page.getByTestId("profile-browse").click();
+    await expect(page.getByTestId("profile-group-LUTs")).toBeVisible();
+    await clearCalls(page);
+    await page.getByTestId("profile-item-Camera Standard").hover();
+    await expect(page.getByTestId("hover-preview-label")).toHaveText("Preview: Camera Standard");
+    expect((await calls(page, "render_preview")).some((c) => (c.args.options as { slot: string }).slot === "navigator")).toBe(true);
+    await page.mouse.move(600, 300);
+    await expect(page.getByTestId("hover-preview")).toHaveCount(0);
+    // Hovering alone changes nothing.
+    expect((await saved(page)).length).toBe(0);
+    // Look filter: B&W shows only monochrome looks.
+    await page.getByTestId("profile-filter").selectOption("bw");
+    await expect(page.getByTestId("profile-item-Camera Standard")).toHaveCount(0);
+    await page.getByTestId("profile-filter").selectOption("all");
+    await clearCalls(page);
+    await page.getByTestId("profile-import").click();
+    await expect.poll(async () => (await calls(page, "import_style_folder")).length).toBe(1);
+    await expect.poll(async () => (await calls(page, "list_profiles")).length).toBeGreaterThan(0); // the lists re-read
+    // The dropdown lists the recent picks and Browse….
+    await page.getByTestId("profile-item-Camera Standard").click();
+    await page.getByTestId("profile-browser-close").click();
+    await page.getByTestId("profile-select").click();
+    await expect(page.getByTestId("profile-recent-Camera Standard")).toBeVisible();
+    await page.getByTestId("profile-browse-menu").click();
+    await expect(page.getByTestId("profile-browser")).toBeVisible();
+  });
+
+  test("Auto: the Tone button and Cmd+U commit one history entry; WB Auto and Cmd+Shift+U; Shift+double-click autos one slider", async ({ page }) => {
+    await openDevelop(page);
+    await clearCalls(page);
+    await page.getByTestId("auto-tone").click();
+    await expect(page.getByTestId("slider-value-exposure")).toHaveText("+0.35");
+    await expect(page.getByTestId("slider-value-highlights")).toHaveText("-42");
+    await expect.poll(async () => (await saved(page)).length).toBe(1);
+    expect((await saved(page))[0].args.label).toBe("Auto Tone");
+    const [at] = await calls(page, "auto_tone");
+    expect(at.args.keys).toBeNull();
+    await expect(page.getByTestId("history-list")).toContainText("Auto Tone");
+
+    // Cmd+U after a manual change: back to the auto values, again one entry.
+    await setSlider(page, "exposure", 2);
+    await clearCalls(page);
+    await page.keyboard.press("Meta+u");
+    await expect(page.getByTestId("slider-value-exposure")).toHaveText("+0.35");
+    await expect.poll(async () => (await saved(page)).length).toBe(1);
+
+    // WB: the select's Auto, then Temp / Tint edits turn it back into Custom.
+    await clearCalls(page);
+    await page.getByTestId("wb-select").selectOption("auto");
+    await expect(page.getByTestId("slider-value-temp")).toHaveText("5350 K");
+    await expect(page.getByTestId("wb-select")).toHaveValue("auto");
+    expect((await saved(page)).at(-1)?.args.label).toBe("Auto White Balance");
+    await setSlider(page, "tint", 40);
+    await expect(page.getByTestId("wb-select")).toHaveValue("custom");
+    await page.keyboard.press("Meta+Shift+u");
+    await expect(page.getByTestId("wb-select")).toHaveValue("auto");
+    expect((await calls(page, "auto_white_balance")).length).toBe(2);
+
+    // Shift+double-click on a slider label: auto for that slider only.
+    await setSlider(page, "contrast", -30);
+    await clearCalls(page);
+    await page.getByTestId("slider-label-exposure").dblclick({ modifiers: ["Shift"] });
+    await expect.poll(async () => (await calls(page, "auto_tone")).length).toBe(1);
+    expect((await calls(page, "auto_tone"))[0].args.keys).toEqual(["exposure"]);
+    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Auto: Exposure");
+    await expect(page.getByTestId("slider-value-contrast")).toHaveText("-30"); // other sliders untouched
+    // Plain double-click still resets.
+    await page.getByTestId("slider-label-contrast").dblclick();
+    await expect(page.getByTestId("slider-value-contrast")).toHaveText("0");
+    // Temp / Tint: Shift+double-click asks for auto white balance and takes only that value.
+    await clearCalls(page);
+    await page.getByTestId("slider-label-temp").dblclick({ modifiers: ["Shift"] });
+    await expect.poll(async () => (await calls(page, "auto_white_balance")).length).toBe(1);
+    await expect.poll(async () => (await saved(page)).at(-1)?.args.label).toBe("Auto: Temp");
+  });
+});

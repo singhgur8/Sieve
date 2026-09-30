@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AdjustmentField } from "../../ipc";
 import { ALL_ADJUSTMENT_FIELDS, DEFAULT_SYNC_FIELDS } from "../../ipc";
-import { FIELD_COLUMNS, loadFields, saveFields, type FieldGroup } from "../../lib/fieldGroups";
+import { DISPLAYED_FIELDS, FIELD_COLUMNS, loadFields, saveFields, type FieldGroup } from "../../lib/fieldGroups";
 import { Dialog } from "../Dialog";
 
 interface Props {
@@ -103,7 +103,7 @@ export function SettingsFieldsDialog({ title, confirm, withName, initialName = "
       </div>
       <div className="mt-3 flex h-[52px] items-center justify-between border-t border-neutral-800 px-5 text-xs">
         <div className="flex gap-3 text-sky-400">
-          <button data-testid="fields-all" onClick={() => setFields(new Set(ALL_ADJUSTMENT_FIELDS.filter((f) => !disabledField(f) && (f !== "lut" || hasLut))))}>
+          <button data-testid="fields-all" onClick={() => setFields(new Set<AdjustmentField>([...DISPLAYED_FIELDS.filter((f) => !disabledField(f) && (f !== "lut" || hasLut)), "process_version"]))}>
             Check All
           </button>
           <button data-testid="fields-none" onClick={() => setFields(new Set())}>
