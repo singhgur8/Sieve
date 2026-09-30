@@ -114,6 +114,7 @@ copy subsets into `test-data/` for anything that writes.
 - [ ] **QA gate**: the user's 95 mask groups import and render plausibly; round trip preserves Lightroom mask data.
 
 ## Phase 8 — Hardening + packaging
+- [ ] **Crop straighten preview** (frontend-dev + rust-engine-dev): live rotation preview while dragging the crop angle (Lightroom parity); currently applied only on commit.
 - [ ] **UX review** (ux-designer → frontend-dev): full-workflow review (import → cull → edit → scenes → export) for polish, friction and keyboard coverage; frontend-dev implements P0/P1 findings; ux-designer re-checks. Acceptance: no open P0/P1, keyboard cheat sheet in-app, Playwright green.
 - [ ] Perf pass (import, analysis, grid, export) with numbers in Status Log. Known items: `render_preview` does a catalog query per slider frame (cache SourceImage in DevelopCache); `handle_protocol` copies the JPEG per hit.
 - [ ] Error states, empty states, crash-safe catalog writes.
