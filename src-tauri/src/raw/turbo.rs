@@ -285,6 +285,40 @@ fn encode_rgb_sub<T>(
     })
 }
 
+/// `TJPF_GRAY` / `TJSAMP_GRAY`.
+const TJPF_GRAY: c_int = 6;
+const TJSAMP_GRAY: c_int = 3;
+
+/// Encodes 8-bit greyscale as a single-component JPEG (mask overlays).
+pub fn encode_gray(pixels: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || pixels.len() < width as usize * height as usize {
+        return Err("TurboJPEG encode: bad buffer".into());
+    }
+    with_handle(&COMPRESSOR, TJINIT_COMPRESS, |tj| {
+        tj.set(TJPARAM_QUALITY, quality.clamp(1, 100) as c_int)?;
+        tj.set(TJPARAM_SUBSAMP, TJSAMP_GRAY)?;
+        tj.set(TJPARAM_FASTDCT, 1)?;
+        let mut buf: *mut c_uchar = std::ptr::null_mut();
+        let mut size: usize = 0;
+        // SAFETY: src holds height rows of width bytes; TurboJPEG allocates `buf`.
+        let rc = unsafe {
+            tj3Compress8(tj.0, pixels.as_ptr(), width as c_int, width as c_int, height as c_int, TJPF_GRAY, &mut buf, &mut size)
+        };
+        let out = if rc == 0 && !buf.is_null() {
+            // SAFETY: TurboJPEG wrote `size` bytes into `buf`, freed below.
+            Ok(unsafe { std::slice::from_raw_parts(buf, size) }.to_vec())
+        } else {
+            Err(tj.error("encode"))
+        };
+        if !buf.is_null() {
+            // SAFETY: allocated by TurboJPEG.
+            unsafe { tj3Free(buf.cast()) };
+        }
+        // Later RGB encodes set their own subsampling.
+        out
+    })
+}
+
 const TJPARAM_OPTIMIZE: c_int = 11;
 const TJPARAM_XDENSITY: c_int = 20;
 const TJPARAM_YDENSITY: c_int = 21;
