@@ -16,7 +16,7 @@ use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer
 
 use super::imgproc::{self, Gray};
 use super::models::{Detection, Models, DET_SIZE};
-use super::{FaceMetrics, ImageMetrics, TileStats};
+use super::{FaceMetrics, HighlightStats, ImageMetrics, TileStats};
 use crate::ipc::types::{NormPoint, NormRect};
 use crate::raw::turbo;
 
@@ -28,6 +28,8 @@ pub const TARGET_IOD: f32 = 40.0;
 const MIN_LANDMARK_FACE: f32 = 0.015;
 /// At most this many faces (largest first) get landmarks + sharpness.
 const MAX_FACES: usize = 16;
+/// Cell size (preview px) of the blown-highlight map.
+const BLOWN_CELL: usize = 32;
 /// Tile grid on the long edge for global sharpness.
 const TILES_LONG: usize = 8;
 /// Mean |gradient| (luma levels/px) below which a tile has too little texture to judge.
@@ -61,6 +63,12 @@ pub fn measure(models: &mut Models, work: &mut Work, path: &Path) -> Result<Imag
     let exposure = imgproc::exposure(&luma);
     let phash = imgproc::phash(&luma);
     let tiles = tile_stats(&luma);
+    let blown = imgproc::BlownMap::new(rgb, w, h, BLOWN_CELL, 2);
+    let highlights = HighlightStats {
+        blown: blown.total(),
+        center: blown.share_in(0.25, 0.25, 0.75, 0.75),
+        region: blown.largest_region(),
+    };
 
     // Faces.
     let (sw, sh) = fit(w, h, DET_SIZE);
@@ -82,7 +90,16 @@ pub fn measure(models: &mut Models, work: &mut Work, path: &Path) -> Result<Imag
         faces.push(face_metrics(models, rgb, w, h, det, measured)?);
     }
 
-    Ok(ImageMetrics { width: w as u32, height: h as u32, faces, global_sharpness: tiles.p90, exposure, phash, tiles })
+    Ok(ImageMetrics {
+        width: w as u32,
+        height: h as u32,
+        faces,
+        global_sharpness: tiles.p90,
+        exposure,
+        phash,
+        tiles,
+        highlights,
+    })
 }
 
 fn face_h(d: &Detection) -> f32 {
@@ -233,6 +250,7 @@ fn face_metrics(
         mesh_ear: None,
         face_luma: 0.0,
         mouth_width: None,
+        blown: blown_share(rgb, w, h, &det.bbox),
     };
     if !measured {
         return Ok(f);
@@ -302,6 +320,32 @@ fn face_metrics(
     f.frontal = f.ear.is_some() && iod / bh >= FRONTAL_MIN;
     f.sharpness = if f.frontal { eye_sharpness(&eye_s).max(tight_best) } else { face_s.mean };
     Ok(f)
+}
+
+/// Share of blown pixels (every channel >= `imgproc::BLOWN_MIN`) in the inner part of
+/// a detector box (cheeks, nose, forehead; the box corners are often bright sky behind
+/// the head, which is not a defect of the face).
+fn blown_share(rgb: &[u8], w: usize, h: usize, b: &[f32; 4]) -> f32 {
+    let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
+    let x0 = (b[0] + 0.25 * bw).clamp(0.0, w as f32) as usize;
+    let y0 = (b[1] + 0.2 * bh).clamp(0.0, h as f32) as usize;
+    let x1 = ((b[0] + 0.75 * bw).clamp(0.0, w as f32) as usize).max(x0);
+    let y1 = ((b[1] + 0.85 * bh).clamp(0.0, h as f32) as usize).max(y0);
+    let (mut n, mut hit) = (0u32, 0u32);
+    for y in (y0..y1).step_by(2) {
+        for x in (x0..x1).step_by(2) {
+            let p = &rgb[(y * w + x) * 3..(y * w + x) * 3 + 3];
+            n += 1;
+            if p.iter().all(|&c| c >= imgproc::BLOWN_MIN) {
+                hit += 1;
+            }
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        hit as f32 / n as f32
+    }
 }
 
 /// Tiled whole-frame sharpness: textured tiles only; percentiles over them, so a

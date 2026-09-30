@@ -22,10 +22,14 @@ pub fn default_thresholds(shoot_type: ShootType) -> CullThresholds {
         global_sharpness_min: 0.45,
         underexposed_mean_luma: 0.15,
         underexposed_clip_pct: 0.30,
-        overexposed_clip_pct: 0.05,
+        // Share of a subject face's skin that is blown (every channel >= 250); a frame
+        // more than half blown also counts (`scoring::OVER_FRAME_BLOWN`).
+        overexposed_clip_pct: 0.15,
         burst_hash_distance: 12,
         pick_min_overall: 0.75,
-        reject_max_overall: 0.30,
+        // Rejects come from hard defects (`scoring`); a low overall alone rejects only
+        // when several defects stack up.
+        reject_max_overall: 0.15,
         weights: ScoreWeights {
             eyes_open: 1.0,
             face_sharpness: 1.0,
