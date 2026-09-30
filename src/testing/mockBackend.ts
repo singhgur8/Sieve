@@ -11,6 +11,7 @@ import type {
   MaskCapabilities,
   MaskGroup,
   MaskOverlayOptions,
+  NormPoint,
   DevelopWarning,
   LookProfileInfo,
   BurstGroup,
@@ -828,6 +829,14 @@ export function installMockBackend(count: number) {
           if (completeAdjustments(getAdj(args.id as number)).masks.some((g) => g.components.some((c) => c.shape.kind === "ai" && !c.shape.digest))) warnings.push({ code: "ai_mask_needs_update", detail: "1" });
           return { imageId: args.id, asShot: { temperatureK: 5200, tint: 8 }, sourceWidth: portrait ? 2000 : 3000, sourceHeight: portrait ? 3000 : 2000, fullWidth: portrait ? 4000 : 6000, fullHeight: portrait ? 6000 : 4000, warnings };
         }
+        case "sample_white_balance": {
+          // IPC v11 WB picker. Deterministic fake: temperature follows x, tint follows y
+          // (sensor frame); the top 5 % of the frame is "clipped".
+          const p = args.point as NormPoint;
+          if (!(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1)) throw { kind: "invalid_argument", message: "white balance sample point must be within 0..=1" };
+          if (p.y < 0.05) throw { kind: "invalid_argument", message: "the sampled area is clipped (overexposed); pick a neutral grey or white that is not blown out" };
+          return { temperatureK: Math.round(3000 + p.x * 5000), tint: Math.round((p.y - 0.5) * 40) };
+        }
         case "list_profiles":
           return {
             imageId: args.id,
@@ -843,10 +852,6 @@ export function installMockBackend(count: number) {
           };
         case "prepare_develop":
           return null;
-        case "sample_white_balance": {
-          const pt = args.point as { x: number; y: number };
-          return { temperatureK: Math.round(4000 + pt.x * 3000), tint: Math.round((pt.y - 0.5) * 40) };
-        }
         // Masks (IPC v10): minimal fakes so the masking UI can be built and tested.
         case "list_masks": {
           const groups = completeAdjustments(getAdj(args.id as number)).masks;

@@ -150,6 +150,18 @@ export const commands = {
 	 */
 	getDevelopInfo: (id: number) => typedError<DevelopInfo, AppError>(__TAURI_INVOKE("get_develop_info", { id })),
 	/**
+	 *  White balance picker (IPC v11): the Temp/Tint that neutralizes the 5x5 develop-source
+	 *  pixel neighbourhood around `point`. `point` is in the **sensor frame** (normalized 0..=1
+	 *  of the un-oriented, uncropped image; same convention as masks: convert a viewer click with
+	 *  `unorientPoint` + the crop mapping). `adjustments` = the live (unsaved) edit; only its
+	 *  `profile` matters (colour matrices, as for `DevelopInfo.asShot`). The result is clamped to
+	 *  the slider ranges; the caller commits `whiteBalance: custom` itself. Errors:
+	 *  `invalid_argument` if the point is outside 0..=1 or the sample is clipped / too dark
+	 *  (message is user-facing). Body: architect (thin wrapper over
+	 *  `DevelopCache::sample_white_balance`; rust-engine-dev owns it from here).
+	 */
+	sampleWhiteBalance: (id: number, point: NormPoint, adjustments: ParametricAdjustments) => typedError<WhiteBalanceValues, AppError>(__TAURI_INVOKE("sample_white_balance", { id, point, adjustments })),
+	/**
 	 *  Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
 	 *  the image being edited). Returns immediately.
 	 */

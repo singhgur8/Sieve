@@ -129,6 +129,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `get_xmp_status` / `getXmpStatus` | – | `XmpStatus` |
 | `render_preview` / `renderPreview` | `id: number, adjustments: ParametricAdjustments, options: RenderOptions` | `RenderedPreview \| null` (`null` = superseded) |
 | `get_develop_info` / `getDevelopInfo` | `id: number` | `DevelopInfo` |
+| `sample_white_balance` / `sampleWhiteBalance` (v11) | `id: number, point: NormPoint` (sensor frame), `adjustments: ParametricAdjustments` | `WhiteBalanceValues` (`invalid_argument` if clipped/too dark) |
 | `prepare_develop` / `prepareDevelop` | `ids: number[]` | `null` (background decode) |
 | `get_history` / `getHistory` | `id: number` | `AdjustmentHistory` |
 | `undo_adjustments` / `undoAdjustments` | `id: number` | `EditState` |
@@ -302,6 +303,12 @@ Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch w
 - White balance happens in the pipeline on raw data: `as_shot` uses the camera multipliers; `custom` converts
   temperature/tint -> multipliers through the camera matrix (`develop::wb`). `getDevelopInfo().asShot` gives the
   as-shot temperature/tint for the sliders.
+- White balance picker (IPC v11, `sampleWhiteBalance`): mean of the 5x5 develop-source pixels (half-size decode,
+  camera RGB, before WB) around a sensor-frame point (convert clicks with `unorientPoint` + crop mapping, as for
+  masks); multipliers = G/R, 1, G/B of that mean; Temp/Tint through `camera::values_of_multipliers` (the DCP of
+  `adjustments.profile` when resolved, else `wb::values_for` with `cam_xyz`: the same path as `asShot`), clamped to
+  the slider ranges. Any sample pixel >= 64200/65535 in any channel => `invalid_argument` "...clipped...";
+  any channel mean < 16 => "...too dark...". The UI commits `whiteBalance: custom` ("White Balance: Picker").
 - Pipeline (shared with Phase 6 full-res export): WB -> camera->linear Rec.2020 -> exposure -> tone (contrast,
   highlights/shadows/whites/blacks) -> texture/clarity/dehaze -> vibrance/saturation -> HSL -> sRGB encode -> LUT
   (amount blend) -> 8-bit -> histogram -> JPEG (TurboJPEG q90 4:4:4). Orientation applied; `region` crops first.

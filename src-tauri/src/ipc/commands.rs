@@ -335,6 +335,30 @@ pub async fn get_develop_info(
     Ok(info)
 }
 
+/// White balance picker (IPC v11): the Temp/Tint that neutralizes the 5x5 develop-source
+/// pixel neighbourhood around `point`. `point` is in the **sensor frame** (normalized 0..=1
+/// of the un-oriented, uncropped image; same convention as masks: convert a viewer click with
+/// `unorientPoint` + the crop mapping). `adjustments` = the live (unsaved) edit; only its
+/// `profile` matters (colour matrices, as for `DevelopInfo.asShot`). The result is clamped to
+/// the slider ranges; the caller commits `whiteBalance: custom` itself. Errors:
+/// `invalid_argument` if the point is outside 0..=1 or the sample is clipped / too dark
+/// (message is user-facing). Body: architect (thin wrapper over
+/// `DevelopCache::sample_white_balance`; rust-engine-dev owns it from here).
+#[tauri::command]
+#[specta::specta]
+pub async fn sample_white_balance(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    point: NormPoint,
+    adjustments: ParametricAdjustments,
+) -> AppResult<WhiteBalanceValues> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    let src = source_images(&catalog, vec![id]).await?.pop().ok_or_else(|| AppError::not_found("image not found"))?;
+    let cache = develop.inner().clone();
+    blocking(move || cache.sample_white_balance(&src, point, &adjustments)).await
+}
+
 /// Decodes `ids` into the develop cache in the background (e.g. filmstrip neighbours of
 /// the image being edited). Returns immediately.
 #[tauri::command]

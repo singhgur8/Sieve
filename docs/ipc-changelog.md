@@ -585,3 +585,22 @@ Who updates what
   `renderPreview(adjustments with masks)`; commit with `saveMasks` (or `saveAdjustments`). Convert pointer
   positions with `unorientPoint` (+ crop mapping). Replace the `mask: null/false` placeholders in `useEditor.ts`
   if the editor state is restructured; `RenderSlot` records must include `mask`.
+
+## v11 — 2026-09-30 (UX review 2: white balance picker, P1-12)
+Commands
+- New `sample_white_balance(id, point: NormPoint, adjustments: ParametricAdjustments) -> WhiteBalanceValues`
+  (TS `commands.sampleWhiteBalance(id, point, adjustments)`). `point` is in the **sensor frame** (normalized,
+  un-oriented, uncropped; same convention as masks: convert a viewer click with `unorientPoint` + crop mapping).
+  Averages the 5x5 develop-source pixels (linear camera RGB, before WB) around the point and returns the Temp/Tint
+  that neutralizes them, through the same colour path as `DevelopInfo.asShot` (DCP of `adjustments.profile`, else
+  the camera matrix), clamped to 2000..=50000 K / -150..=150. Errors: `invalid_argument` with a user-facing message
+  when the point is outside 0..=1, any sample pixel is clipped ("...clipped (overexposed)...") or the sample is too
+  dark ("...too dark to measure..."). Decodes the source if not cached.
+- No type or schema changes. `develop::camera::values_of_multipliers` factored out of `as_shot_values`.
+
+Who updates what
+- architect (done): command + registration, body (`DevelopCache::sample_white_balance`, `develop::sample_multipliers`;
+  thin, rust-engine-dev owns it from here), tests, bindings, mock backend (`sample_white_balance`: temperature
+  `3000 + 5000·x`, tint `(y − 0.5)·40`, clipped error for `y < 0.05`).
+- frontend-dev: P1-12 UI (W toggles the picker; click -> `sampleWhiteBalance` -> commit
+  `whiteBalance: {custom: values}` with history label "White Balance: Picker"; show the error message on failure).
