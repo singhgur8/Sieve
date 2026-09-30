@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { FileUp } from "lucide-react";
+import { FileUp, Pipette } from "lucide-react";
 import type { AdjustmentField, LutInfo, ParametricAdjustments } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
 import {
@@ -11,6 +11,9 @@ import {
   HSL_BW_FIELDS,
   HSL_FIELD,
   posToTemp,
+  sameAdjustments,
+  TEMP_MAX,
+  TEMP_MIN,
   PRESENCE,
   PRESENCE_FIELDS,
   tempToPos,
@@ -25,6 +28,7 @@ import { ToneCurvePanel } from "./ToneCurvePanel";
 import { ColorGradingPanel } from "./ColorGradingPanel";
 import { CalibrationPanel, DetailPanel, EffectsPanel } from "./DetailPanels";
 import { CropPanel, type CropApi } from "./CropPanel";
+import { hint } from "../../lib/keymap";
 
 interface Props {
   editor: Editor;
@@ -33,12 +37,16 @@ interface Props {
   imageId: number | null;
   onError: (e: unknown) => void;
   crop: CropApi;
+  /** White balance eyedropper (W). */
+  picker: { active: boolean; toggle: () => void };
 }
 
-export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop }: Props) {
+export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop, picker }: Props) {
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
   const resetFields = (fields: AdjustmentField[], label: string) => change((a) => copyFields(a, editor.defaults, fields), label);
+  /** Some field of the section differs from its default (section dot). */
+  const dirty = (fields: AdjustmentField[]) => !sameAdjustments(copyFields(adj, editor.defaults, fields), adj);
 
   const simple = (d: SliderDef) => (
     <Slider
@@ -50,6 +58,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
       max={d.max}
       step={d.step}
       digits={d.digits}
+      defaultValue={editor.defaults[d.key]}
       onInput={(v) => edit((a) => ({ ...a, [d.key]: v }), d.label)}
       onCommit={commit}
       onReset={() => change((a) => ({ ...a, [d.key]: editor.defaults[d.key] }), d.label)}
@@ -76,16 +85,25 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
         <HistogramView h={editor.histogram} />
       </div>
 
-      <Section id="crop" title="Crop" onReset={() => resetFields(["crop"], "Reset Crop")}>
+      <Section id="crop" dirty={adj.crop.enabled} title="Crop" onReset={() => resetFields(["crop"], "Reset Crop")}>
         <CropPanel editor={editor} crop={crop} />
       </Section>
 
-      <Section id="profile" title="Profile" onReset={() => resetFields(["profile"], "Reset Profile")}>
+      <Section id="profile" dirty={dirty(["profile"])} title="Profile" onReset={() => resetFields(["profile"], "Reset Profile")}>
         <ProfilePanel editor={editor} imageId={imageId} onError={onError} />
       </Section>
 
-      <Section id="basic" title="Basic" onReset={() => resetFields(BASIC_FIELDS, "Reset Basic")}>
+      <Section id="basic" dirty={dirty(BASIC_FIELDS)} title="Basic" onReset={() => resetFields(BASIC_FIELDS, "Reset Basic")}>
         <div className="mb-2 flex gap-1" data-testid="wb-mode">
+          <button
+            className={`flex items-center justify-center rounded px-2 py-0.5 ${picker.active ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`}
+            data-testid="wb-picker"
+            aria-pressed={picker.active}
+            title={`White balance picker${hint("wbPicker")}`}
+            onClick={picker.toggle}
+          >
+            <Pipette className="size-3.5" />
+          </button>
           <button
             className={seg(wb.mode === "as_shot")}
             data-testid="wb-as-shot"
@@ -109,6 +127,13 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
           max={1}
           step={0.001}
           display={(p) => `${posToTemp(p)} K`}
+          defaultValue={tempToPos(asShot.temperatureK)}
+          editText={(p) => String(posToTemp(p))}
+          parse={(t) => {
+            const k = Number.parseFloat(t);
+            return Number.isFinite(k) ? tempToPos(Math.min(TEMP_MAX, Math.max(TEMP_MIN, k))) : null;
+          }}
+          textStep={50}
           accent="#fbbf24"
           onInput={(p) => setWb(posToTemp(p), tint, "Temp")}
           onCommit={commit}
@@ -122,6 +147,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
           min={-150}
           max={150}
           step={1}
+          defaultValue={asShot.tint}
           accent="#e879f9"
           onInput={(v) => setWb(temp, v, "Tint")}
           onCommit={commit}
@@ -131,15 +157,15 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
         {BASIC.map(simple)}
       </Section>
 
-      <Section id="presence" title="Presence" onReset={() => resetFields(PRESENCE_FIELDS, "Reset Presence")}>
+      <Section id="presence" dirty={dirty(PRESENCE_FIELDS)} title="Presence" onReset={() => resetFields(PRESENCE_FIELDS, "Reset Presence")}>
         {PRESENCE.map(simple)}
       </Section>
 
-      <Section id="tone-curve" title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
+      <Section id="tone-curve" dirty={dirty(["tone_curve"])} title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
         <ToneCurvePanel editor={editor} />
       </Section>
 
-      <Section id="hsl" title={adj.blackAndWhite.enabled ? "Black & White" : "Color Mixer"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
+      <Section id="hsl" dirty={dirty(HSL_BW_FIELDS)} title={adj.blackAndWhite.enabled ? "Black & White" : "Color Mixer"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
         <div className="mb-2 flex gap-1" data-testid="bw-mode">
           <button className={seg(!adj.blackAndWhite.enabled)} onClick={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, enabled: false } }), "Color")} data-testid="bw-off">
             Color
@@ -201,19 +227,19 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
         )}
       </Section>
 
-      <Section id="color-grading" title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
+      <Section id="color-grading" dirty={dirty(["color_grading"])} title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
         <ColorGradingPanel editor={editor} />
       </Section>
 
-      <Section id="detail" title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
+      <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
         <DetailPanel editor={editor} />
       </Section>
 
-      <Section id="effects" title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
+      <Section id="effects" dirty={dirty(["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
         <EffectsPanel editor={editor} />
       </Section>
 
-      <Section id="lut" title="LUT" onReset={() => resetFields(["lut"], "Reset LUT")}>
+      <Section id="lut" dirty={dirty(["lut"])} title="LUT" onReset={() => resetFields(["lut"], "Reset LUT")}>
         <div className="mb-2 flex gap-1">
           <select
             data-testid="lut-select"
@@ -246,6 +272,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
             min={0}
             max={100}
             step={1}
+            defaultValue={100}
             onInput={(v) => setLut({ ...lut, amount: v }, false)}
             onCommit={commit}
             onReset={() => change((a) => ({ ...a, lut: a.lut ? { ...a.lut, amount: 100 } : null }), "LUT")}
@@ -253,7 +280,7 @@ export function AdjustPanel({ editor, luts, onImportLut, imageId, onError, crop 
         )}
       </Section>
 
-      <Section id="calibration" title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
+      <Section id="calibration" dirty={dirty(["calibration"])} title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
         <CalibrationPanel editor={editor} />
       </Section>
     </div>

@@ -843,6 +843,10 @@ export function installMockBackend(count: number) {
           };
         case "prepare_develop":
           return null;
+        case "sample_white_balance": {
+          const pt = args.point as { x: number; y: number };
+          return { temperatureK: Math.round(4000 + pt.x * 3000), tint: Math.round((pt.y - 0.5) * 40) };
+        }
         // Masks (IPC v10): minimal fakes so the masking UI can be built and tested.
         case "list_masks": {
           const groups = completeAdjustments(getAdj(args.id as number)).masks;

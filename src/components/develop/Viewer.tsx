@@ -49,6 +49,8 @@ interface Props {
   onPan: (z: Zoom) => void;
   onPanEnd: () => void;
   onToggleZoom: (at?: { x: number; y: number }) => void;
+  /** Margin (px) around the fitted image (crop tool: handles must not sit on the panel borders). */
+  inset?: number;
 }
 
 const img = "pointer-events-none absolute select-none";
@@ -70,6 +72,8 @@ export function Viewer(p: Props) {
   }, []);
 
   const zoomed = p.zoom.on && p.fw > 0;
+  const ins = p.inset ?? 0;
+  const insetStyle: React.CSSProperties = ins ? { inset: ins, width: `calc(100% - ${2 * ins}px)`, height: `calc(100% - ${2 * ins}px)` } : {};
   const off = frameOffset(p.zoom, p.size, p.fw, p.fh);
 
   const onDown = (e: React.PointerEvent) => {
@@ -127,13 +131,13 @@ export function Viewer(p: Props) {
         </div>
       ) : p.split && p.before && p.main ? (
         <>
-          <img src={p.main.url} alt={alt(p.main)} draggable={false} className={`${img} inset-0 size-full object-contain`} data-testid="view-main" />
+          <img src={p.main.url} alt={alt(p.main)} draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid="view-main" />
           <img
             src={p.before.url}
             alt={alt(p.before)}
             draggable={false}
             className={`${img} inset-0 size-full object-contain`}
-            style={{ clipPath: `inset(0 ${(1 - p.splitPos) * 100}% 0 0)` }}
+            style={{ ...insetStyle, clipPath: `inset(0 ${(1 - p.splitPos) * 100}% 0 0)` }}
             data-testid="view-before"
           />
           <div
@@ -152,7 +156,7 @@ export function Viewer(p: Props) {
           <span className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-1.5 text-[10px] text-white">After</span>
         </>
       ) : (
-        shown && <img src={shown.url} alt={alt(shown)} draggable={false} className={`${img} inset-0 size-full object-contain`} data-testid={p.showBefore ? "view-before" : "view-main"} />
+        shown && <img src={shown.url} alt={alt(shown)} draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid={p.showBefore ? "view-before" : "view-main"} />
       )}
       {p.showBefore && <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="before-badge">Before</span>}
       {p.loading && !shown && (

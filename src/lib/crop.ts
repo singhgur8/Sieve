@@ -12,8 +12,9 @@ export interface Rect {
 export const FULL: Rect = { l: 0, t: 0, r: 1, b: 1 };
 export const MIN_SIZE = 0.02;
 
-export type AspectId = "free" | "original" | "1:1" | "4:5" | "5:7" | "3:2" | "16:9";
-export const ASPECTS: { id: AspectId; label: string; ratio: number | null }[] = [
+/** "custom" = locked to the ratio the free rectangle had when X / the swap button was used (not offered in the list). */
+export type AspectId = "free" | "original" | "custom" | "1:1" | "4:5" | "5:7" | "3:2" | "16:9";
+export const ASPECTS: { id: Exclude<AspectId, "custom">; label: string; ratio: number | null }[] = [
   { id: "free", label: "Free", ratio: null },
   { id: "original", label: "Original", ratio: null },
   { id: "1:1", label: "1 x 1", ratio: 1 },
@@ -145,3 +146,34 @@ export function fitRatio(rect: Rect, fr: number): Rect {
 
 /** Fraction-unit ratio (w / h of the rect) for a pixel aspect ratio on an image of aspect `imageAspect` (w / h). */
 export const fractionRatio = (pixelRatio: number, imageAspect: number) => pixelRatio / imageAspect;
+
+const ASPECT_KEY = "sieve.crop.aspect";
+const VALID: AspectId[] = ["free", "original", "1:1", "4:5", "5:7", "3:2", "16:9"];
+let lastLocked: AspectId = "original";
+
+/** Aspect the crop tool starts with: the last one used (Lightroom starts locked to Original). */
+export function loadCropAspect(): AspectId {
+  try {
+    const v = localStorage.getItem(ASPECT_KEY) as AspectId | null;
+    if (v && VALID.includes(v)) {
+      if (v !== "free") lastLocked = v;
+      return v;
+    }
+  } catch {
+    /* private mode */
+  }
+  return "original";
+}
+
+export function saveCropAspect(a: AspectId) {
+  if (a === "custom") return;
+  if (a !== "free") lastLocked = a;
+  try {
+    localStorage.setItem(ASPECT_KEY, a);
+  } catch {
+    /* private mode */
+  }
+}
+
+/** Aspect the A key restores when unlocking -> locking (the last locked one, Original by default). */
+export const lastLockedAspect = (): AspectId => lastLocked;

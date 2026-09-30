@@ -6,7 +6,22 @@ import { soloSection, toggleSection, useSectionOpen } from "../../lib/sections";
 import { Slider } from "./Slider";
 
 /** Collapsible panel section. State is remembered (localStorage); Alt-click solos the section. */
-export function Section({ id, title, onReset, children, badge }: { id: string; title: string; onReset?: () => void; children: ReactNode; badge?: ReactNode }) {
+export function Section({
+  id,
+  title,
+  onReset,
+  children,
+  badge,
+  dirty,
+}: {
+  id: string;
+  title: string;
+  onReset?: () => void;
+  children: ReactNode;
+  badge?: ReactNode;
+  /** Some field of the section differs from its default: shows a small dot after the title. */
+  dirty?: boolean;
+}) {
   const open = useSectionOpen(id);
   return (
     <section className="border-b border-neutral-800 py-2" data-testid={`section-${id}`} data-open={open}>
@@ -20,6 +35,7 @@ export function Section({ id, title, onReset, children, badge }: { id: string; t
         >
           {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
           {title}
+          {dirty && <span className="ml-0.5 size-1.5 rounded-full bg-sky-400" title="Changed from the default" data-testid={`section-dot-${id}`} />}
           {badge}
         </button>
         {onReset && (
@@ -64,6 +80,7 @@ export function NumField({ editor, id, label, group, min, max, step, digits = 0,
       max={max}
       step={step}
       digits={digits}
+      defaultValue={get(editor.defaults)}
       accent={accent}
       disabled={disabled}
       display={display}

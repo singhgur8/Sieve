@@ -76,6 +76,10 @@ export interface Editor {
   goto: (entryId: number) => void;
   /** Re-read adjustments + history from the backend (after batch operations). */
   reload: () => Promise<void>;
+  /** Time (ms) of the adjustment Cmd+Z would undo; 0 when there is nothing to undo. */
+  lastCommitAt: () => number;
+  /** True when a redo entry exists. */
+  canRedo: () => boolean;
 }
 
 /** Settings that change the develop warnings: the profile / look, and which AI masks have a computed matte. */
@@ -104,6 +108,8 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const draft = useRef(false);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const chain = useRef<Promise<unknown>>(Promise.resolve());
+  const historyRef = useRef<AdjustmentHistory | null>(null);
+  historyRef.current = history;
 
   const enqueue = useCallback((fn: () => Promise<unknown>) => {
     chain.current = chain.current.then(fn).catch((e) => optsRef.current.onError(e));
@@ -312,8 +318,16 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     optsRef.current.onChanged(cur);
   }, [commitPending, setAdjBoth, schedule]);
 
+  const lastCommitAt = useCallback(() => {
+    if (pending.current) return Date.now();
+    const h = historyRef.current;
+    if (!h || !h.canUndo) return 0;
+    return h.entries.find((e) => e.id === h.currentEntryId)?.createdAtMs ?? 0;
+  }, []);
+  const canRedo = useCallback(() => !!historyRef.current?.canRedo, []);
+
   return useMemo(
-    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload }),
-    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload],
+    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
+    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
   );
 }
