@@ -40,17 +40,17 @@ export function isFiltered(q: Query): boolean {
 }
 
 /** Filter counts for the current folder; refreshed whenever the library changes (`epoch`). */
-export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number): FilterCounts | null {
+export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number, keepersOnly = false): FilterCounts | null {
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   useEffect(() => {
     let stale = false;
-    unwrap(commands.getFilterCounts(folderId, projectId, null))
+    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null))
       .then((c) => !stale && setCounts(c))
       .catch(() => {});
     return () => {
       stale = true;
     };
-  }, [folderId, projectId, epoch]);
+  }, [folderId, projectId, epoch, keepersOnly]);
   return counts;
 }
 
@@ -245,12 +245,12 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
 }
 
 /** "Filtered: ... · 12 of 340" / "No filters · 340" (collapsed summary bar and the Develop filmstrip header). */
-export function filterSummaryText(query: Query, shown: number, total: number | null, sceneNumber: (id: number) => number): string {
-  return `${isFiltered(query) ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · ${shown}${total != null ? ` of ${total}` : ""}`;
+export function filterSummaryText(query: Query, shown: number, total: number | null, sceneNumber: (id: number) => number, unit = ""): string {
+  return `${isFiltered(query) ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · ${shown}${total != null ? ` of ${total}` : ""}${unit ? ` ${unit}` : ""}`;
 }
 
 /** 28 px summary shown instead of the filter bars outside the Grid. */
-export function FilterSummary({ query, shown, total, sceneNumber, onEdit }: { query: Query; shown: number; total: number | null; sceneNumber: (id: number) => number; onEdit: () => void }) {
+export function FilterSummary({ query, shown, total, sceneNumber, onEdit, unit = "" }: { query: Query; shown: number; total: number | null; sceneNumber: (id: number) => number; onEdit: () => void; unit?: string }) {
   const filtered = isFiltered(query);
   return (
     <div className="flex h-7 shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs text-neutral-300" data-testid="filter-summary">
@@ -258,6 +258,7 @@ export function FilterSummary({ query, shown, total, sceneNumber, onEdit }: { qu
       <span className="truncate" data-testid="filter-summary-text">
         {filtered ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · {shown}
         {total != null ? ` of ${total}` : ""}
+        {unit ? ` ${unit}` : ""}
       </span>
       <button className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" onClick={onEdit} data-testid="edit-filters">
         Edit filters

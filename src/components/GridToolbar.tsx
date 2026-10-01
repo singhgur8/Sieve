@@ -24,6 +24,8 @@ interface Props {
   total: number;
   /** Photos in the catalog / folder before filtering (null while loading). */
   catalogTotal?: number | null;
+  /** What the photos are called in the count (`keepers` in the Edit / Export steps). */
+  unit?: string;
   capsLock?: boolean;
   autoAdvance: boolean;
   onAutoAdvance: (v: boolean) => void;
@@ -108,7 +110,7 @@ export function GridToolbar(p: Props) {
         </Menu>
       )}
       <span className="ml-auto min-w-[120px] shrink-0 truncate pl-2 text-right" data-testid="selection-count">
-        {p.catalogTotal != null && p.catalogTotal !== p.total ? `${p.total} of ${p.catalogTotal}` : `${p.total} photos`} · {p.selectedCount} selected
+        {p.catalogTotal != null && p.catalogTotal !== p.total ? `${p.total} of ${p.catalogTotal}${p.unit && p.unit !== "photos" ? ` ${p.unit}` : ""}` : `${p.total} ${p.unit ?? "photos"}`} · {p.selectedCount} selected
       </span>
     </div>
     {p.trailing && <div className="flex shrink-0 items-center px-3">{p.trailing}</div>}

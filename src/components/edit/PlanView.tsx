@@ -1,22 +1,21 @@
 // Edit step overview: keepers grouped into scenes, one representative per scene, and a checklist
 // (to do / edited / applied) with Auto edit (my style), Apply to scene and Apply all.
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, ChevronDown, MoreHorizontal } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowRight, ChevronDown, ChevronRight, MoreHorizontal, X } from "lucide-react";
 import type { KeeperRule } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
-import type { SceneRow, Workflow } from "../../hooks/useWorkflow";
+import { rowInTab, type PlanTab, type SceneRow, type Workflow } from "../../hooks/useWorkflow";
 import { Menu, menuItem } from "../Menu";
 import { Dialog } from "../Dialog";
 import { AutoEditButton, StatusIcon, statusLine, Thumb, useWide } from "./bits";
 
-type Tab = "all" | "todo" | "edited" | "applied";
-const TABS: { id: Tab; label: string }[] = [
+const TABS: { id: PlanTab; label: string }[] = [
   { id: "all", label: "All" },
   { id: "todo", label: "To do" },
   { id: "edited", label: "Edited" },
   { id: "applied", label: "Applied" },
+  { id: "skipped", label: "Skipped" },
 ];
-const inTab = (r: SceneRow, t: Tab) => t === "all" || (t === "todo" ? r.ui === "todo" : t === "applied" ? r.ui === "applied" : r.ui === "edited" || r.ui === "auto" || r.ui === "stale");
 
 export const KEEPER_RULES: { rule: KeeperRule; label: string; long: string }[] = [
   { rule: { minRating: 1, useSuggestions: true }, label: "Picks, 1★+, suggested", long: "Picks, anything rated 1★ and up, and photos Sieve suggests" },
@@ -53,16 +52,18 @@ interface Props {
 export function PlanView(p: Props) {
   const { wf } = p;
   const wide = useWide();
-  const [tab, setTab] = useState<Tab>("all");
+  const { tab, setTab } = wf;
   const [confirmRegroup, setConfirmRegroup] = useState(false);
   const rows = wf.rows;
   const keeperCount = wf.plan?.keeperIds.length ?? 0;
-  const todo = rows.filter((r) => r.ui === "todo");
-  const pending = rows.filter((r) => r.ui === "edited" || r.ui === "auto" || r.ui === "stale");
-  const applied = rows.filter((r) => r.ui === "applied");
-  const pendingTargets = pending.reduce((a, r) => a + r.targets, 0);
-  const allDone = rows.length > 0 && applied.length === rows.length;
-  const visible = useMemo(() => rows.filter((r) => inTab(r, tab)), [rows, tab]);
+  const counts = wf.plan?.counts;
+  const todo = rows.filter((r) => r.ui === "todo" && !r.skipped);
+  // Scenes the "Apply" button handles: edited ones, and applied ones that gained keepers since.
+  const pending = rows.filter((r) => !r.skipped && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
+  const pendingTargets = pending.reduce((a, r) => a + (r.ui === "applied" ? r.unapplied.length : r.targets), 0);
+  const allDone = wf.done;
+  const visible = wf.layout.visible;
+  const unassigned = wf.plan?.unassignedKeeperIds.length ?? 0;
   const memberShown = wide ? 8 : 6;
 
   // Keep the thumbnails of every visible row loaded.
@@ -119,10 +120,25 @@ export function PlanView(p: Props) {
   } else {
     body = (
       <div ref={listRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3" data-testid="plan-list">
-        {visible.length === 0 && <p className="py-10 text-center text-sm text-neutral-400">No scenes in this tab.</p>}
-        {visible.map((r) => (
+        {visible.length === 0 && wf.layout.minor.length === 0 && <p className="py-10 text-center text-sm text-neutral-400">No scenes in this tab.</p>}
+        {wf.layout.main.map((r) => (
           <SceneRowView key={r.entry.sceneId} r={r} p={p} memberShown={memberShown} focused={p.focusId === r.entry.sceneId} />
         ))}
+        {wf.layout.minor.length > 0 && (
+          <>
+            <button
+              className="flex h-6 w-full items-center gap-1 rounded text-left text-xs text-neutral-300 hover:text-neutral-100"
+              data-testid="plan-minor-toggle"
+              aria-expanded={wf.minorOpen}
+              onClick={() => wf.setMinorOpen(!wf.minorOpen)}
+            >
+              {wf.minorOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+              Small scenes ({plural(wf.layout.minor.length, "scene")}, {plural(wf.layout.minor.reduce((a, r) => a + r.entry.imageIds.length, 0), "photo")})
+              <span className="h-px flex-1 bg-neutral-800" />
+            </button>
+            {wf.minorOpen && wf.layout.minor.map((r) => <SceneRowView key={r.entry.sceneId} r={r} p={p} memberShown={memberShown} focused={p.focusId === r.entry.sceneId} />)}
+          </>
+        )}
       </div>
     );
   }
@@ -165,20 +181,23 @@ export function PlanView(p: Props) {
             {rows.length > 0 && (
               <div className="flex shrink-0 items-center gap-2 text-xs text-neutral-300" data-testid="plan-progress">
                 <span className="flex h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-neutral-800 min-[1600px]:w-[200px]" aria-hidden>
-                  <span className="h-full bg-emerald-500" style={{ width: `${(applied.length / rows.length) * 100}%` }} />
-                  <span className="h-full bg-sky-500" style={{ width: `${(pending.length / rows.length) * 100}%` }} />
+                  <span className="h-full bg-emerald-500" style={{ width: `${((counts?.applied ?? 0) / rows.length) * 100}%` }} />
+                  <span className="h-full bg-sky-500" style={{ width: `${(((counts?.edited ?? 0) + (counts?.outdated ?? 0)) / rows.length) * 100}%` }} />
                 </span>
                 <span className="whitespace-nowrap" data-testid="plan-counts">
-                  {pending.length} edited · {applied.length} applied · {todo.length} to do
+                  {(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · {counts?.applied ?? 0} applied · {counts?.toEdit ?? 0} to do{(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}
                 </span>
               </div>
             )}
           </>
         )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {busy?.kind === "all" && (
-            <span className="text-xs text-emerald-300" data-testid="plan-applying">
-              Applying… {busy.done}/{busy.total}
+          {(busy?.kind === "all" || busy?.kind === "scene") && (
+            <span className="flex items-center gap-1 rounded-full bg-emerald-950 py-0.5 pl-2.5 pr-1 text-xs text-emerald-300" data-testid="plan-applying">
+              {wf.cancelling ? "Stopping…" : `Applying… ${busy.done}/${busy.total}`}
+              <button className="rounded-full p-0.5 hover:bg-emerald-900 disabled:opacity-40" data-testid="plan-apply-cancel" aria-label="Stop applying (Esc)" title="Stop applying (Esc). Scenes already applied stay applied" disabled={wf.cancelling} onClick={wf.cancelApply}>
+                <X className="size-3" />
+              </button>
             </span>
           )}
           {todo.length > 0 && (
@@ -243,9 +262,20 @@ export function PlanView(p: Props) {
         </div>
       </header>
 
+      {unassigned > 0 && !wf.grouping && (
+        <div className="flex h-8 shrink-0 items-center gap-3 border-b border-amber-900 bg-amber-950 px-3 text-xs text-amber-100" data-testid="plan-unassigned">
+          <span>
+            {unassigned === 1 ? "1 keeper is not in a scene yet." : `${unassigned} keepers are not in a scene yet.`}
+          </span>
+          <button className="rounded bg-amber-800 px-2 py-0.5 font-medium hover:bg-amber-700" data-testid="plan-group-new" onClick={() => void wf.loadPlan(true)}>
+            Group them
+          </button>
+        </div>
+      )}
+
       <div className="flex h-8 shrink-0 items-center gap-1 border-b border-neutral-800 px-3 text-xs" role="tablist">
         {TABS.map((t) => {
-          const n = rows.filter((r) => inTab(r, t.id)).length;
+          const n = rows.filter((r) => rowInTab(r, t.id)).length;
           return (
             <button
               key={t.id}
@@ -336,9 +366,11 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const busyHere = wf.busy?.kind === "scene" && wf.busy.sceneId === id;
   const anyBusy = wf.busy != null;
   const last = wf.batchForScene(id);
-  const applyLabel = r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
-  const canApply = r.ui !== "todo" && r.targets > 0;
+  const newKeepers = r.ui === "applied" ? r.unapplied.length : 0;
+  const applyLabel = newKeepers > 0 ? `Apply to ${newKeepers} new` : r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
+  const canApply = r.ui !== "todo" && r.targets > 0 && !r.skipped;
   const reviewSet = new Set(r.review);
+  const appliedSet = new Set(e.appliedIds);
 
   return (
     <article
@@ -346,7 +378,8 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
       data-status={r.ui}
       data-focused={focused}
       onClick={() => p.onFocus(id)}
-      className={`flex h-[112px] items-center gap-3 rounded-lg border bg-neutral-900 px-3 min-[1600px]:h-[140px] ${focused ? "border-sky-500 ring-2 ring-sky-500" : "border-neutral-800"}`}
+      data-skipped={r.skipped}
+      className={`flex h-[112px] items-center gap-3 rounded-lg border bg-neutral-900 px-3 min-[1600px]:h-[140px] ${r.skipped ? "opacity-60" : ""} ${focused ? "border-sky-500 ring-2 ring-sky-500" : "border-neutral-800"}`}
     >
       <StatusIcon ui={r.ui} />
       <button
@@ -379,7 +412,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         {shown.map((i) => (
           <div key={i} className="relative h-12 w-[72px] shrink-0 overflow-hidden rounded min-[1600px]:h-[60px] min-[1600px]:w-[90px]">
             <Thumb entry={lib.getEntry(i)} version={lib.version(i)} className="size-full" />
-            {reviewSet.has(i) ? <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-1 text-[10px] font-bold text-amber-400">!</span> : r.ui === "applied" && <span className="absolute bottom-0.5 right-0.5 rounded bg-black/60 px-0.5 text-[10px] text-emerald-400">✓</span>}
+            {reviewSet.has(i) ? <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-1 text-[10px] font-bold text-amber-400" data-testid={`plan-mark-review-${i}`}>!</span> : appliedSet.has(i) && <span className="absolute bottom-0.5 right-0.5 rounded bg-black/60 px-0.5 text-[10px] text-emerald-400">✓</span>}
           </div>
         ))}
         {more > 0 && (
@@ -394,18 +427,18 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         )}
       </div>
       <div className="flex shrink-0 items-center justify-end gap-2" onClick={(ev) => ev.stopPropagation()}>
-        {(r.ui === "edited" || r.ui === "auto" || r.ui === "stale") && (
+        {!r.skipped && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || newKeepers > 0) && (
           <button
             className="h-7 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid={`plan-apply-${id}`}
             disabled={!canApply || anyBusy}
-            title={canApply ? `Copies this edit to ${r.targets} photos, matching exposure and white balance to each.` : "No other keepers in this scene"}
+            title={canApply ? (newKeepers > 0 ? `Copies this edit to the ${newKeepers} keepers added since it was applied.` : `Copies this edit to ${r.targets} photos, matching exposure and white balance to each.`) : "No other keepers in this scene"}
             onClick={() => void wf.applyScene(id, "match", p.onReview)}
           >
             {applyLabel}
           </button>
         )}
-        {r.ui === "applied" && r.review.length > 0 && (
+        {r.review.length > 0 && !r.skipped && (
           <button className="h-7 whitespace-nowrap rounded-md bg-amber-900/70 px-3 text-xs font-medium text-amber-100 hover:bg-amber-800" data-testid={`plan-review-${id}`} onClick={() => p.onReview(id)}>
             Review {r.review.length}
           </button>
@@ -417,7 +450,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         >
           {r.ui === "auto" ? "Review" : "Edit"} ▸
         </button>
-        {(r.ui === "todo" || r.ui === "edited") && (
+        {!r.skipped && (r.ui === "todo" || r.ui === "edited") && (
           <AutoEditButton style={wf.style} testid={`plan-auto-${id}`} label="Auto edit" disabled={anyBusy} onClick={() => wf.requestAutoEdit([id])} className="px-2" />
         )}
         <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
@@ -440,6 +473,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
                 {item(`plan-change-rep-${id}`, "Change representative…", () => p.onChangeRep(id))}
                 {item(`plan-options-${id}`, "Apply with options…", () => p.onApplyOptions(id), r.ui === "todo")}
                 {item(`plan-exact-${id}`, "Copy exactly (no matching)", () => void wf.applyScene(id, "exact", p.onReview), r.ui === "todo" || anyBusy || r.targets === 0)}
+                {item(`plan-skip-${id}`, r.skipped ? "Include this scene" : "Skip this scene (S)", () => void wf.setSkipped(id, !r.skipped))}
                 {item(`plan-show-${id}`, `Show all ${e.memberCount} photos`, () => p.onShowScene(id))}
                 {item(`plan-undo-${id}`, "Undo apply", () => last && void wf.undoBatch(last), !last)}
               </div>

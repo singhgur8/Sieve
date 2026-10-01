@@ -25,6 +25,7 @@ interface Props {
   xmp: XmpStatus | null;
   xmpFailures: XmpFailureRow[];
   onOpenXmpErrors: () => void;
+  onShowXmpFailure?: (imageId: number) => void;
   onXmpExplain: () => void;
   busy: boolean;
   mode: Mode | "plan";
@@ -149,7 +150,7 @@ export function TopBar(p: Props) {
         </button>
       )}
 
-      <XmpStatusPill xmp={xmp} failures={p.xmpFailures} onOpenErrors={p.onOpenXmpErrors} onRetry={p.onSaveAllDirty} onSaveAll={p.onSaveAllDirty} onAutoSync={p.onAutoXmp} onExplain={p.onXmpExplain} />
+      <XmpStatusPill xmp={xmp} failures={p.xmpFailures} onOpenErrors={p.onOpenXmpErrors} onShow={p.onShowXmpFailure} onRetry={p.onSaveAllDirty} onSaveAll={p.onSaveAllDirty} onAutoSync={p.onAutoXmp} onExplain={p.onXmpExplain} />
       <button onClick={p.onWriteXmp} disabled={!p.hasSelection} className={btn} data-testid="save-metadata" title={`Write XMP sidecars for the selection${hint("saveXmp")}`}>
         <CloudUpload className="size-4" />
         Save

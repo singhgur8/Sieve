@@ -58,7 +58,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const projectId = project?.id ?? null;
   const [queryState, setQuery] = useState<Query>(BASE_QUERY);
   // The project scope is applied here, so resetting filters (BASE_QUERY) can never leave the project.
-  const query = useMemo<Query>(() => ({ ...queryState, projectId }), [queryState, projectId]);
+  // The Edit and Export steps list the project's keepers only (server-side, so counts and ids agree).
+  const keepersStep = projectId != null && (project?.workflowStep === "edit" || project?.workflowStep === "export");
+  const query = useMemo<Query>(() => ({ ...queryState, projectId, keepersOnly: keepersStep }), [queryState, projectId, keepersStep]);
   const [mode, setMode] = useState<Mode>("grid");
   const [cmp, setCmp] = useState<CompareState | null>(null);
   const [size, setSize] = useState(200);
@@ -114,13 +116,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     onScenesDetected: () => scenes.sync(),
     fileName: (id) => rawLib.getEntry(id)?.fileName ?? `#${id}`,
   });
-  // The Edit step works on the project's keepers only: the grid, loupe and filmstrip list just those.
-  const keeperSet = useMemo(() => (step === "edit" && wf.plan ? new Set(wf.plan.keeperIds) : null), [step, wf.plan]);
-  const scopedIds = useMemo(() => (keeperSet ? rawLib.ids.filter((i) => keeperSet.has(i)) : rawLib.ids), [keeperSet, rawLib.ids]);
-  const lib: Library = keeperSet ? { ...rawLib, ids: scopedIds } : rawLib;
+  // "Show" on an XMP failure: the grid lists just those photos (failures are few, so the id list is cut client-side).
+  const [idFilter, setIdFilter] = useState<{ ids: Set<number>; label: string } | null>(null);
+  useEffect(() => setIdFilter(null), [projectId]);
+  const scopedIds = useMemo(() => (idFilter ? rawLib.ids.filter((i) => idFilter.ids.has(i)) : rawLib.ids), [idFilter, rawLib.ids]);
+  const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
-  const counts = useFilterCounts(query.folderId, projectId, lib.epoch);
+  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
@@ -508,7 +511,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     unwrap(commands.setUiPrefs(next)).catch(reportError);
   }, [uiPrefs, reportError]);
 
-  // Failure list for the status popover: session failures plus, when the catalog knows of more, a scan for entries with an error.
+  // Failure list for the status popover: session failures plus the catalog's list (`list_xmp_failures`) when it is opened.
   const [xmpNames, setXmpNames] = useState<Map<number, string>>(new Map());
   const xmpFailureRows = useMemo(
     () => [...status.xmpFailures].map(([imageId, reason]) => ({ imageId, reason, fileName: rawLib.getEntry(imageId)?.fileName ?? xmpNames.get(imageId) ?? `Photo #${imageId}` })),
@@ -517,24 +520,27 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const { noteXmpFailures } = status;
   const openXmpErrors = useCallback(async () => {
     try {
-      const found: { imageId: number; reason: string }[] = [];
-      const names = new Map<number, string>();
-      for (let offset = 0; ; offset += 1000) {
-        const page = await unwrap(commands.listImages({ ...BASE_QUERY, offset, limit: 1000 }));
-        for (const e of page.items) {
-          if (e.xmp.error) {
-            found.push({ imageId: e.id, reason: e.xmp.error });
-            names.set(e.id, e.fileName);
-          }
-        }
-        if (offset + 1000 >= page.total) break;
-      }
-      setXmpNames(names);
+      const found = await unwrap(commands.listXmpFailures(projectId));
       noteXmpFailures(found, [], true);
+      const entries = await unwrap(commands.getImages(found.slice(0, 200).map((f) => f.imageId)));
+      setXmpNames(new Map(entries.map((e) => [e.id, e.fileName])));
     } catch {
       /* the session failures stay listed */
     }
-  }, [noteXmpFailures]);
+  }, [noteXmpFailures, projectId]);
+  /** Show: leave the Plan / loupe and list the failed photos (all of them, not just this row) in the grid. */
+  const showXmpFailure = useCallback(
+    (imageId: number) => {
+      const failed = new Set([...status.xmpFailures.keys(), imageId]);
+      setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }));
+      setIdFilter({ ids: failed, label: `${plural(failed.size, "photo")} with sidecar errors` });
+      setPlanOpen(false);
+      setCmp(null);
+      setMode("grid");
+      sel.set([imageId], imageId);
+    },
+    [status.xmpFailures, sel],
+  );
 
   const readXmp = useCallback(async () => {
     const t = targets();
@@ -735,18 +741,18 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       const cur = planOpen ? rows.findIndex((r) => r.entry.sceneId === planFocus) : active != null ? rows.findIndex((r) => r.entry.imageIds.includes(active)) : -1;
       for (let k = 1; k <= rows.length; k++) {
         const r = rows[(((cur < 0 ? (dir === 1 ? -1 : 0) : cur) + dir * k) % rows.length + rows.length) % rows.length];
-        if (skipDone && r.ui === "applied") continue;
+        if (skipDone && (r.ui === "applied" || r.skipped)) continue;
         setReviewScene(null);
         if (planOpen) setPlanFocus(r.entry.sceneId);
         else openScene(r.entry.sceneId);
         return;
       }
-      setNotice("Every scene is applied");
+      setNotice("Every scene is applied or skipped");
     },
     [wf.rows, planOpen, planFocus, active, openScene, setNotice],
   );
 
-  /** Review an apply: Develop on the first frame that needs a look; N walks the rest. */
+  /** Review an apply: Develop on the first frame that needs a look; N walks the rest of `plan.needsReviewIds`. */
   const reviewFrames = useCallback(
     (sceneId: number, reviewIds?: number[]) => {
       const row = rowOfScene(sceneId);
@@ -758,14 +764,20 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [rowOfScene, openScene, setNotice],
   );
   const nextReview = useCallback(() => {
-    const row = reviewScene != null ? rowOfScene(reviewScene) : active != null ? rowOfImage.get(active) : undefined;
-    if (!row || row.review.length === 0) return setNotice("No more frames to review");
-    const at = active != null ? row.review.indexOf(active) : -1;
-    const next = row.review[at + 1];
+    const plan = wf.plan;
+    const list = plan?.needsReviewIds ?? [];
+    if (!plan || list.length === 0) return setNotice("No more frames to review");
+    // The frame being fixed leaves the list, so "next" is the first one after it in capture order.
+    const order = new Map(plan.keeperIds.map((id, i) => [id, i]));
+    const at = active != null ? (order.get(active) ?? -1) : -1;
+    const next = list.find((id) => (order.get(id) ?? -1) > at);
     if (next == null) return setNotice("That was the last frame to review");
+    const row = rowOfImage.get(next);
+    if (!row) return;
     setReviewScene(row.entry.sceneId);
-    sel.set([next], next);
-  }, [reviewScene, rowOfScene, rowOfImage, active, sel, setNotice]);
+    if (query.sceneId != null && query.sceneId !== row.entry.sceneId) openScene(row.entry.sceneId, next);
+    else sel.set([next], next);
+  }, [wf.plan, active, rowOfImage, query.sceneId, openScene, sel, setNotice]);
 
   /** Shift+A in the Edit step: the photo becomes the representative of its scene. */
   const makeRepresentative = useCallback(
@@ -932,12 +944,22 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     const inPlan = planOpen && projectId != null && step === "edit";
     if (inPlan && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       // Plan: Up / Down move the row focus, Enter / D open the representative.
-      const at = wf.rows.findIndex((r) => r.entry.sceneId === planFocus);
+      const shown = wf.layout.visible;
+      const at = shown.findIndex((r) => r.entry.sceneId === planFocus);
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        const n = wf.rows[Math.min(wf.rows.length - 1, Math.max(0, at + (e.key === "ArrowDown" ? 1 : -1)))];
+        const n = shown[Math.min(shown.length - 1, Math.max(0, at + (e.key === "ArrowDown" ? 1 : -1)))];
         if (n) setPlanFocus(n.entry.sceneId);
         return;
+      }
+      if (e.key === "Escape" && wf.busy && wf.busy.kind !== "auto") {
+        e.preventDefault();
+        return wf.cancelApply();
+      }
+      if (e.key.toLowerCase() === "s" && planFocus != null) {
+        e.preventDefault();
+        const r = rowOfScene(planFocus);
+        return r ? void wf.setSkipped(planFocus, !r.skipped) : undefined;
       }
       if ((e.key === "Enter" || e.key.toLowerCase() === "d") && planFocus != null) {
         e.preventDefault();
@@ -959,7 +981,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return goStep("export");
       case "nextScene":
         if (step !== "edit") return;
-        if (mode === "develop" && (reviewScene != null || (active != null && (rowOfImage.get(active)?.review.includes(active) ?? false)))) return nextReview();
+        if (mode === "develop" && (reviewScene != null || (active != null && wf.needsReviewSet.has(active)))) return nextReview();
         return stepScene(1, true);
       case "prevScene":
         return step === "edit" ? stepScene(-1, false) : undefined;
@@ -967,6 +989,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         if (step !== "edit") return;
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
         if (!row || row.ui === "todo" || row.targets === 0) return setNotice("Edit this scene's representative first");
+        if (row.skipped) return setNotice("This scene is skipped. Include it first (S in the Plan)");
         return void wf.applyScene(row.entry.sceneId, "match", reviewFrames);
       }
       case "autoEdit": {
@@ -1169,6 +1192,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         xmp={status.xmp}
         xmpFailures={xmpFailureRows}
         onOpenXmpErrors={openXmpErrors}
+        onShowXmpFailure={showXmpFailure}
         onXmpExplain={() => setExplainOpen(true)}
         busy={busy}
         mode={planOpen ? "plan" : mode}
@@ -1196,14 +1220,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 wf.grouping
                   ? "Grouping…"
                   : wf.rows.length > 0
-                    ? wf.rows.every((r) => r.ui === "applied")
+                    ? wf.done
                       ? "All scenes applied"
-                      : `${wf.rows.filter((r) => r.ui === "applied").length} of ${wf.rows.length} scenes`
+                      : wf.plan?.outdated
+                        ? "Needs a look"
+                        : `${wf.rows.filter((r) => r.ui === "applied" || r.skipped).length} of ${wf.rows.length} scenes`
                     : null
               }
               exportSub={exportPct != null ? `Exporting ${exportPct}%` : exportedCount != null ? `Exported ${exportedCount}` : `${project.keeperCount} photos`}
               exportPct={exportPct}
-              editDone={wf.rows.length > 0 && wf.rows.every((r) => r.ui === "applied")}
+              editDone={wf.done}
               onStep={goStep}
             />
           ) : undefined
@@ -1281,13 +1307,21 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
 
+      {idFilter && !planOpen && (
+        <div className="flex h-7 shrink-0 items-center gap-3 border-b border-amber-900 bg-amber-950 px-3 text-xs text-amber-100" data-testid="id-filter-bar">
+          <span>Showing {idFilter.label}</span>
+          <button className="rounded bg-amber-800 px-2 py-0.5 hover:bg-amber-700" data-testid="id-filter-clear" onClick={() => setIdFilter(null)}>
+            Show all
+          </button>
+        </div>
+      )}
       {planOpen ? null : mode === "grid" ? (
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
             <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
           ) : (
-            <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} />
+            <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
           )}
           <GridToolbar
             query={query}
@@ -1297,6 +1331,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             selectedCount={sel.selected.size}
             total={ids.length}
             catalogTotal={counts?.total ?? null}
+            unit={keepersStep ? "keepers" : "photos"}
             capsLock={caps}
             autoAdvance={autoAdvance}
             onAutoAdvance={setAutoAdvance}
@@ -1340,6 +1375,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           query={query}
           shown={ids.length}
           total={counts?.total ?? null}
+          unit={keepersStep ? "keepers" : ""}
           sceneNumber={scenes.number}
           onEdit={() => {
             changeMode("grid");
@@ -1426,7 +1462,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onRate={ratePhoto}
             onFlag={flagPhoto}
             filterSummary={{
-              text: filterSummaryText(query, ids.length, counts?.total ?? null, scenes.number),
+              text: filterSummaryText(query, ids.length, counts?.total ?? null, scenes.number, keepersStep ? "keepers" : ""),
               onEdit: () => {
                 changeMode("grid");
                 setFiltersOpen(true);
@@ -1475,8 +1511,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                             <span className="pointer-events-none absolute left-0.5 top-4 rounded bg-black/70 px-0.5 text-[9px] font-bold text-amber-400">R</span>
                           </>
                         )}
-                        {!isRep && row.review.includes(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-amber-400" data-testid={`film-review-${fid}`}>!</span>}
-                        {!isRep && !row.review.includes(fid) && row.ui === "applied" && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-emerald-400" data-testid={`film-applied-${fid}`}>✓</span>}
+                        {!isRep && wf.needsReviewSet.has(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-amber-400" data-testid={`film-review-${fid}`}>!</span>}
+                        {!isRep && !wf.needsReviewSet.has(fid) && row.entry.appliedIds.includes(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-emerald-400" data-testid={`film-applied-${fid}`}>✓</span>}
                       </>
                     );
                   }
@@ -1508,29 +1544,41 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       </div>
       {matchScene && (
         <MatchPanel
-          scene={matchScene}
+          // In the Edit step the scene's representative is the single anchor of the preview (no anchors are graded there).
+          scene={step === "edit" && matchScene.anchorIds.length === 0 ? { ...matchScene, anchorIds: [rowOfScene(matchScene.id)?.entry.representativeId ?? matchScene.imageIds[0]] } : matchScene}
           sceneNumber={scenes.number(matchScene.id)}
           progress={scenes.progress}
           fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
           onClose={() => setMatchOpen(null)}
-          onApplied={(changed, attempted) => {
+          onApplied={
+            step === "edit"
+              ? undefined
+              : (changed, attempted) => {
+                  setMatchOpen(null);
+                  void lib.refresh(attempted.filter((id) => lib.getEntry(id))).catch(reportError);
+                  setDevEpoch((n) => n + 1);
+                  wf.refreshPlan();
+                  if (changed.length === 0) return setNotice(`Applied Match Scene to 0 of ${plural(attempted.length, "photo")}`);
+                  push(`Applied Match Scene to ${changed.length} of ${plural(attempted.length, "photo")} (history: Match Scene)`, {
+                    action: {
+                      label: "Undo",
+                      testid: "match-undo",
+                      onClick: () =>
+                        void run(async () => {
+                          for (const id of changed) await unwrap(commands.undoAdjustments(id));
+                          await lib.refresh(changed.filter((id) => lib.getEntry(id)));
+                          setDevEpoch((n) => n + 1);
+                          setNotice(`Undid Match Scene on ${plural(changed.length, "photo")}`);
+                        }),
+                    },
+                  });
+                }
+          }
+          onApply={(options) => {
+            const id = matchScene.id;
             setMatchOpen(null);
-            void lib.refresh(attempted.filter((id) => lib.getEntry(id))).catch(reportError);
-            setDevEpoch((n) => n + 1);
-            wf.refreshPlan();
-            if (changed.length === 0) return setNotice(`Applied Match Scene to 0 of ${plural(attempted.length, "photo")}`);
-            push(`Applied Match Scene to ${changed.length} of ${plural(attempted.length, "photo")} (history: Match Scene)`, {
-              action: {
-                label: "Undo",
-                testid: "match-undo",
-                onClick: () =>
-                  void run(async () => {
-                    for (const id of changed) await unwrap(commands.undoAdjustments(id));
-                    await lib.refresh(changed.filter((id) => lib.getEntry(id)));
-                    setDevEpoch((n) => n + 1);
-                    setNotice(`Undid Match Scene on ${plural(changed.length, "photo")}`);
-                  }),
-              },
+            void wf.applyScene(id, options, reviewFrames).then(() => {
+              setDevEpoch((n) => n + 1);
             });
           }}
         />
