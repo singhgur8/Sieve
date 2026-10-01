@@ -12,7 +12,7 @@ use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_specta::Event;
 
@@ -115,6 +115,13 @@ pub struct RunStats {
     pub burst_groups: u32,
 }
 
+/// Measures previews on the pool threads (the real [`AnalyzerPool`]; a stub in tests).
+trait Measure: Sync {
+    /// Fails when the models cannot be loaded (checked once, before the first batch).
+    fn check(&self) -> Result<(), String>;
+    fn measure(&self, preview: &Path) -> Result<ImageMetrics, String>;
+}
+
 /// Lazily loaded analyzers shared by the pool threads (one in use per thread).
 struct AnalyzerPool<'a> {
     models_dir: &'a Path,
@@ -136,15 +143,83 @@ impl AnalyzerPool<'_> {
     }
 }
 
+impl Measure for AnalyzerPool<'_> {
+    fn check(&self) -> Result<(), String> {
+        self.with(|a| {
+            eprintln!("[analysis] execution providers (detector, landmarks): {:?}", a.providers());
+            Ok(())
+        })
+    }
+
+    fn measure(&self, preview: &Path) -> Result<ImageMetrics, String> {
+        self.with(|a| a.measure(preview))
+    }
+}
+
 struct Outcome {
     id: ImageId,
     result: Result<ImageMetrics, String>,
 }
 
+/// How the queue loop ended (when it did not fail).
+enum End {
+    Idle,
+    ModelsMissing,
+}
+
 /// Processes the queue until it is empty and ingest is idle (or cancelled), then runs
 /// the rescore/burst pass and clears `running`. The caller must have claimed `running`.
+/// Emits exactly one `AnalysisFinished`, also when the pass fails (then `cancelled`).
 pub fn run_until_idle(config: &AnalysisConfig, sink: &dyn AnalysisSink, flags: &WorkerFlags) -> AppResult<RunStats> {
-    let mut conn = db::open(&config.catalog_path)?;
+    let analyzers = AnalyzerPool { models_dir: &config.models_dir, free: Mutex::new(Vec::new()) };
+    run_with(config, sink, flags, &analyzers)
+}
+
+fn run_with(
+    config: &AnalysisConfig,
+    sink: &dyn AnalysisSink,
+    flags: &WorkerFlags,
+    measurer: &dyn Measure,
+) -> AppResult<RunStats> {
+    let mut stats = RunStats::default();
+    let mut progress = Progress { done: 0, failed: 0, last: None };
+    let mut conn = None;
+    let end = db::open(&config.catalog_path)
+        .and_then(|c| run_queue(conn.insert(c), sink, flags, measurer, &mut stats, &mut progress));
+    if let Err(e) = &end {
+        eprintln!("[analysis] pass failed: {}", e.message);
+        stats.cancelled = true;
+    }
+    if stats.cancelled {
+        flags.running.store(false, Ordering::SeqCst);
+    } else if stats.burst_groups == 0 {
+        if let Some(conn) = &conn {
+            stats.burst_groups = conn.query_row("SELECT COUNT(*) FROM burst_groups", [], |r| r.get(0)).unwrap_or(0);
+        }
+    }
+    if !matches!(end, Ok(End::ModelsMissing)) {
+        sink.progress(AnalysisProgress { done: progress.done, total: progress.done, failed: progress.failed });
+    }
+    sink.finished(AnalysisFinished {
+        analyzed: stats.analyzed,
+        failed: stats.failed,
+        cancelled: stats.cancelled,
+        burst_groups: stats.burst_groups,
+    });
+    end.map(|_| stats)
+}
+
+/// The queue loop of [`run_until_idle`] (no `AnalysisFinished`; the caller emits it).
+/// Results of images removed from the catalog mid-pass are dropped: they count neither
+/// as done nor as analyzed / failed, and emit no per-image event.
+fn run_queue(
+    conn: &mut Connection,
+    sink: &dyn AnalysisSink,
+    flags: &WorkerFlags,
+    measurer: &dyn Measure,
+    stats: &mut RunStats,
+    progress: &mut Progress,
+) -> AppResult<End> {
     let threads = std::env::var(THREADS_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -155,111 +230,97 @@ pub fn run_until_idle(config: &AnalysisConfig, sink: &dyn AnalysisSink, flags: &
         .thread_name(|i| format!("sieve-analyze-{i}"))
         .build()
         .map_err(|e| AppError::internal(format!("thread pool: {e}")))?;
-    let analyzers = AnalyzerPool { models_dir: &config.models_dir, free: Mutex::new(Vec::new()) };
 
-    let mut stats = RunStats::default();
-    let mut progress = Progress { done: 0, failed: 0, last: None };
     let mut dirty = false;
     let mut models_ok = false;
     loop {
         if flags.cancel.load(Ordering::SeqCst) {
             stats.cancelled = true;
-            break;
+            return Ok(End::Idle);
         }
-        let batch = store::needs_analysis(&conn, BATCH)?;
+        let batch = store::needs_analysis(conn, BATCH)?;
         if batch.is_empty() {
             if sink.ingest_running() {
                 std::thread::sleep(INGEST_POLL);
                 continue;
             }
             if dirty || flags.rescore.swap(false, Ordering::SeqCst) {
-                stats.burst_groups = rescore_all(&mut conn)?;
+                stats.burst_groups = rescore_all(conn)?;
                 dirty = false;
             }
             flags.running.store(false, Ordering::SeqCst);
             // Close the race with a `start` that saw `running == true` just before we
             // cleared it: reclaim the flag if work appeared.
-            let more = store::count_needs(&conn)? > 0 || flags.rescore.load(Ordering::SeqCst);
+            let more = store::count_needs(conn)? > 0 || flags.rescore.load(Ordering::SeqCst);
             if more && flags.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 continue;
             }
-            break;
+            return Ok(End::Idle);
         }
         if !models_ok {
             // Fail fast (without touching rows) when the models are missing: the images
             // stay pending and are picked up once `scripts/fetch-models.sh` has run.
-            if let Err(e) = analyzers.with(|a| {
-                eprintln!("[analysis] execution providers (detector, landmarks): {:?}", a.providers());
-                Ok(())
-            }) {
+            if let Err(e) = measurer.check() {
                 eprintln!("[analysis] models unavailable, analysis stopped: {e}");
-                flags.running.store(false, Ordering::SeqCst);
                 stats.cancelled = true;
-                sink.finished(AnalysisFinished { analyzed: 0, failed: 0, cancelled: true, burst_groups: 0 });
-                return Ok(stats);
+                return Ok(End::ModelsMissing);
             }
             models_ok = true;
         }
-        progress.maybe_emit(&conn, sink, true)?;
+        progress.maybe_emit(conn, sink, true)?;
 
         // Each image is scored with its project's shoot type (IPC v14).
         let mut shoot = ShootTypes::default();
         for (id, _) in &batch {
-            shoot.of_image(&conn, *id)?;
+            shoot.of_image(conn, *id)?;
         }
         let (tx, rx) = mpsc::channel::<Outcome>();
         let cancel = &flags.cancel;
         std::thread::scope(|s| -> AppResult<()> {
             let batch = &batch;
             let pool = &pool;
-            let analyzers = &analyzers;
             s.spawn(move || {
                 pool.install(|| {
                     batch.par_iter().for_each_with(tx, |tx, (id, path)| {
                         if cancel.load(Ordering::SeqCst) {
                             return;
                         }
-                        let result = analyzers.with(|a| a.measure(Path::new(path)));
+                        let result = measurer.measure(Path::new(path));
                         let _ = tx.send(Outcome { id: *id, result });
                     })
                 })
             });
             for out in rx {
-                match out.result {
+                let recorded = match out.result {
                     Ok(metrics) => {
-                        let (shoot_type, thresholds) = shoot.of_image(&conn, out.id)?;
+                        let (shoot_type, thresholds) = shoot.of_image(conn, out.id)?;
                         let scored = score(&metrics, &thresholds, shoot_type);
-                        store::record_measured(&mut conn, out.id, &metrics, &scored)?;
-                        stats.analyzed += 1;
-                        sink.ready(AnalysisReady { image_id: out.id });
+                        let recorded = store::record_measured(conn, out.id, &metrics, &scored)?;
+                        if recorded {
+                            stats.analyzed += 1;
+                            sink.ready(AnalysisReady { image_id: out.id });
+                        }
+                        recorded
                     }
                     Err(reason) => {
-                        store::record_failed(&mut conn, out.id, &reason)?;
-                        stats.failed += 1;
-                        progress.failed += 1;
-                        sink.failed(AnalysisFailed { image_id: out.id, reason });
+                        let recorded = store::record_failed(conn, out.id, &reason)?;
+                        if recorded {
+                            stats.failed += 1;
+                            progress.failed += 1;
+                            sink.failed(AnalysisFailed { image_id: out.id, reason });
+                        }
+                        recorded
                     }
-                }
+                };
+                // An image removed mid-pass (e.g. `remove_project`) is neither done nor
+                // reported; the closing rescore still runs to regroup what remains.
                 dirty = true;
-                progress.done += 1;
-                progress.maybe_emit(&conn, sink, false)?;
+                progress.done += u32::from(recorded);
+                progress.maybe_emit(conn, sink, false)?;
             }
             Ok(())
         })?;
     }
-    if stats.cancelled {
-        flags.running.store(false, Ordering::SeqCst);
-    } else if stats.burst_groups == 0 {
-        stats.burst_groups = conn.query_row("SELECT COUNT(*) FROM burst_groups", [], |r| r.get(0))?;
-    }
-    sink.progress(AnalysisProgress { done: progress.done, total: progress.done, failed: progress.failed });
-    sink.finished(AnalysisFinished {
-        analyzed: stats.analyzed,
-        failed: stats.failed,
-        cancelled: stats.cancelled,
-        burst_groups: stats.burst_groups,
-    });
-    Ok(stats)
 }
 
 struct Progress {
@@ -282,8 +343,11 @@ impl Progress {
 
 /// No-ML pass over every analyzed image: score with the current shoot type and
 /// thresholds, regroup bursts per folder, demote non-keepers, write everything in one
-/// transaction. Returns the number of burst groups.
+/// transaction. Returns the number of burst groups. The transaction is immediate (holds
+/// the write lock while reading) so images removed concurrently are never written back.
 pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let conn: &Connection = &tx;
     let mut shoot = ShootTypes::default();
     let window: u32 = conn
         .query_row("SELECT value FROM catalog_meta WHERE key = 'burst_window_ms'", [], |r| r.get::<_, String>(0))?
@@ -330,7 +394,6 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
         }
     }
 
-    let tx = conn.transaction()?;
     let now = now_ms();
     for (a, s) in analyzed.iter().zip(&scored) {
         store::write_scored(&tx, a.id, s, now)?;
@@ -634,6 +697,125 @@ mod tests {
         let s = store::analysis_status(&conn, false).unwrap();
         assert_eq!((s.pending, s.failed, s.analyzed), (2, 0, 0));
         assert!(rec.finished.lock().unwrap()[0].cancelled);
+    }
+
+    /// Stub measurer: the first `measure` call runs `removal` (every other call waits for
+    /// it, so all results are recorded after it); ids in `fail` fail to measure.
+    struct Stub<F: Fn() + Sync> {
+        once: std::sync::Once,
+        removal: F,
+        fail: Vec<ImageId>,
+    }
+
+    impl<F: Fn() + Sync> Measure for Stub<F> {
+        fn check(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn measure(&self, preview: &Path) -> Result<ImageMetrics, String> {
+            self.once.call_once(&self.removal);
+            let name = preview.file_name().unwrap().to_string_lossy();
+            let id: ImageId = name.split('_').next().unwrap().parse().unwrap();
+            if self.fail.contains(&id) {
+                return Err("broken preview".into());
+            }
+            let mut m = metrics(vec![face(0.4, 0.15, 0.6, 0.28)]);
+            m.phash = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            Ok(m)
+        }
+    }
+
+    fn run_stub(config: &AnalysisConfig, removal: impl Fn() + Sync, fail: Vec<ImageId>) -> (RunStats, Recorder) {
+        let rec = Recorder::default();
+        let flags = WorkerFlags::default();
+        flags.running.store(true, Ordering::SeqCst);
+        let stub = Stub { once: std::sync::Once::new(), removal, fail };
+        let stats = run_with(config, &rec, &flags, &stub).unwrap();
+        assert!(!flags.running.load(Ordering::SeqCst));
+        (stats, rec)
+    }
+
+    fn assert_finished_once(rec: &Recorder, analyzed: u32, failed: u32) {
+        let fin = rec.finished.lock().unwrap().clone();
+        assert_eq!(fin.len(), 1, "exactly one AnalysisFinished");
+        assert_eq!((fin[0].analyzed, fin[0].failed, fin[0].cancelled), (analyzed, failed, false));
+        let last = rec.progress.lock().unwrap().last().unwrap().clone();
+        assert_eq!((last.done, last.total, last.failed), (analyzed + failed, analyzed + failed, failed));
+    }
+
+    #[test]
+    fn images_removed_mid_pass_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 4, &[]);
+        // 2 (measures fine) and 4 (fails to measure) disappear while being measured.
+        let path = config.catalog_path.clone();
+        let removal = move || {
+            db::open(&path).unwrap().execute("DELETE FROM images WHERE id IN (2, 4)", []).unwrap();
+        };
+        let (stats, rec) = run_stub(&config, removal, vec![3, 4]);
+        assert_eq!((stats.analyzed, stats.failed, stats.cancelled), (1, 1, false));
+        assert_eq!(*rec.ready.lock().unwrap(), vec![1]);
+        assert_eq!(rec.failed.lock().unwrap().iter().map(|f| f.image_id).collect::<Vec<_>>(), vec![3]);
+        assert_finished_once(&rec, 1, 1);
+        let conn = db::open(&config.catalog_path).unwrap();
+        let s = store::analysis_status(&conn, false).unwrap();
+        assert_eq!((s.total, s.analyzed, s.failed, s.pending), (2, 1, 1, 0));
+        let rows: u32 = conn.query_row("SELECT COUNT(*) FROM image_analysis", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn project_removed_mid_pass_finishes_for_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 6, &[]);
+        // Project 10: folder 1 (images 1-3); project 11: folder 2 (images 4-6).
+        db::open(&config.catalog_path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO projects (id, name, shoot_type, created_at) VALUES (10, 'a', 'wedding', 0), (11, 'b', 'portrait', 0);
+                 UPDATE folders SET project_id = 10 WHERE id = 1;
+                 INSERT INTO folders (id, path, added_at, project_id) VALUES (2, '/g', 0, 11);
+                 UPDATE images SET folder_id = 2 WHERE id IN (4, 5, 6);",
+            )
+            .unwrap();
+        let path = config.catalog_path.clone();
+        let removal = move || {
+            let (res, ids) = projects::remove_project(&mut db::open(&path).unwrap(), 11).unwrap();
+            assert_eq!((res.removed_images, ids), (3, vec![4, 5, 6]));
+        };
+        let (stats, rec) = run_stub(&config, removal, vec![2, 5]);
+        assert_eq!((stats.analyzed, stats.failed, stats.cancelled), (2, 1, false));
+        let mut ready = rec.ready.lock().unwrap().clone();
+        ready.sort();
+        assert_eq!(ready, vec![1, 3]);
+        assert_eq!(rec.failed.lock().unwrap().iter().map(|f| f.image_id).collect::<Vec<_>>(), vec![2]);
+        assert_finished_once(&rec, 2, 1);
+        let conn = db::open(&config.catalog_path).unwrap();
+        let s = store::analysis_status(&conn, false).unwrap();
+        assert_eq!((s.total, s.analyzed, s.failed, s.pending), (3, 2, 1, 0));
+        let scored: Vec<ImageId> = conn
+            .prepare("SELECT image_id FROM quality_scores ORDER BY image_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(scored, vec![1, 3]);
+    }
+
+    #[test]
+    fn failed_pass_still_finishes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory is not a catalog: the pass fails before the first batch.
+        let config = AnalysisConfig { catalog_path: dir.path().to_path_buf(), models_dir: dir.path().join("none") };
+        let rec = Recorder::default();
+        let flags = WorkerFlags::default();
+        flags.running.store(true, Ordering::SeqCst);
+        let stub = Stub { once: std::sync::Once::new(), removal: || {}, fail: vec![] };
+        assert!(run_with(&config, &rec, &flags, &stub).is_err());
+        assert!(!flags.running.load(Ordering::SeqCst));
+        let fin = rec.finished.lock().unwrap().clone();
+        assert_eq!(fin.len(), 1);
+        assert!(fin[0].cancelled);
     }
 
     /// Real previews from the Phase 2 bench cache + real models.

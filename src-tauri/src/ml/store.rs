@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{AutoTag, ImageMetrics, Scored, MODEL_VERSION};
 use crate::db::now_ms;
@@ -103,9 +103,19 @@ fn stamp(tx: &Transaction, id: ImageId) -> AppResult<i64> {
     Ok(now_ms().max(extracted.unwrap_or(0)))
 }
 
+/// Opens an immediate (write-locked) transaction for the results of image `id`, or `None`
+/// when its `images` row is gone (removed mid-pass, e.g. by `remove_project`). The write
+/// lock makes the existence check and the writes atomic against concurrent removals.
+fn begin_for_image(conn: &mut Connection, id: ImageId) -> AppResult<Option<Transaction<'_>>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)", [id], |r| r.get(0))?;
+    Ok(exists.then_some(tx))
+}
+
 /// One transaction: measurements + scores + faces + auto tags of a measured image.
-pub fn record_measured(conn: &mut Connection, id: ImageId, metrics: &ImageMetrics, scored: &Scored) -> AppResult<()> {
-    let tx = conn.transaction()?;
+/// Returns `false` (nothing written) when the image was removed from the catalog.
+pub fn record_measured(conn: &mut Connection, id: ImageId, metrics: &ImageMetrics, scored: &Scored) -> AppResult<bool> {
+    let Some(tx) = begin_for_image(conn, id)? else { return Ok(false) };
     let now = stamp(&tx, id)?;
     tx.prepare_cached(
         "INSERT INTO image_analysis (image_id, status, model_version, analyzed_at, error, phash, faces_json, metrics_json)
@@ -123,12 +133,13 @@ pub fn record_measured(conn: &mut Connection, id: ImageId, metrics: &ImageMetric
     ])?;
     write_scored(&tx, id, scored, now)?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Records a failed measurement; stale scores and auto tags of the image are removed.
-pub fn record_failed(conn: &mut Connection, id: ImageId, reason: &str) -> AppResult<()> {
-    let tx = conn.transaction()?;
+/// Returns `false` (nothing written) when the image was removed from the catalog.
+pub fn record_failed(conn: &mut Connection, id: ImageId, reason: &str) -> AppResult<bool> {
+    let Some(tx) = begin_for_image(conn, id)? else { return Ok(false) };
     let now = stamp(&tx, id)?;
     tx.prepare_cached(
         "INSERT INTO image_analysis (image_id, status, model_version, analyzed_at, error)
@@ -140,7 +151,7 @@ pub fn record_failed(conn: &mut Connection, id: ImageId, reason: &str) -> AppRes
     tx.execute("DELETE FROM quality_scores WHERE image_id = ?1", [id])?;
     set_auto_tags(&tx, id, &[], &[])?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Writes `quality_scores`, `faces_json` and the per-image auto tags (everything except
