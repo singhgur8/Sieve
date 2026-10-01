@@ -628,7 +628,8 @@ mod tests {
         let flags = WorkerFlags::default();
         kick(&config, &flags, AnalysisScope::Rescore, rec.clone()).unwrap();
         let t = Instant::now();
-        while flags.running.load(Ordering::SeqCst) {
+        // Wait for the finish event: `running` is cleared just before it is sent.
+        while rec.finished.lock().unwrap().is_empty() {
             assert!(t.elapsed() < Duration::from_secs(30));
             std::thread::sleep(Duration::from_millis(5));
         }
