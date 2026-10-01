@@ -990,4 +990,61 @@ mod tests {
             .collect();
         assert_eq!(left, vec![3]);
     }
+
+    #[test]
+    fn v13_history_sources_and_batch_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, sql) in schema::MIGRATIONS[..12].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(
+                r#"INSERT INTO projects (id, name, shoot_type, created_at) VALUES (1, 'p', 'general', 0);
+                 INSERT INTO folders (id, path, added_at, project_id) VALUES (1, '/f', 0, 1);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0);
+                 INSERT INTO adjustment_history (id, image_id, label, params_json, created_at, updated_at) VALUES
+                     (10, 1, 'Original', '{}', 0, 0), (11, 1, 'Exposure', '{"exposure":1}', 0, 0),
+                     (12, 1, 'Paste Settings', '{"exposure":2}', 0, 0), (13, 1, 'Apply to Scene', '{"exposure":3}', 0, 0);
+                 INSERT INTO edit_batches (id, label, kind, created_at) VALUES (5, 'Apply to Scene', 'scene_apply', 0);
+                 INSERT INTO edit_batch_items (batch_id, image_id, scene_id, before_json, after_json)
+                     VALUES (5, 1, NULL, '{"exposure":2}', '{"exposure":3}');
+                 INSERT INTO scenes (id, method, created_at, updated_at) VALUES (3, 'auto', 0, 0);"#,
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let rows: Vec<(i64, Option<String>, Option<i64>)> = conn
+            .prepare("SELECT id, source, batch_id FROM adjustment_history ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (10, Some("sidecar".into()), None),
+                (11, Some("user".into()), None),
+                (12, Some("pasted".into()), None),
+                (13, Some("scene_apply".into()), Some(5)),
+            ]
+        );
+        let (skipped, covered): (bool, Option<String>) = conn
+            .query_row("SELECT skipped, applied_covered_json FROM scenes WHERE id = 3", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((skipped, covered), (false, None));
+        let reviewed: Option<i64> =
+            conn.query_row("SELECT reviewed_at FROM edit_batch_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(reviewed, None);
+    }
 }

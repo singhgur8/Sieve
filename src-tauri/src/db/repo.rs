@@ -526,8 +526,22 @@ fn text_list<T: Copy>(items: &[T], args: &mut Vec<Value>, as_str: fn(T) -> &'sta
     vec!["?"; items.len()].join(",")
 }
 
+/// SQL predicate "is a keeper under `rule`" over the `images` columns prefixed with `prefix`
+/// (`""` or `"i."`); mirror of `KeeperRule::is_keeper_values` (unknown pick values count as
+/// unflagged). Values are integers, so inlining them is injection-safe.
+pub fn keeper_predicate(rule: &KeeperRule, prefix: &str) -> String {
+    format!(
+        "({prefix}pick = 'pick' OR ({prefix}pick <> 'reject' AND ({prefix}rating >= {min} OR \
+         ({sugg} AND {prefix}rating = 0 AND {prefix}id IN \
+         (SELECT image_id FROM quality_scores WHERE suggested_pick = 'pick')))))",
+        min = rule.min_rating,
+        sugg = i32::from(rule.use_suggestions),
+    )
+}
+
 /// `WHERE` clause (with leading space, or empty) and its bound values for `q`'s filters.
-fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
+/// `keepers` = the catalog's keeper rule, required when `q.keepersOnly`.
+fn query_filter(q: &ImageQuery, keepers: Option<&KeeperRule>) -> AppResult<(String, Vec<Value>)> {
     let mut clauses: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
 
@@ -593,6 +607,10 @@ fn query_filter(q: &ImageQuery) -> AppResult<(String, Vec<Value>)> {
     }
     if q.missing_only {
         clauses.push("i.missing_since_ms IS NOT NULL".into());
+    }
+    if q.keepers_only {
+        let rule = keepers.ok_or_else(|| AppError::internal("keepersOnly without a keeper rule"))?;
+        clauses.push(keeper_predicate(rule, "i."));
     }
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
@@ -680,7 +698,8 @@ pub fn list_images(conn: &Connection, q: &ImageQuery) -> AppResult<ImagePage> {
 
 /// Every id matching `q` in sort order; `offset`/`limit` are ignored.
 pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageId>> {
-    let (where_sql, args) = query_filter(q)?;
+    let rule = if q.keepers_only { Some(keeper_rule(conn)?) } else { None };
+    let (where_sql, args) = query_filter(q, rule.as_ref())?;
     let quality = q.sort == ImageSort::Quality;
     let (name_col, overall_col, join) = if quality {
         ("''", "q.overall", " LEFT JOIN quality_scores q ON q.image_id = i.id")
@@ -709,10 +728,20 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
 /// statements per case so SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1`
 /// predicate cannot).
 pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
-    let scope: FolderScope = scope.into();
+    filter_counts_impl(conn, scope.into(), None)
+}
+
+/// [`filter_counts`] over the keepers of `scope` only (`get_filter_counts(.., keepersOnly)`,
+/// IPC v15; keeper rule = the catalog's).
+pub fn filter_counts_keepers(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
+    let rule = keeper_rule(conn)?;
+    filter_counts_impl(conn, scope.into(), Some(&rule))
+}
+
+fn filter_counts_impl(conn: &Connection, scope: FolderScope, keepers: Option<&KeeperRule>) -> AppResult<FilterCounts> {
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
     let scoped;
-    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() {
+    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() && keepers.is_none() {
         true => (
             // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
             // without a temp B-tree; the per-folder rows are summed below.
@@ -726,8 +755,13 @@ pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppRes
             "SELECT COUNT(*) FROM images WHERE missing_since_ms IS NOT NULL",
         ),
         false => {
-            let f = scope.predicate("folder_id");
-            let fi = scope.predicate("i.folder_id");
+            let (f, fi) = match keepers {
+                None => (scope.predicate("folder_id"), scope.predicate("i.folder_id")),
+                Some(rule) => (
+                    format!("{} AND {}", scope.predicate("folder_id"), keeper_predicate(rule, "")),
+                    format!("{} AND {}", scope.predicate("i.folder_id"), keeper_predicate(rule, "i.")),
+                ),
+            };
             scoped = [
                 format!("SELECT pick, rating, COUNT(*) FROM images WHERE {f} GROUP BY pick, rating"),
                 format!(
@@ -776,6 +810,19 @@ pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppRes
         conn.prepare_cached(burst_sql)?.query_row(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?;
     c.missing = conn.prepare_cached(missing_sql)?.query_row(params_from_iter(args.iter()), |r| r.get(0))?;
     Ok(c)
+}
+
+/// Images of `scope` whose last sidecar write / read failed, capture order (IPC v15
+/// `list_xmp_failures`).
+pub fn xmp_failures(conn: &Connection, scope: &FolderScope) -> AppResult<Vec<XmpFailure>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, xmp_error FROM images
+         WHERE xmp_error IS NOT NULL AND {}
+         ORDER BY captured_at_ms IS NULL, captured_at_ms, file_name, id",
+        scope.predicate("folder_id")
+    ))?;
+    let rows = stmt.query_map([], |r| Ok(XmpFailure { image_id: r.get(0)?, reason: r.get(1)? }))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,6 +2134,46 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn keepers_only_query_counts_and_xmp_failures() {
+        let conn = phase4_fixture();
+        let keepers = ImageQuery { keepers_only: true, ..Default::default() };
+        // Default rule (1 star keeps): 1 (2 stars), 2 (picked), 4 (2 stars); 3 is rejected.
+        assert_eq!(ids_for(&conn, keepers.clone()), [1, 2, 4]);
+        assert_eq!(ids_for(&conn, ImageQuery { folder_id: Some(1), ..keepers.clone() }), [1, 2]);
+        let c = filter_counts_keepers(&conn, FolderScope::from(Some(1))).unwrap();
+        assert_eq!((c.total, c.picked, c.rejected, c.unflagged), (2, 1, 0, 1));
+        assert_eq!(c.ratings, vec![0, 0, 1, 0, 0, 1]);
+        assert_eq!(c.burst_groups, 1);
+        assert!(c.tags.iter().all(|t| t.tag != CullTag::Blink), "the rejected frame's tags are not counted");
+        assert_eq!(filter_counts_keepers(&conn, FolderScope::all()).unwrap().total, 3);
+        // Suggestions keep untouched frames; a stricter rule drops the 2-star ones.
+        conn.execute("UPDATE images SET rating = 0 WHERE id = 4", []).unwrap();
+        conn.execute(
+            "INSERT INTO quality_scores (image_id, overall, global_sharpness, face_count, clipped_highlights_pct,
+                                         clipped_shadows_pct, mean_luma, model_version, analyzed_at,
+                                         suggested_rating, suggested_pick)
+             VALUES (4, 0.9, 0.5, 0, 0, 0, 0.5, 'test', 1, 3, 'pick')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(ids_for(&conn, keepers.clone()), [1, 2, 4]);
+        set_keeper_rule(&conn, &KeeperRule { min_rating: 3, use_suggestions: false }).unwrap();
+        assert_eq!(ids_for(&conn, keepers.clone()), [2]);
+        assert_eq!(filter_counts_keepers(&conn, FolderScope::all()).unwrap().total, 1);
+        for id in 1..=4 {
+            let e = get_image(&conn, id).unwrap();
+            let rule = keeper_rule(&conn).unwrap();
+            assert_eq!(rule.is_keeper(&e), ids_for(&conn, keepers.clone()).contains(&id), "SQL mirrors the rule");
+        }
+
+        conn.execute("UPDATE images SET xmp_error = 'read-only volume' WHERE id IN (4, 2)", []).unwrap();
+        let f = xmp_failures(&conn, &FolderScope::all()).unwrap();
+        assert_eq!(f.iter().map(|x| x.image_id).collect::<Vec<_>>(), vec![2, 4], "capture order, undated last");
+        assert_eq!(f[0].reason, "read-only volume");
+        assert_eq!(xmp_failures(&conn, &FolderScope::from(Some(1))).unwrap().len(), 1);
     }
 
     fn ids_for(conn: &Connection, q: ImageQuery) -> Vec<ImageId> {

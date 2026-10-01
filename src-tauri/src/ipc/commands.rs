@@ -3,6 +3,7 @@
 //! be reimplemented by the owning specialist without changing them.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -60,6 +61,31 @@ impl Catalog {
         })
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
+    }
+}
+
+/// Managed state (IPC v15): cancel flag of the running `apply_scene_edit` /
+/// `apply_all_edited_scenes` (`cancel_scene_apply`).
+#[derive(Clone, Default)]
+pub struct SceneApplyControl {
+    cancel: Arc<AtomicBool>,
+}
+
+impl SceneApplyControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&self) {
+        self.cancel.store(false, Ordering::SeqCst);
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 }
 
@@ -220,15 +246,26 @@ pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> A
 }
 
 /// Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
-/// inside a project pass its id). Unknown project -> `not_found`.
+/// inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
+/// (`ImageQuery.keepersOnly`, the Edit / Export steps). Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_filter_counts(
     catalog: State<'_, Catalog>,
     folder_id: Option<FolderId>,
     project_id: Option<ProjectId>,
+    keepers_only: Option<bool>,
 ) -> AppResult<FilterCounts> {
-    catalog.run(move |c| repo::filter_counts(c, FolderScope::resolve(c, folder_id, project_id)?)).await
+    catalog
+        .run(move |c| {
+            let scope = FolderScope::resolve(c, folder_id, project_id)?;
+            if keepers_only.unwrap_or(false) {
+                repo::filter_counts_keepers(c, scope)
+            } else {
+                repo::filter_counts(c, scope)
+            }
+        })
+        .await
 }
 
 // Culling writes. Each marks changed images `xmp.dirty` (DB triggers) and notifies the
@@ -1097,6 +1134,18 @@ pub async fn set_xmp_auto_sync(
     Ok(())
 }
 
+/// Every image whose last sidecar write / read failed (`XmpSyncState.error`), in capture
+/// order, scoped like `get_filter_counts` (`projectId` `null` = whole catalog) (v15). Unknown
+/// project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_xmp_failures(
+    catalog: State<'_, Catalog>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<XmpFailure>> {
+    catalog.run(move |c| repo::xmp_failures(c, &FolderScope::resolve(c, None, project_id)?)).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>) -> AppResult<XmpStatus> {
@@ -1740,15 +1789,61 @@ pub async fn set_scene_representative(
     catalog.run(move |c| scene::workflow::set_representative(c, scene_id, image_id)).await
 }
 
+/// Skips scene `sceneId` in the Edit step (`skipped = true`: counts as done, nothing is
+/// copied to it, `apply_all_edited_scenes` leaves it alone) or includes it again (v15).
+/// Settings are never touched; applying the scene includes it again. Unknown scene ->
+/// `not_found`; a scene without keepers -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_scene_skipped(
+    catalog: State<'_, Catalog>,
+    scene_id: SceneId,
+    skipped: bool,
+) -> AppResult<SceneEditEntry> {
+    catalog.run(move |c| scene::workflow::set_skipped(c, scene_id, skipped)).await
+}
+
+/// Per-photo workflow state of `imageIds` (given order): edit source, the batch / scene the
+/// current settings were applied from, "needs a look" (v15). Unknown ids -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_edit_states(catalog: State<'_, Catalog>, image_ids: Vec<ImageId>) -> AppResult<Vec<ImageEditState>> {
+    catalog.run(move |c| develop::batches::edit_states(c, &image_ids)).await
+}
+
+/// Clears "needs a look" on `imageIds` without changing their settings ("Looks good") (v15).
+/// Images that do not need a look are ignored. Returns the ids that were cleared. Unknown
+/// ids -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn mark_reviewed(catalog: State<'_, Catalog>, image_ids: Vec<ImageId>) -> AppResult<Vec<ImageId>> {
+    catalog.run(move |c| develop::batches::mark_reviewed(c, &image_ids)).await
+}
+
+/// Stops the running `apply_scene_edit` / `apply_all_edited_scenes` (v15; no-op when none):
+/// scenes whose matching finished are committed as the call's batch, the rest are left
+/// alone; that call resolves with `cancelled: true`.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_scene_apply(control: State<'_, SceneApplyControl>) -> AppResult<()> {
+    control.cancel();
+    Ok(())
+}
+
+/// Targets matched per step of an apply; `cancel_scene_apply` takes effect between steps.
+const APPLY_CANCEL_CHUNK: usize = 32;
+
 /// Matches every job's targets to its representative (`match_scene` machinery) off the
-/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets.
+/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets. On cancel
+/// returns the jobs finished before it (and `true`).
 async fn match_scene_jobs(
     app: AppHandle,
     develop: &DevelopCache,
     luts: &LutLibrary,
+    control: SceneApplyControl,
     jobs: Vec<scene::workflow::SceneApplyJob>,
     options: MatchOptions,
-) -> AppResult<(Vec<scene::workflow::SceneApplyJob>, Vec<Vec<MatchPreview>>)> {
+) -> AppResult<(Vec<scene::workflow::SceneApplyJob>, Vec<Vec<MatchPreview>>, bool)> {
     let cache = develop.clone();
     let luts = luts.clone();
     blocking(move || {
@@ -1756,15 +1851,24 @@ async fn match_scene_jobs(
         let total: u32 = jobs.iter().map(|j| j.targets.len() as u32).sum();
         let mut offset = 0u32;
         let mut previews = Vec::with_capacity(jobs.len());
-        for job in &jobs {
+        let mut cancelled = false;
+        'jobs: for job in &jobs {
+            if control.cancelled() {
+                cancelled = true;
+                break;
+            }
             if job.targets.is_empty() {
                 previews.push(Vec::new());
                 continue;
             }
-            let base = offset;
-            let progress = |done: u32, _: u32| emit(base + done, total);
             let mut out = Vec::with_capacity(job.targets.len());
-            for chunk in job.targets.chunks(MatchOptions::MAX_TARGETS) {
+            for chunk in job.targets.chunks(APPLY_CANCEL_CHUNK) {
+                if control.cancelled() {
+                    cancelled = true;
+                    break 'jobs;
+                }
+                let base = offset + out.len() as u32;
+                let progress = |done: u32, _: u32| emit(base + done, total);
                 out.extend(scene::matching::match_images(
                     &cache,
                     &luts,
@@ -1777,21 +1881,28 @@ async fn match_scene_jobs(
             offset += job.targets.len() as u32;
             previews.push(out);
         }
-        emit(total, total);
-        Ok((jobs, previews))
+        if !cancelled {
+            emit(total, total);
+        }
+        let mut jobs = jobs;
+        jobs.truncate(previews.len());
+        Ok((jobs, previews, cancelled))
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_scenes(
     app: AppHandle,
     catalog: &Catalog,
     develop: &DevelopCache,
     luts: &LutLibrary,
     xmp: &XmpSync,
+    control: &SceneApplyControl,
     scene_ids: SceneIds,
     options: Option<SceneApplyOptions>,
 ) -> AppResult<ApplyScenesResult> {
+    control.reset();
     let options = options.unwrap_or_default();
     options.match_options.validate().map_err(AppError::invalid)?;
     let opts = options.clone();
@@ -1804,8 +1915,9 @@ async fn apply_scenes(
             scene::workflow::apply_inputs(c, &ids, &opts)
         })
         .await?;
-    let (jobs, previews) = match_scene_jobs(app.clone(), develop, luts, jobs, options.match_options).await?;
-    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews)).await?;
+    let (jobs, previews, cancelled) =
+        match_scene_jobs(app.clone(), develop, luts, control.clone(), jobs, options.match_options).await?;
+    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews, cancelled)).await?;
     if !result.batch.changed_ids.is_empty() {
         xmp.notify(&app);
     }
@@ -1822,35 +1934,44 @@ enum SceneIds {
 /// normalised per frame, `SceneApplyOptions.matchOptions`), skipping frames the user retouched
 /// after the last apply (`skipUserEdited`). One undoable batch (`undo_edit_batch`); one "Apply
 /// to Scene" history entry per changed image. Blocking until done (`sceneProgress` task
-/// `apply`). Representative without edits -> `invalid_argument`.
+/// `apply`; `cancel_scene_apply` stops it). Representative without edits ->
+/// `invalid_argument`. v15: `excludeIds` are left alone; non-converged targets are stored as
+/// "needs a look" (`ImageEditState`); a skipped scene is included again; the scene's coverage
+/// is recorded (`SceneEditEntry.unappliedKeeperIds`).
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_scene_edit(
     app: AppHandle,
     catalog: State<'_, Catalog>,
     develop: State<'_, DevelopCache>,
     luts: State<'_, LutLibrary>,
     xmp: State<'_, XmpSync>,
+    control: State<'_, SceneApplyControl>,
     scene_id: SceneId,
     options: Option<SceneApplyOptions>,
 ) -> AppResult<ApplyScenesResult> {
-    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::One(scene_id), options).await
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, &control, SceneIds::One(scene_id), options).await
 }
 
-/// `apply_scene_edit` for every scene of `projectId` whose status is `edited` or `outdated`,
-/// as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
+/// `apply_scene_edit` for every scene of `projectId` that is not skipped and whose status is
+/// `edited` or `outdated`, or `applied` with `unappliedKeeperIds` (v15), as one undoable
+/// batch. No such scene -> empty result (`batch.batchId = null`). `excludeIds` apply to every
+/// scene.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_all_edited_scenes(
     app: AppHandle,
     catalog: State<'_, Catalog>,
     develop: State<'_, DevelopCache>,
     luts: State<'_, LutLibrary>,
     xmp: State<'_, XmpSync>,
+    control: State<'_, SceneApplyControl>,
     project_id: ProjectId,
     options: Option<SceneApplyOptions>,
 ) -> AppResult<ApplyScenesResult> {
-    apply_scenes(app, &catalog, &develop, &luts, &xmp, SceneIds::EditedIn(project_id), options).await
+    apply_scenes(app, &catalog, &develop, &luts, &xmp, &control, SceneIds::EditedIn(project_id), options).await
 }
 
 /// Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
@@ -1961,7 +2082,12 @@ pub async fn apply_style_prediction(
     let predictions = blocking(move || model.predict(&cache, &lut_lib, &inputs)).await?;
     let items: Vec<develop::batches::BatchItem> = predictions
         .into_iter()
-        .map(|p| develop::batches::BatchItem { image_id: p.image_id, adjustments: p.adjustments, scene_id: None })
+        .map(|p| develop::batches::BatchItem {
+            image_id: p.image_id,
+            adjustments: p.adjustments,
+            scene_id: None,
+            review_reason: None,
+        })
         .collect();
     let r = catalog
         .run(move |c| {

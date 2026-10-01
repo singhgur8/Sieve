@@ -10,6 +10,7 @@ import type {
   ColorGrading,
   ColorWheel,
   CropSettings,
+  EditPlan,
   ExportFormatKind,
   HslChannels,
   ImageFormat,
@@ -357,6 +358,15 @@ export function isKeeperValues(
 /** Keeper rule on an image. Mirror of Rust `KeeperRule::is_keeper`. */
 export function isKeeper(rule: KeeperRule, e: RawImageEntry): boolean {
   return isKeeperValues(rule, e.pick, e.rating, e.quality?.suggestedPick);
+}
+
+/**
+ * The Edit step is complete (IPC v15): every scene is applied or skipped and the plan covers
+ * every keeper (`!plan.outdated`: no keepers outside a scene, none added to an applied scene
+ * since its apply). An empty plan (no keepers) is not done.
+ */
+export function isEditPlanDone(plan: EditPlan): boolean {
+  return plan.scenes.length > 0 && !plan.outdated && plan.scenes.every((s) => s.skipped || s.status === "applied");
 }
 
 /** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */

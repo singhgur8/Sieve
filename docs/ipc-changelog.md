@@ -838,3 +838,105 @@ Who updates what
   the v14 default auto-sync on (off otherwise for the existing suites); style library, auto tone/WB, edit plan,
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
+
+## v15 — 2026-09-30 (Phase 8b feedback: persisted workflow state, skipped / minor scenes, apply options)
+Schema v13 (`migrations/0013_workflow_state.sql`). Driven by `docs/ux-review-8b.md` P1-2..P1-5 and the triage's P2
+backend items. **Breaking** for TS callers in two places: `get_filter_counts` has a third argument
+(`keepersOnly: boolean | null`), and object literals typed as `SceneEditEntry` / `EditPlan` /
+`SceneApplyOutcome` / `ApplyScenesResult` need the new fields (only the mock builds them). Everything else is
+additive. `src/ipc/bindings.ts` regenerated.
+
+Per-photo workflow state (P1-2)
+- `EditSource = "none" | "user" | "pasted" | "auto_style" | "scene_apply" | "sidecar"`.
+- `ImageEditState {imageId, editSource, batchId, appliedSceneId, needsReview, reviewReason}`.
+  Derived from the history entry the image's cursor points at (`adjustment_history.source` / `batch_id`, new in
+  schema v13), so it is persisted, survives reloads / project switches, and follows per-image undo / redo.
+  `needsReview` is set by an apply for targets whose match did not converge (`SceneApplyOutcome.notConvergedIds`;
+  `reviewReason` = the match notes, else "Exposure or white balance did not fully match the representative") and
+  clears as soon as the image is edited in any way (its settings no longer come from that apply), or with
+  `mark_reviewed`. A per-image undo back to the applied settings shows it again (unless marked reviewed).
+  `undo_edit_batch` restores the provenance the frames had before the batch.
+- `get_edit_states(imageIds) -> ImageEditState[]` (any image, e.g. the Develop chip / filmstrip outside the plan);
+  `mark_reviewed(imageIds) -> ImageId[]` ("Looks good": clears needs-a-look without touching settings; returns
+  the ids that were cleared).
+- `EditPlan` += `editStates` (one per keeper, `keeperIds` order), `needsReviewIds` (keepers, capture order).
+- `SceneEditEntry` += `appliedIds` (members whose current settings came from an apply; non-keepers included when
+  applied to), `needsReviewIds` (keepers), `autoEdited` (the representative's current settings came from the
+  style model).
+
+Coverage of applies (P1-3) and the plan `outdated` flag
+- `SceneEditEntry.unappliedKeeperIds`: for an applied, not-skipped scene, keepers the last apply did not cover
+  (became keepers / moved into the scene after it), not the representative, and with no edit of their own
+  (`editSource` `none` or `auto_style`). "Apply to N new" = the existing `apply_scene_edit` (frames applied
+  before come out unchanged and get no new history entry). Applies before v15 have no recorded coverage: their
+  unapplied keepers are the non-representative keepers that still have no edit.
+- `EditPlan.outdated`: `unassignedKeeperIds` non-empty or any not-skipped scene has `unappliedKeeperIds`.
+  "All done" = `isEditPlanDone(plan)` (new TS helper in `src/ipc/index.ts`): scenes non-empty, `!outdated`, every
+  scene applied or skipped.
+- `apply_all_edited_scenes` now also applies `applied` scenes with `unappliedKeeperIds`, and never skipped scenes.
+
+Skipped and minor scenes (P1-4)
+- `set_scene_skipped(sceneId, skipped) -> SceneEditEntry` (no settings change; idempotent; unknown scene ->
+  `not_found`, no keepers -> `invalid_argument`). `SceneEditEntry.skipped`; the status is kept (read `skipped`
+  first). Applying a skipped scene includes it again. The flag (and the coverage) follow the representative
+  through re-detection like the rest of the plan state.
+- `SceneEditEntry.minor` = at most `MINOR_SCENE_MAX_KEEPERS` (= 2, exported constant) keepers.
+- `EditPlan.counts: EditPlanCounts {scenes, toEdit, edited, applied, outdated, skipped, minor, needsReview,
+  unappliedKeepers, unassignedKeepers}`; status counts exclude skipped scenes.
+
+Apply options (P1-5) and cancel (P2-4)
+- `SceneApplyOptions.excludeIds?: ImageId[]` (optional on the wire; `DEFAULT_SCENE_APPLY_OPTIONS.excludeIds = []`):
+  frames left alone, reported in the new `SceneApplyOutcome.excludedIds`, and counted as covered (they do not
+  become `unappliedKeeperIds`). "Apply with options…" should now call `apply_scene_edit(sceneId, {matchOptions:
+  panel options, excludeIds: unchecked frames, ...})` instead of `match_scene` + `apply_scene_match`, so it is a
+  batch (plan status, needs-a-look, one-step undo via `undo_edit_batch`). `match_scene` stays the preview path.
+- `cancel_scene_apply()`: stops the running `apply_scene_edit` / `apply_all_edited_scenes` between steps of 32
+  targets; scenes whose matching finished are committed as the call's batch, the rest are untouched; the call
+  resolves with `ApplyScenesResult.cancelled = true` (new field; `scenes` = the committed scenes only).
+
+Server-side keepers filter (P2-5) and XMP failures (P2-6)
+- `ImageQuery.keepersOnly?: boolean` (optional, default false): keepers under the catalog's `KeeperRule` (SQL
+  mirror of `KeeperRule::is_keeper_values`).
+- `get_filter_counts(folderId, projectId, keepersOnly)` — **new third argument** (`null` = false): every facet
+  counted over keepers only, for the Edit / Export steps ("15 of 42 keepers").
+- `list_xmp_failures(projectId | null) -> XmpFailure[]` (images whose last sidecar write/read failed, capture
+  order; replaces paging the catalog in `openXmpErrors`). "Show" = grid query by ids (`get_images`).
+
+Schema v13
+- `adjustment_history.source` (CHECK user/pasted/auto_style/scene_apply/sidecar; backfilled from labels: Original
+  and "Read from XMP" -> sidecar, "Apply to Scene"/"Match Scene" -> scene_apply, "Auto Edit (My Style)" ->
+  auto_style, Paste/Sync/Paste from Previous -> pasted, else user), `adjustment_history.batch_id` (backfilled from
+  matching `edit_batch_items`), `edit_batch_items.before_source / before_batch_id / review_reason / reviewed_at`,
+  `scenes.skipped`, `scenes.applied_covered_json`.
+
+Who updates what
+- architect (done): types, schema v13, commands + registration (`SceneApplyControl` managed state), bodies
+  (`develop::history::source_for_label`, `develop::batches::{edit_states, edit_states_where, mark_reviewed}` +
+  provenance in `commit_recorded` / `undo`, `scene::workflow` plan fields / skip / coverage / exclusions / cancel,
+  `scene::store::replace_scenes` carries `skipped` + coverage, `repo::{keeper_predicate, filter_counts_keepers,
+  xmp_failures}`), Rust tests, bindings, `isEditPlanDone` in `src/ipc/index.ts`, mock backend (everything above
+  emulated; mock applies take one `__mockSceneDelay` step per scene and honour `cancel_scene_apply` between
+  scenes), `FilterBar.tsx` compile fix (`getFilterCounts(folderId, projectId, null)`).
+- frontend-dev:
+  1. P1-2: delete `useWorkflow`'s session maps (`review`, `autoAt`, `appliedCount`); derive the row / strip /
+     chip markers from `EditPlan` (`scenes[i].needsReviewIds`, `appliedIds`, `autoEdited`, `editStates`) and, for
+     photos outside the plan, `getEditStates(ids)`. Refetch the plan (or `getEditStates([id])`) after
+     `save_adjustments` / undo so the "!" clears when the user edits the frame. Add a "Looks good" action on the
+     needs-look chip -> `markReviewed([id])`. Review navigation (N) walks `plan.needsReviewIds`.
+  2. P1-3: status line `Applied to N · M new keepers not edited` + primary `Apply to M new` when
+     `unappliedKeeperIds.length > 0`; the "keepers not in a scene" banner from `unassignedKeeperIds` (`[Group
+     them]` -> detect + reload); `allDone` / "All scenes applied" via `isEditPlanDone(plan)`.
+  3. P1-4: `Skipped N` tab (`counts.skipped`), row ⋯ Skip / Include (`setSceneSkipped`), key S in the Plan,
+     skipped rows dimmed, minor scenes (`minor`) folded last under "Small scenes (N scenes, M photos)"; tab counts
+     from `plan.counts`.
+  4. P1-5: MatchPanel "Apply" -> `applySceneEdit(sceneId, {...DEFAULT_SCENE_APPLY_OPTIONS, matchOptions,
+     excludeIds})` with the same toast / `LastBatch` as Apply to scene (drop the per-image undo loop).
+  5. P2-4: × on the `Applying… n/N` pill and Esc in the Plan -> `cancelSceneApply()`; handle `result.cancelled`
+     (toast "Stopped after N scenes" with Undo when `batch.batchId`).
+  6. P2-5: Edit / Export step grids query with `keepersOnly: true` and `getFilterCounts(null, projectId, true)`;
+     filmstrip header "15 of 42 keepers".
+  7. P2-6: `openXmpErrors` -> `listXmpFailures(projectId)`; each row gets a `Show` link (grid filtered to the
+     failed ids).
+- rust-engine-dev / vision-ml-dev: nothing required. New multi-image write paths that should count as an apply or
+  auto edit must go through `develop::batches::commit_recorded` (it stamps the history entries); labels decide the
+  source of everything else (`history::source_for_label`).
