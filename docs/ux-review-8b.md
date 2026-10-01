@@ -227,3 +227,77 @@ Register every new chord in `KEYMAP` so `hint()` and the cheat sheet pick it up.
 - Develop layout: panel order, tool strip, single-row sliders, Copy… / Paste and Previous / Reset placement, the grouped Copy Settings dialog (`1280-55-copy.png`), the viewer toolbar.
 - Compare view (`1280-10-compare.png`), the XMP explainer copy and the XMP popover.
 - Export dialog with the `Keepers (43)` scope, default from step 3 (`1280-63-export.png`).
+
+## Re-check (2026-09-30, `phase-8b-feedback` @ 1d0bdb9)
+
+Author: ux-designer (read-only). Evidence: mock backend (`vite --port 1933`, `/?mock=201&style=ready`), Chromium at 1280×800 and 1728×1117.
+Drivers: `test-data/ux-review-8b/recheck/{recheck,recheck2,probe3,probe4}.spec.ts` (config `pw.config.ts`). Logs: `recheck.log`, `probe3.log`, `probe4.log`.
+Screenshots: `test-data/ux-review-8b/recheck/{1280,1728}-NN-*.png`.
+
+**Result: all 2 P0 and 9 P1 from the review are resolved. The fixes add 2 new P1s, so the gate "no open P0/P1" is not met yet.**
+Both new P1s are small, contained frontend fixes. One of them also needs a backend guard **[ARCH]**.
+
+### Original P0/P1 status
+
+| Item | Status | Evidence |
+|---|---|---|
+| P0-1 Scene nav lands on the first frame | **Resolved** | `recheck.log`: reps 23/55/96. `›`=55, N=96, Shift+N=55, `‹`=23, and the checklist jump to Scene 3 = 96. Every one has `edit-chip=rep`, at both sizes. `1280-11-develop-next-scene.png` shows `Scene 2 of 3 · To do · representative` on DSC00055. |
+| P0-2 Stuck profile hover preview | **Resolved** | Hover `Preview: Adobe Standard`, then Esc: label count 0, browser closed, still in Develop. No label after Cmd+U. Leaving a preset hover clears it as well (`1280-13/14`). |
+| P1-1 Toast Review does nothing | **Resolved** for Apply to scene / Apply all: toast Review opens Develop on 21 with `chip=review` (`1280-18-review-frame.png`). **New P1-10** covers a regression on the "Apply with options…" path. |
+| P1-2 Session-only needs-a-look | **Resolved** | After Home and back, scene 1 still reads `Applied to 15 · 1 need a look` and scene 2 still reads `auto` (`1280-19-plan-after-home.png`). Editing 21 clears its `!` (chip `member`, no `film-review-21`). Cmd+Z brings it back (chip `review`), as specified. Not verified across a real page reload, because the mock resets (frontend's stated limit). |
+| P1-3 New keepers after apply | **Resolved** | After Apply all, picking frame 4 in Cull gives `Applied to 15 · 1 need a look · 1 new keeper not edited`, `Apply to 1 new`, the step pill reads `Needs a look`, and `Continue to Export` is hidden (`1280-61-plan-new-keeper.png`). The Develop context bar offers `Apply to 1 new` (`1280-62`). The unassigned banner `15 keepers are not in a scene yet. [Group them]` renders correctly at both sizes (`*-47-plan-unassigned-minor.png`). |
+| P1-4 Skip / minor scenes | **Resolved** | S on the focused row toggles skip at both sizes. Skipped rows are at opacity 60 with `Skipped, no edit copied` and appear under the `Skipped 1` tab (`1280-15-plan-skipped.png`). The state persists through Home and back. `Small scenes (1 scene, 2 photos)` is folded last, and its rows can be reached with ↓ once expanded. |
+| P1-5 Options apply bypasses the batch | **Resolved** as specified: it now goes through `apply_scene_edit`, the row reads Applied, and there is one toast with `Review` and `Undo`. **New P1-10** covers the target set it now uses. |
+| P1-6 Single-level batch undo | **Resolved** | Apply, then Cmd+Z, undoes the apply, and its toast Undo disappears (`undo buttons=0`). The suite covers Auto edit then two Cmd+Z presses. **New P1-11** covers out-of-order undo from an older toast. |
+| P1-7 Toolbar overflow at 1280 | **Resolved** | `grid-toolbar` scrollWidth 1044 equals clientWidth 1044. `View ▾` holds Size, Sort, direction and Auto-advance, and Esc closes it (`1280-03-view-menu.png`). Nothing overflows the viewport in Cull, Plan, Develop, the Edit-step grid, the Match panel, the Applying state or Export at 1280 (`recheck.log` overflow lines; the filmstrip's own horizontal scroll is expected). |
+| P1-8 Cheat sheet keyboard | **Resolved** | PgDn + Space scroll it (scrollTop 894 at 1280) and the sheet stays open. Type-to-filter works. The first Esc clears the filter and the second closes the sheet. In the Edit step the subtitle reads `Showing Edit step first` with Workflow listed first (`1280-52-cheat-plan.png`). |
+| P1-9 Import options in New project | **Resolved** | Both checkboxes are present, and Pair is enabled only when Include is on (`1280-01b-new-project-checked.png`). |
+
+### Regression checks (keyboard, layout)
+
+- **S in the Plan**: no conflict. Plain S is unbound everywhere else. Shift+S is inert in the Plan (it is in `PLAN_INERT`; `scene-strip` count stays 0). Cmd+S (save), Cmd+Shift+S and Cmd+Alt+S (sync) are only reached with modifiers. With Caps Lock on, S still works (the handler lowercases the key). S does nothing in the Edit-step grid or in Develop (no toast, no state change). When a row button has DOM focus (Tab), S acts on the focused row, which is consistent.
+- **Esc in the Plan**: when idle it does nothing (it keeps the row focus and does not leave the Plan). With a row ⋯ menu open during an apply, the first Esc closes only the menu and the apply keeps running (`menu=0 applying=1`). The second Esc cancels it, with the toast `Stopped after 1 scene (15 photos)`. Esc in Develop closes the profile browser and stays in Develop.
+- **Layout at 1280**: no new overflow (see P1-7). The top bar shows a label only on the active segment (`Plan`), and Snapshots is hidden.
+
+### New P1
+
+#### P1-10 "Apply with options…" in the Edit step edits non-keepers, so its counts disagree with the row and its toast Review opens an empty Develop
+- **Where**: `src/components/scenes/MatchPanel.tsx` `apply()` (l. 110–120) hard-codes `includeNonKeepers: true, skipUserEdited: false`. The panel's card list is every scene member except the rep. `App.tsx` `reviewFrames` (l. 756) then opens whatever id it receives.
+- **Evidence** (`probe3.log`, `1280-42-match-panel-run.png`, `1280-60-options-toast-review.png`): Scene 3 has 10 keepers and the plan button reads `Apply to 9`. The panel reads `19 targets` and `Apply to 19 photos`, listing non-keepers 82, 83, 84 and others. After the apply, the row reads `Applied to 19` with no needs-a-look, but the toast reads `Applied Scene 3 to 18 photos · 3 need a look`. Those 3 frames (84, 91, 98) are non-keepers. Toast `[Review]` opens Develop with no image: the viewer is black, the Navigator says `No preview`, the context bar says `Not in a scene`, the sliders sit at defaults, and N does nothing.
+- **Why it matters**: the photographer opens "with options" to adjust strength or untick a frame. Instead the edit spreads to culled-out frames, the counts in the toast, the row and the button no longer agree, and the Review button leads to a blank, editable-looking screen. Separately, `skipUserEdited: false` silently overwrites frames the user had retouched by hand, while the plain Apply leaves them alone.
+- **Fix spec (frontend)**:
+  1. In the Edit step (`onApplied` undefined), the panel's targets are the scene's **keepers** minus the rep, which is the same set as `Apply to N`. Next to `Include rejected (n)`, add a checkbox `Include non-keepers (n)` (`match-include-nonkeepers`), off by default. When on, add those cards and send `includeNonKeepers: true`. Otherwise send `false`, and do not list non-keeper ids in `excludeIds`.
+  2. Cards for frames whose `editSource` is `user` or `pasted` (`get_edit_states`) start unchecked, with a neutral badge `Edited by you`. Keep `skipUserEdited: false` so an explicit tick overrides. The footer reads `n of m selected · k edited by you (unticked)`.
+  3. Guard in `reviewFrames`: keep only ids in the current result set (`ids`). If none remain, show the toast `The frames that need a look are not keepers` and do not change view. Develop must never open with an id outside the result set.
+  4. Acceptance: in Scene 3, Options gives `Apply to 9 photos`. The toast count matches the row's `need a look`, and toast Review lands on a keeper with `chip=review`.
+
+#### P1-11 Undo on an older toast silently undoes a batch that a newer batch was built on **[ARCH]**
+- **Where**: `useWorkflow` batch stack and toast actions. Every Undo toast stays clickable, whatever was applied after it.
+- **Evidence** (`probe4.log`, `1280-64-older-undo.png`): run Auto edit (3 scenes), then Apply Scene 1, then click Undo on the *older* toast `Auto edited 3 scenes`. Scene 1 still reads `Applied to 15 · 1 need a look`, and its rep 23 still shows `Applied · representative`, but its exposure is back to 0 (Original). Member 24 keeps `From Scene 1's edit ✓` with exposure 0.9, which was derived from the undone look.
+- **Why it matters**: the plan says the scene is done, while the representative and its 15 frames no longer match. An export would deliver an inconsistent scene, and nothing on screen says so. Lightroom's undo is strictly linear, and photographers expect the same here.
+- **Fix spec (frontend)**: a toast's Undo is shown only while its batch is the **newest** entry of the batch stack *and* no later culling or adjustment commit touched its images. Otherwise remove the button and keep the text, as is already done for undone batches. The row ⋯ `Undo apply` follows the same rule. Cmd+Z behaviour is unchanged.
+- **[ARCH]**: `undo_edit_batch` must return `conflict` ("Later edits on n photos; undo those first") when any image in the batch has a history entry newer than the batch's entry. The plan status should also stop reporting `applied` when the rep's current settings no longer equal `applied_params_json`; check that the real backend, not only the mock, recomputes this after an undo of the rep's batch.
+
+### Remaining P2 (none block the gate)
+
+Done since the review: P2-1 (label on the active segment), P2-2 (Snapshots hidden), P2-4 (apply cancel ×/Esc), P2-5 (keepers filter: `16 of 44 keepers` in the grid and filmstrip), P2-6 (`list_xmp_failures` + Show), P2-10 (plan filenames now `neutral-400`).
+
+Still open:
+1. P2-3: the histogram is hidden while Masks is open.
+2. P2-7: Shift+S in the Edit step still toggles the hidden scene strip. It does not toggle `This scene only` (`1280-63-develop-shift-s.png`).
+3. P2-8: the disabled Auto edit still explains itself only through `title` (no `aria-disabled` pattern).
+4. P2-9: toasts cover the Develop viewer toolbar (Before / Split / Compare / flags) at 1280. Undo toasts also persist and stack, so two toasts cover it for minutes (`1280-62-develop-new-keeper.png`). Raise the stack above the toolbar, and auto-dismiss Undo toasts after 10 s (the Undo stays reachable with Cmd+Z).
+5. P2-11: the XMP `pending` pill is still amber with a ring.
+6. P2-12: the keeper rule menu has no `Applies to all projects` footer.
+7. P2-13: home keyboard (Cmd+Shift+I, Cmd+F or `/`, arrow keys between cards) and Cmd+Shift+O for the project switcher are not bound.
+8. P2-14: the plan member strip is fixed at 6 or 8 thumbs, which leaves about 220 px empty at 1728 (`1728-47`).
+9. P2-15: the `S1`/`S2` scene badge appears on every filmstrip cell (`1280-11`).
+10. New: the cheat sheet does not list the Plan keys. Filtering for "skip" returns no rows (`1280-04b`). Add Workflow rows `S | Skip / include the focused scene | Plan` and `Esc | Stop applying | Plan` (register them in `KEYMAP`, matched by the Plan handler), and add `(S)` to the `Include this scene` menu item.
+11. New: the progress pill reads `Applying… 0/0` before the first progress event (`1280-44-applying.png`). Show `Applying…` until `total > 0`.
+12. New: the header primary reads `Apply 0 edited scenes (0)` (disabled) when the plan is outdated only through unassigned keepers (`*-47`). Hide the button when there is nothing to apply; the banner's `Group them` is the next action.
+13. New: the batch undo stack is session-only. After Home and back, Cmd+Z reports `Nothing to undo` and the row ⋯ `Undo apply` is disabled, although `undo_edit_batch` could still undo the scene's last batch. Enable row `Undo apply` from persisted plan state (the scene's last batch id, **[ARCH]** if that is not exposed). Cmd+Z may stay session-scoped, which matches Lightroom.
+14. New: the View ▾ popover's sort-direction control is an icon-only, full-width button (`1280-03-view-menu.png`). Label it `Ascending` / `Descending` with the icon.
+15. Noted, not a defect: the Match panel outside the Edit step still uses `apply_scene_match` with a per-photo Undo loop (frontend decision). That flow is only for Library scenes. Move it to the batch path when convenient.
+
+### No change needed
+The Plan layout, skip and minor presentation, the unassigned banner, the Applying pill with × and Esc, the New project dialog, the 1280 View menu, the cheat sheet's keyboard model, the Develop context bar's `Apply to 1 new`, the XMP failures popover, and Export.
