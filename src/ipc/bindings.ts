@@ -686,6 +686,10 @@ export const commands = {
 	 *  `apply_style_prediction`): images still carrying what the batch wrote get their previous
 	 *  settings back ("Undo <label>" entry each); images edited since are left alone
 	 *  (`skippedIds`). Unknown batch -> `not_found`; already undone -> `invalid_argument`.
+	 *  Undo is linear (v16): when any photo of the batch has a later history entry (a later
+	 *  batch or a manual edit), nothing changes and the call fails with `conflict` ("Later edits
+	 *  on n photos; undo those first"). Scenes whose last apply was this batch go back to
+	 *  `edited` (`SceneEditEntry.appliedBatch` = null).
 	 */
 	undoEditBatch: (batchId: number) => typedError<UndoBatchResult, AppError>(__TAURI_INVOKE("undo_edit_batch", { batchId })),
 	/**
@@ -784,6 +788,13 @@ export const commands = {
 	 *  project -> `not_found`.
 	 */
 	listXmpFailures: (projectId: number | null) => typedError<XmpFailure[], AppError>(__TAURI_INVOKE("list_xmp_failures", { projectId })),
+	/**
+	 *  Persisted state of edit batches (v16), given order: undone, and whether
+	 *  `undo_edit_batch` would succeed now (`undoable`; `conflictCount` photos edited since).
+	 *  The UI shows a toast's / row's Undo only while its batch is `undoable`. Unknown ids ->
+	 *  `not_found`.
+	 */
+	getEditBatches: (batchIds: number[]) => typedError<EditBatchInfo[], AppError>(__TAURI_INVOKE("get_edit_batches", { batchIds })),
 };
 
 /** Events */
@@ -1577,6 +1588,39 @@ export type DevelopWarningCode =
  */
 "source_color_assumed";
 
+/**
+ *  Persisted state of one edit batch (v16; `SceneEditEntry.appliedBatch`,
+ *  `EditPlan.latestBatch`, `get_edit_batches`). Undo is linear: a batch can be undone only
+ *  while none of its photos has a history entry newer than the batch's own (a later batch or
+ *  a manual edit); undoing a later batch restores the photos to this batch's settings and
+ *  makes it undoable again. Per-image undo (Cmd+Z in Develop) of the later edit also does.
+ */
+export type EditBatchInfo = {
+	batchId: number,
+	/**  History label, e.g. "Apply to Scene", "Auto Edit (My Style)". */
+	label: string,
+	kind: EditBatchKind,
+	createdAtMs: number,
+	/**  `null` = not undone. */
+	undoneAtMs: number | null,
+	/**  Photos the batch changed. */
+	imageCount: number,
+	/**
+	 *  Photos edited after the batch (0 when undone): `undo_edit_batch` refuses with
+	 *  `conflict` while this is > 0.
+	 */
+	conflictCount: number,
+	/**  Not undone and `conflictCount == 0`: `undo_edit_batch` would succeed now. */
+	undoable: boolean,
+};
+
+/**  What produced an edit batch (v16). */
+export type EditBatchKind = 
+/**  `apply_scene_edit` / `apply_all_edited_scenes`. */
+"scene_apply" | 
+/**  `apply_style_prediction` ("Auto edit (my style)"). */
+"style_prediction";
+
 /**  An undoable multi-image edit (`undo_edit_batch`). */
 export type EditBatchResult = {
 	/**  `null` when nothing changed (nothing to undo). */
@@ -1611,6 +1655,12 @@ export type EditPlan = {
 	editStates: ImageEditState[],
 	/**  Keepers that need a look, capture order (v15). */
 	needsReviewIds: number[],
+	/**
+	 *  The newest edit batch (any kind) that is not undone and changed at least one image of
+	 *  the project (v16); `null` = none. Its `undoable` says whether `undo_edit_batch` would
+	 *  succeed now (linear undo: a later edit of its photos blocks it).
+	 */
+	latestBatch: EditBatchInfo | null,
 };
 
 /**  Scene counts of an `EditPlan` (v15). Status counts are over scenes that are not skipped. */
@@ -1686,7 +1736,13 @@ export type ErrorKind =
 /**  The original exists but could not be decoded (damaged, still copying, unsupported). */
 "decode_failed" | 
 /**  The catalog is damaged and was opened read-only (`CatalogState.health`). */
-"catalog_read_only";
+"catalog_read_only" | 
+/**
+ *  The operation would undo or overwrite something a later edit was built on (v16:
+ *  `undo_edit_batch` of a batch whose photos were edited since). Nothing was changed;
+ *  the message says what to undo first.
+ */
+"conflict";
 
 /**  What the export engine can do here (`get_export_capabilities`). */
 export type ExportCapabilities = {
@@ -3416,6 +3472,13 @@ export type SceneEditEntry = {
 	 *  N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
 	 */
 	unappliedKeeperIds: number[],
+	/**
+	 *  The edit batch of this scene's last apply that changed something (v16): `null` when
+	 *  never applied, or that batch was undone (undoing it also clears the scene's applied
+	 *  state). Row "Undo apply" = `undo_edit_batch(appliedBatch.batchId)` while
+	 *  `appliedBatch.undoable`; persisted, so it survives leaving the workflow.
+	 */
+	appliedBatch: EditBatchInfo | null,
 };
 
 /**  Progress of one scene in the Edit step checklist. */
@@ -3822,7 +3885,11 @@ export type UiPrefs = {
 export type UndoBatchResult = {
 	/**  Images put back to their settings before the batch (one "Undo <label>" history entry each). */
 	restoredIds: number[],
-	/**  Images edited again after the batch: left alone. */
+	/**
+	 *  Images whose batch edit was already taken back with per-image undo (their history
+	 *  cursor is before the batch's entry): left alone. (Before v16 also images edited after
+	 *  the batch; since v16 those make the whole undo fail with `conflict`.)
+	 */
 	skippedIds: number[],
 };
 

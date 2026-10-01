@@ -10,6 +10,10 @@
 //! Per-photo workflow state (IPC v15, migration 0013) is derived from the history entry an
 //! image's cursor points at: its `source` and `batch_id`, and that batch's item for the image
 //! (scene, review reason, reviewed). See [`edit_states`].
+//!
+//! Linear undo (IPC v16): [`undo`] refuses with `conflict` while any image of the batch has
+//! a history entry newer than the batch's own entry for it ([`conflict_ids`]); undoing a
+//! batch also clears the applied state of the scenes whose last apply it was.
 
 use std::collections::HashMap;
 
@@ -17,26 +21,14 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::history;
 use crate::db::{now_ms, repo};
-use crate::ipc::error::{AppError, AppResult};
+use crate::ipc::error::{AppError, AppResult, ErrorKind};
 use crate::ipc::types::{
-    EditBatchId, EditBatchResult, EditSource, ImageEditState, ImageId, ParametricAdjustments, SceneId, UndoBatchResult,
+    EditBatchId, EditBatchInfo, EditBatchResult, EditSource, ImageEditState, ImageId, ParametricAdjustments, SceneId,
+    UndoBatchResult,
 };
 
-/// `edit_batches.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchKind {
-    SceneApply,
-    StylePrediction,
-}
-
-impl BatchKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            BatchKind::SceneApply => "scene_apply",
-            BatchKind::StylePrediction => "style_prediction",
-        }
-    }
-}
+/// `edit_batches.kind` (the IPC enum since v16).
+pub use crate::ipc::types::EditBatchKind as BatchKind;
 
 /// History label of scene applies.
 pub const LABEL_APPLY_SCENE: &str = "Apply to Scene";
@@ -158,8 +150,104 @@ pub fn written_by(
     json.map(|j| serde_json::from_str(&j).map_err(AppError::from)).transpose()
 }
 
+/// Images of batch `batch_id` that were edited after it (v16), in item order: the image's
+/// history cursor is newer than the batch's entry for it, and is not an entry that restored
+/// this batch's settings (undo of a later batch is stamped with this batch). Images whose
+/// batch entry is gone (pruned, or dropped as redo tail by a newer edit) count when their
+/// settings differ from what the batch wrote. Images whose cursor is before the batch's
+/// entry (the batch edit was taken back with per-image undo) do not count.
+pub fn conflict_ids(conn: &Connection, batch_id: EditBatchId) -> AppResult<Vec<ImageId>> {
+    type Row = (ImageId, String, Option<i64>, Option<EditBatchId>, Option<i64>);
+    let rows: Vec<Row> = conn
+        .prepare_cached(
+            "SELECT bi.image_id, bi.after_json, a.history_entry_id, c.batch_id,
+                    (SELECT MIN(h.id) FROM adjustment_history h WHERE h.image_id = bi.image_id AND h.batch_id = ?1)
+             FROM edit_batch_items bi
+             LEFT JOIN adjustments a ON a.image_id = bi.image_id
+             LEFT JOIN adjustment_history c ON c.id = a.history_entry_id
+             WHERE bi.batch_id = ?1 ORDER BY bi.rowid",
+        )?
+        .query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut out = Vec::new();
+    for (id, after, cursor, cursor_batch, entry) in rows {
+        let Some(cursor) = cursor else { continue };
+        if cursor_batch == Some(batch_id) {
+            continue;
+        }
+        let conflict = match entry {
+            Some(e) => cursor > e,
+            None => repo::get_adjustments(conn, id)? != serde_json::from_str::<ParametricAdjustments>(&after)?,
+        };
+        if conflict {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// `EditBatchInfo` of batch `batch_id` (unknown -> `not_found`).
+pub fn batch_info(conn: &Connection, batch_id: EditBatchId) -> AppResult<EditBatchInfo> {
+    let row: Option<(String, String, i64, Option<i64>, u32)> = conn
+        .query_row(
+            "SELECT label, kind, created_at, undone_at, (SELECT COUNT(*) FROM edit_batch_items WHERE batch_id = b.id)
+             FROM edit_batches b WHERE id = ?1",
+            [batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let (label, kind, created_at_ms, undone_at_ms, image_count) =
+        row.ok_or_else(|| AppError::not_found(format!("edit batch {batch_id}")))?;
+    let kind = BatchKind::parse(&kind).ok_or_else(|| AppError::internal(format!("unknown edit batch kind {kind}")))?;
+    let conflict_count = if undone_at_ms.is_some() { 0 } else { conflict_ids(conn, batch_id)?.len() as u32 };
+    Ok(EditBatchInfo {
+        batch_id,
+        label,
+        kind,
+        created_at_ms,
+        undone_at_ms,
+        image_count,
+        conflict_count,
+        undoable: undone_at_ms.is_none() && conflict_count == 0,
+    })
+}
+
+/// `get_edit_batches`: [`batch_info`] of each id (given order). Unknown id -> `not_found`.
+pub fn batch_infos(conn: &Connection, ids: &[EditBatchId]) -> AppResult<Vec<EditBatchInfo>> {
+    ids.iter().map(|&id| batch_info(conn, id)).collect()
+}
+
+/// The newest batch that is not undone and changed an image matching the SQL predicate
+/// `where_images` (over alias `i`), as `EditBatchInfo`.
+pub fn latest_batch_where(conn: &Connection, where_images: &str) -> AppResult<Option<EditBatchInfo>> {
+    let id: Option<EditBatchId> = conn
+        .query_row(
+            &format!(
+                "SELECT b.id FROM edit_batches b WHERE b.undone_at IS NULL AND EXISTS (
+                     SELECT 1 FROM edit_batch_items bi JOIN images i ON i.id = bi.image_id
+                     WHERE bi.batch_id = b.id AND {where_images})
+                 ORDER BY b.id DESC LIMIT 1"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    id.map(|id| batch_info(conn, id)).transpose()
+}
+
+/// User-facing message of a `conflict` undo.
+pub fn conflict_message(n: usize) -> String {
+    if n == 1 {
+        "Later edits on 1 photo; undo those first".to_owned()
+    } else {
+        format!("Later edits on {n} photos; undo those first")
+    }
+}
+
 /// Undoes batch `batch_id` (see the module docs). Unknown batch -> `not_found`; already undone
-/// -> `invalid_argument`. Atomic.
+/// -> `invalid_argument`; photos edited after the batch -> `conflict` (nothing changed).
+/// Scenes whose last apply was this batch lose their applied state (status back to
+/// `edited`; apply again to re-apply). Atomic.
 pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatchResult> {
     let row: Option<(String, Option<i64>)> = conn
         .query_row("SELECT label, undone_at FROM edit_batches WHERE id = ?1", [batch_id], |r| {
@@ -169,6 +257,10 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
     let (label, undone) = row.ok_or_else(|| AppError::not_found(format!("edit batch {batch_id}")))?;
     if undone.is_some() {
         return Err(AppError::invalid("this edit was already undone"));
+    }
+    let conflicts = conflict_ids(conn, batch_id)?;
+    if !conflicts.is_empty() {
+        return Err(AppError::new(ErrorKind::Conflict, conflict_message(conflicts.len())));
     }
     type Item = (ImageId, String, String, Option<String>, Option<EditBatchId>);
     let items: Vec<Item> = conn
@@ -200,6 +292,12 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
         }
     }
     inner.execute("UPDATE edit_batches SET undone_at = ?2 WHERE id = ?1", params![batch_id, now_ms()])?;
+    inner.execute(
+        "UPDATE scenes SET applied_at_ms = NULL, applied_params_json = NULL, applied_batch_id = NULL,
+                           applied_covered_json = NULL
+         WHERE applied_batch_id = ?1",
+        [batch_id],
+    )?;
     inner.commit()?;
     Ok(result)
 }
@@ -366,12 +464,26 @@ mod tests {
         assert_eq!(written_by(&conn, batch, ids[0]).unwrap(), Some(adj(1.0)));
         assert_eq!(written_by(&conn, batch, ids[2]).unwrap(), None);
 
-        // The user touches one image after the batch: undo leaves it alone.
+        // The user touches one image after the batch: linear undo refuses, nothing changes.
         history::commit(&mut conn, ids[1], &adj(1.5), "Exposure").unwrap();
+        let e = undo(&mut conn, batch).unwrap_err();
+        assert_eq!((e.kind, e.message.as_str()), (ErrorKind::Conflict, "Later edits on 1 photo; undo those first"));
+        assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap(), adj(1.0));
+        let info = batch_info(&conn, batch).unwrap();
+        assert_eq!((info.image_count, info.conflict_count, info.undoable), (2, 1, false));
+        assert_eq!(info.kind, BatchKind::SceneApply);
+        // Per-image undo of that edit makes the batch undoable again; one more per-image undo
+        // takes the batch's own edit back, and the batch undo then leaves the image alone.
+        history::undo(&mut conn, ids[1]).unwrap();
+        assert!(batch_info(&conn, batch).unwrap().undoable);
+        history::undo(&mut conn, ids[1]).unwrap();
+        assert!(batch_info(&conn, batch).unwrap().undoable);
         let u = undo(&mut conn, batch).unwrap();
         assert_eq!(u, UndoBatchResult { restored_ids: vec![ids[0]], skipped_ids: vec![ids[1]] });
         assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap(), ParametricAdjustments::default());
-        assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), adj(1.5));
+        assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), ParametricAdjustments::default());
+        let info = batch_info(&conn, batch).unwrap();
+        assert!(info.undone_at_ms.is_some() && !info.undoable && info.conflict_count == 0);
         let h = history::history(&conn, ids[0]).unwrap();
         assert_eq!(h.entries.last().unwrap().label, "Undo Apply to Scene");
         assert_eq!(undo(&mut conn, batch).unwrap_err().kind, ErrorKind::InvalidArgument);
@@ -394,5 +506,73 @@ mod tests {
             ErrorKind::NotFound
         );
         assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap(), ParametricAdjustments::default());
+    }
+
+    fn image_ids(conn: &Connection) -> Vec<ImageId> {
+        conn.prepare("SELECT id FROM images ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn items(ids: &[ImageId], ev: f32) -> Vec<BatchItem> {
+        ids.iter()
+            .map(|&id| BatchItem { image_id: id, adjustments: adj(ev), scene_id: None, review_reason: None })
+            .collect()
+    }
+
+    #[test]
+    fn undo_is_linear_across_batches() {
+        let mut conn = fixture();
+        let ids = image_ids(&conn);
+        // A: auto edit of all three; B: an apply over two of them, built on A.
+        let a = commit_recorded(&mut conn, &items(&ids, 0.5), LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        let b = commit_recorded(&mut conn, &items(&ids[..2], 0.9), LABEL_APPLY_SCENE, BatchKind::SceneApply)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        assert_eq!(latest_batch_where(&conn, "1").unwrap().map(|i| i.batch_id), Some(b));
+        // Undoing the older batch first is refused (B was built on it), nothing changes.
+        let e = undo(&mut conn, a).unwrap_err();
+        assert_eq!((e.kind, e.message.as_str()), (ErrorKind::Conflict, "Later edits on 2 photos; undo those first"));
+        assert_eq!(conflict_ids(&conn, a).unwrap(), vec![ids[0], ids[1]]);
+        assert_eq!(repo::get_adjustments(&conn, ids[2]).unwrap(), adj(0.5));
+        let infos = batch_infos(&conn, &[a, b]).unwrap();
+        assert_eq!(
+            infos.iter().map(|i| (i.undoable, i.conflict_count)).collect::<Vec<_>>(),
+            vec![(false, 2), (true, 0)]
+        );
+        assert_eq!(batch_infos(&conn, &[a, 999]).unwrap_err().kind, ErrorKind::NotFound);
+        // Undo B: the images are back on A's settings (stamped A), so A is undoable again.
+        assert_eq!(undo(&mut conn, b).unwrap().restored_ids, vec![ids[0], ids[1]]);
+        assert_eq!(latest_batch_where(&conn, "1").unwrap().map(|i| i.batch_id), Some(a));
+        assert!(batch_info(&conn, a).unwrap().undoable);
+        let u = undo(&mut conn, a).unwrap();
+        assert_eq!(u.restored_ids, ids);
+        assert!(u.skipped_ids.is_empty());
+        assert_eq!(latest_batch_where(&conn, "1").unwrap(), None);
+    }
+
+    #[test]
+    fn edit_after_dropped_batch_entry_conflicts() {
+        let mut conn = fixture();
+        let ids = image_ids(&conn);
+        let a = commit_recorded(&mut conn, &items(&ids[..1], 0.5), LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        // Per-image undo of the batch edit, then a new edit drops the batch entry (redo tail).
+        history::undo(&mut conn, ids[0]).unwrap();
+        assert!(batch_info(&conn, a).unwrap().undoable, "taken back per image: not a conflict");
+        history::commit(&mut conn, ids[0], &adj(-0.4), "Exposure").unwrap();
+        assert_eq!(undo(&mut conn, a).unwrap_err().kind, ErrorKind::Conflict);
+        // An edit that happens to land on the batch's settings again is not a conflict.
+        history::commit(&mut conn, ids[0], &adj(0.5), "Exposure").unwrap();
+        assert!(batch_info(&conn, a).unwrap().undoable);
     }
 }

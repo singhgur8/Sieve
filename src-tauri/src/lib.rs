@@ -177,6 +177,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::mark_reviewed,
             commands::cancel_scene_apply,
             commands::list_xmp_failures,
+            // IPC v16
+            commands::get_edit_batches,
         ])
         .events(collect_events![
             ImportProgress,

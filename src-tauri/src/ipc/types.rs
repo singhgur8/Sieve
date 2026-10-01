@@ -3845,6 +3845,11 @@ pub struct SceneEditEntry {
     /// have no edit of their own (`editSource` `none` or `auto_style`). Non-empty = "Apply to
     /// N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
     pub unapplied_keeper_ids: Vec<ImageId>,
+    /// The edit batch of this scene's last apply that changed something (v16): `null` when
+    /// never applied, or that batch was undone (undoing it also clears the scene's applied
+    /// state). Row "Undo apply" = `undo_edit_batch(appliedBatch.batchId)` while
+    /// `appliedBatch.undoable`; persisted, so it survives leaving the workflow.
+    pub applied_batch: Option<EditBatchInfo>,
 }
 
 /// Scenes with at most this many keepers are `SceneEditEntry.minor` (v15).
@@ -3936,6 +3941,10 @@ pub struct EditPlan {
     pub edit_states: Vec<ImageEditState>,
     /// Keepers that need a look, capture order (v15).
     pub needs_review_ids: Vec<ImageId>,
+    /// The newest edit batch (any kind) that is not undone and changed at least one image of
+    /// the project (v16); `null` = none. Its `undoable` says whether `undo_edit_batch` would
+    /// succeed now (linear undo: a later edit of its photos blocks it).
+    pub latest_batch: Option<EditBatchInfo>,
 }
 
 /// Options of `apply_scene_edit` / `apply_all_edited_scenes`. `null` on the wire = default.
@@ -3988,6 +3997,40 @@ pub struct SceneApplyOutcome {
     pub notes: Vec<String>,
 }
 
+string_enum! {
+    /// What produced an edit batch (v16).
+    pub enum EditBatchKind {
+        /// `apply_scene_edit` / `apply_all_edited_scenes`.
+        SceneApply => "scene_apply",
+        /// `apply_style_prediction` ("Auto edit (my style)").
+        StylePrediction => "style_prediction",
+    }
+}
+
+/// Persisted state of one edit batch (v16; `SceneEditEntry.appliedBatch`,
+/// `EditPlan.latestBatch`, `get_edit_batches`). Undo is linear: a batch can be undone only
+/// while none of its photos has a history entry newer than the batch's own (a later batch or
+/// a manual edit); undoing a later batch restores the photos to this batch's settings and
+/// makes it undoable again. Per-image undo (Cmd+Z in Develop) of the later edit also does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditBatchInfo {
+    pub batch_id: EditBatchId,
+    /// History label, e.g. "Apply to Scene", "Auto Edit (My Style)".
+    pub label: String,
+    pub kind: EditBatchKind,
+    pub created_at_ms: i64,
+    /// `null` = not undone.
+    pub undone_at_ms: Option<i64>,
+    /// Photos the batch changed.
+    pub image_count: u32,
+    /// Photos edited after the batch (0 when undone): `undo_edit_batch` refuses with
+    /// `conflict` while this is > 0.
+    pub conflict_count: u32,
+    /// Not undone and `conflictCount == 0`: `undo_edit_batch` would succeed now.
+    pub undoable: bool,
+}
+
 /// An undoable multi-image edit (`undo_edit_batch`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -4017,7 +4060,9 @@ pub struct ApplyScenesResult {
 pub struct UndoBatchResult {
     /// Images put back to their settings before the batch (one "Undo <label>" history entry each).
     pub restored_ids: Vec<ImageId>,
-    /// Images edited again after the batch: left alone.
+    /// Images whose batch edit was already taken back with per-image undo (their history
+    /// cursor is before the batch's entry): left alone. (Before v16 also images edited after
+    /// the batch; since v16 those make the whole undo fail with `conflict`.)
     pub skipped_ids: Vec<ImageId>,
 }
 

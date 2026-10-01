@@ -6,6 +6,7 @@ import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
 import { completeAdjustments, lerpAdjustments, orientPoint } from "../ipc";
 import type {
+  EditBatchInfo,
   AiMaskRequest,
   AiMaskStatus,
   MaskCapabilities,
@@ -810,7 +811,9 @@ export function installMockBackend(count: number) {
 
   // ---- edit plan / apply-to-scene / style batches (v14) ----
   const sceneRep = new Map<number, number>();
-  const sceneApplied = new Map<number, { at: number; snaps: Map<number, string> }>();
+  // v16: `repSnap` = the representative's settings the apply was made from (Rust
+  // `applied_params_json`), `batchId` = the scene's last apply batch that changed something.
+  const sceneApplied = new Map<number, { at: number; snaps: Map<number, string>; repSnap: string; batchId: number | null }>();
   interface MockBatchItem {
     id: number;
     before: string;
@@ -821,7 +824,7 @@ export function installMockBackend(count: number) {
     reviewReason: string | null;
     reviewed: boolean;
   }
-  const batches = new Map<number, { label: string; items: MockBatchItem[]; undone: boolean; sceneIds: number[] }>();
+  const batches = new Map<number, { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[] }>();
   let batchSeq = 0;
   // IPC v15: skipped scenes, frames the last apply covered, apply cancel flag.
   const sceneSkipped = new Set<number>();
@@ -860,12 +863,48 @@ export function installMockBackend(count: number) {
   function recordItems(label: string, items: MockBatchItem[], sceneIds: number[]): number | null {
     if (items.length === 0) return null;
     const batchId = ++batchSeq;
-    batches.set(batchId, { label, items, undone: false, sceneIds });
+    batches.set(batchId, { label, items, undone: false, undoneAt: null, createdAt: Date.now(), sceneIds });
     for (const it of items) {
       const e = cursorEntry(it.id);
       if (e) e.batchId = batchId;
     }
     return batchId;
+  }
+  /** v16 (Rust `batches::conflict_ids`): images of the batch edited after it. */
+  function batchConflicts(batchId: number): number[] {
+    const b = batches.get(batchId);
+    if (!b) return [];
+    const out: number[] = [];
+    for (const it of b.items) {
+      const h = hists.get(it.id);
+      if (!h || h.cursor < 0) continue;
+      const cur = h.entries[h.cursor];
+      if (cur.batchId === batchId) continue;
+      const own = h.entries.find((e) => e.batchId === batchId);
+      const conflict = own ? cur.id > own.id : JSON.stringify(getAdj(it.id)) !== it.after;
+      if (conflict) out.push(it.id);
+    }
+    return out;
+  }
+  function batchInfo(batchId: number): EditBatchInfo {
+    const b = batches.get(batchId);
+    if (!b) throw { kind: "not_found", message: `edit batch ${batchId}` };
+    const conflictCount = b.undone ? 0 : batchConflicts(batchId).length;
+    return {
+      batchId,
+      label: b.label,
+      kind: b.label === "Auto Edit (My Style)" ? "style_prediction" : "scene_apply",
+      createdAtMs: b.createdAt,
+      undoneAtMs: b.undoneAt,
+      imageCount: b.items.length,
+      conflictCount,
+      undoable: !b.undone && conflictCount === 0,
+    };
+  }
+  /** Newest batch not undone that changed one of `ids` (Rust `batches::latest_batch_where`). */
+  function latestBatch(ids: Set<number>): EditBatchInfo | null {
+    const found = [...batches.entries()].filter(([, b]) => !b.undone && b.items.some((i) => ids.has(i.id))).map(([id]) => id);
+    return found.length ? batchInfo(Math.max(...found)) : null;
   }
   const STYLE_FIELDS: AdjustmentField[] = ["exposure", "contrast", "highlights", "shadows", "vibrance"];
   const styleAdj = (a: ParametricAdjustments): ParametricAdjustments => ({ ...a, exposure: 0.3, contrast: 10, highlights: -25, shadows: 20, vibrance: 12 });
@@ -886,7 +925,9 @@ export function installMockBackend(count: number) {
       const { rep, user } = repOf(ks, sc.id);
       const applied = sceneApplied.get(sc.id);
       const editedAt = rep.hasEdits ? lastEditAt(rep.id) : null;
-      const status: SceneEditEntry["status"] = applied ? (editedAt != null && editedAt > applied.at ? "outdated" : "applied") : rep.hasEdits ? "edited" : "to_edit";
+      // Rust: applied while the representative's settings equal those the apply was made from.
+      const status: SceneEditEntry["status"] = applied ? (JSON.stringify(getAdj(rep.id)) === applied.repSnap ? "applied" : "outdated") : rep.hasEdits ? "edited" : "to_edit";
+      const appliedBatch = applied?.batchId != null ? batchInfo(applied.batchId) : null;
       const skipped = sceneSkipped.has(sc.id);
       const covered = sceneCovered.get(sc.id) ?? [];
       const src = (id: number) => editState(id).editSource;
@@ -908,6 +949,7 @@ export function installMockBackend(count: number) {
         editedAtMs: editedAt,
         appliedAtMs: applied?.at ?? null,
         status,
+        appliedBatch: appliedBatch && appliedBatch.undoneAtMs == null ? appliedBatch : null,
       });
     }
     return out;
@@ -972,12 +1014,14 @@ export function installMockBackend(count: number) {
       }
       done += targets.length;
       void emit("scene-progress", { task: "apply", done, total });
-      sceneApplied.set(sc.id, { at: Date.now(), snaps });
+      sceneApplied.set(sc.id, { at: Date.now(), snaps, repSnap: JSON.stringify(getAdj(rep.id)), batchId: prev?.batchId ?? null });
       sceneCovered.set(sc.id, [rep.id, ...targets.map((t) => t.id)]);
       sceneSkipped.delete(sc.id);
       outcomes.push({ sceneId: sc.id, representativeId: rep.id, changedIds, skippedIds, excludedIds, notConvergedIds, notes: [] });
     }
     const batchId = recordItems(label, items, outcomes.map((x) => x.sceneId));
+    // Rust keeps the previous batch id when the apply changed nothing.
+    if (batchId != null) outcomes.forEach((x) => { const a = sceneApplied.get(x.sceneId); if (a) a.batchId = batchId; });
     return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, scenes: outcomes, cancelled };
   }
 
@@ -1793,6 +1837,7 @@ export function installMockBackend(count: number) {
             counts,
             editStates,
             needsReviewIds,
+            latestBatch: latestBatch(new Set(rows.filter((r) => inScope(r, null, pid)).map((r) => r.id))),
           };
           return plan;
         }
@@ -1935,7 +1980,12 @@ export function installMockBackend(count: number) {
           const b = batches.get(args.batchId as number);
           if (!b) throw { kind: "not_found", message: `batch ${args.batchId}` };
           if (b.undone) throw { kind: "invalid_argument", message: "batch already undone" };
+          // v16: linear undo; later edits on the batch's photos block it (nothing changes).
+          const conflicts = batchConflicts(args.batchId as number);
+          if (conflicts.length)
+            throw { kind: "conflict", message: `Later edits on ${conflicts.length} photo${conflicts.length === 1 ? "" : "s"}; undo those first` };
           b.undone = true;
+          b.undoneAt = Date.now();
           const restoredIds: number[] = [];
           const skippedIds: number[] = [];
           for (const it of b.items) {
@@ -1950,7 +2000,8 @@ export function installMockBackend(count: number) {
               restoredIds.push(it.id);
             } else skippedIds.push(it.id);
           }
-          b.sceneIds.forEach((sid) => sceneApplied.delete(sid));
+          // v16: scenes whose last apply was this batch are no longer applied.
+          for (const [sid, a] of [...sceneApplied]) if (a.batchId === (args.batchId as number)) sceneApplied.delete(sid);
           return { restoredIds, skippedIds };
         }
         // ---- IPC v15 ----
@@ -1969,6 +2020,8 @@ export function installMockBackend(count: number) {
           if (unknown != null) throw { kind: "not_found", message: `image ${unknown}` };
           return ids.map(editState);
         }
+        case "get_edit_batches":
+          return (args.batchIds as number[]).map(batchInfo);
         case "mark_reviewed": {
           const ids = args.imageIds as number[];
           const unknown = ids.find((i) => !byId.has(i));
