@@ -28,6 +28,14 @@
 //!    skin-coloured pixels) have a channel at or above 250, lower Whites, then Highlights,
 //!    then Exposure.
 //!
+//! # Not analysed yet (`faces = None`)
+//! Skin-coloured pixels stand in for the face boxes, conservatively (warm bright scenes are
+//! full of skin-coloured pixels that are not skin): the mask is estimated once, on the render
+//! with every Auto slider at 0, from unclipped pixels only, kept only as compact regions
+//! ([`estimate_skin`]); if it covers more than [`EST_SKIN_MAX`] of the frame it is not skin.
+//! The guard is bounded ([`ESTIMATED_GUARD`]), so Auto without faces stays close to Auto
+//! with them.
+//!
 //! # Auto white balance
 //! Grey-world on near-neutral pixels of the camera-space source (skin and sky chroma
 //! excluded), converted like the WB picker; clamped to Camera Raw's Auto range
@@ -50,6 +58,27 @@ const KEY_KEEP: f32 = 0.5;
 const FACE_WEIGHT: f32 = 0.7;
 /// Max share of skin pixels with a channel >= 250 in the result.
 pub const SKIN_CLIP_MAX: f32 = 0.003;
+
+/// Smallest / largest share of the frame an estimated skin mask may cover.
+const EST_SKIN_MIN: f32 = 0.005;
+pub const EST_SKIN_MAX: f32 = 0.30;
+/// Cell edge (px of the measurement render) of the skin region grid.
+const SKIN_CELL: usize = 8;
+
+/// Bounds of the skin guard when the skin is estimated (no face boxes): the guard may cost
+/// at most this much relative to the slider models' values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EstimatedGuard {
+    /// Lowest Whites (the model's value if that is lower already).
+    pub whites_floor: f32,
+    /// Most the Highlights may go below the model.
+    pub highlights_drop: f32,
+    /// Most the Exposure may go below the model (EV).
+    pub exposure_drop: f32,
+}
+
+pub const ESTIMATED_GUARD: EstimatedGuard =
+    EstimatedGuard { whites_floor: -30.0, highlights_drop: 30.0, exposure_drop: 0.3 };
 
 /// Faces known from the analysis (normalized, oriented preview frame, uncropped).
 pub fn auto_tone(
@@ -97,8 +126,12 @@ struct Stats {
 
 impl Stats {
     /// `faces`: `Some` = the analysis ran (skin = the face boxes; none = no skin), `None` =
-    /// unknown (skin-coloured pixels stand in).
-    fn from_render(img: &super::pipeline::RenderedImage, faces: Option<&[NormRect]>) -> Stats {
+    /// unknown: `estimated` (from [`estimate_skin`]) stands in, or no skin without it.
+    fn from_render(
+        img: &super::pipeline::RenderedImage,
+        faces: Option<&[NormRect]>,
+        estimated: Option<&[bool]>,
+    ) -> Stats {
         let lin = lstar_lut();
         let (w, h) = (img.width as usize, img.height as usize);
         let n = w * h;
@@ -125,7 +158,6 @@ impl Stats {
             s.chroma.push(a.hypot(bb));
         }
         // Skin: the central part of each face box (boxes include hair and background).
-        let mut any_face = false;
         for f in faces.unwrap_or_default() {
             let (cx, cy) = (f.x + f.width / 2.0, f.y + f.height / 2.0);
             let (hw, hh) = (f.width * 0.35, f.height * 0.35);
@@ -136,24 +168,12 @@ impl Stats {
             for y in y0..y1 {
                 for x in x0..x1 {
                     s.skin[y * w + x] = true;
-                    any_face = true;
                 }
             }
         }
-        if faces.is_none() && !any_face {
-            // Skin-coloured pixels: warm hue (a*, b* > 0, hue 20..75 deg), moderate chroma, mid L*.
-            for (i, px) in img.rgb.as_chunks::<3>().0.iter().enumerate() {
-                let (r, g, b) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
-                let l = s.l[i];
-                s.skin[i] = r > g && g > b && r - b > 20 && r - g < 110 && (35.0..97.0).contains(&l) && {
-                    let c = s.chroma[i];
-                    (8.0..55.0).contains(&c)
-                };
-            }
-            // Too few to matter (landscapes, products): no skin constraint.
-            let count = s.skin.iter().filter(|&&v| v).count();
-            if count < n / 100 {
-                s.skin.iter_mut().for_each(|v| *v = false);
+        if faces.is_none() {
+            if let Some(est) = estimated.filter(|e| e.len() == n) {
+                s.skin.copy_from_slice(est);
             }
         }
         s
@@ -254,6 +274,87 @@ impl Stats {
     }
 }
 
+/// Skin mask of a photo without face boxes, from the render with every Auto slider at 0:
+/// skin-coloured (warm hue, moderate chroma, mid L*), unclipped pixels, kept only in compact
+/// regions (grid cells of [`SKIN_CELL`] px at least half skin, 4-connected groups of >= 3
+/// cells). Empty (no skin) when the regions cover less than [`EST_SKIN_MIN`] (landscapes,
+/// products) or more than [`EST_SKIN_MAX`] of the frame (warm light on sand, walls, wood:
+/// not people).
+fn estimate_skin(img: &super::pipeline::RenderedImage, s: &Stats) -> Vec<bool> {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let n = w * h;
+    let mut px_skin = vec![false; n];
+    for (i, px) in img.rgb.as_chunks::<3>().0.iter().enumerate() {
+        let (r, g, b) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+        px_skin[i] = s.maxc[i] < 250
+            && r > g
+            && g > b
+            && r - b > 20
+            && r - g < 110
+            && (35.0..97.0).contains(&s.l[i])
+            && (8.0..55.0).contains(&s.chroma[i]);
+    }
+    let (cw, ch) = (w.div_ceil(SKIN_CELL), h.div_ceil(SKIN_CELL));
+    let mut cell = vec![false; cw * ch];
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (mut k, mut t) = (0usize, 0usize);
+            for y in cy * SKIN_CELL..((cy + 1) * SKIN_CELL).min(h) {
+                for x in cx * SKIN_CELL..((cx + 1) * SKIN_CELL).min(w) {
+                    t += 1;
+                    k += usize::from(px_skin[y * w + x]);
+                }
+            }
+            cell[cy * cw + cx] = 2 * k >= t;
+        }
+    }
+    // 4-connected groups of skin cells; groups of fewer than 3 cells are texture, not skin.
+    let mut keep = vec![false; cw * ch];
+    let mut seen = vec![false; cw * ch];
+    let (mut stack, mut group) = (Vec::new(), Vec::new());
+    for start in 0..cw * ch {
+        if !cell[start] || seen[start] {
+            continue;
+        }
+        group.clear();
+        stack.push(start);
+        seen[start] = true;
+        while let Some(c) = stack.pop() {
+            group.push(c);
+            let (x, y) = (c % cw, c / cw);
+            let neighbours = [
+                (x > 0).then(|| c - 1),
+                (x + 1 < cw).then(|| c + 1),
+                (y > 0).then(|| c - cw),
+                (y + 1 < ch).then(|| c + cw),
+            ];
+            for nc in neighbours.into_iter().flatten() {
+                if cell[nc] && !seen[nc] {
+                    seen[nc] = true;
+                    stack.push(nc);
+                }
+            }
+        }
+        if group.len() >= 3 {
+            group.iter().for_each(|&c| keep[c] = true);
+        }
+    }
+    let mut mask = vec![false; n];
+    let mut count = 0usize;
+    for (i, m) in mask.iter_mut().enumerate() {
+        let (x, y) = (i % w, i / w);
+        if px_skin[i] && keep[(y / SKIN_CELL) * cw + x / SKIN_CELL] {
+            *m = true;
+            count += 1;
+        }
+    }
+    let share = count as f32 / n.max(1) as f32;
+    if !(EST_SKIN_MIN..=EST_SKIN_MAX).contains(&share) {
+        mask.iter_mut().for_each(|v| *v = false);
+    }
+    mask
+}
+
 /// The analysis' faces of image `id`: `None` if it has not been analysed (no
 /// `image_analysis.faces_json`), `Some(vec![])` if it was and has no faces.
 pub fn analysis_faces(
@@ -285,10 +386,24 @@ struct Probe<'a> {
     src: &'a SourceImage,
     luts: LutLibrary,
     faces: Option<&'a [NormRect]>,
+    /// Estimated skin (`faces = None`), fixed by the first measurement.
+    estimated: Option<Vec<bool>>,
     renders: u32,
 }
 
-impl Probe<'_> {
+impl<'a> Probe<'a> {
+    fn new(cache: &'a DevelopCache, src: &'a SourceImage, faces: Option<&'a [NormRect]>) -> Self {
+        Probe {
+            cache,
+            src,
+            luts: LutLibrary::new(std::env::temp_dir().join("sieve-auto-no-luts")),
+            faces,
+            estimated: None,
+            renders: 0,
+        }
+    }
+
+    /// Measures `adj`; with `faces = None`, the first call estimates the skin mask.
     fn measure(&mut self, adj: &ParametricAdjustments) -> AppResult<Stats> {
         let mut a = adj.clone();
         a.crop.enabled = false;
@@ -297,7 +412,11 @@ impl Probe<'_> {
         a.effects.vignette.amount = 0.0;
         self.renders += 1;
         let r = self.cache.render_image(self.src, &a, None, MEASURE_EDGE, &self.luts)?;
-        Ok(Stats::from_render(&r.image, self.faces))
+        if self.faces.is_none() && self.estimated.is_none() {
+            let s = Stats::from_render(&r.image, None, None);
+            self.estimated = Some(estimate_skin(&r.image, &s));
+        }
+        Ok(Stats::from_render(&r.image, self.faces, self.estimated.as_deref()))
     }
 }
 
@@ -450,8 +569,7 @@ pub fn exposure_features(
     let mut adj = adjustments.clone();
     (adj.exposure, adj.contrast, adj.highlights, adj.shadows) = (0.0, 0.0, 0.0, 0.0);
     (adj.whites, adj.blacks, adj.vibrance, adj.saturation) = (0.0, 0.0, 0.0, 0.0);
-    let mut probe =
-        Probe { cache, src, luts: LutLibrary::new(std::env::temp_dir().join("sieve-auto-no-luts")), faces, renders: 0 };
+    let mut probe = Probe::new(cache, src, faces);
     let mut stats = probe.measure(&adj)?;
     let has_faces = faces.is_some_and(|f| !f.is_empty()) && stats.has_skin();
     solve_exposure(&mut probe, &mut adj, &mut stats, has_faces, &targets)?;
@@ -482,8 +600,7 @@ pub fn auto_tone_opts(
     use AdjustmentField as F;
     // Stages 1-2 on the settings with every Auto slider at 0: a slider's Auto value does not
     // depend on which sliders were requested (Shift-double-click = that slider of full Auto).
-    let mut probe =
-        Probe { cache, src, luts: LutLibrary::new(std::env::temp_dir().join("sieve-auto-no-luts")), faces, renders: 0 };
+    let mut probe = Probe::new(cache, src, faces);
     let mut work = adjustments.clone();
     (work.exposure, work.contrast, work.highlights, work.shadows) = (0.0, 0.0, 0.0, 0.0);
     (work.whites, work.blacks, work.vibrance, work.saturation) = (0.0, 0.0, 0.0, 0.0);
@@ -519,17 +636,27 @@ pub fn auto_tone_opts(
 
     // 3. Skin guard: never clip skin. Whites first (down to -60), then Highlights, then
     //    Exposure; stop when the skin is clean or nothing requested can lower it (skin blown
-    //    in the source).
+    //    in the source). Estimated skin (no face boxes): bounded by [`ESTIMATED_GUARD`].
     if want(F::Whites) || want(F::Exposure) || want(F::Highlights) {
+        let (whites_floor, highlights_floor, exposure_floor) = if faces.is_none() {
+            let g = ESTIMATED_GUARD;
+            (
+                adj.whites.min(g.whites_floor),
+                (adj.highlights - g.highlights_drop).max(-100.0),
+                round_to((adj.exposure - g.exposure_drop).max(-4.0), 0.05),
+            )
+        } else {
+            (-60.0, -100.0, -4.0)
+        };
         stats = probe.measure(&adj)?;
         let mut rounds = 0;
         while stats.has_skin() && stats.skin_clipped() > SKIN_CLIP_MAX && rounds < 20 {
-            if want(F::Whites) && adj.whites > -60.0 {
-                adj.whites = (adj.whites - 15.0).max(-60.0);
-            } else if want(F::Highlights) && adj.highlights > -100.0 {
-                adj.highlights = (adj.highlights - 20.0).max(-100.0);
-            } else if want(F::Exposure) && adj.exposure > -4.0 {
-                adj.exposure = round_to((adj.exposure - 0.1).max(-4.0), 0.05);
+            if want(F::Whites) && adj.whites > whites_floor {
+                adj.whites = (adj.whites - 15.0).max(whites_floor);
+            } else if want(F::Highlights) && adj.highlights > highlights_floor {
+                adj.highlights = (adj.highlights - 20.0).max(highlights_floor);
+            } else if want(F::Exposure) && adj.exposure > exposure_floor + 0.01 {
+                adj.exposure = round_to((adj.exposure - 0.1).max(exposure_floor), 0.05);
             } else {
                 break;
             }
@@ -559,8 +686,7 @@ pub fn skin_clipped_fraction(
     adj: &ParametricAdjustments,
     faces: Option<&[NormRect]>,
 ) -> AppResult<Option<f32>> {
-    let mut probe =
-        Probe { cache, src, luts: LutLibrary::new(std::env::temp_dir().join("sieve-auto-no-luts")), faces, renders: 0 };
+    let mut probe = Probe::new(cache, src, faces);
     let s = probe.measure(adj)?;
     Ok(s.has_skin().then(|| s.skin_clipped()))
 }
@@ -776,6 +902,103 @@ mod tests {
         // Auto WB of a neutral-ish frame stays within the Auto range.
         let wb = auto_white_balance(&cache, &src, &base).unwrap();
         assert!(wb.temperature_k <= AUTO_WB_MAX_TEMP && (AUTO_WB_TINT.0..=AUTO_WB_TINT.1).contains(&wb.tint), "{wb:?}");
+    }
+
+    fn rendered(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> crate::develop::pipeline::RenderedImage {
+        let rgb = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).flat_map(|(x, y)| f(x, y)).collect();
+        crate::develop::pipeline::RenderedImage { width: w, height: h, rgb, histogram: Default::default() }
+    }
+
+    fn skin_share(img: &crate::develop::pipeline::RenderedImage) -> f32 {
+        let s = Stats::from_render(img, None, None);
+        let m = estimate_skin(img, &s);
+        m.iter().filter(|&&v| v).count() as f32 / m.len() as f32
+    }
+
+    #[test]
+    fn estimated_skin_needs_a_plausible_region() {
+        let grey = [90u8, 92, 95];
+        let skin = [205u8, 150, 120];
+        // A compact skin patch (~8% of the frame) is skin.
+        let face =
+            rendered(240, 160, |x, y| if (100..150).contains(&x) && (40..100).contains(&y) { skin } else { grey });
+        let share = skin_share(&face);
+        assert!((0.06..0.1).contains(&share), "{share}");
+        // Warm light over most of the frame (sand, walls): not skin.
+        let warm = rendered(240, 160, |x, _| if x < 200 { skin } else { grey });
+        assert_eq!(skin_share(&warm), 0.0);
+        // Scattered skin-coloured pixels (texture): not skin.
+        let speckle = rendered(240, 160, |x, y| if (x * 7 + y * 13) % 11 == 0 { skin } else { grey });
+        assert_eq!(skin_share(&speckle), 0.0);
+        // Already clipped warm highlights are not skin to protect.
+        let blown =
+            rendered(
+                240,
+                160,
+                |x, y| {
+                    if (100..150).contains(&x) && (40..100).contains(&y) {
+                        [255, 236, 210]
+                    } else {
+                        grey
+                    }
+                },
+            );
+        assert_eq!(skin_share(&blown), 0.0);
+    }
+
+    /// Auto on a synthetic JPEG with analysis faces `Some(&[])` (analysed, no faces: no skin
+    /// guard) and `None` (not analysed: estimated skin).
+    fn auto_both(name: &str, f: impl Fn(u32, u32) -> [u8; 3]) -> (AutoToneValues, AutoToneValues) {
+        use crate::develop::{DevelopConfig, SourceImage};
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (320u32, 240u32);
+        let px: Vec<u8> = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).flat_map(|(x, y)| f(x, y)).collect();
+        let path = dir.path().join(name);
+        std::fs::write(&path, crate::raw::turbo::encode_rgb_444(&px, w, h, 95).unwrap()).unwrap();
+        let cache = DevelopCache::new(DevelopConfig::default());
+        let src = SourceImage { id: 1, path, orientation: None };
+        let base = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Jpeg);
+        let analysed = auto_tone_with_faces(&cache, &src, &base, AdjustmentField::AUTO_TONE, Some(&[])).unwrap();
+        let unknown = auto_tone_with_faces(&cache, &src, &base, AdjustmentField::AUTO_TONE, None).unwrap();
+        (analysed, unknown)
+    }
+
+    /// Not analysed yet (no face boxes): Auto stays within [`ESTIMATED_GUARD`] of Auto on the
+    /// same frame analysed without faces (the old skin-colour fallback took Whites to -60 and
+    /// exposure down by up to 1.3 EV on warm, bright frames).
+    #[test]
+    fn auto_tone_without_faces_is_bounded() {
+        let within = |a: &AutoToneValues, u: &AutoToneValues| {
+            let (ea, eu) = (a.exposure.unwrap(), u.exposure.unwrap());
+            assert!(eu >= ea - ESTIMATED_GUARD.exposure_drop - 1e-4, "exposure {ea} -> {eu}");
+            let (wa, wu) = (a.whites.unwrap(), u.whites.unwrap());
+            assert!(wu >= wa.min(ESTIMATED_GUARD.whites_floor), "whites {wa} -> {wu}");
+            let (ha, hu) = (a.highlights.unwrap(), u.highlights.unwrap());
+            assert!(hu >= ha - ESTIMATED_GUARD.highlights_drop, "highlights {ha} -> {hu}");
+        };
+        // Warm light over a quarter of a dark frame (a lit wall, sand) with the hue of skin,
+        // partly clipped already: not a plausible face.
+        let (a, u) = auto_both("wall.jpg", |x, y| {
+            if x < 240 {
+                let v = 25.0 + 35.0 * (y as f32 / 240.0);
+                [v as u8, v as u8, (v * 1.05) as u8]
+            } else {
+                let v = 200.0 + 55.0 * (y as f32 / 240.0);
+                [v as u8, (v * 0.82) as u8, (v * 0.62) as u8]
+            }
+        });
+        within(&a, &u);
+        // A compact, bright skin-coloured patch in a dark frame: protected, but bounded.
+        let (a, u) = auto_both("face.jpg", |x, y| {
+            if (130..190).contains(&x) && (70..150).contains(&y) {
+                [236, 186, 150]
+            } else {
+                let v = 20 + (40 * x / 320) as u8;
+                [v, v, v + 2]
+            }
+        });
+        within(&a, &u);
+        assert_ne!(a, u, "the guard protects the estimated skin");
     }
 
     #[test]
