@@ -370,6 +370,9 @@ impl DevelopCache {
         let _ = std::thread::Builder::new().name("profile-scan".into()).spawn(move || {
             ProfileLibrary::shared().warm();
             if let Some(path) = catalog_path {
+                // Tests: don't replace the registry mid-way through a style-import test.
+                #[cfg(test)]
+                let _registry = crate::styles::test_registry_guard();
                 let registered = masks::open_catalog_read_only(&path)
                     .and_then(|conn| crate::styles::register_imported_profiles(&conn));
                 if let Err(e) = registered {

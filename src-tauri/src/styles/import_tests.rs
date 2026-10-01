@@ -35,6 +35,7 @@ const CUBE: &str = "TITLE \"Warm\"\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0
 
 #[test]
 fn import_folder_groups_skips_and_replaces() {
+    let _registry = test_registry_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("MyStyles");
     let film = root.join("Film");
@@ -324,6 +325,7 @@ fn synthetic_presets_apply_exactly_their_keys() {
 #[test]
 #[ignore = "needs the user's preset folders (test-data/styles) / Adobe Camera Raw Settings"]
 fn real_preset_folders_apply_exactly_their_keys() {
+    let _registry = test_registry_guard();
     let dirs: Vec<PathBuf> = match std::env::var_os("SIEVE_STYLE_DIRS") {
         Some(v) => std::env::split_paths(&v).collect(),
         None => vec![
