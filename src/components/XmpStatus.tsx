@@ -26,6 +26,7 @@ interface Props {
   xmp: XmpStatus | null;
   failures: XmpFailureRow[];
   onOpenErrors: () => void;
+  onShow?: (imageId: number) => void;
   onRetry: () => void;
   onSaveAll: () => void;
   onAutoSync: (v: boolean) => void;
@@ -40,7 +41,7 @@ const pillClass: Record<XmpUiState, string> = {
   off: "bg-neutral-900 text-neutral-400 ring-neutral-700 hover:bg-neutral-800",
 };
 
-export function XmpStatusPill({ xmp, failures, onOpenErrors, onRetry, onSaveAll, onAutoSync, onExplain }: Props) {
+export function XmpStatusPill({ xmp, failures, onOpenErrors, onShow, onRetry, onSaveAll, onAutoSync, onExplain }: Props) {
   const state = xmpUiState(xmp);
   const dirty = xmp?.dirty ?? 0;
   const failed = xmp?.failed ?? 0;
@@ -84,6 +85,7 @@ export function XmpStatusPill({ xmp, failures, onOpenErrors, onRetry, onSaveAll,
             failures={failures}
             autoSync={autoSync}
             onOpenErrors={onOpenErrors}
+            onShow={onShow && ((id) => (close(), onShow(id)))}
             onRetry={onRetry}
             onSaveAll={() => {
               close();
@@ -109,6 +111,7 @@ function PopoverBody(p: {
   failures: XmpFailureRow[];
   autoSync: boolean;
   onOpenErrors: () => void;
+  onShow?: (imageId: number) => void;
   onRetry: () => void;
   onSaveAll: () => void;
   onAutoSync: (v: boolean) => void;
@@ -138,7 +141,14 @@ function PopoverBody(p: {
           <ul className="mt-2 max-h-40 space-y-1.5 overflow-y-auto" data-testid="xmp-failures">
             {p.failures.map((f) => (
               <li key={f.imageId} className="rounded bg-neutral-800/70 px-2 py-1" data-testid={`xmp-failure-${f.imageId}`}>
-                <div className="font-medium text-neutral-200">{f.fileName}</div>
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate font-medium text-neutral-200">{f.fileName}</span>
+                  {p.onShow && (
+                    <button className="shrink-0 text-sky-300 hover:underline" data-testid={`xmp-failure-show-${f.imageId}`} onClick={() => p.onShow!(f.imageId)}>
+                      Show
+                    </button>
+                  )}
+                </div>
                 <div className="text-neutral-400">{describeReason(f.reason).message}</div>
               </li>
             ))}

@@ -8,6 +8,7 @@ import {
   commands,
   convertFileSrc,
   DEFAULT_MATCH_OPTIONS,
+  DEFAULT_SCENE_APPLY_OPTIONS,
   lerpAdjustments,
   unwrap,
   type AdjustmentField,
@@ -16,6 +17,7 @@ import {
   type RawImageEntry,
   type ParametricAdjustments,
   type Scene,
+  type SceneApplyOptions,
   type SceneProgress,
 } from "../../ipc";
 import { SettingsFieldsDialog } from "../develop/SettingsFieldsDialog";
@@ -28,13 +30,18 @@ interface Props {
   progress: SceneProgress | null;
   fileName: (id: number) => string;
   onClose: () => void;
-  /** Called after apply_scene_match resolved with the changed image ids. */
-  onApplied: (changed: number[], attempted: number[]) => void;
+  /** Apply with the panel's options: the caller runs `apply_scene_edit` (one undoable batch, plan status, needs-a-look) and closes the panel. */
+  onApply: (options: SceneApplyOptions) => void;
+  /**
+   * Outside the Edit step there is no plan (no representative, no batch state): the scene strip's anchor-based
+   * Match Scene keeps writing per-photo history through `apply_scene_match` and reports here.
+   */
+  onApplied?: (changed: number[], attempted: number[]) => void;
 }
 
 const RENDER_EDGE = 360;
 
-export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, onClose, onApplied }: Props) {
+export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, onClose, onApply, onApplied }: Props) {
   const [rows, setRows] = useState<Map<number, RawImageEntry>>(new Map());
   const fileName = useCallback((id: number) => rows.get(id)?.fileName ?? libName(id), [rows, libName]);
   useEffect(() => {
@@ -100,6 +107,18 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
     if (selected.length === 0) return;
     setApplying(true);
     setError(null);
+    if (!onApplied) {
+      const keep = new Set(selected.map((p) => p.targetId));
+      // The Edit step: one `apply_scene_edit` batch with the panel's options. Every frame of the scene the user left
+      // unchecked (rejects hidden by the panel included) is excluded.
+      return onApply({
+        ...(DEFAULT_SCENE_APPLY_OPTIONS as unknown as SceneApplyOptions),
+        matchOptions: opts,
+        includeNonKeepers: true,
+        skipUserEdited: false,
+        excludeIds: scene.imageIds.filter((i) => !keep.has(i)),
+      });
+    }
     try {
       const apps = selected.map((p) => ({ imageId: p.targetId, adjustments: predicted(p) }));
       const changed = await unwrap(commands.applySceneMatch(apps, "Match Scene"));

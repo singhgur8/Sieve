@@ -1,5 +1,5 @@
 // 32 px bar under the TopBar while Developing in the Edit step: which scene, its state, and Auto edit / Apply to scene.
-import { ChevronDown, ChevronLeft, ChevronRight, ListChecks } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ListChecks, X } from "lucide-react";
 import type { SceneRow, Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
 import { Menu, menuItem } from "../Menu";
@@ -34,7 +34,8 @@ export function EditContextBar(p: Props) {
   const isRep = !!row && row.entry.representativeId === p.activeId;
   const busy = wf.busy != null;
   const last = row ? wf.batchForScene(row.entry.sceneId) : null;
-  const canApply = !!row && row.ui !== "todo" && row.targets > 0;
+  const canApply = !!row && row.ui !== "todo" && row.targets > 0 && !row.skipped;
+  const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
 
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
   let hintText: string | null = null;
@@ -48,18 +49,22 @@ export function EditContextBar(p: Props) {
         </span>
       );
       if (row.ui === "todo" || row.ui === "edited") hintText = `Edit this photo, then apply it to the other ${row.targets}.`;
-    } else if (row.review.includes(p.activeId)) {
+    } else if (wf.needsReviewSet.has(p.activeId)) {
+      const reason = wf.stateById.get(p.activeId)?.reviewReason;
       chip = (
         <>
-          <span className="rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-200" data-testid="edit-chip" data-kind="review">
-            Needs a look: exposure did not match
+          <span className="max-w-[420px] truncate rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-200" data-testid="edit-chip" data-kind="review" title={reason ?? undefined}>
+            Needs a look: {reason ? reason.charAt(0).toLowerCase() + reason.slice(1) : "exposure did not match"}
           </span>
+          <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-emerald-200 hover:bg-neutral-700" onClick={() => void wf.markReviewed([p.activeId!])} data-testid="edit-looks-good" title="Keep the settings and clear the mark">
+            Looks good
+          </button>
           <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review">
             Next to review ›
           </button>
         </>
       );
-    } else if (row.ui === "applied") {
+    } else if (row.entry.appliedIds.includes(p.activeId)) {
       chip = (
         <span className="rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="applied">
           From Scene {num}&apos;s edit ✓
@@ -133,7 +138,10 @@ export function EditContextBar(p: Props) {
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {wf.busy?.kind === "scene" && (
           <span className="flex h-6 items-center rounded bg-emerald-950 px-2 text-xs text-emerald-200" data-testid="edit-applying">
-            Applying… {wf.busy.done}/{wf.busy.total}
+            {wf.cancelling ? "Stopping…" : `Applying… ${wf.busy.done}/${wf.busy.total}`}
+            <button className="ml-1 rounded p-0.5 hover:bg-emerald-900 disabled:opacity-40" data-testid="edit-apply-cancel" aria-label="Stop applying" title="Stop applying. Scenes already applied stay applied" disabled={wf.cancelling} onClick={wf.cancelApply}>
+              <X className="size-3" />
+            </button>
           </span>
         )}
         <AutoEditButton
@@ -151,7 +159,7 @@ export function EditContextBar(p: Props) {
             title={row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
             onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview)}
           >
-            Apply to scene{row ? ` (${row.targets})` : ""}
+            {newKeepers > 0 ? `Apply to ${newKeepers} new` : `Apply to scene${row ? ` (${row.targets})` : ""}`}
           </button>
           <Menu
             trigger={<ChevronDown className="size-3.5" />}
