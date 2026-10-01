@@ -214,7 +214,7 @@ export function PlanView(p: Props) {
             <button className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600" data-testid="plan-continue-export" onClick={p.onContinueExport}>
               Continue to Export <ArrowRight className="size-3.5" /> {keeperCount}
             </button>
-          ) : pending.length === 0 && (counts?.toEdit ?? 0) === 0 ? null : (
+          ) : (pending.length === 0 && (counts?.toEdit ?? 0) === 0) || (pending.length === 0 && rows.some((r) => r.ui === "applied" || r.ui === "reset")) ? null : (
             <button
               className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
               data-testid="plan-apply-all"
@@ -362,7 +362,20 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const t = p.sceneTimes(id);
   const repEntry = lib.getEntry(e.representativeId);
   const others = e.imageIds.filter((i) => i !== e.representativeId);
-  const shown = others.slice(0, memberShown);
+  // Size the strip from the width left after the action buttons: whole thumbs plus the "+N" chip.
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [stripW, setStripW] = useState<number | null>(null);
+  useEffect(() => {
+    const el = stripRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setStripW(el.clientWidth));
+    ro.observe(el);
+    setStripW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+  const cell = (typeof window !== "undefined" && window.innerWidth >= 1600 ? 90 : 72) + 4;
+  const fit = stripW == null ? memberShown : others.length * cell <= stripW ? others.length : Math.max(0, Math.floor((stripW - 48) / cell));
+  const shown = others.slice(0, Math.min(memberShown, fit));
   const more = others.length - shown.length;
   const busyHere = wf.busy?.kind === "scene" && wf.busy.sceneId === id;
   const anyBusy = wf.busy != null;
@@ -409,7 +422,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           {repEntry?.fileName ?? `#${e.representativeId}`}
         </p>
       </div>
-      <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden" data-testid={`plan-members-${id}`}>
+      <div ref={stripRef} className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden" data-testid={`plan-members-${id}`}>
         {shown.map((i) => (
           <div key={i} className="relative h-12 w-[72px] shrink-0 overflow-hidden rounded min-[1600px]:h-[60px] min-[1600px]:w-[90px]">
             <Thumb entry={lib.getEntry(i)} version={lib.version(i)} className="size-full" />
@@ -439,7 +452,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
             {applyLabel}
           </button>
         )}
-        {r.review.length > 0 && !r.skipped && (
+        {r.review.length > 0 && !r.skipped && r.ui !== "reset" && (
           <button className="h-7 whitespace-nowrap rounded-md bg-amber-900/70 px-3 text-xs font-medium text-amber-100 hover:bg-amber-800" data-testid={`plan-review-${id}`} onClick={() => p.onReview(id)}>
             Review {r.review.length}
           </button>

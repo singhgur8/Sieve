@@ -136,7 +136,7 @@ export function EditContextBar(p: Props) {
         <ChevronRight className="size-4" />
       </button>
       <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap">{chip}</div>
-      {hintText && <span className="min-w-0 truncate text-xs text-neutral-400 max-[1439px]:hidden">{hintText}</span>}
+      {hintText && <span className={`min-w-0 truncate text-xs text-neutral-400 ${row?.ui === "reset" ? "" : "max-[1439px]:hidden"}`}>{hintText}</span>}
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {wf.busy?.kind === "scene" && (
           <span className="flex h-6 items-center rounded bg-emerald-950 px-2 text-xs text-emerald-200" data-testid="edit-applying">
