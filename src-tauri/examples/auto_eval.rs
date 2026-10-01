@@ -11,6 +11,10 @@
 //! - `--models` (default `~/Library/Application Support/com.sieve.app/models`): SCRFD face
 //!   detector for the face boxes (as the analysis would provide); faces are detected on the
 //!   user's render. Without models, Auto runs without faces (skin-colour guard only).
+//! - `--no-faces`: Auto runs as on a photo that has not been analysed yet (`faces = None`);
+//!   the detected faces are still used for the face L* and skin-clipping statistics.
+//! - `--both`: per frame, also compare Auto with vs without faces (exposure / Whites drop,
+//!   render mean CIELAB dE76 vs the user's render); prints the worst cases.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -96,6 +100,44 @@ fn mean_l(img: &sieve_lib::develop::pipeline::RenderedImage, faces: &[NormRect])
     (all, (n > 0).then(|| s / n as f64))
 }
 
+/// Mean CIELAB dE76 between two renders of the same size (D65 sRGB).
+fn mean_delta_e(
+    a: &sieve_lib::develop::pipeline::RenderedImage,
+    b: &sieve_lib::develop::pipeline::RenderedImage,
+) -> f64 {
+    let lin = |v: u8| {
+        let e = f64::from(v) / 255.0;
+        if e <= 0.04045 {
+            e / 12.92
+        } else {
+            ((e + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let lab = |p: &[u8; 3]| {
+        let (r, g, b) = (lin(p[0]), lin(p[1]), lin(p[2]));
+        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+        let f = |t: f64| if t > 216.0 / 24389.0 { t.cbrt() } else { (24389.0 / 27.0 * t + 16.0) / 116.0 };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    };
+    if a.width != b.width || a.height != b.height {
+        return f64::NAN;
+    }
+    let (pa, pb) = (a.rgb.as_chunks::<3>().0, b.rgb.as_chunks::<3>().0);
+    let sum: f64 = pa
+        .iter()
+        .zip(pb)
+        .map(|(x, y)| {
+            let (l1, a1, b1) = lab(x);
+            let (l2, a2, b2) = lab(y);
+            ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+        })
+        .sum();
+    sum / pa.len().max(1) as f64
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
@@ -159,7 +201,9 @@ fn main() {
     if args.iter().any(|a| a == "--wb-no-blue") {
         wb_opts.exclude_blue = true;
     }
-    println!("targets {targets:?} wb {wb_opts:?}");
+    let no_faces = args.iter().any(|a| a == "--no-faces");
+    let both = args.iter().any(|a| a == "--both");
+    println!("targets {targets:?} wb {wb_opts:?} no_faces {no_faces} both {both}");
     // Camera Raw's own Auto (Adobe DNG Converter with crs:AutoTone + WhiteBalance Auto;
     // `test-data/lr-auto/make_oracle.sh`): stem -> resolved values.
     let lr_auto_map: serde_json::Map<String, serde_json::Value> = arg("--lr-auto")
@@ -200,6 +244,8 @@ fn main() {
     let (mut skin_frames, mut auto_clip_frames, mut user_clip_frames) = (0usize, 0usize, 0usize);
     let (mut auto_clip_sum, mut user_clip_sum, mut auto_clip_max) = (0.0f64, 0.0f64, 0.0f32);
     let mut times = Vec::new();
+    let mut times_nf: Vec<f64> = Vec::new();
+    let mut both_rows: Vec<BothRow> = Vec::new();
     let (mut vs_lr, mut vs_lr_faces) = (Acc::default(), Acc::default());
     let (mut lr_wb_n, mut lr_wb_t, mut lr_wb_n_t, mut lr_asshot_t, mut lr_asshot_n) =
         (0usize, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -243,8 +289,9 @@ fn main() {
             }
             _ => Vec::new(),
         };
+        let auto_faces = (!no_faces).then_some(faces.as_slice());
         let t = Instant::now();
-        let a = match auto::auto_tone_opts(&cache, &src, user, AdjustmentField::AUTO_TONE, Some(&faces), targets) {
+        let a = match auto::auto_tone_opts(&cache, &src, user, AdjustmentField::AUTO_TONE, auto_faces, targets) {
             Ok(a) => a,
             Err(e) => {
                 println!("{}: {}", path.display(), e.message);
@@ -253,6 +300,34 @@ fn main() {
         };
         times.push(t.elapsed().as_secs_f64() * 1000.0);
         let auto_adj = a.apply_to(user);
+        if both {
+            let tn = Instant::now();
+            if let Ok(an) = auto::auto_tone_opts(&cache, &src, user, AdjustmentField::AUTO_TONE, None, targets) {
+                times_nf.push(tn.elapsed().as_secs_f64() * 1000.0);
+                let af = auto::auto_tone_opts(&cache, &src, user, AdjustmentField::AUTO_TONE, Some(&faces), targets)
+                    .unwrap_or(a);
+                let mut uu = user.clone();
+                uu.crop.enabled = false;
+                let (mut fa, mut na) = (af.apply_to(&uu), an.apply_to(&uu));
+                (fa.crop.enabled, na.crop.enabled) = (false, false);
+                if let (Ok(ru), Ok(rf), Ok(rn)) = (
+                    cache.render_image(&src, &uu, None, 512, &luts),
+                    cache.render_image(&src, &fa, None, 512, &luts),
+                    cache.render_image(&src, &na, None, 512, &luts),
+                ) {
+                    both_rows.push(BothRow {
+                        name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        faces: faces.len(),
+                        exp_f: fa.exposure,
+                        exp_n: na.exposure,
+                        whites_f: fa.whites,
+                        whites_n: na.whites,
+                        de_f: mean_delta_e(&rf.image, &ru.image),
+                        de_n: mean_delta_e(&rn.image, &ru.image),
+                    });
+                }
+            }
+        }
         let av = sliders(&auto_adj);
         let uv = sliders(user);
         all.add(av, uv);
@@ -379,7 +454,7 @@ fn main() {
             let mut base = ParametricAdjustments::defaults_for(fmt);
             base.white_balance = WhiteBalance::Custom { temperature_k: g("ColorTemperature"), tint: g("Tint") };
             if let Some(out) = std::env::var_os("AUTO_EVAL_FEATURES") {
-                if let Ok((e, f)) = auto::exposure_features(&cache, &src, &base, Some(&faces), targets) {
+                if let Ok((e, f)) = auto::exposure_features(&cache, &src, &base, auto_faces, targets) {
                     use std::io::Write;
                     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(out).unwrap();
                     let fs: Vec<String> = f.iter().map(|v| format!("{v:.5}")).collect();
@@ -387,8 +462,7 @@ fn main() {
                     writeln!(file, "{stem},{e},{},{}", fs.join(","), ls.join(",")).unwrap();
                 }
             }
-            if let Ok(sa) = auto::auto_tone_opts(&cache, &src, &base, AdjustmentField::AUTO_TONE, Some(&faces), targets)
-            {
+            if let Ok(sa) = auto::auto_tone_opts(&cache, &src, &base, AdjustmentField::AUTO_TONE, auto_faces, targets) {
                 let sieve_adj = sa.apply_to(&base);
                 let sv = sliders(&sieve_adj);
                 vs_lr.add(sv, lr_vals);
@@ -530,5 +604,65 @@ fn main() {
     if !times.is_empty() {
         println!("auto_tone time: p50 {:.0} ms, p95 {:.0} ms", times[times.len() / 2], times[times.len() * 95 / 100]);
     }
+    if !both_rows.is_empty() {
+        let n = both_rows.len() as f64;
+        let mean = |f: &dyn Fn(&BothRow) -> f64| both_rows.iter().map(f).sum::<f64>() / n;
+        println!(
+            "\nAuto with vs without faces ({} frames, {} with faces): render dE76 vs user: with {:.2} / without {:.2}; \
+             mean |exposure diff| {:.3} EV; frames with exposure lower by > 0.25 EV without faces: {}; \
+             mean |Whites diff| {:.1}",
+            both_rows.len(),
+            both_rows.iter().filter(|r| r.faces > 0).count(),
+            mean(&|r| r.de_f),
+            mean(&|r| r.de_n),
+            mean(&|r| f64::from((r.exp_n - r.exp_f).abs())),
+            both_rows.iter().filter(|r| r.exp_n < r.exp_f - 0.25).count(),
+            mean(&|r| f64::from((r.whites_n - r.whites_f).abs())),
+        );
+        let mut by_de: Vec<&BothRow> = both_rows.iter().collect();
+        by_de.sort_by(|a, b| (b.de_n - b.de_f).total_cmp(&(a.de_n - a.de_f)));
+        println!("Worst dE increase without faces:");
+        for r in by_de.iter().take(6) {
+            println!(
+                "   {:<14} faces {} exposure {:+.2} -> {:+.2} whites {:+.0} -> {:+.0} dE {:.2} -> {:.2}",
+                r.name, r.faces, r.exp_f, r.exp_n, r.whites_f, r.whites_n, r.de_f, r.de_n
+            );
+        }
+        let mut by_exp: Vec<&BothRow> = both_rows.iter().collect();
+        by_exp.sort_by(|a, b| (a.exp_n - a.exp_f).total_cmp(&(b.exp_n - b.exp_f)));
+        let w = by_exp[0];
+        println!(
+            "Worst exposure drop without faces: {} {:+.2} -> {:+.2} ({:+.2} EV), dE {:.2} -> {:.2}",
+            w.name,
+            w.exp_f,
+            w.exp_n,
+            w.exp_n - w.exp_f,
+            w.de_f,
+            w.de_n
+        );
+        for r in both_rows.iter().filter(|r| r.name.starts_with("AZA06767")) {
+            println!(
+                "   {} exposure {:+.2} -> {:+.2} whites {:+.0} -> {:+.0} dE {:.2} -> {:.2}",
+                r.name, r.exp_f, r.exp_n, r.whites_f, r.whites_n, r.de_f, r.de_n
+            );
+        }
+        times_nf.sort_by(f64::total_cmp);
+        println!(
+            "auto_tone time without faces: p50 {:.0} ms, p95 {:.0} ms",
+            times_nf[times_nf.len() / 2],
+            times_nf[times_nf.len() * 95 / 100]
+        );
+    }
     let _ = Path::new("");
+}
+
+struct BothRow {
+    name: String,
+    faces: usize,
+    exp_f: f32,
+    exp_n: f32,
+    whites_f: f32,
+    whites_n: f32,
+    de_f: f64,
+    de_n: f64,
 }
