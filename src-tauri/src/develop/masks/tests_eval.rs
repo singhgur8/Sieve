@@ -484,11 +484,17 @@ fn a_few_masks_evaluate_fast_at_preview_size() {
         group(3, vec![comp(3, MaskShape::Radial(radial(20.0, 50.0)))]),
     ];
     let _ = evaluate(&groups, &g, 1, &src, None); // warm the pool
-    let t = std::time::Instant::now();
-    let w = evaluate(&groups, &g, 1, &src, None);
-    let ms = t.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("3 masks at 2048 px: {ms:.1} ms");
-    assert!(w.groups.iter().all(Option::is_some));
+
+    // Best of 5: a single wall-clock sample is at the mercy of the other tests competing for
+    // the CPU (and the rayon pool) in a full `cargo test` run.
+    let mut ms = f64::INFINITY;
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let w = evaluate(&groups, &g, 1, &src, None);
+        ms = ms.min(t.elapsed().as_secs_f64() * 1000.0);
+        assert!(w.groups.iter().all(Option::is_some));
+    }
+    eprintln!("3 masks at 2048 px: {ms:.1} ms (best of 5)");
     // Debug builds are ~10x slower than release (and share the CPU with the other tests);
     // the budget is ~10 ms in release.
     assert!(ms < if cfg!(debug_assertions) { 1500.0 } else { 20.0 }, "{ms} ms");

@@ -399,6 +399,18 @@ pub fn register_imported_profiles(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Test-only serialisation of the process-wide imported-profile registry
+/// (`profiles::set_imported`). Every test that replaces the registry (style imports,
+/// group removals, `DevelopCache` startup registration) holds this guard for its whole
+/// replace-then-assert sequence so parallel tests cannot clobber each other's set.
+/// Not reentrant: take it in the test (or the spawned thread), never inside
+/// [`register_imported_profiles`].
+#[cfg(test)]
+pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The stored `crs:` settings of an imported preset (`None` for Sieve presets).
 pub fn preset_settings(conn: &Connection, preset_id: PresetId) -> AppResult<Option<PresetSettings>> {
     let json: Option<Option<String>> =
@@ -661,6 +673,7 @@ mod tests {
 
     #[test]
     fn list_orders_groups_and_attaches_items() {
+        let _registry = test_registry_guard();
         let mut conn = open_in_memory();
         let user = presets::save(&conn, None, "Warm", &ParametricAdjustments::default(), &[AdjustmentField::Exposure])
             .unwrap();
