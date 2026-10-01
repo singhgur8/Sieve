@@ -51,6 +51,21 @@ impl Lru {
     }
 }
 
+impl Lru {
+    /// Drops every matte of `ids` (images removed from the catalog).
+    pub fn remove_images(&mut self, ids: &[ImageId]) {
+        let mut bytes = self.bytes;
+        self.entries.retain(|((id, _), m)| {
+            let keep = !ids.contains(id);
+            if !keep {
+                bytes -= m.data.len();
+            }
+            keep
+        });
+        self.bytes = bytes;
+    }
+}
+
 pub type SharedLru = Arc<Mutex<Lru>>;
 
 pub fn lock(l: &SharedLru) -> std::sync::MutexGuard<'_, Lru> {

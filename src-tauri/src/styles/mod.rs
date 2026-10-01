@@ -38,6 +38,11 @@
 //! - Duplicate names within a group get " (2)", " (3)"...
 //! - One transaction for all catalog writes; files that fail parse are listed in `skipped`.
 
+#[cfg(test)]
+mod import_tests;
+pub mod lua;
+pub mod preset_file;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -48,27 +53,378 @@ use crate::develop::presets;
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::*;
 use crate::lut::LutLibrary;
-use crate::profiles::CameraKey;
+use crate::profiles::{CameraKey, LookProfile};
+
+use preset_file::{ParsedPreset, PresetSettings, Template};
+
+/// Maximum directory depth below the import root.
+const MAX_DEPTH: usize = 8;
+/// Files larger than this are skipped (Adobe's biggest look profiles are a few MB; 65^3 .cube
+/// files are ~8 MB).
+const MAX_FILE_BYTES: u64 = 64 << 20;
+
+/// One importable item found in a directory.
+pub(crate) enum Item {
+    Preset { path: PathBuf, format: StyleSourceFormat, parsed: ParsedPreset },
+    Profile(ProfileRow),
+}
+
+pub(crate) struct ProfileRow {
+    kind: StyleProfileKind,
+    name: String,
+    format: StyleSourceFormat,
+    path: String,
+    look_uuid: Option<String>,
+    lut_id: Option<String>,
+    camera_profile: Option<String>,
+    camera_model: Option<String>,
+    supports_amount: bool,
+    monochrome: bool,
+}
+
+fn stem(path: &Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn ext_of(path: &Path) -> Option<String> {
+    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
+}
+
+/// Directories under `root` (itself first), sorted, depth-limited, symlinks not followed.
+fn directories(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        out.push(dir.to_path_buf());
+        if depth >= MAX_DEPTH {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut subs: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .collect();
+        subs.sort();
+        for d in subs {
+            walk(&d, depth + 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out
+}
+
+/// Group name of `dir` (UX spec 7.1): the path relative to the import root's parent, at most
+/// the last two components (`VSCO / Film 01`).
+fn group_name(root: &Path, dir: &Path) -> String {
+    let base = root.parent().unwrap_or(root);
+    let rel = dir.strip_prefix(base).unwrap_or(dir);
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let parts = if parts.len() > 2 { &parts[parts.len() - 2..] } else { &parts[..] };
+    let name = parts.join(" / ");
+    if name.is_empty() {
+        dir.display().to_string()
+    } else {
+        name
+    }
+}
+
+/// Reads one file: `Ok(None)` for unsupported extensions (ignored silently), `Err(reason)`
+/// for files that could not be imported.
+fn read_item(path: &Path, luts: &LutLibrary) -> Result<Option<Item>, String> {
+    let Some(ext) = ext_of(path) else { return Ok(None) };
+    if !matches!(ext.as_str(), "xmp" | "lrtemplate" | "dcp" | "cube") {
+        return Ok(None);
+    }
+    let size = std::fs::metadata(path).map_err(|e| format!("unreadable: {e}"))?.len();
+    if size > MAX_FILE_BYTES {
+        return Err(format!("file too large ({} MB)", size >> 20));
+    }
+    match ext.as_str() {
+        "xmp" => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+            if let Some(parsed) = preset_file::parse_xmp(&text).map_err(|e| format!("invalid XMP: {e}"))? {
+                return Ok(Some(Item::Preset { path: path.to_owned(), format: StyleSourceFormat::XmpPreset, parsed }));
+            }
+            match LookProfile::parse_file_opts(&text, false) {
+                Ok(Some(look)) => Ok(Some(Item::Profile(ProfileRow {
+                    kind: StyleProfileKind::Look,
+                    name: if look.name.trim().is_empty() { stem(path) } else { look.name.trim().to_owned() },
+                    format: StyleSourceFormat::XmpProfile,
+                    path: path.display().to_string(),
+                    look_uuid: Some(look.uuid),
+                    lut_id: None,
+                    camera_profile: look.camera_profile,
+                    camera_model: look.camera_model_restriction,
+                    supports_amount: look.supports_amount,
+                    monochrome: look.monochrome,
+                }))),
+                Ok(None) => {
+                    let kind = crate::xmp::packet::Packet::parse(&text).ok().and_then(|p| {
+                        use crate::xmp::crs::CrsSource;
+                        p.top().scalar(crate::xmp::crs::CRS_NS, "PresetType")
+                    });
+                    Err(match kind {
+                        Some(k) => format!("not a develop preset or profile (crs:PresetType \"{}\")", k.trim()),
+                        None => "not a develop preset or profile (photo sidecar or other XMP)".into(),
+                    })
+                }
+                Err(e) => Err(format!("invalid look profile: {e}")),
+            }
+        }
+        "lrtemplate" => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+            match preset_file::parse_lrtemplate(&text).map_err(|e| format!("invalid .lrtemplate: {e}"))? {
+                Template::Develop(parsed) => {
+                    Ok(Some(Item::Preset { path: path.to_owned(), format: StyleSourceFormat::Lrtemplate, parsed }))
+                }
+                Template::Other(kind) => Err(format!("not a develop preset ({kind} preset)")),
+            }
+        }
+        "dcp" => {
+            let (model, name) = crate::profiles::read_dcp_names(path).ok_or("unreadable DCP")?;
+            if name.trim().is_empty() || model.trim().is_empty() {
+                return Err("DCP without ProfileName / UniqueCameraModel".into());
+            }
+            Ok(Some(Item::Profile(ProfileRow {
+                kind: StyleProfileKind::CameraProfile,
+                name: name.clone(),
+                format: StyleSourceFormat::Dcp,
+                path: path.display().to_string(),
+                look_uuid: None,
+                lut_id: None,
+                camera_profile: Some(name),
+                camera_model: Some(model),
+                supports_amount: false,
+                monochrome: false,
+            })))
+        }
+        _ => {
+            let info = luts.import(path).map_err(|e| {
+                let prefix = format!("{}: ", path.display());
+                format!("invalid .cube: {}", e.message.strip_prefix(&prefix).unwrap_or(&e.message))
+            })?;
+            Ok(Some(Item::Profile(ProfileRow {
+                kind: StyleProfileKind::Lut,
+                name: if info.name.trim().is_empty() { stem(path) } else { info.name.clone() },
+                format: StyleSourceFormat::Cube,
+                path: info.path.clone(),
+                look_uuid: None,
+                lut_id: Some(info.id),
+                camera_profile: None,
+                camera_model: None,
+                supports_amount: true,
+                monochrome: false,
+            })))
+        }
+    }
+}
+
+/// `name`, or `name (2)`, `name (3)`... not yet in `taken` (case-insensitive); records it.
+fn unique_name(name: &str, taken: &mut Vec<String>) -> String {
+    let base: String = name.trim().chars().take(100).collect();
+    let base = if base.is_empty() { "Untitled".to_owned() } else { base };
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
+        let suffix = format!(" ({n})");
+        let keep = 100 - suffix.chars().count();
+        candidate = format!("{}{suffix}", base.chars().take(keep).collect::<String>());
+        n += 1;
+    }
+    taken.push(candidate.clone());
+    candidate
+}
 
 /// Imports every preset / profile under `root` (see the module docs). Contract:
-/// rust-engine-dev.
+/// rust-engine-dev. [`scan_folder`] + [`store_scan`] (the command runs the scan off the
+/// catalog thread).
 pub fn import_folder(conn: &mut Connection, luts: &LutLibrary, root: &Path) -> AppResult<ImportStyleReport> {
-    let _ = (conn, luts, root);
-    Err(AppError::internal("Importing presets and profiles is not implemented yet (IPC v14 stub, rust-engine-dev)."))
+    let scan = scan_folder(luts, root)?;
+    store_scan(conn, scan)
+}
+
+/// Result of [`scan_folder`]: parsed items per directory, not yet in the catalog.
+pub struct FolderScan {
+    root: PathBuf,
+    found: Vec<(PathBuf, Vec<Item>)>,
+    skipped: Vec<StyleImportSkip>,
+}
+
+/// Walks and parses `root` (no catalog access; `.cube` files are copied into the LUT
+/// library). Errors: `not_found`, `invalid_argument` (nothing importable).
+pub fn scan_folder(luts: &LutLibrary, root: &Path) -> AppResult<FolderScan> {
+    if !root.is_dir() {
+        return Err(AppError::not_found(format!("{}: no such folder", root.display())));
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut report = ImportStyleReport { root: root.display().to_string(), ..Default::default() };
+    let mut found: Vec<(PathBuf, Vec<Item>)> = Vec::new();
+
+    for dir in directories(&root) {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+        let mut items = Vec::new();
+        for f in files {
+            match read_item(&f, luts) {
+                Ok(Some(Item::Preset { parsed, .. })) if parsed.settings.is_empty() => {
+                    let why = if parsed.warnings.is_empty() {
+                        "preset has no develop settings".to_owned()
+                    } else {
+                        format!("no settings Sieve can apply ({})", parsed.warnings.join("; "))
+                    };
+                    report.skipped.push(StyleImportSkip { path: f.display().to_string(), reason: why });
+                }
+                Ok(Some(item)) => items.push(item),
+                Ok(None) => {}
+                Err(reason) => report.skipped.push(StyleImportSkip { path: f.display().to_string(), reason }),
+            }
+        }
+        if !items.is_empty() {
+            found.push((dir, items));
+        }
+    }
+    if found.is_empty() && report.skipped.is_empty() {
+        return Err(AppError::invalid(format!(
+            "{}: no presets or profiles found (.xmp, .lrtemplate, .dcp, .cube)",
+            root.display()
+        )));
+    }
+
+    Ok(FolderScan { root, found, skipped: report.skipped })
+}
+
+/// Writes a [`FolderScan`] in one transaction (groups replaced by source folder) and
+/// registers the imported looks / DCPs with the render engine.
+pub fn store_scan(conn: &mut Connection, scan: FolderScan) -> AppResult<ImportStyleReport> {
+    let FolderScan { root, found, skipped } = scan;
+    let mut report = ImportStyleReport { root: root.display().to_string(), skipped, ..Default::default() };
+    let now = now_ms();
+    let tx = conn.transaction()?;
+    for (dir, items) in found {
+        let source = dir.display().to_string();
+        let name = group_name(&root, &dir);
+        let existing: Option<StyleGroupId> =
+            tx.query_row("SELECT id FROM style_groups WHERE source_path = ?1", [&source], |r| r.get(0)).optional()?;
+        let gid = match existing {
+            Some(id) => {
+                tx.execute("DELETE FROM presets WHERE group_id = ?1", [id])?;
+                tx.execute("DELETE FROM style_profiles WHERE group_id = ?1", [id])?;
+                tx.execute(
+                    "UPDATE style_groups SET name = ?2, imported_at = ?3 WHERE id = ?1",
+                    params![id, name, now],
+                )?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO style_groups (name, kind, source_path, imported_at) VALUES (?1, 'imported', ?2, ?3)",
+                    params![name, source, now],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        report.group_ids.push(gid);
+        let mut preset_names = Vec::new();
+        let mut profile_names = Vec::new();
+        for item in items {
+            match item {
+                Item::Preset { path, format, parsed } => {
+                    let name = unique_name(&parsed.name.clone().unwrap_or_else(|| stem(&path)), &mut preset_names);
+                    let adjustments =
+                        parsed.settings.apply(&ParametricAdjustments::default()).map_err(AppError::internal)?;
+                    let fields: Vec<&str> = parsed.settings.fields().iter().map(|f| f.as_str()).collect();
+                    tx.execute(
+                        "INSERT INTO presets (group_id, name, params_json, fields_json, source_format, source_path,
+                                              settings_json, setting_keys_json, supports_amount, warnings_json,
+                                              created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                        params![
+                            gid,
+                            name,
+                            serde_json::to_string(&adjustments)?,
+                            serde_json::to_string(&fields)?,
+                            format.as_str(),
+                            path.display().to_string(),
+                            serde_json::to_string(&parsed.settings)?,
+                            serde_json::to_string(&parsed.settings.keys())?,
+                            parsed.supports_amount,
+                            serde_json::to_string(&parsed.warnings)?,
+                            now
+                        ],
+                    )?;
+                    report.presets += 1;
+                }
+                Item::Profile(p) => {
+                    let name = unique_name(&p.name, &mut profile_names);
+                    tx.execute(
+                        "INSERT INTO style_profiles (group_id, kind, name, source_format, source_path, look_uuid, lut_id,
+                                                     camera_profile, camera_model, supports_amount, monochrome, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            gid,
+                            p.kind.as_str(),
+                            name,
+                            p.format.as_str(),
+                            p.path,
+                            p.look_uuid,
+                            p.lut_id,
+                            p.camera_profile,
+                            p.camera_model,
+                            p.supports_amount,
+                            p.monochrome,
+                            now
+                        ],
+                    )?;
+                    report.profiles += 1;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    register_imported_profiles(conn)?;
+    Ok(report)
+}
+
+/// Makes the library's imported looks / DCPs resolvable by the render engine and the XMP
+/// writer (`profiles::set_imported`). Called after imports / removals and at startup.
+pub fn register_imported_profiles(conn: &Connection) -> AppResult<()> {
+    crate::profiles::set_imported(&imported_profile_paths(conn)?);
+    Ok(())
+}
+
+/// The stored `crs:` settings of an imported preset (`None` for Sieve presets).
+pub fn preset_settings(conn: &Connection, preset_id: PresetId) -> AppResult<Option<PresetSettings>> {
+    let json: Option<Option<String>> =
+        conn.query_row("SELECT settings_json FROM presets WHERE id = ?1", [preset_id], |r| r.get(0)).optional()?;
+    match json {
+        None => Err(AppError::not_found(format!("preset {preset_id}"))),
+        Some(None) => Ok(None),
+        Some(Some(j)) => Ok(Some(serde_json::from_str(&j)?)),
+    }
 }
 
 /// What applying preset `preset_id` to an image whose adjustments are `base` gives.
 /// Sieve presets: `base` with the preset's `fields` copied. Imported presets: exactly the
-/// preset's `crs:` settings applied onto `base` (rust-engine-dev: `xmp::crs`; until then the
-/// `fields` approximation below).
+/// preset's `crs:` settings applied onto `base` (Lightroom semantics; masks are appended).
 pub fn resolve_preset(
     conn: &Connection,
     preset_id: PresetId,
     base: &ParametricAdjustments,
 ) -> AppResult<ParametricAdjustments> {
+    if let Some(settings) = preset_settings(conn, preset_id)? {
+        let out = settings.apply(base).map_err(AppError::internal)?;
+        out.validate().map_err(AppError::internal)?;
+        return Ok(out);
+    }
     let preset = presets::get(conn, preset_id)?;
     let mut out = base.clone();
-    // TODO(rust-engine-dev): imported presets (settings_json NOT NULL) apply key by key.
     out.copy_fields(&preset.adjustments, &preset.fields);
     Ok(out)
 }
@@ -208,7 +564,7 @@ pub fn remove_group(conn: &mut Connection, id: StyleGroupId) -> AppResult<()> {
         None => Err(AppError::not_found(format!("style group {id}"))),
         Some(StyleGroupKind::Imported) => {
             conn.execute("DELETE FROM style_groups WHERE id = ?1", [id])?;
-            Ok(())
+            register_imported_profiles(conn)
         }
         Some(_) => Err(AppError::invalid("built-in style groups cannot be removed")),
     }

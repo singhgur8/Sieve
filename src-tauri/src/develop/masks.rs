@@ -207,6 +207,16 @@ impl MaskCache {
         self.config.cache_dir.join(cache::rel_path(image_id, digest))
     }
 
+    /// Forgets images removed from the catalog (`remove_project`): their decoded mattes and
+    /// their matte files (`<cacheDir>/masks/<id>/`; ids can be reused by the next import).
+    /// Their `mask_cache` rows go with the image rows (cascade).
+    pub fn forget_images(&self, ids: &[ImageId]) {
+        cache::lock(&self.lru).remove_images(ids);
+        for id in ids {
+            let _ = std::fs::remove_dir_all(self.masks_dir().join(id.to_string()));
+        }
+    }
+
     /// XMP read path: decodes the sidecar's Lightroom mattes into the cache (origin
     /// `lightroom`, model version `lr:<crs:ModelVersion>`), skipping those already cached.
     /// Returns per-matte errors (the component then renders empty / `needs_update`).

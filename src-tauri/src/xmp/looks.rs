@@ -70,14 +70,15 @@ fn library() -> &'static Library {
     LIB.get_or_init(|| Library { index: scan(&ProfileConfig::from_env().look_dirs), texts: Mutex::new(HashMap::new()) })
 }
 
-/// The installed look file (XMP text) with `uuid`, if any.
+/// The installed (or style-library imported) look file (XMP text) with `uuid`, if any.
 pub fn installed(uuid: &str) -> Option<Arc<str>> {
     let lib = library();
     let uuid = uuid.to_ascii_uppercase();
     if let Some(t) = lib.texts.lock().unwrap_or_else(|e| e.into_inner()).get(&uuid) {
         return Some(t.clone());
     }
-    let path = lib.index.get(&uuid)?;
+    // Adobe-installed first, then looks imported into the style library (IPC v14).
+    let path = lib.index.get(&uuid).cloned().or_else(|| crate::profiles::imported_look_path(&uuid))?;
     let text: Arc<str> = std::fs::read_to_string(path).ok()?.into();
     let mut cache = lib.texts.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= 16 {

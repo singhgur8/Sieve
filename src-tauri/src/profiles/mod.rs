@@ -45,9 +45,9 @@ pub mod table;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use crate::ipc::types::{CameraProfileInfo, ImageFormat, LookProfileInfo, ProfileCatalog};
+use crate::ipc::types::{CameraProfileInfo, ImageFormat, LookProfileInfo, ProfileCatalog, StyleProfileKind};
 
 pub use dcp::Dcp;
 pub use look::LookProfile;
@@ -199,6 +199,78 @@ fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
+/// Looks and DCPs of the style library (`styles`, IPC v14): imported files read in place,
+/// resolved after the Adobe-installed ones. Process-wide (one catalog per process); replaced
+/// by [`set_imported`] after every import / group removal and at startup.
+fn imported() -> &'static RwLock<Index> {
+    static I: OnceLock<RwLock<Index>> = OnceLock::new();
+    I.get_or_init(|| RwLock::new(Index::default()))
+}
+
+/// Replaces the imported profile set (`styles::imported_profile_paths`). Only headers are
+/// read here (DCP names, look UUIDs); tables are parsed on first use. Unreadable files are
+/// skipped (the style library reports them unavailable). Parsed-profile caches are cleared
+/// so a re-imported file with the same UUID is re-read.
+pub fn set_imported(items: &[(StyleProfileKind, PathBuf)]) {
+    let mut index = Index::default();
+    for (kind, path) in items {
+        match kind {
+            StyleProfileKind::CameraProfile => {
+                if let Some((model, name)) = read_dcp_names(path) {
+                    let group = path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    index.dcps.push(DcpEntry {
+                        model_lower: model.to_ascii_lowercase(),
+                        model,
+                        name,
+                        group,
+                        path: path.clone(),
+                    });
+                }
+            }
+            StyleProfileKind::Look => {
+                let Ok(text) = std::fs::read_to_string(path) else { continue };
+                if let Ok(Some(mut info)) = LookProfile::parse_file_opts(&text, false) {
+                    if info.group.is_empty() {
+                        info.group = path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                    }
+                    if !index.looks.iter().any(|l| l.info.uuid == info.uuid) {
+                        index.looks.push(LookEntry { info, path: path.clone() });
+                    }
+                }
+            }
+            StyleProfileKind::Lut => {}
+        }
+    }
+    *imported().write().unwrap_or_else(|e| e.into_inner()) = index;
+    for inner in registry().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let mut c = inner.caches.lock().unwrap_or_else(|e| e.into_inner());
+        c.dcps.clear();
+        c.looks.clear();
+    }
+}
+
+/// File of an imported look (style library), if registered.
+pub fn imported_look_path(uuid: &str) -> Option<PathBuf> {
+    let uuid = uuid.trim().to_ascii_uppercase();
+    let idx = imported().read().unwrap_or_else(|e| e.into_inner());
+    idx.looks.iter().find(|l| l.info.uuid == uuid).map(|l| l.path.clone())
+}
+
+/// `(UniqueCameraModel, ProfileName)` of a DCP file (header first, then the whole file).
+pub fn read_dcp_names(path: &Path) -> Option<(String, String)> {
+    head(path, 8192)
+        .and_then(|b| Dcp::peek_names(&b).ok())
+        .or_else(|| std::fs::read(path).ok().and_then(|b| Dcp::peek_names(&b).ok()))
+}
+
 /// Reads the first `n` bytes of a file.
 fn head(path: &Path, n: usize) -> Option<Vec<u8>> {
     let f = std::fs::File::open(path).ok()?;
@@ -226,10 +298,7 @@ impl Index {
             walk(dir, "dcp", &mut files, 0);
             for path in files {
                 // The names sit near the start of Adobe's DCPs; fall back to the whole file.
-                let names = head(&path, 8192)
-                    .and_then(|b| Dcp::peek_names(&b).ok())
-                    .or_else(|| std::fs::read(&path).ok().and_then(|b| Dcp::peek_names(&b).ok()));
-                if let Some((model, name)) = names {
+                if let Some((model, name)) = read_dcp_names(&path) {
                     let group = dcp_group(&path, &name);
                     dcps.push(DcpEntry { model_lower: model.to_ascii_lowercase(), model, name, group, path });
                 }
@@ -372,7 +441,13 @@ impl ProfileLibrary {
     /// The parsed DCP named `profile_name` (`crs:CameraProfile`) for `camera`, if installed.
     pub fn dcp(&self, camera: &CameraKey, profile_name: &str) -> Option<Arc<Dcp>> {
         let (_, dcps) = self.index().camera_dcps(camera);
-        let entry = dcps.into_iter().find(|d| d.name.eq_ignore_ascii_case(profile_name.trim()))?;
+        let found =
+            dcps.into_iter().find(|d| d.name.eq_ignore_ascii_case(profile_name.trim())).cloned().or_else(|| {
+                let idx = imported().read().unwrap_or_else(|e| e.into_inner());
+                let (_, dcps) = idx.camera_dcps(camera);
+                dcps.into_iter().find(|d| d.name.eq_ignore_ascii_case(profile_name.trim())).cloned()
+            });
+        let entry = found?;
         let key = (entry.path.clone(), entry.name.clone());
         {
             let mut c = self.inner.caches.lock().unwrap_or_else(|e| e.into_inner());
@@ -411,7 +486,13 @@ impl ProfileLibrary {
                 return Some(l);
             }
         }
-        let entry = self.index().looks.iter().find(|l| l.info.uuid == uuid)?;
+        let entry = match self.index().looks.iter().find(|l| l.info.uuid == uuid) {
+            Some(e) => e.clone(),
+            None => {
+                let idx = imported().read().unwrap_or_else(|e| e.into_inner());
+                idx.looks.iter().find(|l| l.info.uuid == uuid)?.clone()
+            }
+        };
         let text = std::fs::read_to_string(&entry.path).ok()?;
         let mut look = match LookProfile::parse_file(&text) {
             Ok(Some(l)) => l,
