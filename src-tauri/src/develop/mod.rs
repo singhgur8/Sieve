@@ -364,8 +364,19 @@ pub const MAX_SOURCES: usize = 4096;
 impl DevelopCache {
     pub fn new(config: DevelopConfig) -> Self {
         // Scan the installed Adobe profiles in the background so the first render does not
-        // wait for it.
-        let _ = std::thread::Builder::new().name("profile-scan".into()).spawn(|| ProfileLibrary::shared().warm());
+        // wait for it, and register the style library's imported looks / DCPs (IPC v14; the
+        // catalog path is known through the mask cache in the app).
+        let catalog_path = config.mask_cache.as_ref().map(|m| m.config().catalog_path.clone());
+        let _ = std::thread::Builder::new().name("profile-scan".into()).spawn(move || {
+            ProfileLibrary::shared().warm();
+            if let Some(path) = catalog_path {
+                let registered = masks::open_catalog_read_only(&path)
+                    .and_then(|conn| crate::styles::register_imported_profiles(&conn));
+                if let Err(e) = registered {
+                    eprintln!("style library profiles: {}", e.message);
+                }
+            }
+        });
         Self {
             config,
             latest: Arc::new(Mutex::new(HashMap::new())),
@@ -409,6 +420,32 @@ impl DevelopCache {
                 map.remove(id);
             }),
             None => map.clear(),
+        }
+    }
+
+    /// Forgets everything held in memory for images removed from the catalog
+    /// (`remove_project`; ids can be reused by the next import): decoded sources and their
+    /// working copies, the last encoded renders and tickets, decode/render locks, queued
+    /// prefetches, remembered sources, evaluated mask weights and decoded mattes (+ matte
+    /// files).
+    pub fn forget_images(&self, ids: &[ImageId]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.forget_sources(Some(ids));
+        lock(&self.inner.lru).map.retain(|id, _| !ids.contains(id));
+        {
+            let mut enc = lock(&self.inner.encoded);
+            enc.0.retain(|(id, _), _| !ids.contains(id));
+            enc.1.retain(|(id, _)| !ids.contains(id));
+        }
+        lock(&self.latest).retain(|(id, _), _| !ids.contains(id));
+        lock(&self.inner.decoding).retain(|id, _| !ids.contains(id));
+        lock(&self.inner.rendering).retain(|(id, _), _| !ids.contains(id));
+        lock(&self.inner.prefetch).queue.retain(|s| !ids.contains(&s.id));
+        self.inner.weights.forget(ids);
+        if let Some(m) = &self.config.mask_cache {
+            m.forget_images(ids);
         }
     }
 
@@ -1114,6 +1151,38 @@ mod tests {
         assert!(e.message.starts_with("Could not decode") && e.message.contains("damaged"), "{}", e.message);
         assert_eq!(cache.cached_count(), 0);
         assert!(lock(&cache.inner.decoding).is_empty(), "decode locks released on failure");
+    }
+
+    /// `remove_project`: everything held for removed images goes; other images stay.
+    #[test]
+    fn forget_images_drops_everything_held_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let luts = LutLibrary::new(dir.path().join("luts"));
+        let jpeg = crate::raw::turbo::encode_rgb_444(&[120u8; 64 * 48 * 3], 64, 48, 90).unwrap();
+        let mattes = masks::MaskCache::new(masks::MaskCacheConfig {
+            catalog_path: dir.path().join("cat.sqlite"),
+            cache_dir: dir.path().join("cache"),
+        });
+        let cache = DevelopCache::new(DevelopConfig { cache_bytes: 64 << 20, mask_cache: Some(mattes.clone()) });
+        let opts = RenderOptions { max_edge: 64, slot: RenderSlot::Main, region: None };
+        let adj = ParametricAdjustments::defaults_for(crate::ipc::types::ImageFormat::Jpeg);
+        for id in [1, 2] {
+            let path = dir.path().join(format!("{id}.jpg"));
+            std::fs::write(&path, &jpeg).unwrap();
+            let src = SourceImage { id, path, orientation: None };
+            cache.remember_source(src.clone());
+            let t = cache.ticket(id, RenderSlot::Main);
+            cache.render(t, &src, &adj, &opts, &luts).unwrap().unwrap();
+            std::fs::create_dir_all(dir.path().join(format!("cache/masks/{id}"))).unwrap();
+        }
+        assert_eq!(cache.cached_count(), 2);
+        cache.forget_images(&[1]);
+        assert_eq!(cache.cached_count(), 1);
+        assert!(cache.source(1).is_none() && cache.source(2).is_some());
+        assert!(cache.encoded(1, RenderSlot::Main, 0).is_none());
+        assert!(cache.encoded(2, RenderSlot::Main, 0).is_some());
+        assert!(!lock(&cache.latest).keys().any(|(id, _)| *id == 1));
+        assert!(!dir.path().join("cache/masks/1").exists() && dir.path().join("cache/masks/2").exists());
     }
 
     #[test]

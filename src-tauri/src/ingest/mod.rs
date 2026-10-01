@@ -228,7 +228,20 @@ struct Progress {
 
 impl Progress {
     fn record(&mut self, conn: &mut Connection, sink: &dyn IngestSink, out: Outcome) -> AppResult<()> {
-        let Outcome { id, meta, result } = out;
+        let Outcome { id, path, meta, result } = out;
+        // The image was removed from the catalog while it was being extracted
+        // (`remove_project`), possibly with its id already reused by a new import: drop the
+        // files just written and report nothing for it.
+        if !still_queued(conn, id, &path)? {
+            if let Ok(files) = &result {
+                let _ = std::fs::remove_file(&files.thumb_path);
+                if let Some(p) = &files.preview_path {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+            self.stats.done += 1;
+            return Ok(());
+        }
         match result {
             Ok(files) => {
                 repo::record_extraction(conn, id, meta.as_ref(), Ok(&files))?;
@@ -263,9 +276,19 @@ impl Progress {
     }
 }
 
+/// `images` still has `id` for `path` (not removed, id not reused).
+fn still_queued(conn: &Connection, id: ImageId, path: &str) -> AppResult<bool> {
+    use rusqlite::OptionalExtension;
+    let current: Option<String> =
+        conn.prepare_cached("SELECT path FROM images WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
+    Ok(current.as_deref() == Some(path))
+}
+
 /// Result of extracting one image (produced on a pool thread).
 struct Outcome {
     id: ImageId,
+    /// The source path the work item was claimed for (`images.path`).
+    path: String,
     meta: Option<ImageMeta>,
     result: Result<repo::ThumbFiles, String>,
 }
@@ -303,7 +326,7 @@ fn process_with(item: &repo::PendingImage, thumbs_dir: &Path, scratch: &mut Scra
     let id = item.id;
     let extracted = match raw::extract(Path::new(&item.path), item.format, &mut scratch.jpeg) {
         Ok(x) => x,
-        Err(reason) => return Outcome { id, meta: None, result: Err(reason) },
+        Err(reason) => return Outcome { id, path: item.path.clone(), meta: None, result: Err(reason) },
     };
     let orientation = extracted.meta.orientation.unwrap_or(1);
     let preview_path = thumbs_dir.join(format!("{id}_2048.jpg"));
@@ -317,7 +340,7 @@ fn process_with(item: &repo::PendingImage, thumbs_dir: &Path, scratch: &mut Scra
         width: r.thumb.0,
         height: r.thumb.1,
     });
-    Outcome { id, meta: Some(extracted.meta), result }
+    Outcome { id, path: item.path.clone(), meta: Some(extracted.meta), result }
 }
 
 /// Catalog-wide thumbnail counts.
@@ -387,6 +410,53 @@ mod tests {
         assert!(failed[0].reason.starts_with(crate::raw::access::MISSING_PREFIX), "{}", failed[0].reason);
         // IPC v13: flagged missing in the catalog.
         assert!(repo::get_image(&conn, 1).unwrap().missing_since_ms.is_some());
+    }
+
+    /// v14 `remove_project` follow-up: an extraction that finishes after its image was
+    /// removed (or its id reused for another file) leaves no files and reports nothing.
+    #[test]
+    fn extraction_of_a_removed_image_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = db::open(&dir.path().join("cat.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms, imported_at)
+             VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0),
+                    (2, 1, '/f/new.arw', 'new.arw', 'arw', 'sony', 1, 0, 0);
+             INSERT INTO thumbnails (image_id) VALUES (1), (2);",
+        )
+        .unwrap();
+        let files = |id: ImageId| {
+            let t = dir.path().join(format!("{id}_512.jpg"));
+            let p = dir.path().join(format!("{id}_2048.jpg"));
+            std::fs::write(&t, b"t").unwrap();
+            std::fs::write(&p, b"p").unwrap();
+            repo::ThumbFiles {
+                thumb_path: t.display().to_string(),
+                preview_path: Some(p.display().to_string()),
+                width: 1,
+                height: 1,
+            }
+        };
+        let rec = Recorder::default();
+        let mut progress = Progress { stats: RunStats::default(), last: None };
+        // 1: removed; 2: id now belongs to another file (claimed for '/f/old.arw').
+        conn.execute("DELETE FROM images WHERE id = 1", []).unwrap();
+        for (id, path) in [(1, "/f/a.arw"), (2, "/f/old.arw")] {
+            let f = files(id);
+            progress
+                .record(&mut conn, &rec, Outcome { id, path: path.into(), meta: None, result: Ok(f.clone()) })
+                .unwrap();
+            assert!(!Path::new(&f.thumb_path).exists() && !Path::new(f.preview_path.as_ref().unwrap()).exists());
+        }
+        assert!(rec.ready.lock().unwrap().is_empty() && rec.failed.lock().unwrap().is_empty());
+        assert_eq!(progress.stats.done, 2);
+        // Still queued: recorded as usual.
+        let f = files(2);
+        progress
+            .record(&mut conn, &rec, Outcome { id: 2, path: "/f/new.arw".into(), meta: None, result: Ok(f) })
+            .unwrap();
+        assert_eq!(rec.ready.lock().unwrap().len(), 1);
     }
 
     #[derive(Default)]

@@ -1576,8 +1576,10 @@ pub async fn import_style_folder(
     path: String,
 ) -> AppResult<ImportStyleReport> {
     let luts = luts.inner().clone();
-    // rust-engine-dev: also refresh `ProfileLibrary` with `styles::imported_profile_paths`.
-    catalog.run(move |c| styles::import_folder(c, &luts, Path::new(&path))).await
+    // Walk + parse (and copy LUTs) off the catalog thread; one transaction to store. Storing
+    // also registers the imported looks / DCPs with the render engine (`profiles`).
+    let scan = blocking(move || styles::scan_folder(&luts, Path::new(&path))).await?;
+    catalog.run(move |c| styles::store_scan(c, scan)).await
 }
 
 /// The whole style library (every project sees every group): "User Presets", imported groups
@@ -1650,13 +1652,22 @@ pub async fn auto_tone(
     if let Some(a) = &adjustments {
         a.validate().map_err(AppError::invalid)?;
     }
-    let adjustments = match adjustments {
-        Some(a) => a,
-        None => catalog.run(move |c| repo::get_adjustments(c, id)).await?,
-    };
+    let (adjustments, faces) = catalog
+        .run(move |c| {
+            let a = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            // Face boxes from the analysis (skin guard + face-weighted exposure); `None` when
+            // the photo has not been analysed yet (skin-coloured pixels stand in).
+            let faces = develop::auto::analysis_faces(c, id)?.map(|f| develop::auto::face_boxes(&f));
+            Ok((a, faces))
+        })
+        .await?;
     let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
-    let r = blocking(move || develop::auto::auto_tone(&cache, &src, &adjustments, &keys)).await;
+    let r = blocking(move || develop::auto::auto_tone_with_faces(&cache, &src, &adjustments, &keys, faces.as_deref()))
+        .await;
     note_if_missing(&catalog, id, r).await
 }
 
@@ -2076,13 +2087,37 @@ pub async fn remove_project(
     ingest: State<'_, Ingest>,
     project_id: ProjectId,
 ) -> AppResult<RemoveProjectResult> {
-    let (result, removed) = catalog.run(move |c| projects::remove_project(c, project_id)).await?;
-    if let Some(develop) = app.try_state::<DevelopCache>() {
-        develop.forget_sources(Some(&removed));
+    // A running analysis would fail writing results for rows that vanish under it: pause it
+    // around the removal and resume the remaining work afterwards. (Ingest drops extractions
+    // of removed images itself; the XMP auto-sync reloads every row before writing.)
+    let resume = match app.try_state::<Analysis>() {
+        Some(a) if a.is_running() => {
+            a.cancel();
+            let handle = app.clone();
+            blocking(move || {
+                let t = std::time::Instant::now();
+                while handle.state::<Analysis>().is_running() && t.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(())
+            })
+            .await?;
+            true
+        }
+        _ => false,
+    };
+    let removal = catalog.run(move |c| projects::remove_project(c, project_id)).await;
+    if resume {
+        if let Some(a) = app.try_state::<Analysis>() {
+            let _ = a.start(&app, AnalysisScope::Pending);
+        }
     }
-    // Image ids can be reused by the next import: drop their cached files now.
-    // TODO(rust-engine-dev): also evict other per-image in-memory caches (mask cache, render
-    // cache) and skip removed ids still queued in ingest / analysis / XMP sync.
+    let (result, removed) = removal?;
+    // Image ids can be reused by the next import: drop everything held for them (decoded
+    // sources, renders, mask weights, mattes) and their cached files.
+    if let Some(develop) = app.try_state::<DevelopCache>() {
+        develop.forget_images(&removed);
+    }
     let config = ingest.config().clone();
     blocking(move || {
         for id in removed {

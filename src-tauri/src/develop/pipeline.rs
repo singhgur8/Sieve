@@ -407,9 +407,16 @@ fn gamut_map(s: [f32; 3], luma: [f32; 3]) -> [f32; 3] {
 
 /// Blends the LUT result of `e` by `a`.
 #[inline(always)]
+/// `a` in 0..=2: 1 = the LUT's output, above 1 extrapolates `e + (lut - e) * a` (Lightroom's
+/// profile Amount > 100%), clamped to the encoded range.
 fn apply_cube(e: [f32; 3], lut: &Lut, a: f32) -> [f32; 3] {
     let m = lut.eval(e, Interpolation::Tetrahedral);
-    [e[0] + (m[0] - e[0]) * a, e[1] + (m[1] - e[1]) * a, e[2] + (m[2] - e[2]) * a]
+    let mix = |k: usize| e[k] + (m[k] - e[k]) * a;
+    if a > 1.0 {
+        [mix(0).clamp(0.0, 1.0), mix(1).clamp(0.0, 1.0), mix(2).clamp(0.0, 1.0)]
+    } else {
+        [mix(0), mix(1), mix(2)]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,7 +1031,7 @@ fn develop(
         }
     });
     let bw = adj.black_and_white.enabled.then_some(adj.black_and_white.mixer);
-    let lut_amount = adj.lut.as_ref().map_or(0.0, |l| (l.amount / 100.0).clamp(0.0, 1.0));
+    let lut_amount = adj.lut.as_ref().map_or(0.0, |l| (l.amount / 100.0).clamp(0.0, 2.0));
     let out = Output::new(space, cube.filter(|_| lut_amount > 0.0).map(|l| (l, lut_amount)), quality);
     let chain = Chain {
         hsm: setup.hsm.as_ref(),
@@ -1823,6 +1830,20 @@ mod tests {
         adj.lut = Some(LutRef { id: "inv".into(), amount: 50.0 });
         let half = run(&adj, Some(&lut));
         assert!(half.rgb.iter().step_by(97).all(|&v| (i32::from(v) - 128).abs() <= 2));
+        // Amount 0 = no LUT; 200 extrapolates in + 2 (lut - in) = 2 - 3 in, clamped (v14).
+        adj.lut = Some(LutRef { id: "inv".into(), amount: 0.0 });
+        assert_eq!(run(&adj, Some(&lut)).rgb, base.rgb);
+        adj.lut = Some(LutRef { id: "inv".into(), amount: 200.0 });
+        let double = run(&adj, Some(&lut));
+        for (a, b) in base.rgb.iter().zip(&double.rgb).step_by(97) {
+            let want = (2.0 - 3.0 * f32::from(*a) / 255.0).clamp(0.0, 1.0) * 255.0;
+            assert!((f32::from(*b) - want).abs() <= 3.0, "{a} -> {b}, want {want}");
+        }
+        let lut3 = Lut::parse("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n").unwrap();
+        assert_eq!(lut3.apply([0.2, 0.5, 0.9], 200.0), [0.2, 0.5, 0.9], "identity LUT stays identity");
+        let inv3 = Lut::parse("LUT_1D_SIZE 2\n1 1 1\n0 0 0\n").unwrap();
+        let x = inv3.apply([0.2, 0.5, 0.9], 125.0);
+        assert!((x[0] - 0.95).abs() < 1e-5 && (x[1] - 0.5).abs() < 1e-5 && x[2] == 0.0, "{x:?}");
     }
 
     /// The clip-anchored shoulder: ~0.29 EV at the raw clip, negligible 3 EV below it,

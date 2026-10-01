@@ -203,6 +203,13 @@ pub struct WeightCache {
     entries: Mutex<VecDeque<(WeightKey, Arc<CachedWeights>)>>,
 }
 
+impl WeightCache {
+    /// Drops the weights of `ids` (images removed from the catalog).
+    pub fn forget(&self, ids: &[ImageId]) {
+        lock(&self.entries).retain(|(k, _)| !ids.contains(&k.image_id));
+    }
+}
+
 /// Entries kept (main + compare slots, a draft and a full size).
 const WEIGHTS_KEEP: usize = 4;
 

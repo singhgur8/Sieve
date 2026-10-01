@@ -1109,3 +1109,91 @@ fn pending_masks_catch_up_imports_only_masks_and_round_trips() {
     assert_eq!(element(&written), element(MASKED_SIDECAR));
     assert_eq!(masks::read(&written).unwrap().unwrap().groups, adj.masks);
 }
+
+/// Phase 8b "XMP auto-save": a fresh catalog auto-saves ratings, flags and edits without any
+/// opt-in, merging into the existing sidecar (unrelated fields untouched), and the status the
+/// UI shows goes pending -> saved (and error on a failed write).
+#[test]
+fn fresh_catalog_auto_saves_edits_preserving_sidecar_fields() {
+    let f = Fixture::new(2);
+    let mut conn = f.conn();
+    // Fresh catalog: on by default, nothing pending.
+    assert!(repo::catalog_state(&conn, "", "").unwrap().xmp_auto_sync);
+    assert_eq!(
+        repo::xmp_status(&conn, false).unwrap(),
+        crate::ipc::types::XmpStatus { dirty: 0, failed: 0, running: false, auto_sync: true }
+    );
+
+    // An existing Lightroom sidecar with fields Sieve does not own.
+    let existing = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+   photoshop:City="Calgary"
+   crs:LensProfileEnable="1"
+   crs:RetouchInfo="centerX = 0.5">
+   <dc:creator><rdf:Seq><rdf:li>Gurjot Singh</rdf:li></rdf:Seq></dc:creator>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+    fs::write(f.sidecar(0), existing).unwrap();
+    let before: Vec<_> = packet::top_level_properties(existing)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, l, _)| matches!(l.as_str(), "City" | "LensProfileEnable" | "RetouchInfo" | "creator"))
+        .collect();
+    assert_eq!(before.len(), 4);
+    tick();
+
+    repo::set_rating(&mut conn, &f.ids[..1], 4).unwrap();
+    repo::set_pick(&mut conn, &f.ids[..1], PickFlag::Pick).unwrap();
+    let adj = ParametricAdjustments { exposure: 0.5, contrast: -20.0, ..Default::default() };
+    crate::develop::history::commit(&mut conn, f.ids[0], &adj, "Exposure").unwrap();
+    // Pending until the debounced pass runs.
+    assert_eq!(repo::xmp_status(&conn, f.sync.is_running()).unwrap().dirty, 1);
+
+    let (s, rx) = sink();
+    f.sync.notify_with(s);
+    let event = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(event.written, vec![f.ids[0]]);
+    wait_idle(&f.sync);
+    // Saved.
+    assert_eq!(
+        repo::xmp_status(&conn, f.sync.is_running()).unwrap(),
+        crate::ipc::types::XmpStatus { dirty: 0, failed: 0, running: false, auto_sync: true }
+    );
+
+    let text = fs::read_to_string(f.sidecar(0)).unwrap();
+    let v = parse(&text).unwrap();
+    assert_eq!(v.rating, Some(4));
+    assert_eq!(v.label.as_deref(), Some("Pick"));
+    let dev = v.develop.expect("edits written");
+    assert_eq!((dev.exposure, dev.contrast), (0.5, -20.0));
+    let after: Vec<_> = packet::top_level_properties(&text)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, l, _)| matches!(l.as_str(), "City" | "LensProfileEnable" | "RetouchInfo" | "creator"))
+        .collect();
+    assert_eq!(after, before, "unrelated sidecar fields are preserved byte for byte");
+    assert!(!f.sidecar(1).exists(), "untouched images get no sidecar");
+
+    // Error: the sidecar cannot be written -> failed count (the UI's error state).
+    let shoot = f.dir.path().join("shoot");
+    let mut perms = fs::metadata(&shoot).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o555);
+    fs::set_permissions(&shoot, perms.clone()).unwrap();
+    repo::set_rating(&mut conn, &f.ids[1..], 3).unwrap();
+    let (s, rx) = sink();
+    f.sync.notify_with(s);
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait_idle(&f.sync);
+    perms.set_mode(0o755);
+    fs::set_permissions(&shoot, perms).unwrap();
+    assert!(first.is_err(), "write failure reported: {first:?}");
+    let st = repo::xmp_status(&conn, false).unwrap();
+    assert_eq!((st.dirty, st.failed), (1, 1));
+}

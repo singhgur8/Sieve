@@ -210,20 +210,24 @@ impl Lut {
         })
     }
 
-    /// Maps one sRGB-encoded pixel (0..=1) and blends by `amount` (0..=100).
+    /// Maps one sRGB-encoded pixel (0..=1) and blends by `amount` (0..=200; above 100
+    /// extrapolates away from the input, clamped to 0..=1).
     pub fn apply(&self, rgb: [f32; 3], amount: f32) -> [f32; 3] {
         self.apply_with(rgb, amount, Interpolation::Tetrahedral)
     }
 
     /// [`Self::apply`] with an explicit 3D interpolation (1D LUTs ignore it).
     pub fn apply_with(&self, rgb: [f32; 3], amount: f32, interp: Interpolation) -> [f32; 3] {
-        let a = (amount / 100.0).clamp(0.0, 1.0);
+        let a = (amount / 100.0).clamp(0.0, 2.0);
         if a <= 0.0 {
             return rgb;
         }
         let mapped = self.eval(rgb, interp);
-        if a >= 1.0 {
+        if a == 1.0 {
             return mapped;
+        }
+        if a > 1.0 {
+            return [0, 1, 2].map(|k| (rgb[k] + (mapped[k] - rgb[k]) * a).clamp(0.0, 1.0));
         }
         [rgb[0] + (mapped[0] - rgb[0]) * a, rgb[1] + (mapped[1] - rgb[1]) * a, rgb[2] + (mapped[2] - rgb[2]) * a]
     }

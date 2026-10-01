@@ -199,28 +199,48 @@ pub fn decode_source(src: &dyn CrsSource) -> Result<Option<ParametricAdjustments
             _ => return Ok(None),
         }
     }
+    let mut adj = ParametricAdjustments::default();
+    decode_onto(src, &mut adj)?;
+    Ok(Some(adj))
+}
+
+/// Sets on `adj` exactly the owned properties `src` carries (everything else keeps `adj`'s
+/// value): the body of [`decode_source`] without its gates, also used to apply imported
+/// Lightroom presets key by key (`styles`). White balance changes only when
+/// `crs:WhiteBalance`, `crs:Temperature` or `crs:Tint` is present (a missing Temperature /
+/// Tint of a custom balance falls back to `adj`'s custom values, else 5500 K / 0).
+pub fn decode_onto(src: &dyn CrsSource, adj: &mut ParametricAdjustments) -> Result<(), String> {
+    let get = |ns: &str, name: &str| src.scalar(ns, name);
+    let crs = |name: &str| get(CRS_NS, name).map(|v| v.trim().to_owned());
     let num = |name: &str, lo: f32, hi: f32| -> Result<Option<f32>, String> {
         crs(name).filter(|v| !v.is_empty()).map(|v| parse_num(name, &v).map(|x| x.clamp(lo, hi))).transpose()
     };
-    let mut adj = ParametricAdjustments::default();
 
     let temp = num("Temperature", wb::MIN_TEMP, wb::MAX_TEMP)?;
     let tint = num("Tint", wb::MIN_TINT, wb::MAX_TINT)?;
-    let preset = |t: f32, n: f32| WhiteBalance::Custom { temperature_k: t, tint: n };
-    adj.white_balance = match crs("WhiteBalance").as_deref() {
-        Some("As Shot") | Some("Auto") => WhiteBalance::AsShot,
-        Some("Daylight") => preset(5500.0, 10.0),
-        Some("Cloudy") => preset(6500.0, 10.0),
-        Some("Shade") => preset(7500.0, 10.0),
-        Some("Tungsten") => preset(2850.0, 0.0),
-        Some("Fluorescent") => preset(3800.0, 21.0),
-        Some("Flash") => preset(5500.0, 0.0),
-        // "Custom", missing or unknown: custom if there are values to use.
-        _ => match (temp, tint) {
-            (None, None) => WhiteBalance::AsShot,
-            (t, n) => preset(t.unwrap_or(5500.0), n.unwrap_or(0.0)),
-        },
-    };
+    let mode = crs("WhiteBalance");
+    if mode.is_some() || temp.is_some() || tint.is_some() {
+        let preset = |t: f32, n: f32| WhiteBalance::Custom { temperature_k: t, tint: n };
+        let (base_t, base_n) = match adj.white_balance {
+            WhiteBalance::Custom { temperature_k, tint } => (temperature_k, tint),
+            WhiteBalance::AsShot => (5500.0, 0.0),
+        };
+        adj.white_balance = match mode.as_deref() {
+            Some("As Shot") | Some("Auto") => WhiteBalance::AsShot,
+            Some("Daylight") => preset(5500.0, 10.0),
+            Some("Cloudy") => preset(6500.0, 10.0),
+            Some("Shade") => preset(7500.0, 10.0),
+            Some("Tungsten") => preset(2850.0, 0.0),
+            Some("Fluorescent") => preset(3800.0, 21.0),
+            Some("Flash") => preset(5500.0, 0.0),
+            // "Custom", missing or unknown: custom if there are values to use.
+            _ => match (temp, tint) {
+                (None, None) if mode.is_none() => adj.white_balance,
+                (None, None) => WhiteBalance::AsShot,
+                (t, n) => preset(t.unwrap_or(base_t), n.unwrap_or(base_n)),
+            },
+        };
+    }
 
     let mut slots: [(&str, &mut f32, f32, f32); 11] = [
         ("Exposure2012", &mut adj.exposure, -5.0, 5.0),
@@ -252,13 +272,12 @@ pub fn decode_source(src: &dyn CrsSource) -> Result<Option<ParametricAdjustments
 
     if let Some(id) = get(SIEVE_NS, "LutId").map(|v| v.trim().to_owned()).filter(|v| is_valid_lut_id(v)) {
         let amount = match get(SIEVE_NS, "LutAmount") {
-            Some(raw) => parse_num("LutAmount", &raw).map_err(|e| e.replacen("crs:", "sieve:", 1))?.clamp(0.0, 100.0),
+            Some(raw) => parse_num("LutAmount", &raw).map_err(|e| e.replacen("crs:", "sieve:", 1))?.clamp(0.0, 200.0),
             None => 100.0,
         };
         adj.lut = Some(LutRef { id, amount });
     }
-    decode_parity(src, &mut adj)?;
-    Ok(Some(adj))
+    decode_parity(src, adj)
 }
 
 // ---------------------------------------------------------------------------
