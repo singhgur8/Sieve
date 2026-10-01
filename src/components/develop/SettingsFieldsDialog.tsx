@@ -134,10 +134,10 @@ export function SettingsFieldsDialog({ title, confirm, withName, initialName = "
 
 function Row({ field, label, checked, disabled, note, onChange, indent }: { field: AdjustmentField; label: string; checked: boolean; disabled?: boolean; note?: string; onChange: (on: boolean) => void; indent?: boolean }) {
   return (
-    <label className={`flex h-[22px] items-center gap-1.5 ${indent ? "pl-5" : ""} ${disabled ? "text-neutral-500" : ""}`}>
+    <label className={`flex h-[22px] items-center gap-1.5 ${indent ? "pl-5" : ""} ${disabled ? "text-neutral-400" : ""}`}>
       <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} data-testid={`field-${field}`} />
       <span className="truncate">{label}</span>
-      {note && <span className="text-neutral-500">{note}</span>}
+      {note && <span className="text-neutral-400">{note}</span>}
     </label>
   );
 }

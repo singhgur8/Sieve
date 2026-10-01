@@ -478,6 +478,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [styles, onNotice]);
   const edgeFor = useCallback((to: "navigator" | "viewer") => (to === "navigator" ? 480 : maxEdge), [maxEdge]);
   const hover = useHoverPreview(id, edgeFor);
+  // Any edit (commit, slider, auto, paste) replaces a hover preview with the real render.
+  const { stop: stopHover } = hover;
+  useEffect(() => stopHover(), [editor.adj, stopHover]);
   const hoverPreset = useCallback(
     (p: StylePreset | null) => {
       if (!p || id == null) return hover.stop();
@@ -857,7 +860,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
       <div className="flex min-h-0 flex-1">
         {!panels.left && (
-          <aside className="w-56 shrink-0 border-r border-neutral-800 min-[1600px]:w-60" data-testid="left-aside">
+          <aside className="w-56 shrink-0 border-r border-neutral-800 min-[1600px]:w-60" data-testid="left-aside" onMouseLeave={hover.stop}>
             <LeftPanel
               groups={styles.groups}
               importing={styles.importing}
@@ -930,7 +933,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           {viewerToolbar}
         </div>
         {!panels.right && (
-          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside">
+          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside" onMouseLeave={hover.stop}>
             {compare && (
               <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
                 Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}

@@ -243,25 +243,28 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           </div>
         </Section>
 
-        <Section
-          id="snapshots"
-          title="Snapshots"
-          defaultOpen={false}
-          action={
-            <button className="text-neutral-400 hover:text-white disabled:opacity-40" disabled={!snaps.supported} title={snaps.supported ? "New snapshot (Cmd+N)" : "Snapshots need backend support (not wired yet)"} data-testid="snapshot-add">
-              <Plus className="size-3.5" />
-            </button>
-          }
-        >
-          {snaps.items.length === 0 && <p className="text-neutral-400">No snapshots. Save the current look with + (Cmd+N).</p>}
-          <ul data-testid="snapshot-list">
-            {snaps.items.map((s) => (
-              <li key={s.id} className="h-6 truncate px-1 leading-6">
-                {s.name}
-              </li>
-            ))}
-          </ul>
-        </Section>
+        {/* Hidden until list/create/update/delete_snapshot exist (docs/ux-review-8b.md P2-2). */}
+        {snaps.supported && (
+          <Section
+            id="snapshots"
+            title="Snapshots"
+            defaultOpen={false}
+            action={
+              <button className="text-neutral-400 hover:text-white disabled:opacity-40" disabled={!snaps.supported} title={snaps.supported ? "New snapshot (Cmd+N)" : "Snapshots need backend support (not wired yet)"} data-testid="snapshot-add">
+                <Plus className="size-3.5" />
+              </button>
+            }
+          >
+            {snaps.items.length === 0 && <p className="text-neutral-400">No snapshots. Save the current look with + (Cmd+N).</p>}
+            <ul data-testid="snapshot-list">
+              {snaps.items.map((s) => (
+                <li key={s.id} className="h-6 truncate px-1 leading-6">
+                  {s.name}
+                </li>
+              ))}
+            </ul>
+          </Section>
+        )}
 
         <Section
           id="history"

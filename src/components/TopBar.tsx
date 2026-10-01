@@ -1,6 +1,6 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
-import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, ListChecks, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
+import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, LayoutList, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
 import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
@@ -132,13 +132,13 @@ export function TopBar(p: Props) {
 
       <div className={`${p.steps ? "" : "mx-auto"} flex gap-1`} data-testid="mode-switcher">
         {p.plan && (
-          <button className={seg(p.plan.on)} aria-pressed={p.plan.on} onClick={p.plan.onPlan} title={`Plan: the scene checklist${hint("toGrid")}`} data-testid="mode-plan">
-            <ListChecks className="size-3.5" /> <span className={p.steps ? labelHide : ""}>Plan</span>
+          <button className={seg(p.plan.on)} aria-label="Plan" aria-pressed={p.plan.on} onClick={p.plan.onPlan} title={`Plan: the scene checklist${hint("toGrid")}`} data-testid="mode-plan">
+            <LayoutList className="size-3.5" /> <span className={p.steps && !p.plan.on ? labelHide : ""}>Plan</span>
           </button>
         )}
         {modes.map(({ m, label, icon: Icon, title, testid }) => (
-          <button key={m} className={seg(p.mode === m || (m === "compare" && !!p.compareOn))} aria-pressed={m === "compare" ? !!p.compareOn || p.mode === m : p.mode === m} onClick={() => p.onMode(m)} title={title} data-testid={testid}>
-            <Icon className="size-3.5" /> <span className={p.steps ? labelHide : ""}>{label}</span>
+          <button key={m} className={seg(p.mode === m || (m === "compare" && !!p.compareOn))} aria-label={label} aria-pressed={m === "compare" ? !!p.compareOn || p.mode === m : p.mode === m} onClick={() => p.onMode(m)} title={title} data-testid={testid}>
+            <Icon className="size-3.5" /> <span className={p.steps && !(p.mode === m && !(p.plan?.on)) ? labelHide : ""}>{label}</span>
           </button>
         ))}
       </div>

@@ -89,12 +89,11 @@ test.describe("panel layout", () => {
 
   test("left panel: Navigator, Presets, Snapshots, History with the Copy… / Paste bar", async ({ page }) => {
     await openDevelop(page);
-    await expectOrder(page, ["section-navigator", "section-presets", "section-snapshots", "section-history", "left-bar"]);
-    await expect(page.getByTestId("section-snapshots")).toHaveAttribute("data-open", "false");
+    await expectOrder(page, ["section-navigator", "section-presets", "section-history", "left-bar"]);
+    // Snapshots are hidden until the backend supports them (ux-review-8b P2-2).
+    await expect(page.getByTestId("section-snapshots")).toHaveCount(0);
     await expect(page.getByTestId("copy-settings")).toHaveText("Copy…");
     await expect(page.getByTestId("paste-settings")).toBeDisabled();
-    // Snapshots need backend support: the + is disabled with a reason.
-    await expect(page.getByTestId("snapshot-add")).toBeDisabled();
     // Navigator: FIT / 100% follow the zoom and the region rectangle shows at 100%.
     await expect(page.getByTestId("nav-fit")).toHaveAttribute("aria-pressed", "true");
     await page.getByTestId("nav-100").click();

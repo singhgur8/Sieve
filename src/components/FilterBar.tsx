@@ -204,7 +204,7 @@ export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { q
         Collapse bursts{counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers} hidden)` : ""}
       </label>
 
-      {catalog && catalog.folders.length > 0 && (
+      {catalog && catalog.folders.length > 1 && (
         <select
           aria-label="Folder"
           data-testid="folder-select"

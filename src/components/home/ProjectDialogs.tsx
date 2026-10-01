@@ -2,10 +2,11 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderOpen } from "lucide-react";
-import { commands, convertFileSrc, unwrap, type ImportOptions, type Project, type RawImageEntry, type ShootType } from "../../ipc";
+import { commands, convertFileSrc, unwrap, type Project, type RawImageEntry, type ShootType } from "../../ipc";
 import { cap, SHOOT_TYPES } from "../../lib/shootTypes";
 import { describeError } from "../../lib/errors";
 import { Dialog } from "../Dialog";
+import { useImportOptions } from "../../lib/importOptions";
 
 const panel = "w-[460px] max-w-full rounded-xl border border-neutral-700 bg-neutral-900 p-5 shadow-2xl";
 const field = "h-9 w-full rounded-md border border-neutral-700 bg-neutral-950 px-2.5 text-sm text-neutral-100 focus:border-sky-600 focus:outline-none";
@@ -14,11 +15,12 @@ const secondary = "h-8 rounded-md bg-neutral-800 px-3 text-sm hover:bg-neutral-7
 
 const baseName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 
-export function NewProjectDialog({ defaultShoot, importOptions, onCancel, onCreated }: { defaultShoot: ShootType; importOptions: ImportOptions; onCancel: () => void; onCreated: (p: Project, existing: boolean) => void }) {
+export function NewProjectDialog({ defaultShoot, onCancel, onCreated }: { defaultShoot: ShootType; onCancel: () => void; onCreated: (p: Project, existing: boolean) => void }) {
   const [path, setPath] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [shoot, setShoot] = useState<ShootType>(defaultShoot);
+  const [importOptions, setImportOptions] = useImportOptions();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -54,7 +56,7 @@ export function NewProjectDialog({ defaultShoot, importOptions, onCancel, onCrea
           <span className="mb-1 block text-xs font-medium text-neutral-400">Folder</span>
           <div className="flex gap-2">
             <div className="flex h-9 min-w-0 flex-1 items-center rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-sm" data-testid="new-project-path" title={path ?? undefined}>
-              <span className={`truncate ${path ? "text-neutral-200" : "text-neutral-500"}`}>{path ?? "No folder chosen"}</span>
+              <span className={`truncate ${path ? "text-neutral-200" : "text-neutral-400"}`}>{path ?? "No folder chosen"}</span>
             </div>
             <button onClick={() => void pick()} className={`${secondary} flex h-9 shrink-0 items-center gap-1.5`} data-testid="new-project-pick" data-autofocus>
               <FolderOpen className="size-4" /> Choose…
@@ -85,6 +87,16 @@ export function NewProjectDialog({ defaultShoot, importOptions, onCancel, onCrea
             ))}
           </select>
         </label>
+        <div className="space-y-1.5">
+          <label className="flex items-center gap-2 text-sm text-neutral-200">
+            <input type="checkbox" checked={importOptions.includeNonRaw} onChange={(e) => setImportOptions({ includeNonRaw: e.target.checked })} data-testid="new-project-nonraw" />
+            Include JPEG, HEIC, TIFF, PNG
+          </label>
+          <label className={`flex items-center gap-2 text-sm ${importOptions.includeNonRaw ? "text-neutral-200" : "text-neutral-400"}`}>
+            <input type="checkbox" checked={importOptions.includeNonRaw && importOptions.pairJpegWithRaw} disabled={!importOptions.includeNonRaw} onChange={(e) => setImportOptions({ pairJpegWithRaw: e.target.checked })} data-testid="new-project-pair" />
+            Pair a camera JPEG with its RAW
+          </label>
+        </div>
       </div>
       {error && (
         <p role="alert" className="mt-3 rounded-md border border-red-900 bg-red-950 px-3 py-2 text-xs text-red-200" data-testid="new-project-error">
@@ -125,7 +137,7 @@ export function RenameDialog({ project, onCancel, onRename }: { project: Project
         data-testid="rename-input"
         aria-label="Project name"
       />
-      <p className="mt-2 text-xs text-neutral-500">Only the name in Sieve changes; the folder on disk keeps its name.</p>
+      <p className="mt-2 text-xs text-neutral-400">Only the name in Sieve changes; the folder on disk keeps its name.</p>
       <div className="mt-4 flex justify-end gap-2">
         <button onClick={onCancel} className={secondary}>
           Cancel
@@ -207,8 +219,8 @@ export function CoverDialog({ project, onCancel, onPick }: { project: Project; o
       <p className="mt-1 text-sm text-neutral-400">Best-rated photos first.</p>
       <div className="mt-3 min-h-40 flex-1 overflow-y-auto" data-testid="cover-grid">
         {error && <p className="text-sm text-red-300">{error}</p>}
-        {!rows && !error && <p className="text-sm text-neutral-500">Loading…</p>}
-        {rows && rows.length === 0 && <p className="text-sm text-neutral-500">No photos with a ready thumbnail yet.</p>}
+        {!rows && !error && <p className="text-sm text-neutral-400">Loading…</p>}
+        {rows && rows.length === 0 && <p className="text-sm text-neutral-400">No photos with a ready thumbnail yet.</p>}
         <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] gap-2">
           {rows?.map((r) =>
             r.thumbnail.status === "ready" ? (

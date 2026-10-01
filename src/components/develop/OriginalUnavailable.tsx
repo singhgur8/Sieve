@@ -19,7 +19,7 @@ export function OriginalUnavailable({ health, fileName, onRetry, onLocate }: Pro
       <p className="max-w-lg break-words text-xs text-neutral-400 select-text" data-testid="original-unavailable-message">
         {health.message}
       </p>
-      <p className="text-xs text-neutral-500">
+      <p className="text-xs text-neutral-400">
         {missing
           ? `Your edits to ${fileName} are kept in the catalog. Reconnect the drive or move the file back, then retry.`
           : "The file may be damaged, still copying, or from a camera Sieve does not support yet. Culling data and the cached preview are unaffected."}
