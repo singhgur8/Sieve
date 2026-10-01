@@ -12,12 +12,19 @@
 //!
 //! Status of a scene: `to_edit` (representative has no edits) -> `edited` -> `applied`
 //! (`scenes.applied_params_json` equals the representative's current adjustments) ->
-//! `outdated` (the representative changed since the last apply).
+//! `outdated` (the representative changed since the last apply); `reset` (v17: applied, but
+//! the representative has no edits any more).
 //!
 //! IPC v15 (architect): `skipped` / `minor` scenes, per-photo state from
 //! `develop::batches::edit_states` (applied / needs a look / auto edited), the last apply's
 //! coverage (`scenes.applied_covered_json`) for `unappliedKeeperIds` and the plan's
 //! `outdated` flag, `SceneApplyOptions.excludeIds`, partial commits after a cancel.
+//!
+//! IPC v17 (architect): status `reset` (applied, then the representative went back to no
+//! edits), `apply_all_edited_scenes` skips scenes it cannot apply ([`apply_all_inputs`],
+//! `ApplyScenesResult.skippedScenes`), errors name the scene by its plan number
+//! ([`scene_label`]), and an apply records the batch its representative's settings came from
+//! (`develop::batches::BatchBase`) so that batch's undo is linear behind it.
 
 use std::collections::HashMap;
 
@@ -26,7 +33,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::MatchImage;
 use crate::db::projects::FolderScope;
 use crate::db::{now_ms, repo};
-use crate::develop::batches::{self, BatchItem, BatchKind};
+use crate::develop::batches::{self, BatchBase, BatchItem, BatchKind};
 use crate::ipc::error::{AppError, AppResult, ErrorKind};
 use crate::ipc::types::*;
 
@@ -245,6 +252,9 @@ fn entry_for(
         None
     };
     let status = match &row.applied_params_json {
+        // v17: applied, then the representative went back to no edits (reset, or its edit
+        // undone): a to-do scene, not a re-apply.
+        Some(_) if !rep.has_edits => SceneEditStatus::Reset,
         Some(json) => {
             let applied: ParametricAdjustments = serde_json::from_str(json)?;
             if applied == repo::get_adjustments(conn, rep.id)? {
@@ -261,22 +271,23 @@ fn entry_for(
         members.iter().copied().filter(|&id| id != rep.id && source_of(id) == EditSource::SceneApply).collect();
     let needs_review_ids: Vec<ImageId> =
         keepers.iter().map(|k| k.id).filter(|id| states.get(id).is_some_and(|s| s.needs_review)).collect();
-    let unapplied_keeper_ids: Vec<ImageId> = if row.applied_params_json.is_none() || row.skipped {
-        Vec::new()
-    } else {
-        keepers
-            .iter()
-            .map(|k| k.id)
-            .filter(|&id| id != rep.id)
-            .filter(|&id| match &row.covered {
-                Some(covered) => {
-                    !covered.contains(&id) && matches!(source_of(id), EditSource::None | EditSource::AutoStyle)
-                }
-                // Applied before v15 (coverage unknown): keepers that still have no edit.
-                None => source_of(id) == EditSource::None,
-            })
-            .collect()
-    };
+    let unapplied_keeper_ids: Vec<ImageId> =
+        if row.applied_params_json.is_none() || row.skipped || status == SceneEditStatus::Reset {
+            Vec::new()
+        } else {
+            keepers
+                .iter()
+                .map(|k| k.id)
+                .filter(|&id| id != rep.id)
+                .filter(|&id| match &row.covered {
+                    Some(covered) => {
+                        !covered.contains(&id) && matches!(source_of(id), EditSource::None | EditSource::AutoStyle)
+                    }
+                    // Applied before v15 (coverage unknown): keepers that still have no edit.
+                    None => source_of(id) == EditSource::None,
+                })
+                .collect()
+        };
     // A batch undone before v16 (which did not clear the scene) is not reported.
     let applied_batch = match row.applied_batch_id {
         Some(b) => match batches::batch_info(conn, b) {
@@ -365,6 +376,10 @@ pub fn edit_plan(conn: &Connection, project_id: ProjectId) -> AppResult<EditPlan
             SceneEditStatus::Edited => counts.edited += 1,
             SceneEditStatus::Applied => counts.applied += 1,
             SceneEditStatus::Outdated => counts.outdated += 1,
+            SceneEditStatus::Reset => {
+                counts.reset += 1;
+                counts.to_edit += 1;
+            }
         }
     }
     Ok(EditPlan {
@@ -463,9 +478,14 @@ pub fn set_skipped(conn: &Connection, scene_id: SceneId, skipped: bool) -> AppRe
 #[derive(Debug, Clone)]
 pub struct SceneApplyJob {
     pub scene_id: SceneId,
+    /// User-facing name of the scene, its plan number ("Scene 2", [`scene_label`]) (v17).
+    pub label: String,
     pub representative: MatchImage,
     /// The representative's current adjustments (stored as `applied_params_json`).
     pub representative_adjustments: ParametricAdjustments,
+    /// The edit batch that wrote those adjustments, if not undone (v17,
+    /// `batches::base_of`): the apply is built on it (linear undo).
+    pub representative_base: Option<EditBatchId>,
     pub targets: Vec<MatchImage>,
     /// Left alone because the user edited them after this scene's last apply.
     pub skipped: Vec<ImageId>,
@@ -487,14 +507,16 @@ impl SceneApplyJob {
     }
 }
 
-/// Scenes of `project_id` that `apply_all_edited_scenes` applies: not skipped, and status
-/// edited / outdated, or applied with keepers added since (`unappliedKeeperIds`).
+/// Scenes of `project_id` that `apply_all_edited_scenes` applies: not skipped, representative
+/// edited, and status edited / outdated, or applied with keepers added since
+/// (`unappliedKeeperIds`). Never `to_edit` or `reset` scenes (v17).
 pub fn edited_scenes(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<SceneId>> {
     Ok(edit_plan(conn, project_id)?
         .scenes
         .into_iter()
         .filter(|s| {
             !s.skipped
+                && s.edited
                 && (matches!(s.status, SceneEditStatus::Edited | SceneEditStatus::Outdated)
                     || (s.status == SceneEditStatus::Applied && !s.unapplied_keeper_ids.is_empty()))
         })
@@ -502,8 +524,123 @@ pub fn edited_scenes(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<
         .collect())
 }
 
-/// Resolves what to match for each scene. A scene whose representative has no edits ->
-/// `invalid_argument` ("Edit the representative first"); unknown scene -> `not_found`.
+/// User-facing name of scene `scene_id` (v17): "Scene N", N = its 1-based position in its
+/// project's `EditPlan.scenes` (the number the Edit step shows). "This scene" when it is not
+/// in a plan (no keepers). Unknown scene -> `not_found`.
+pub fn scene_label(conn: &Connection, scene_id: SceneId) -> AppResult<String> {
+    scene_row(conn, scene_id)?;
+    let project: Option<ProjectId> = conn
+        .query_row(
+            "SELECT f.project_id FROM images i JOIN folders f ON f.id = i.folder_id
+             WHERE i.scene_id = ?1 AND f.project_id IS NOT NULL LIMIT 1",
+            [scene_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(project) = project else { return Ok("This scene".to_owned()) };
+    let scope = FolderScope::resolve(conn, None, Some(project))?;
+    let rule = repo::keeper_rule(conn)?;
+    // Same set and order as `edit_plan`: scenes with a keeper in the project, by start time.
+    let ids: Vec<SceneId> = conn
+        .prepare(&format!(
+            "SELECT s.id FROM scenes s WHERE EXISTS (
+                 SELECT 1 FROM images i WHERE i.scene_id = s.id AND {} AND {})
+             ORDER BY s.started_at_ms IS NULL, s.started_at_ms, s.id",
+            scope.predicate("i.folder_id"),
+            repo::keeper_predicate(&rule, "i.")
+        ))?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(match ids.iter().position(|&s| s == scene_id) {
+        Some(i) => format!("Scene {}", i + 1),
+        None => "This scene".to_owned(),
+    })
+}
+
+/// `e` with its message prefixed by the scene's name ("Scene 2: ...") (v17).
+pub fn named(label: &str, e: AppError) -> AppError {
+    AppError::new(e.kind, format!("{label}: {}", e.message))
+}
+
+/// Errors of one scene that `apply_all_edited_scenes` reports as a skipped scene (v17) rather
+/// than failing the whole call: the scene's own data (a missing / undecodable original, a
+/// representative or member gone). Catalog and disk-level failures still fail the call.
+pub fn skippable(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::NotFound
+            | ErrorKind::InvalidArgument
+            | ErrorKind::Io
+            | ErrorKind::FileMissing
+            | ErrorKind::DecodeFailed
+    )
+}
+
+/// Why a scene cannot be applied: `(reason, user-facing message naming the scene)`.
+pub type CannotApply = (SceneSkipReason, String);
+
+/// The job of one scene, or why it cannot be applied (no keepers, representative without
+/// edits). Unknown scene -> `not_found`.
+fn scene_job(
+    conn: &Connection,
+    scene_id: SceneId,
+    label: &str,
+    options: &SceneApplyOptions,
+) -> AppResult<Result<SceneApplyJob, CannotApply>> {
+    scene_row(conn, scene_id)?;
+    let (keepers, members) = scene_keepers(conn, scene_id)?;
+    if keepers.is_empty() {
+        return Ok(Err((SceneSkipReason::NoKeepers, format!("{label} has no keepers."))));
+    }
+    let entry = entry_for(conn, scene_id, &keepers, &members, &scene_states(conn, scene_id)?)?;
+    if !entry.edited {
+        let message = if entry.status == SceneEditStatus::Reset {
+            format!("{label}: its representative was reset after the last apply. Edit it first, then apply.")
+        } else {
+            format!("{label}: edit its representative first, then apply.")
+        };
+        return Ok(Err((SceneSkipReason::NotEdited, message)));
+    }
+    let applied_batch: Option<EditBatchId> =
+        conn.query_row("SELECT applied_batch_id FROM scenes WHERE id = ?1", [scene_id], |r| r.get(0))?;
+    let pool: Vec<ImageId> = if options.include_non_keepers { members } else { keepers.iter().map(|k| k.id).collect() };
+    let mut target_ids = Vec::new();
+    let mut skipped = Vec::new();
+    let mut excluded = Vec::new();
+    for id in pool.into_iter().filter(|&id| id != entry.representative_id) {
+        if options.exclude_ids.contains(&id) {
+            excluded.push(id);
+            continue;
+        }
+        let user_edited = match (options.skip_user_edited, applied_batch) {
+            (true, Some(b)) => match batches::written_by(conn, b, id)? {
+                Some(written) => written != repo::get_adjustments(conn, id)?,
+                None => false,
+            },
+            _ => false,
+        };
+        if user_edited {
+            skipped.push(id);
+        } else {
+            target_ids.push(id);
+        }
+    }
+    let rep = super::store::match_inputs(conn, &[entry.representative_id])?.remove(0);
+    Ok(Ok(SceneApplyJob {
+        scene_id,
+        label: label.to_owned(),
+        representative_adjustments: rep.adjustments.clone(),
+        representative_base: batches::base_of(conn, entry.representative_id)?,
+        representative: rep,
+        targets: super::store::match_inputs(conn, &target_ids)?,
+        skipped,
+        excluded,
+    }))
+}
+
+/// Resolves what to match for each scene (`apply_scene_edit`). A scene that cannot be
+/// applied -> `invalid_argument` naming it ("Scene 1: edit its representative first, then
+/// apply."); unknown scene -> `not_found`; other errors are prefixed with the scene's name.
 /// Scenes with no targets left are returned with empty `targets`.
 pub fn apply_inputs(
     conn: &Connection,
@@ -512,50 +649,109 @@ pub fn apply_inputs(
 ) -> AppResult<Vec<SceneApplyJob>> {
     let mut jobs = Vec::with_capacity(scene_ids.len());
     for &scene_id in scene_ids {
-        let (keepers, members) = scene_keepers(conn, scene_id)?;
-        if keepers.is_empty() {
-            return Err(AppError::invalid(format!("scene {scene_id} has no keepers")));
+        let label = scene_label(conn, scene_id)?;
+        match scene_job(conn, scene_id, &label, options).map_err(|e| named(&label, e))? {
+            Ok(job) => jobs.push(job),
+            Err((_, message)) => return Err(AppError::invalid(message)),
         }
-        let entry = entry_for(conn, scene_id, &keepers, &members, &scene_states(conn, scene_id)?)?;
-        if !entry.edited {
-            return Err(AppError::invalid("Edit the scene's representative photo first, then apply it to the scene."));
-        }
-        let applied_batch: Option<EditBatchId> =
-            conn.query_row("SELECT applied_batch_id FROM scenes WHERE id = ?1", [scene_id], |r| r.get(0))?;
-        let pool: Vec<ImageId> =
-            if options.include_non_keepers { members } else { keepers.iter().map(|k| k.id).collect() };
-        let mut target_ids = Vec::new();
-        let mut skipped = Vec::new();
-        let mut excluded = Vec::new();
-        for id in pool.into_iter().filter(|&id| id != entry.representative_id) {
-            if options.exclude_ids.contains(&id) {
-                excluded.push(id);
-                continue;
-            }
-            let user_edited = match (options.skip_user_edited, applied_batch) {
-                (true, Some(b)) => match batches::written_by(conn, b, id)? {
-                    Some(written) => written != repo::get_adjustments(conn, id)?,
-                    None => false,
-                },
-                _ => false,
-            };
-            if user_edited {
-                skipped.push(id);
-            } else {
-                target_ids.push(id);
-            }
-        }
-        let rep = super::store::match_inputs(conn, &[entry.representative_id])?.remove(0);
-        jobs.push(SceneApplyJob {
-            scene_id,
-            representative_adjustments: rep.adjustments.clone(),
-            representative: rep,
-            targets: super::store::match_inputs(conn, &target_ids)?,
-            skipped,
-            excluded,
-        });
     }
     Ok(jobs)
+}
+
+/// `apply_all_edited_scenes` inputs (v17): the jobs of [`edited_scenes`], and the scenes among
+/// them that cannot be applied ([`skippable`] errors, no keepers / edits), plan order. Other
+/// errors fail the call, named after their scene.
+pub fn apply_all_inputs(
+    conn: &Connection,
+    project_id: ProjectId,
+    options: &SceneApplyOptions,
+) -> AppResult<(Vec<SceneApplyJob>, Vec<SkippedScene>)> {
+    lenient_inputs(conn, &edited_scenes(conn, project_id)?, options)
+}
+
+/// The jobs of `scene_ids`, leaving out (and reporting) the scenes that cannot be applied.
+fn lenient_inputs(
+    conn: &Connection,
+    scene_ids: &[SceneId],
+    options: &SceneApplyOptions,
+) -> AppResult<(Vec<SceneApplyJob>, Vec<SkippedScene>)> {
+    let mut jobs = Vec::new();
+    let mut skipped = Vec::new();
+    for &scene_id in scene_ids {
+        let label = scene_label(conn, scene_id)?;
+        match scene_job(conn, scene_id, &label, options) {
+            Ok(Ok(job)) => jobs.push(job),
+            Ok(Err((reason, message))) => skipped.push(SkippedScene { scene_id, reason, message }),
+            Err(e) if skippable(e.kind) => skipped.push(SkippedScene {
+                scene_id,
+                reason: SceneSkipReason::Failed,
+                message: named(&label, e).message,
+            }),
+            Err(e) => return Err(named(&label, e)),
+        }
+    }
+    Ok((jobs, skipped))
+}
+
+/// Result of [`match_jobs`].
+#[derive(Debug, Clone)]
+pub struct MatchedJobs {
+    /// Jobs whose matching finished, with their previews (`previews[i]` of `jobs[i]`).
+    pub jobs: Vec<SceneApplyJob>,
+    pub previews: Vec<Vec<MatchPreview>>,
+    /// Stopped by the cancel flag: the job being matched and the ones after it are left out.
+    pub cancelled: bool,
+    /// `skip_failures`: scenes whose matching failed (reason `failed`) (v17).
+    pub failed: Vec<SkippedScene>,
+}
+
+/// Matcher of [`match_jobs`]: `(job, targets, offset) -> previews of targets`.
+pub type JobMatcher<'a> = dyn FnMut(&SceneApplyJob, &[MatchImage], u32) -> AppResult<Vec<MatchPreview>> + 'a;
+
+/// Matches every job's targets in steps of `chunk` targets with `matcher(job, targets,
+/// offset)` (`offset` = targets matched before this step over all jobs, for progress),
+/// checking `cancelled` before each step. A matcher error fails the call named after its
+/// scene, or with `skip_failures` (apply all, v17) leaves the scene out and reports it in
+/// `failed` when [`skippable`]. Jobs without targets pass through.
+pub fn match_jobs(
+    jobs: Vec<SceneApplyJob>,
+    skip_failures: bool,
+    chunk: usize,
+    cancelled: &dyn Fn() -> bool,
+    matcher: &mut JobMatcher<'_>,
+) -> AppResult<MatchedJobs> {
+    let mut out = MatchedJobs { jobs: Vec::new(), previews: Vec::new(), cancelled: false, failed: Vec::new() };
+    let mut offset = 0u32;
+    'jobs: for job in jobs {
+        let mut previews = Vec::with_capacity(job.targets.len());
+        for step in job.targets.chunks(chunk.max(1)) {
+            if cancelled() {
+                out.cancelled = true;
+                break 'jobs;
+            }
+            match matcher(&job, step, offset + previews.len() as u32) {
+                Ok(p) => previews.extend(p),
+                Err(e) if skip_failures && skippable(e.kind) => {
+                    offset += job.targets.len() as u32;
+                    out.failed.push(SkippedScene {
+                        scene_id: job.scene_id,
+                        reason: SceneSkipReason::Failed,
+                        message: named(&job.label, e).message,
+                    });
+                    continue 'jobs;
+                }
+                Err(e) => return Err(named(&job.label, e)),
+            }
+        }
+        if job.targets.is_empty() && cancelled() {
+            out.cancelled = true;
+            break;
+        }
+        offset += job.targets.len() as u32;
+        out.jobs.push(job);
+        out.previews.push(previews);
+    }
+    Ok(out)
 }
 
 /// "Needs a look" reason of a match that did not converge (its notes, else the default).
@@ -568,14 +764,18 @@ fn review_reason(p: &MatchPreview) -> Option<String> {
 
 /// Commits the matched settings of every job as one edit batch ("Apply to Scene") and marks
 /// the scenes applied (and not skipped). `previews[i]` are the `match_scene`-style results of
-/// `jobs[i]`; jobs without previews (a cancelled apply) are not committed.
+/// `jobs[i]`; jobs without previews (a cancelled apply) are not committed. `skipped_scenes`
+/// is passed through to the result (v17). Each scene whose representative's settings came
+/// from a batch records it as the apply's base (v17).
 pub fn commit_apply(
     conn: &mut Connection,
     jobs: &[SceneApplyJob],
     previews: &[Vec<MatchPreview>],
     cancelled: bool,
+    skipped_scenes: Vec<SkippedScene>,
 ) -> AppResult<ApplyScenesResult> {
     let mut items = Vec::new();
+    let mut bases = Vec::new();
     for (job, pv) in jobs.iter().zip(previews) {
         for p in pv {
             items.push(BatchItem {
@@ -585,8 +785,16 @@ pub fn commit_apply(
                 review_reason: review_reason(p),
             });
         }
+        if let Some(base) = job.representative_base {
+            bases.push(BatchBase {
+                image_id: job.representative.src.id,
+                base_batch_id: base,
+                for_ids: pv.iter().map(|p| p.target_id).collect(),
+            });
+        }
     }
-    let batch = batches::commit_recorded(conn, &items, batches::LABEL_APPLY_SCENE, BatchKind::SceneApply)?;
+    let batch =
+        batches::commit_recorded_with_bases(conn, &items, batches::LABEL_APPLY_SCENE, BatchKind::SceneApply, &bases)?;
     let now = now_ms();
     let mut scenes = Vec::with_capacity(jobs.len());
     for (job, pv) in jobs.iter().zip(previews) {
@@ -621,7 +829,7 @@ pub fn commit_apply(
             notes,
         });
     }
-    Ok(ApplyScenesResult { batch, scenes, cancelled })
+    Ok(ApplyScenesResult { batch, scenes, cancelled, skipped_scenes })
 }
 
 #[cfg(test)]
@@ -809,7 +1017,7 @@ mod tests {
             .iter()
             .map(|j| j.targets.iter().map(|t| fake_preview(t.src.id, &j.representative_adjustments)).collect())
             .collect();
-        let r = commit_apply(&mut conn, &jobs, &previews, false).unwrap();
+        let r = commit_apply(&mut conn, &jobs, &previews, false, Vec::new()).unwrap();
         assert_eq!(r.batch.changed_ids, vec![ids[0], ids[3]]);
         assert_eq!(r.scenes[0].changed_ids, vec![ids[0], ids[3]]);
         assert_eq!(edit_plan(&conn, folder).unwrap().scenes[0].status, SceneEditStatus::Applied);
@@ -897,7 +1105,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        commit_apply(conn, &jobs, &previews, false).unwrap()
+        commit_apply(conn, &jobs, &previews, false, Vec::new()).unwrap()
     }
 
     fn state(conn: &Connection, id: ImageId) -> ImageEditState {
@@ -1079,7 +1287,7 @@ mod tests {
             .unwrap();
         // Nothing matched before the cancel: no batch, scene untouched.
         let jobs = apply_inputs(&conn, &[scene], &SceneApplyOptions::default()).unwrap();
-        let r = commit_apply(&mut conn, &jobs[..0], &[], true).unwrap();
+        let r = commit_apply(&mut conn, &jobs[..0], &[], true, Vec::new()).unwrap();
         assert!(r.cancelled);
         assert_eq!((r.batch.batch_id, r.scenes.len()), (None, 0));
         assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Edited);
@@ -1183,5 +1391,285 @@ mod tests {
         conn.execute_batch(crate::db::schema::MIGRATIONS[13]).unwrap();
         let e = &edit_plan(&conn, project).unwrap().scenes[0];
         assert_eq!((e.applied_at_ms, e.applied_batch.clone(), e.status), (None, None, SceneEditStatus::ToEdit));
+    }
+
+    /// Project with 3 scenes of 3 picked frames each (scene order = creation order), the
+    /// first frame of each the representative. Returns (conn, project, scenes, ids per scene).
+    fn three_scenes() -> (Connection, ProjectId, Vec<SceneId>, Vec<Vec<ImageId>>) {
+        let mut conn = open_in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["A", "B", "C", "D", "E", "F", "G", "H", "I"] {
+            let mut bytes = b"II*\0".to_vec();
+            bytes.resize(64, 0);
+            std::fs::write(dir.path().join(format!("{n}.ARW")), bytes).unwrap();
+        }
+        let s = repo::import_folder(&mut conn, dir.path(), &ImportOptions::raw_only(false)).unwrap();
+        let ids: Vec<ImageId> = conn
+            .prepare("SELECT id FROM images ORDER BY file_name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        repo::set_pick(&mut conn, &ids, PickFlag::Pick).unwrap();
+        let groups: Vec<Vec<ImageId>> = ids.chunks(3).map(|c| c.to_vec()).collect();
+        let mut scenes = Vec::new();
+        for g in &groups {
+            let sc = super::super::store::create_scene(&mut conn, g).unwrap();
+            set_representative(&conn, sc.id, Some(g[0])).unwrap();
+            scenes.push(sc.id);
+        }
+        (conn, s.project_id, scenes, groups)
+    }
+
+    /// "Auto edit" of the given representatives as one style batch.
+    fn auto_edit(conn: &mut Connection, reps: &[ImageId]) -> EditBatchId {
+        let items: Vec<BatchItem> = reps
+            .iter()
+            .map(|&id| BatchItem {
+                image_id: id,
+                adjustments: ParametricAdjustments { exposure: 0.4, ..Default::default() },
+                scene_id: None,
+                review_reason: None,
+            })
+            .collect();
+        batches::commit_recorded(conn, &items, batches::LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap()
+    }
+
+    fn fake_previews(jobs: &[SceneApplyJob]) -> Vec<Vec<MatchPreview>> {
+        jobs.iter()
+            .map(|j| j.targets.iter().map(|t| fake_preview(t.src.id, &j.representative_adjustments)).collect())
+            .collect()
+    }
+
+    /// v17 (UX re-check 2 P1-12, repro a): auto edit 3 scenes -> apply Scene 1 -> undo the
+    /// older auto edit. The apply was built on the auto edit of Scene 1's representative, so
+    /// the undo is refused (strictly linear) until the apply is undone.
+    #[test]
+    fn apply_from_auto_edit_blocks_its_undo() {
+        let (mut conn, project, scenes, g) = three_scenes();
+        let reps: Vec<ImageId> = g.iter().map(|x| x[0]).collect();
+        let auto = auto_edit(&mut conn, &reps);
+        let plan = edit_plan(&conn, project).unwrap();
+        assert!(plan.scenes.iter().all(|s| s.status == SceneEditStatus::Edited && s.auto_edited));
+        let apply = apply_fake(&mut conn, scenes[0], &SceneApplyOptions::default(), &[]).batch.batch_id.unwrap();
+        let deps: Vec<(ImageId, EditBatchId)> = conn
+            .prepare("SELECT image_id, base_batch_id FROM edit_batch_bases WHERE batch_id = ?1")
+            .unwrap()
+            .query_map([apply], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(deps, vec![(reps[0], auto)], "the apply records what it was built on");
+
+        // The older auto edit: conflict, nothing changes.
+        let before: Vec<ParametricAdjustments> =
+            g.concat().iter().map(|&id| repo::get_adjustments(&conn, id).unwrap()).collect();
+        let err = batches::undo(&mut conn, auto).unwrap_err();
+        assert_eq!(
+            (err.kind, err.message.as_str()),
+            (ErrorKind::Conflict, "A scene was applied from this edit since; undo that apply first")
+        );
+        let after: Vec<ParametricAdjustments> =
+            g.concat().iter().map(|&id| repo::get_adjustments(&conn, id).unwrap()).collect();
+        assert_eq!(before, after);
+        let info = batches::batch_info(&conn, auto).unwrap();
+        assert_eq!((info.conflict_count, info.undoable), (1, false));
+        assert_eq!(batches::conflict_ids(&conn, auto).unwrap(), vec![reps[0]]);
+        let plan = edit_plan(&conn, project).unwrap();
+        assert_eq!(plan.scenes[0].status, SceneEditStatus::Applied, "Scene 1 stays consistent");
+        assert_eq!(plan.latest_batch.map(|b| (b.batch_id, b.undoable)), Some((apply, true)));
+
+        // A second apply from the same auto edit counts too (plural message).
+        apply_fake(&mut conn, scenes[1], &SceneApplyOptions::default(), &[]);
+        let err = batches::undo(&mut conn, auto).unwrap_err();
+        assert_eq!(err.message, "2 scenes were applied from this edit since; undo those applies first");
+        let latest = edit_plan(&conn, project).unwrap().latest_batch.unwrap();
+        batches::undo(&mut conn, latest.batch_id).unwrap();
+
+        // Plus a manual edit of another photo of the auto edit: the v16 message with every
+        // conflict counted.
+        history::commit(&mut conn, reps[2], &ParametricAdjustments { exposure: 1.0, ..Default::default() }, "Exp")
+            .unwrap();
+        let err = batches::undo(&mut conn, auto).unwrap_err();
+        assert_eq!(err.message, "Later edits on 2 photos; undo those first");
+        history::undo(&mut conn, reps[2]).unwrap();
+
+        // Undo the apply first (linear): the auto edit is undoable again, and undoing it puts
+        // every scene back to "to edit".
+        batches::undo(&mut conn, apply).unwrap();
+        assert!(batches::batch_info(&conn, auto).unwrap().undoable);
+        let u = batches::undo(&mut conn, auto).unwrap();
+        assert_eq!(u.restored_ids, reps);
+        let plan = edit_plan(&conn, project).unwrap();
+        assert!(plan.scenes.iter().all(|s| s.status == SceneEditStatus::ToEdit), "{:?}", plan.scenes);
+        assert_eq!(plan.latest_batch, None);
+
+        // An apply from a representative the user graded by hand records no base.
+        history::commit(&mut conn, reps[0], &ParametricAdjustments { exposure: 0.2, ..Default::default() }, "Exp")
+            .unwrap();
+        let b = apply_fake(&mut conn, scenes[0], &SceneApplyOptions::default(), &[]).batch.batch_id.unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM edit_batch_bases WHERE batch_id = ?1", [b], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// v17 (UX re-check 2 P1-12, repro b): auto edit -> apply Scene 1 -> reset its
+    /// representative. Scene 1 is `reset` (a to-do, no re-apply), apply all applies the other
+    /// scenes, and Scene 1's apply stays undoable.
+    #[test]
+    fn reset_representative_after_apply_is_a_to_do_scene() {
+        let (mut conn, project, scenes, g) = three_scenes();
+        let reps: Vec<ImageId> = g.iter().map(|x| x[0]).collect();
+        auto_edit(&mut conn, &reps[..1]);
+        let apply = apply_fake(&mut conn, scenes[0], &SceneApplyOptions::default(), &[]).batch.batch_id.unwrap();
+        let applied_look = repo::get_adjustments(&conn, g[0][1]).unwrap();
+        history::commit(&mut conn, reps[0], &ParametricAdjustments::default(), history::LABEL_RESET).unwrap();
+
+        let plan = edit_plan(&conn, project).unwrap();
+        let e = &plan.scenes[0];
+        assert_eq!((e.status, e.edited, e.auto_edited), (SceneEditStatus::Reset, false, false));
+        assert!(e.unapplied_keeper_ids.is_empty());
+        assert_eq!(e.applied_ids, vec![g[0][1], g[0][2]], "the members keep the earlier look");
+        assert_eq!(repo::get_adjustments(&conn, g[0][1]).unwrap(), applied_look);
+        let b = e.applied_batch.clone().unwrap();
+        assert_eq!((b.batch_id, b.undoable), (apply, true), "the apply stays undoable");
+        assert_eq!(
+            (plan.counts.to_edit, plan.counts.reset, plan.counts.outdated, plan.counts.edited),
+            (3, 1, 0, 0),
+            "reset counts as to do"
+        );
+        assert!(edited_scenes(&conn, project).unwrap().is_empty(), "nothing for apply all yet");
+
+        // Applying Scene 1 alone fails, naming it.
+        let err = apply_inputs(&conn, &[scenes[0]], &SceneApplyOptions::default()).unwrap_err();
+        assert_eq!(
+            (err.kind, err.message.as_str()),
+            (
+                ErrorKind::InvalidArgument,
+                "Scene 1: its representative was reset after the last apply. Edit it first, then apply."
+            )
+        );
+        let err = apply_inputs(&conn, &[scenes[1]], &SceneApplyOptions::default()).unwrap_err();
+        assert_eq!(err.message, "Scene 2: edit its representative first, then apply.");
+
+        // Auto edit Scenes 2 and 3, then apply all: those 2 are applied, Scene 1 is left alone.
+        auto_edit(&mut conn, &reps[1..]);
+        let plan = edit_plan(&conn, project).unwrap();
+        assert_eq!((plan.counts.edited, plan.counts.to_edit, plan.counts.reset), (2, 1, 1));
+        assert_eq!(edited_scenes(&conn, project).unwrap(), scenes[1..].to_vec());
+        let (jobs, skipped) = apply_all_inputs(&conn, project, &SceneApplyOptions::default()).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(
+            jobs.iter().map(|j| (j.scene_id, j.label.as_str())).collect::<Vec<_>>(),
+            vec![(scenes[1], "Scene 2"), (scenes[2], "Scene 3")]
+        );
+        let previews = fake_previews(&jobs);
+        let r = commit_apply(&mut conn, &jobs, &previews, false, skipped).unwrap();
+        assert_eq!(r.scenes.iter().map(|s| s.scene_id).collect::<Vec<_>>(), scenes[1..].to_vec());
+        assert_eq!(r.batch.changed_ids, [&g[1][1..], &g[2][1..]].concat());
+        let plan = edit_plan(&conn, project).unwrap();
+        assert_eq!(
+            plan.scenes.iter().map(|s| s.status).collect::<Vec<_>>(),
+            vec![SceneEditStatus::Reset, SceneEditStatus::Applied, SceneEditStatus::Applied]
+        );
+        assert_eq!(repo::get_adjustments(&conn, g[0][1]).unwrap(), applied_look, "Scene 1 untouched");
+
+        // The row's "Undo apply" restores Scene 1's members; the scene is then plain "to edit".
+        let u = batches::undo(&mut conn, apply).unwrap();
+        assert_eq!(u.restored_ids, vec![g[0][1], g[0][2]]);
+        let e = &edit_plan(&conn, project).unwrap().scenes[0];
+        assert_eq!((e.status, e.applied_batch.clone()), (SceneEditStatus::ToEdit, None));
+
+        // Per-image undo of the representative's only edit reaches `reset` too.
+        let (mut conn, project, scenes, g) = three_scenes();
+        history::commit(&mut conn, g[0][0], &ParametricAdjustments { exposure: 0.3, ..Default::default() }, "Exp")
+            .unwrap();
+        apply_fake(&mut conn, scenes[0], &SceneApplyOptions::default(), &[]);
+        history::undo(&mut conn, g[0][0]).unwrap();
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Reset);
+        // Editing it again: outdated (re-apply), and apply all takes it.
+        history::commit(&mut conn, g[0][0], &ParametricAdjustments { exposure: 0.6, ..Default::default() }, "Exp")
+            .unwrap();
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Outdated);
+        assert_eq!(edited_scenes(&conn, project).unwrap(), vec![scenes[0]]);
+    }
+
+    /// v17: apply all leaves out scenes it cannot apply and reports them by plan number; a
+    /// matching failure of one scene skips it (apply all) or fails naming it (one scene).
+    #[test]
+    fn apply_all_skips_scenes_it_cannot_apply() {
+        let (mut conn, _project, scenes, g) = three_scenes();
+        let reps: Vec<ImageId> = g.iter().map(|x| x[0]).collect();
+        auto_edit(&mut conn, &reps[1..]);
+        // Scene 3 loses its keepers after the plan was read (here: rejected).
+        repo::set_pick(&mut conn, &g[2], PickFlag::Reject).unwrap();
+        let (jobs, skipped) = lenient_inputs(&conn, &scenes, &SceneApplyOptions::default()).unwrap();
+        assert_eq!(jobs.iter().map(|j| j.scene_id).collect::<Vec<_>>(), vec![scenes[1]]);
+        assert_eq!(
+            skipped,
+            vec![
+                SkippedScene {
+                    scene_id: scenes[0],
+                    reason: SceneSkipReason::NotEdited,
+                    message: "Scene 1: edit its representative first, then apply.".into(),
+                },
+                SkippedScene {
+                    scene_id: scenes[2],
+                    reason: SceneSkipReason::NoKeepers,
+                    message: "This scene has no keepers.".into(),
+                },
+            ]
+        );
+        assert_eq!(scene_label(&conn, scenes[2]).unwrap(), "This scene");
+        assert_eq!(scene_label(&conn, 999).unwrap_err().kind, ErrorKind::NotFound);
+        repo::set_pick(&mut conn, &g[2], PickFlag::Pick).unwrap();
+
+        // Matching: Scene 2's original is missing. Apply all skips it and applies Scene 3.
+        let (jobs, _) = lenient_inputs(&conn, &scenes[1..], &SceneApplyOptions::default()).unwrap();
+        let missing = jobs[0].representative.src.id;
+        let mut matcher = |job: &SceneApplyJob, targets: &[MatchImage], _offset: u32| {
+            if job.representative.src.id == missing {
+                Err(AppError::new(ErrorKind::FileMissing, "D.ARW is missing"))
+            } else {
+                Ok(targets.iter().map(|t| fake_preview(t.src.id, &job.representative_adjustments)).collect())
+            }
+        };
+        let m = match_jobs(jobs.clone(), true, 1, &|| false, &mut matcher).unwrap();
+        assert_eq!(m.jobs.iter().map(|j| j.scene_id).collect::<Vec<_>>(), vec![scenes[2]]);
+        assert_eq!(
+            m.failed,
+            vec![SkippedScene {
+                scene_id: scenes[1],
+                reason: SceneSkipReason::Failed,
+                message: "Scene 2: D.ARW is missing".into(),
+            }]
+        );
+        assert!(!m.cancelled);
+        let r = commit_apply(&mut conn, &m.jobs, &m.previews, false, m.failed.clone()).unwrap();
+        assert_eq!(r.skipped_scenes, m.failed);
+        assert_eq!(r.batch.changed_ids, g[2][1..].to_vec());
+        // One scene (or a catalog-level error): fails, naming the scene.
+        let err = match_jobs(jobs.clone(), false, 1, &|| false, &mut matcher).unwrap_err();
+        assert_eq!((err.kind, err.message.as_str()), (ErrorKind::FileMissing, "Scene 2: D.ARW is missing"));
+        let mut broken = |_: &SceneApplyJob, _: &[MatchImage], _: u32| -> AppResult<Vec<MatchPreview>> {
+            Err(AppError::new(ErrorKind::Database, "disk I/O error"))
+        };
+        assert_eq!(
+            match_jobs(jobs.clone(), true, 1, &|| false, &mut broken).unwrap_err().message,
+            "Scene 2: disk I/O error"
+        );
+        // Cancel: stops before the next step; finished jobs only.
+        let calls = std::cell::Cell::new(0);
+        let mut counting = |job: &SceneApplyJob, targets: &[MatchImage], _: u32| {
+            calls.set(calls.get() + 1);
+            Ok(targets.iter().map(|t| fake_preview(t.src.id, &job.representative_adjustments)).collect())
+        };
+        let m = match_jobs(jobs, false, 1, &|| calls.get() >= 2, &mut counting).unwrap();
+        assert!(m.cancelled);
+        assert_eq!((m.jobs.len(), m.previews.len()), (1, 1));
     }
 }

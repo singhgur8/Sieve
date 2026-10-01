@@ -14,6 +14,11 @@
 //! Linear undo (IPC v16): [`undo`] refuses with `conflict` while any image of the batch has
 //! a history entry newer than the batch's own entry for it ([`conflict_ids`]); undoing a
 //! batch also clears the applied state of the scenes whose last apply it was.
+//!
+//! Applies built on a batch (IPC v17, migration 0015): a scene apply made from a
+//! representative whose current settings were written by batch A records A as its base
+//! (`edit_batch_bases`, [`commit_recorded_with_bases`], [`base_of`]); while that apply is not
+//! undone, the representative counts as a conflict of A ([`dependent_ids`]).
 
 use std::collections::HashMap;
 
@@ -79,6 +84,28 @@ pub fn commit_recorded(
     label: &str,
     kind: BatchKind,
 ) -> AppResult<EditBatchResult> {
+    commit_recorded_with_bases(conn, items, label, kind, &[])
+}
+
+/// What a new batch was made from (v17): image `image_id`'s settings, written by batch
+/// `base_batch_id` (a scene apply from its representative). Recorded only when one of
+/// `for_ids` (the items made from it) changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchBase {
+    pub image_id: ImageId,
+    pub base_batch_id: EditBatchId,
+    pub for_ids: Vec<ImageId>,
+}
+
+/// [`commit_recorded`], also recording `bases` (v17, `edit_batch_bases`). Unknown base batch
+/// -> `not_found` (nothing written).
+pub fn commit_recorded_with_bases(
+    conn: &mut Connection,
+    items: &[BatchItem],
+    label: &str,
+    kind: BatchKind,
+    bases: &[BatchBase],
+) -> AppResult<EditBatchResult> {
     for (i, it) in items.iter().enumerate() {
         if items[..i].iter().any(|o| o.image_id == it.image_id) {
             return Err(AppError::invalid(format!("image {} listed twice", it.image_id)));
@@ -128,6 +155,16 @@ pub fn commit_recorded(
                 stamp_cursor(&inner, it.image_id, None, Some(id))?;
             }
         }
+        for b in bases.iter().filter(|b| b.for_ids.iter().any(|i| changed.contains(i))) {
+            inner
+                .query_row("SELECT 1 FROM edit_batches WHERE id = ?1", [b.base_batch_id], |_| Ok(()))
+                .optional()?
+                .ok_or_else(|| AppError::not_found(format!("edit batch {}", b.base_batch_id)))?;
+            inner.execute(
+                "INSERT OR REPLACE INTO edit_batch_bases (batch_id, image_id, base_batch_id) VALUES (?1, ?2, ?3)",
+                params![id, b.image_id, b.base_batch_id],
+            )?;
+        }
         Some(id)
     };
     inner.commit()?;
@@ -150,13 +187,55 @@ pub fn written_by(
     json.map(|j| serde_json::from_str(&j).map_err(AppError::from)).transpose()
 }
 
+/// The batch that wrote image `image_id`'s current settings (its history cursor's batch, v17),
+/// if that batch is not undone: what an apply from this image as representative is built on.
+pub fn base_of(conn: &Connection, image_id: ImageId) -> AppResult<Option<EditBatchId>> {
+    let Some((_, Some(batch))) = cursor_entry(conn, image_id)? else { return Ok(None) };
+    let undone: Option<Option<i64>> =
+        conn.query_row("SELECT undone_at FROM edit_batches WHERE id = ?1", [batch], |r| r.get(0)).optional()?;
+    Ok(match undone {
+        Some(None) => Some(batch),
+        _ => None,
+    })
+}
+
+/// Images of batch `batch_id` (item order) whose settings from it a later scene apply that
+/// is not undone was made from (v17; the representatives of those applies).
+pub fn dependent_ids(conn: &Connection, batch_id: EditBatchId) -> AppResult<Vec<ImageId>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT bi.image_id FROM edit_batch_items bi
+             WHERE bi.batch_id = ?1 AND EXISTS (
+                 SELECT 1 FROM edit_batch_bases bb JOIN edit_batches b ON b.id = bb.batch_id
+                 WHERE bb.base_batch_id = ?1 AND bb.image_id = bi.image_id AND b.undone_at IS NULL)
+             ORDER BY bi.rowid",
+        )?
+        .query_map([batch_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Every conflict of batch `batch_id` (v17, item order): [`edited_after_ids`] and
+/// [`dependent_ids`]. `undo` refuses while non-empty.
+pub fn conflict_ids(conn: &Connection, batch_id: EditBatchId) -> AppResult<Vec<ImageId>> {
+    let edited = edited_after_ids(conn, batch_id)?;
+    let dependent = dependent_ids(conn, batch_id)?;
+    if dependent.is_empty() {
+        return Ok(edited);
+    }
+    let order: Vec<ImageId> = conn
+        .prepare_cached("SELECT image_id FROM edit_batch_items WHERE batch_id = ?1 ORDER BY rowid")?
+        .query_map([batch_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(order.into_iter().filter(|id| edited.contains(id) || dependent.contains(id)).collect())
+}
+
 /// Images of batch `batch_id` that were edited after it (v16), in item order: the image's
 /// history cursor is newer than the batch's entry for it, and is not an entry that restored
 /// this batch's settings (undo of a later batch is stamped with this batch). Images whose
 /// batch entry is gone (pruned, or dropped as redo tail by a newer edit) count when their
 /// settings differ from what the batch wrote. Images whose cursor is before the batch's
 /// entry (the batch edit was taken back with per-image undo) do not count.
-pub fn conflict_ids(conn: &Connection, batch_id: EditBatchId) -> AppResult<Vec<ImageId>> {
+pub fn edited_after_ids(conn: &Connection, batch_id: EditBatchId) -> AppResult<Vec<ImageId>> {
     type Row = (ImageId, String, Option<i64>, Option<EditBatchId>, Option<i64>);
     let rows: Vec<Row> = conn
         .prepare_cached(
@@ -244,6 +323,16 @@ pub fn conflict_message(n: usize) -> String {
     }
 }
 
+/// User-facing message of a `conflict` undo whose only conflicts are `n` scene applies built
+/// on the batch (v17).
+pub fn applied_from_message(n: usize) -> String {
+    if n == 1 {
+        "A scene was applied from this edit since; undo that apply first".to_owned()
+    } else {
+        format!("{n} scenes were applied from this edit since; undo those applies first")
+    }
+}
+
 /// Undoes batch `batch_id` (see the module docs). Unknown batch -> `not_found`; already undone
 /// -> `invalid_argument`; photos edited after the batch -> `conflict` (nothing changed).
 /// Scenes whose last apply was this batch lose their applied state (status back to
@@ -258,9 +347,14 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
     if undone.is_some() {
         return Err(AppError::invalid("this edit was already undone"));
     }
-    let conflicts = conflict_ids(conn, batch_id)?;
-    if !conflicts.is_empty() {
-        return Err(AppError::new(ErrorKind::Conflict, conflict_message(conflicts.len())));
+    let edited = edited_after_ids(conn, batch_id)?;
+    if !edited.is_empty() {
+        let n = conflict_ids(conn, batch_id)?.len();
+        return Err(AppError::new(ErrorKind::Conflict, conflict_message(n)));
+    }
+    let dependent = dependent_ids(conn, batch_id)?;
+    if !dependent.is_empty() {
+        return Err(AppError::new(ErrorKind::Conflict, applied_from_message(dependent.len())));
     }
     type Item = (ImageId, String, String, Option<String>, Option<EditBatchId>);
     let items: Vec<Item> = conn

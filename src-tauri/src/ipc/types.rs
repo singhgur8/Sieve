@@ -3789,6 +3789,11 @@ string_enum! {
         Applied => "applied",
         /// Applied, but the representative was edited again since (apply again).
         Outdated => "outdated",
+        /// The scene was applied, but its representative has no edits any more (v17: reset,
+        /// or its edit undone, after the apply). The members keep the look of the last apply
+        /// (`appliedBatch` stays undoable when nothing blocks it). A to-do scene: edit the
+        /// representative, then apply; not applied by `apply_all_edited_scenes`.
+        Reset => "reset",
     }
 }
 
@@ -3840,10 +3845,11 @@ pub struct SceneEditEntry {
     /// Keepers of this scene that need a look (`ImageEditState.needsReview`), capture order
     /// (v15).
     pub needs_review_ids: Vec<ImageId>,
-    /// Applied scenes only (`appliedAtMs` set, not skipped): keepers that the last apply did
-    /// not cover (added to the scene or made keepers since), are not the representative, and
-    /// have no edit of their own (`editSource` `none` or `auto_style`). Non-empty = "Apply to
-    /// N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
+    /// Applied scenes only (`appliedAtMs` set, not skipped, status not `reset` (v17)):
+    /// keepers that the last apply did not cover (added to the scene or made keepers since),
+    /// are not the representative, and have no edit of their own (`editSource` `none` or
+    /// `auto_style`). Non-empty = "Apply to N new" (`apply_scene_edit`; already applied frames
+    /// come out unchanged) (v15).
     pub unapplied_keeper_ids: Vec<ImageId>,
     /// The edit batch of this scene's last apply that changed something (v16): `null` when
     /// never applied, or that batch was undone (undoing it also clears the scene's applied
@@ -3903,10 +3909,13 @@ pub struct ImageEditState {
 #[serde(rename_all = "camelCase")]
 pub struct EditPlanCounts {
     pub scenes: u32,
+    /// Scenes to do: status `to_edit` or `reset` (v17: `reset` scenes count here too).
     pub to_edit: u32,
     pub edited: u32,
     pub applied: u32,
     pub outdated: u32,
+    /// Status `reset` (v17); included in `toEdit`.
+    pub reset: u32,
     pub skipped: u32,
     /// Minor scenes (skipped or not).
     pub minor: u32,
@@ -4012,6 +4021,8 @@ string_enum! {
 /// while none of its photos has a history entry newer than the batch's own (a later batch or
 /// a manual edit); undoing a later batch restores the photos to this batch's settings and
 /// makes it undoable again. Per-image undo (Cmd+Z in Develop) of the later edit also does.
+/// v17: a scene apply made from a representative whose settings this batch wrote (e.g. Auto
+/// edit, then Apply to scene) is a later edit of this batch too: undo the apply first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EditBatchInfo {
@@ -4024,8 +4035,9 @@ pub struct EditBatchInfo {
     pub undone_at_ms: Option<i64>,
     /// Photos the batch changed.
     pub image_count: u32,
-    /// Photos edited after the batch (0 when undone): `undo_edit_batch` refuses with
-    /// `conflict` while this is > 0.
+    /// Photos of the batch edited after it, or (v17) whose settings from this batch a later
+    /// scene apply that is not undone was made from (the representative of an auto-edited
+    /// scene) (0 when undone): `undo_edit_batch` refuses with `conflict` while this is > 0.
     pub conflict_count: u32,
     /// Not undone and `conflictCount == 0`: `undo_edit_batch` would succeed now.
     pub undoable: bool,
@@ -4052,6 +4064,34 @@ pub struct ApplyScenesResult {
     /// `cancel_scene_apply` stopped the call (v15): scenes in `scenes` were applied (one
     /// batch); the scene being matched and the ones after it were not touched.
     pub cancelled: bool,
+    /// `apply_all_edited_scenes` only (v17; always empty for `apply_scene_edit`, which fails
+    /// instead): scenes it was going to apply but could not, plan order. Nothing was written
+    /// to them; the other scenes were applied.
+    pub skipped_scenes: Vec<SkippedScene>,
+}
+
+string_enum! {
+    /// Why `apply_all_edited_scenes` left a scene out (v17).
+    pub enum SceneSkipReason {
+        /// The representative has no edits (edit it first).
+        NotEdited => "not_edited",
+        /// The scene has no keepers (any more).
+        NoKeepers => "no_keepers",
+        /// Reading or matching the scene failed (e.g. an original is missing or cannot be
+        /// decoded); `message` says why.
+        Failed => "failed",
+    }
+}
+
+/// A scene `apply_all_edited_scenes` could not apply (v17).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedScene {
+    pub scene_id: SceneId,
+    pub reason: SceneSkipReason,
+    /// User-facing, names the scene by its plan number, e.g. "Scene 2: edit its representative
+    /// first, then apply." / "Scene 3: DSC01234.ARW is missing ...".
+    pub message: String,
 }
 
 /// Result of `undo_edit_batch`.
