@@ -147,7 +147,7 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
 function Unavailable({ title, detail }: { title: string; detail: string }) {
   return (
     <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center" data-testid="preview-unavailable">
-      <ImageOff className="size-8 text-neutral-500" />
+      <ImageOff className="size-8 text-neutral-400" />
       <p className="text-sm font-medium text-neutral-200">{title}</p>
       <p className="max-w-sm break-words text-xs text-neutral-400">{detail}</p>
     </div>

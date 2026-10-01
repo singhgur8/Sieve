@@ -147,15 +147,26 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // If the active image left the result set (filter/rating change), move to its neighbour.
   const prevIds = useRef<number[]>([]);
   const { active: selActive, set: selSet, clear: selClear } = sel;
+  /** Scene navigation target: selected once the (re-queried) result set contains it; meanwhile the neighbour fallback is skipped. */
+  const pendingActive = useRef<number | null>(null);
+  const [pendingTick, setPendingTick] = useState(0);
   useEffect(() => {
     const prev = prevIds.current;
     prevIds.current = ids;
+    const pending = pendingActive.current;
+    if (pending != null) {
+      if (ids.includes(pending)) {
+        pendingActive.current = null;
+        selSet([pending], pending);
+      }
+      return;
+    }
     if (selActive != null && lib.loaded && !ids.includes(selActive)) {
       const at = Math.min(Math.max(prev.indexOf(selActive), 0), ids.length - 1);
       if (ids[at] != null) selSet([ids[at]], ids[at]);
       else selClear();
     }
-  }, [ids, lib.loaded, selActive, selSet, selClear]);
+  }, [ids, lib.loaded, selActive, selSet, selClear, pendingTick]);
 
   // A scene filter that no longer exists (deleted, merged away, other folder) is dropped.
   const { scenes: sceneList } = scenes;
@@ -672,12 +683,20 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       const id = photo ?? row?.entry.representativeId;
       if (id == null) return;
       setQuery((q) => (q.sceneId === sceneId ? q : { ...q, sceneId }));
-      sel.set([id], id);
+      pendingActive.current = id;
+      setPendingTick((t) => t + 1);
+      // Safety: a target that never shows up (hidden by another filter) must not freeze the neighbour fallback.
+      window.setTimeout(() => {
+        if (pendingActive.current === id) {
+          pendingActive.current = null;
+          setPendingTick((t) => t + 1);
+        }
+      }, 2000);
       setCmp(null);
       setPlanOpen(false);
       setMode("develop");
     },
-    [rowOfScene, sel],
+    [rowOfScene],
   );
 
   const goStep = useCallback(
@@ -729,9 +748,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   /** Review an apply: Develop on the first frame that needs a look; N walks the rest. */
   const reviewFrames = useCallback(
-    (sceneId: number) => {
+    (sceneId: number, reviewIds?: number[]) => {
       const row = rowOfScene(sceneId);
-      const first = row?.review[0];
+      const first = (reviewIds && reviewIds.length > 0 ? reviewIds : row?.review)?.[0];
       if (first == null) return setNotice("Nothing to review in this scene");
       setReviewScene(sceneId);
       openScene(sceneId, first);
@@ -1256,7 +1275,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       {project && <StyleDialogs wf={wf} fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`} />}
       {(explainOpen || explainerDue) && <XmpExplainer autoSync={status.catalog?.xmpAutoSync ?? false} onClose={closeExplainer} />}
-      {cheatOpen && <CheatSheet mode={mode} onClose={() => setCheatOpen(false)} />}
+      {cheatOpen && <CheatSheet mode={mode} editStep={projectId != null && step === "edit" && (planOpen || mode === "develop")} onClose={() => setCheatOpen(false)} />}
       {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}

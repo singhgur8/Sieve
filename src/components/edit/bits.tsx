@@ -5,7 +5,7 @@ import { convertFileSrc, type RawImageEntry, type StyleModelStatus } from "../..
 import { styleGate, type SceneRow, type SceneUi } from "../../hooks/useWorkflow";
 
 export const STATUS_ICON: Record<SceneUi, { icon: typeof Circle; cls: string }> = {
-  todo: { icon: Circle, cls: "text-neutral-500" },
+  todo: { icon: Circle, cls: "text-neutral-400" },
   auto: { icon: Wand2, cls: "text-amber-400" },
   edited: { icon: CircleDot, cls: "text-sky-400" },
   applied: { icon: CheckCircle2, cls: "text-emerald-400" },

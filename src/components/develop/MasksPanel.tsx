@@ -215,7 +215,7 @@ function ReorderHandle({ index, onMove, onPick, testid, label }: { index: number
   };
   return (
     <button
-      className="cursor-grab touch-none rounded p-0.5 text-neutral-500 hover:text-neutral-200 active:cursor-grabbing"
+      className="cursor-grab touch-none rounded p-0.5 text-neutral-400 hover:text-neutral-200 active:cursor-grabbing"
       aria-label={label}
       title={`${label} (drag, or Alt+Up / Alt+Down)`}
       data-testid={testid}

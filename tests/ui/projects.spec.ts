@@ -111,10 +111,8 @@ test.describe("projects home page", () => {
     expect((await calls(page, "get_filter_counts")).at(-1)!.args).toMatchObject({ folderId: null, projectId: 1 });
     await expect(page.getByTestId("filter-bar")).toContainText("Unflagged 86"); // 8 + 7 + 86 = 101 photos of this project
 
-    // Folder dropdown only lists this project's folder.
-    const folders = page.getByTestId("folder-select").locator("option");
-    await expect(folders).toHaveCount(2); // "All folders" + ceremony
-    await expect(folders.nth(1)).toHaveText(/ceremony/);
+    // A single-folder project has no folder dropdown (ux-review-8b P1-7).
+    await expect(page.getByTestId("folder-select")).toHaveCount(0);
 
     // Switch via the TopBar.
     await clearCalls(page);

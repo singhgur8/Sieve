@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Aperture, FolderPlus, Search, X } from "lucide-react";
 import { commands, unwrap, type Project, type ShootType } from "../../ipc";
-import { useImportOptions } from "../../lib/importOptions";
 import { describeError, noteFailure, clearFileHealth } from "../../lib/errors";
 import { Toasts, useToasts } from "../Toasts";
 import { CoverDialog, NewProjectDialog, RemoveDialog, RenameDialog } from "./ProjectDialogs";
@@ -38,7 +37,6 @@ export function HomePage({ onOpen }: { onOpen: (id: number) => Promise<void> }) 
   const [sort, setSort] = useState<SortKey>(loadSort);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [shoot, setShoot] = useState<ShootType>("wedding");
-  const [importOpts] = useImportOptions();
   const toasts = useToasts();
   const { push } = toasts;
   const [error, setError] = useState<ReturnType<typeof describeError> | null>(null);
@@ -119,14 +117,14 @@ export function HomePage({ onOpen }: { onOpen: (id: number) => Promise<void> }) 
         {total > 0 && (
           <>
             <label className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-neutral-500" />
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-neutral-400" />
               <input
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search projects"
                 aria-label="Search projects"
-                className="h-8 w-64 rounded-md border border-neutral-700 bg-neutral-900 pl-8 pr-7 text-sm placeholder:text-neutral-500 focus:border-sky-600 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+                className="h-8 w-64 rounded-md border border-neutral-700 bg-neutral-900 pl-8 pr-7 text-sm placeholder:text-neutral-400 focus:border-sky-600 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
                 data-testid="home-search"
               />
               {query && (
@@ -167,7 +165,7 @@ export function HomePage({ onOpen }: { onOpen: (id: number) => Promise<void> }) 
 
       <div className="min-h-0 flex-1 overflow-y-auto" data-testid="home-scroll">
         {projects === null ? (
-          <p className="p-10 text-center text-sm text-neutral-500" data-testid="home-loading">
+          <p className="p-10 text-center text-sm text-neutral-400" data-testid="home-loading">
             Loading projects…
           </p>
         ) : total === 0 ? (
@@ -182,7 +180,7 @@ export function HomePage({ onOpen }: { onOpen: (id: number) => Promise<void> }) 
             <button onClick={() => setDialog({ kind: "new" })} className="mt-1 flex items-center gap-2 rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600" data-testid="empty-new-project">
               <FolderPlus className="size-4" /> New project
             </button>
-            <p className="text-xs text-neutral-500">Sony ARW, Fujifilm RAF, Canon CR3 · JPEG, HEIC, TIFF, PNG when enabled in Import options</p>
+            <p className="text-xs text-neutral-400">Sony ARW, Fujifilm RAF, Canon CR3 · JPEG, HEIC, TIFF, PNG (turn on in New project)</p>
           </div>
         ) : visible.length === 0 ? (
           <div className="flex flex-col items-center gap-2 p-16 text-center text-sm text-neutral-400" data-testid="home-no-match">
@@ -216,7 +214,6 @@ export function HomePage({ onOpen }: { onOpen: (id: number) => Promise<void> }) 
       {dialog?.kind === "new" && (
         <NewProjectDialog
           defaultShoot={shoot}
-          importOptions={importOpts}
           onCancel={() => setDialog(null)}
           onCreated={(p, existing) => {
             setDialog(null);

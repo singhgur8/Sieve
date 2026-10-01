@@ -81,7 +81,15 @@ export function useWorkflow(d: Deps) {
   const [autoAt, setAutoAt] = useState<Map<number, number>>(new Map());
   const [learnFor, setLearnFor] = useState<number[] | null>(null);
   const [replaceFor, setReplaceFor] = useState<number[] | null>(null);
-  const [lastBatch, setLastBatch] = useState<LastBatch | null>(null);
+  const [batchStack, setBatchStack] = useState<LastBatch[]>([]);
+  const lastBatch: LastBatch | null = batchStack.length > 0 ? batchStack[batchStack.length - 1] : null;
+  /** Batch id -> id of the toast offering its Undo (dismissed once the batch is undone). */
+  const batchToast = useRef(new Map<number, number>());
+  const bindToast = (b: LastBatch | null, toastId: number) => {
+    if (b) batchToast.current.set(b.batchId, toastId);
+  };
+  /** Newest batch that touched a scene (row menus: Undo apply). */
+  const batchForScene = (sceneId: number): LastBatch | null => [...batchStack].reverse().find((b) => b.sceneIds.includes(sceneId)) ?? null;
   const seq = useRef(0);
   const dref = useRef(d);
   dref.current = d;
@@ -156,7 +164,8 @@ export function useWorkflow(d: Deps) {
     setReview(new Map());
     setAppliedCount(new Map());
     setAutoAt(new Map());
-    setLastBatch(null);
+    setBatchStack([]);
+    batchToast.current.clear();
   }, [projectId]);
 
   // ---- style model ----
@@ -238,7 +247,12 @@ export function useWorkflow(d: Deps) {
     async (batch: LastBatch) => {
       try {
         const r = await unwrap(commands.undoEditBatch(batch.batchId));
-        setLastBatch((b) => (b?.batchId === batch.batchId ? null : b));
+        setBatchStack((st) => st.filter((b) => b.batchId !== batch.batchId));
+        const tid = batchToast.current.get(batch.batchId);
+        if (tid != null) {
+          toasts.dismiss(tid);
+          batchToast.current.delete(batch.batchId);
+        }
         setReview((m) => {
           const n = new Map(m);
           batch.sceneIds.forEach((s) => n.delete(s));
@@ -265,7 +279,7 @@ export function useWorkflow(d: Deps) {
   const remember = (batchId: number | null, label: string, sceneIds: number[]): LastBatch | null => {
     if (batchId == null) return null;
     const b = { batchId, label, sceneIds, at: Date.now() };
-    setLastBatch(b);
+    setBatchStack((st) => [...st, b].slice(-20));
     return b;
   };
 
@@ -284,7 +298,7 @@ export function useWorkflow(d: Deps) {
   };
 
   const applyScene = useCallback(
-    async (sceneId: number, opts: "match" | "exact" = "match", onReview?: (sceneId: number) => void) => {
+    async (sceneId: number, opts: "match" | "exact" = "match", onReview?: (sceneId: number, ids?: number[]) => void) => {
       if (busyRef.current) return;
       setBusy({ kind: "scene", sceneId, done: 0, total: 0 });
       try {
@@ -300,10 +314,11 @@ export function useWorkflow(d: Deps) {
         const b = remember(r.batch.batchId, `Apply ${labelOf(sceneId)}`, [sceneId]);
         await afterChange(r.batch.changedIds);
         const label = labelOf(sceneId);
-        toasts.push(`Applied ${label} to ${plural(n, "photo")}${need > 0 ? ` · ${need} need a look` : ""}`, {
+        const tid = toasts.push(`Applied ${label} to ${plural(n, "photo")}${need > 0 ? ` · ${need} need a look` : ""}`, {
           action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
-          secondary: need > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(sceneId) } : undefined,
+          secondary: need > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(sceneId, out?.notConvergedIds) } : undefined,
         });
+        bindToast(b, tid);
       } catch (e) {
         onError(e);
       } finally {
@@ -314,7 +329,7 @@ export function useWorkflow(d: Deps) {
   );
 
   const applyAll = useCallback(
-    async (onReview?: (sceneId: number) => void) => {
+    async (onReview?: (sceneId: number, ids?: number[]) => void) => {
       if (projectId == null || busyRef.current) return;
       setBusy({ kind: "all", done: 0, total: 0 });
       try {
@@ -329,10 +344,11 @@ export function useWorkflow(d: Deps) {
         const needN = need.reduce((a, s) => a + s.notConvergedIds.length, 0);
         const b = remember(r.batch.batchId, `Apply ${plural(r.scenes.length, "scene")}`, r.scenes.map((s) => s.sceneId));
         await afterChange(r.batch.changedIds);
-        toasts.push(`Applied ${plural(r.scenes.length, "scene")} to ${plural(n, "photo")}${needN > 0 ? ` · ${needN} need a look` : ""}`, {
+        const tid = toasts.push(`Applied ${plural(r.scenes.length, "scene")} to ${plural(n, "photo")}${needN > 0 ? ` · ${needN} need a look` : ""}`, {
           action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
-          secondary: needN > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId) } : undefined,
+          secondary: needN > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId, need[0].notConvergedIds) } : undefined,
         });
+        bindToast(b, tid);
       } catch (e) {
         onError(e);
       } finally {
@@ -360,9 +376,10 @@ export function useWorkflow(d: Deps) {
           sceneIds.forEach((id) => n.set(id, fresh.scenes.find((s) => s.sceneId === id)?.editedAtMs ?? Date.now()));
           return n;
         });
-        toasts.push(`Auto edited ${plural(sceneIds.length, "scene")}. Review ${sceneIds.length === 1 ? "it" : "each one"}, then apply.`, {
+        const tid = toasts.push(`Auto edited ${plural(sceneIds.length, "scene")}. Review ${sceneIds.length === 1 ? "it" : "each one"}, then apply.`, {
           action: b ? { label: "Undo", testid: "auto-undo", onClick: () => void undoBatch(b) } : undefined,
         });
+        bindToast(b, tid);
       } catch (e) {
         onError(e);
       } finally {
@@ -437,6 +454,7 @@ export function useWorkflow(d: Deps) {
     style,
     busy,
     lastBatch,
+    batchForScene,
     learnFor,
     setLearnFor,
     replaceFor,

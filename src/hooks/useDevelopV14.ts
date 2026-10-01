@@ -102,6 +102,19 @@ export function useHoverPreview(imageId: number | null, maxEdgeFor: (to: "naviga
     [imageId, maxEdgeFor],
   );
   useEffect(() => stop, [imageId, stop]);
+  // A hover preview is transient: Esc, losing window focus or hiding the page always drops it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && stop();
+    const onVis = () => document.hidden && stop();
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("blur", stop);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("blur", stop);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [stop]);
   return { preview, start, stop };
 }
 

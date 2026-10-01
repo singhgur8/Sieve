@@ -142,7 +142,7 @@ function PopoverBody(p: {
                 <div className="text-neutral-400">{describeReason(f.reason).message}</div>
               </li>
             ))}
-            {p.failures.length < p.failed && <li className="text-neutral-500">{p.failed - p.failures.length} more, retry to list them.</li>}
+            {p.failures.length < p.failed && <li className="text-neutral-400">{p.failed - p.failures.length} more, retry to list them.</li>}
           </ul>
           <button className="mt-2 flex items-center gap-1.5 rounded-md bg-neutral-700 px-2.5 py-1 text-neutral-100 hover:bg-neutral-600" data-testid="xmp-retry" onClick={p.onRetry}>
             <RotateCw className="size-3.5" /> Retry

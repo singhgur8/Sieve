@@ -419,6 +419,9 @@ test.describe("P1-10 cheat sheet and keymap", () => {
     await page.keyboard.press("d");
     expect((await calls(page, "set_pick")).length).toBe(0);
     await expect(page.getByTestId("develop-view")).toHaveCount(0);
+    await expect(page.getByTestId("cheat-filter")).toHaveValue("xd"); // typing filters the list
+    await page.keyboard.press("Escape"); // clears the filter first
+    await expect(page.getByTestId("cheat-filter")).toHaveValue("");
     await page.keyboard.press("Escape");
     await expect(sheet).toHaveCount(0);
 

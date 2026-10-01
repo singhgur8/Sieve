@@ -35,9 +35,9 @@ function Body({ project, close, onHome, onOpenProject, onSetCover }: Props & { c
       >
         <Home className="size-4" /> All projects
       </button>
-      <div className="mt-1 border-t border-neutral-800 px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-neutral-500">Switch to</div>
+      <div className="mt-1 border-t border-neutral-800 px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-neutral-400">Switch to</div>
       <div className="max-h-72 overflow-y-auto">
-        {others === null && <p className="px-3 py-1.5 text-xs text-neutral-500">Loading…</p>}
+        {others === null && <p className="px-3 py-1.5 text-xs text-neutral-400">Loading…</p>}
         {others?.map((p) => (
           <button
             key={p.id}
@@ -50,7 +50,7 @@ function Body({ project, close, onHome, onOpenProject, onSetCover }: Props & { c
           >
             <span className="flex size-4 shrink-0 items-center justify-center">{p.id === project.id && <Check className="size-4 text-sky-400" />}</span>
             <span className="min-w-0 flex-1 truncate">{p.name}</span>
-            <span className="shrink-0 text-xs text-neutral-500">{p.photoCount}</span>
+            <span className="shrink-0 text-xs text-neutral-400">{p.photoCount}</span>
           </button>
         ))}
       </div>

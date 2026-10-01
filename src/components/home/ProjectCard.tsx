@@ -52,7 +52,7 @@ export function ProjectCard({ project: p, onOpen, onRename, onCover, onAutoCover
           </p>
           <div className="mt-1 flex items-center gap-3 text-xs text-neutral-300" data-testid={`project-counts-${id}`}>
             <span className="flex items-center gap-1" title="Photos">
-              <Aperture className="size-3.5 text-neutral-500" />
+              <Aperture className="size-3.5 text-neutral-400" />
               <b className="font-semibold" data-testid={`project-photos-${id}`}>{p.photoCount}</b> photos
             </span>
             <span className="flex items-center gap-1" title="Keepers by the current keeper rule">
@@ -64,7 +64,7 @@ export function ProjectCard({ project: p, onOpen, onRename, onCover, onAutoCover
               <b className="font-semibold" data-testid={`project-edited-${id}`}>{p.editedCount}</b> edited
             </span>
           </div>
-          <p className="mt-auto pt-1 text-[11px] text-neutral-500" data-testid={`project-opened-${id}`} title={p.lastOpenedAtMs != null ? new Date(p.lastOpenedAtMs).toLocaleString() : undefined}>
+          <p className="mt-auto pt-1 text-[11px] text-neutral-400" data-testid={`project-opened-${id}`} title={p.lastOpenedAtMs != null ? new Date(p.lastOpenedAtMs).toLocaleString() : undefined}>
             {p.lastOpenedAtMs != null ? `Opened ${relativeTime(p.lastOpenedAtMs)}` : "Never opened"} · Created {formatDate(p.createdAtMs)}
           </p>
         </div>

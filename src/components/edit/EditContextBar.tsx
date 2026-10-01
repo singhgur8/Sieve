@@ -15,7 +15,7 @@ interface Props {
   onPlan: () => void;
   onMakeRep: (imageId: number) => void;
   onApplyOptions: (sceneId: number) => void;
-  onReview: (sceneId: number) => void;
+  onReview: (sceneId: number, ids?: number[]) => void;
   onNextReview: () => void;
 }
 
@@ -33,7 +33,7 @@ export function EditContextBar(p: Props) {
   const idx = row ? rows.indexOf(row) : -1;
   const isRep = !!row && row.entry.representativeId === p.activeId;
   const busy = wf.busy != null;
-  const last = row && wf.lastBatch && wf.lastBatch.sceneIds.includes(row.entry.sceneId) ? wf.lastBatch : null;
+  const last = row ? wf.batchForScene(row.entry.sceneId) : null;
   const canApply = !!row && row.ui !== "todo" && row.targets > 0;
 
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
@@ -110,7 +110,7 @@ export function EditContextBar(p: Props) {
                 <StatusIcon ui={r.ui} className="size-4" />
                 <span className="w-16 shrink-0">Scene {r.number}</span>
                 <span className="w-8 shrink-0 text-right text-xs text-neutral-400">{r.entry.imageIds.length}</span>
-                <span className="min-w-0 flex-1 truncate pl-2 text-xs text-neutral-500">{p.fileName(r.entry.representativeId)}</span>
+                <span className="min-w-0 flex-1 truncate pl-2 text-xs text-neutral-400">{p.fileName(r.entry.representativeId)}</span>
               </button>
             ))}
             <button

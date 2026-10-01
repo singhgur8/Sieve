@@ -59,7 +59,7 @@ export class ErrorBoundary extends Component<Props, State> {
             </button>
           )}
         </div>
-        <p className="text-[11px] text-neutral-500">Your catalog and edits are safe. The error was logged to the console.</p>
+        <p className="text-[11px] text-neutral-400">Your catalog and edits are safe. The error was logged to the console.</p>
       </div>
     );
   }

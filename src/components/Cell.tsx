@@ -136,7 +136,7 @@ function Thumb({ src, name }: { src: string; name: string | undefined }) {
   if (broken === src)
     return (
       <div className="flex size-full flex-col items-center justify-center gap-1 text-center" data-testid="thumb-broken" title="The cached preview could not be loaded. Regenerate previews from the More menu, or re-import the folder.">
-        <ImageOff className="size-5 text-neutral-500" />
+        <ImageOff className="size-5 text-neutral-400" />
         <span className="text-[10px] text-neutral-400">Preview unavailable</span>
       </div>
     );

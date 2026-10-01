@@ -41,7 +41,7 @@ interface Props {
   focusId: number | null;
   onFocus: (sceneId: number) => void;
   onEdit: (sceneId: number) => void;
-  onReview: (sceneId: number) => void;
+  onReview: (sceneId: number, ids?: number[]) => void;
   onShowScene: (sceneId: number) => void;
   onChangeRep: (sceneId: number) => void;
   onApplyOptions: (sceneId: number) => void;
@@ -255,7 +255,7 @@ export function PlanView(p: Props) {
               onClick={() => setTab(t.id)}
               className={`rounded px-2 py-1 ${tab === t.id ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:text-neutral-200"}`}
             >
-              {t.label} <span className="text-neutral-500">{n}</span>
+              {t.label} <span className="text-neutral-400">{n}</span>
             </button>
           );
         })}
@@ -335,7 +335,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const more = others.length - shown.length;
   const busyHere = wf.busy?.kind === "scene" && wf.busy.sceneId === id;
   const anyBusy = wf.busy != null;
-  const last = wf.lastBatch && wf.lastBatch.sceneIds.includes(id) ? wf.lastBatch : null;
+  const last = wf.batchForScene(id);
   const applyLabel = r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
   const canApply = r.ui !== "todo" && r.targets > 0;
   const reviewSet = new Set(r.review);
@@ -371,7 +371,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           {busyHere ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : line.text}
           {!busyHere && line.extra && <span className="text-amber-300">{line.extra}</span>}
         </p>
-        <p className="truncate text-[11px] text-neutral-500" title={e.representativeReason}>
+        <p className="truncate text-[11px] text-neutral-400" title={e.representativeReason}>
           {repEntry?.fileName ?? `#${e.representativeId}`}
         </p>
       </div>

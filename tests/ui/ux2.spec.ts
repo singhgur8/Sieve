@@ -499,7 +499,7 @@ test.describe("P1-10 export skips rejects", () => {
 });
 
 test.describe("P1-11 cheat sheet", () => {
-  test("1728x1117 in Develop: every Develop and Masks row is visible without scrolling; key column 112 px", async ({ page }) => {
+  test("1728x1117 in Develop: every Develop and Masks row is visible without scrolling; key column 128 px", async ({ page }) => {
     await page.setViewportSize({ width: 1728, height: 1117 });
     await openDevelop(page);
     await page.keyboard.press("?");
@@ -523,7 +523,7 @@ test.describe("P1-11 cheat sheet", () => {
     }
     console.log(`CHEAT 1728: ${checked} Develop+Masks rows visible, columns box ${cols.width}x${cols.height}`);
     const keyCol = await page.getByTestId("cheat-undoAdj").locator("span").first().boundingBox();
-    expect(Math.round(keyCol!.width)).toBe(112);
+    expect(Math.round(keyCol!.width)).toBe(128);
     await shot(page, `${P}cheatsheet-1728`);
     await page.keyboard.press("Escape");
     // Library modes list Culling, Navigate, View first.

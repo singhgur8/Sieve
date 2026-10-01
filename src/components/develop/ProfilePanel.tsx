@@ -194,6 +194,9 @@ export function ProfileBrowser({ editor, catalog, importing, onImport, hover, on
     if (filter !== "bw") catalog?.luts.forEach((l) => slot(l.group).luts.push(l));
     return [...m.entries()].filter(([, v]) => v.cams.length + v.looks.length + v.luts.length > 0);
   }, [catalog, filter]);
+  // Closing the browser (any way) drops a pending or shown hover preview.
+  const stopHover = hover.stop;
+  useEffect(() => stopHover, [stopHover]);
   const hov = (label: string, adj: ParametricAdjustments) => ({ onMouseEnter: () => hover.start(label, adj), onMouseLeave: hover.stop });
   const amount =
     look && lookInfo?.supportsAmount ? (
@@ -213,7 +216,7 @@ export function ProfileBrowser({ editor, catalog, importing, onImport, hover, on
     ) : null;
 
   return (
-    <div data-testid="profile-browser" className="pb-2">
+    <div data-testid="profile-browser" className="pb-2" onMouseLeave={hover.stop}>
       <div className="sticky top-0 z-10 bg-neutral-950 pb-1">
         <div className="flex h-8 items-center justify-between border-b border-neutral-800">
           <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-300">Profile Browser</h3>
