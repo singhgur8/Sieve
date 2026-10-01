@@ -23,6 +23,7 @@ src-tauri/
                                columns, style_models/style_features, keeper_rule, XMP auto-sync on
   migrations/0013_workflow_state.sql v13: adjustment_history.source/batch_id (per-photo edit source), batch item
                                provenance + review flags, scenes.skipped/applied_covered_json
+  migrations/0014_linear_undo.sql v14: clears the applied state of scenes whose apply batch was undone (IPC v16)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -204,7 +205,8 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `set_scene_representative` / `setSceneRepresentative` (v14) | `sceneId: number, imageId: number \| null` | `SceneEditEntry` |
 | `apply_scene_edit` / `applySceneEdit` (v14) | `sceneId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (one undoable batch) |
 | `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` |
-| `undo_edit_batch` / `undoEditBatch` (v14) | `batchId: number` | `UndoBatchResult` |
+| `undo_edit_batch` / `undoEditBatch` (v14; linear since v16: `conflict` when photos were edited after the batch) | `batchId: number` | `UndoBatchResult` |
+| `get_edit_batches` / `getEditBatches` (v16) | `batchIds: number[]` | `EditBatchInfo[]` |
 | `paste_previous` / `pastePrevious` (v14) | `targetIds: number[], previousId: number, fields: AdjustmentField[] \| null` | `null` |
 | `import_style_folder` / `importStyleFolder` (v14) | `path: string` | `ImportStyleReport` |
 | `list_styles` / `listStyles` (v14) | – | `StyleLibrary` |

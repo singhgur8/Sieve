@@ -27,7 +27,7 @@ use super::MatchImage;
 use crate::db::projects::FolderScope;
 use crate::db::{now_ms, repo};
 use crate::develop::batches::{self, BatchItem, BatchKind};
-use crate::ipc::error::{AppError, AppResult};
+use crate::ipc::error::{AppError, AppResult, ErrorKind};
 use crate::ipc::types::*;
 
 /// Reason shown for a user-chosen representative.
@@ -173,13 +173,15 @@ struct SceneRow {
     skipped: bool,
     /// Ids the last apply covered (`None` = applied before v15, or never).
     covered: Option<Vec<ImageId>>,
+    applied_batch_id: Option<EditBatchId>,
 }
 
 fn scene_row(conn: &Connection, id: SceneId) -> AppResult<SceneRow> {
     let row = conn
         .query_row(
             "SELECT representative_id, representative_source, representative_reason, applied_at_ms, applied_params_json,
-                    started_at_ms, (SELECT COUNT(*) FROM images WHERE scene_id = s.id), skipped, applied_covered_json
+                    started_at_ms, (SELECT COUNT(*) FROM images WHERE scene_id = s.id), skipped, applied_covered_json,
+                    applied_batch_id
              FROM scenes s WHERE id = ?1",
             [id],
             |r| {
@@ -194,6 +196,7 @@ fn scene_row(conn: &Connection, id: SceneId) -> AppResult<SceneRow> {
                         member_count: r.get(6)?,
                         skipped: r.get(7)?,
                         covered: None,
+                        applied_batch_id: r.get(9)?,
                     },
                     r.get::<_, Option<String>>(8)?,
                 ))
@@ -274,6 +277,15 @@ fn entry_for(
             })
             .collect()
     };
+    // A batch undone before v16 (which did not clear the scene) is not reported.
+    let applied_batch = match row.applied_batch_id {
+        Some(b) => match batches::batch_info(conn, b) {
+            Ok(i) => Some(i).filter(|i| i.undone_at_ms.is_none()),
+            Err(e) if e.kind == ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
     Ok(SceneEditEntry {
         scene_id,
         image_ids: keepers.iter().map(|k| k.id).collect(),
@@ -291,6 +303,7 @@ fn entry_for(
         applied_ids,
         needs_review_ids,
         unapplied_keeper_ids,
+        applied_batch,
     })
 }
 
@@ -364,6 +377,7 @@ pub fn edit_plan(conn: &Connection, project_id: ProjectId) -> AppResult<EditPlan
         counts,
         edit_states,
         needs_review_ids,
+        latest_batch: batches::latest_batch_where(conn, &scope.predicate("i.folder_id"))?,
     })
 }
 
@@ -810,10 +824,20 @@ mod tests {
         assert_eq!(jobs[0].skipped, vec![ids[0]]);
         assert_eq!(jobs[0].targets.iter().map(|t| t.src.id).collect::<Vec<_>>(), vec![ids[3]]);
 
-        // Undo the first batch: image 4 still has what that batch wrote -> restored.
-        let u = batches::undo(&mut conn, r.batch.batch_id.unwrap()).unwrap();
+        // Undo the first batch: image 1 was retouched after it -> conflict (v16), nothing changes.
+        let batch = r.batch.batch_id.unwrap();
+        assert_eq!(batches::undo(&mut conn, batch).unwrap_err().kind, ErrorKind::Conflict);
+        let applied = edit_plan(&conn, folder).unwrap().scenes[0].applied_batch.clone().unwrap();
+        assert_eq!((applied.batch_id, applied.conflict_count, applied.undoable), (batch, 1, false));
+        // Per-image undo of the retouch and of image 1's applied edit: the batch undo then
+        // restores image 4 and leaves image 1 alone; the scene is no longer applied.
+        history::undo(&mut conn, ids[0]).unwrap();
+        history::undo(&mut conn, ids[0]).unwrap();
+        let u = batches::undo(&mut conn, batch).unwrap();
         assert_eq!(u.restored_ids, vec![ids[3]]);
         assert_eq!(u.skipped_ids, vec![ids[0]]);
+        let e = &edit_plan(&conn, folder).unwrap().scenes[0];
+        assert_eq!((e.status, e.applied_at_ms, e.applied_batch.clone()), (SceneEditStatus::Edited, None, None));
     }
 
     fn fake_preview(target: ImageId, adj: &ParametricAdjustments) -> MatchPreview {
@@ -930,9 +954,13 @@ mod tests {
         history::commit(&mut conn, ids[0], &ParametricAdjustments::default(), history::LABEL_RESET).unwrap();
         assert_eq!(state(&conn, ids[0]).edit_source, EditSource::None);
 
+        // Image 1 was pasted / reset after the batch: undo refuses until those are undone.
+        assert_eq!(batches::undo(&mut conn, batch).unwrap_err().kind, ErrorKind::Conflict);
+        history::undo(&mut conn, ids[0]).unwrap();
+        history::undo(&mut conn, ids[0]).unwrap();
         // Undoing the batch restores the provenance the frames had before it.
         let u = batches::undo(&mut conn, batch).unwrap();
-        assert_eq!(u.restored_ids, vec![ids[3]]);
+        assert_eq!(u.restored_ids, vec![ids[0], ids[3]]);
         assert_eq!(state(&conn, ids[3]).edit_source, EditSource::None);
         assert_eq!(batches::edit_states(&conn, &[999]).unwrap_err().kind, ErrorKind::NotFound);
     }
@@ -1055,5 +1083,105 @@ mod tests {
         assert!(r.cancelled);
         assert_eq!((r.batch.batch_id, r.scenes.len()), (None, 0));
         assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Edited);
+    }
+
+    /// v16 (UX re-check P1-11): the plan's applied state follows the representative's
+    /// settings and the apply batch's undo; the scene's batch and the project's newest batch
+    /// are exposed with their undoability.
+    #[test]
+    fn applied_state_follows_rep_and_batch_undo() {
+        let (mut conn, project, scene, ids) = fixture();
+        set_representative(&conn, scene, Some(ids[1])).unwrap();
+        // Auto edit (my style) of every keeper, then Apply to scene from the representative.
+        let style: Vec<BatchItem> = [ids[0], ids[1], ids[3]]
+            .iter()
+            .map(|&id| BatchItem {
+                image_id: id,
+                adjustments: ParametricAdjustments { exposure: 0.4, ..Default::default() },
+                scene_id: None,
+                review_reason: None,
+            })
+            .collect();
+        let auto = batches::commit_recorded(&mut conn, &style, batches::LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        let plan = edit_plan(&conn, project).unwrap();
+        assert_eq!(plan.scenes[0].applied_batch, None);
+        assert_eq!(plan.latest_batch.as_ref().map(|b| (b.batch_id, b.undoable)), Some((auto, true)));
+        let graded = ParametricAdjustments { exposure: 0.9, ..Default::default() };
+        history::commit(&mut conn, ids[1], &graded, "Exposure").unwrap();
+        let apply = apply_fake(&mut conn, scene, &SceneApplyOptions::default(), &[]).batch.batch_id.unwrap();
+        let plan = edit_plan(&conn, project).unwrap();
+        let e = &plan.scenes[0];
+        assert_eq!(e.status, SceneEditStatus::Applied);
+        let b = e.applied_batch.clone().unwrap();
+        assert_eq!((b.batch_id, b.kind, b.image_count, b.undoable), (apply, EditBatchKind::SceneApply, 2, true));
+        assert_eq!(plan.latest_batch.map(|b| b.batch_id), Some(apply));
+
+        // Out-of-order undo of the older auto edit: refused, nothing changes (P1-11).
+        let err = batches::undo(&mut conn, auto).unwrap_err();
+        assert_eq!(
+            (err.kind, err.message.as_str()),
+            (ErrorKind::Conflict, "Later edits on 3 photos; undo those first")
+        );
+        assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), graded);
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Applied);
+
+        // The representative changes after the apply -> outdated; per-image undo back to the
+        // applied settings -> applied again; per-image undo past them -> outdated. (Own label:
+        // same-label commits within 1.5 s coalesce.)
+        history::commit(
+            &mut conn,
+            ids[1],
+            &ParametricAdjustments { exposure: 1.2, ..Default::default() },
+            "Exposure 2",
+        )
+        .unwrap();
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Outdated);
+        history::undo(&mut conn, ids[1]).unwrap();
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Applied);
+        history::undo(&mut conn, ids[1]).unwrap(); // back to the auto edit
+        assert_eq!(edit_plan(&conn, project).unwrap().scenes[0].status, SceneEditStatus::Outdated);
+        history::redo(&mut conn, ids[1]).unwrap();
+
+        // A member edited after the apply blocks its undo (the row hides "Undo apply").
+        history::commit(&mut conn, ids[0], &ParametricAdjustments { exposure: 0.1, ..Default::default() }, "Exposure")
+            .unwrap();
+        let b = edit_plan(&conn, project).unwrap().scenes[0].applied_batch.clone().unwrap();
+        assert_eq!((b.conflict_count, b.undoable), (1, false));
+        history::undo(&mut conn, ids[0]).unwrap();
+
+        // Undo the apply (newest first): the scene is no longer applied, and the auto edit is
+        // the project's newest batch, undoable again except for the representative's own edit.
+        batches::undo(&mut conn, apply).unwrap();
+        let plan = edit_plan(&conn, project).unwrap();
+        let e = &plan.scenes[0];
+        assert_eq!((e.status, e.applied_at_ms, e.applied_batch.clone()), (SceneEditStatus::Edited, None, None));
+        assert!(e.applied_ids.is_empty());
+        let latest = plan.latest_batch.unwrap();
+        assert_eq!((latest.batch_id, latest.conflict_count, latest.undoable), (auto, 1, false));
+        history::undo(&mut conn, ids[1]).unwrap();
+        assert!(edit_plan(&conn, project).unwrap().latest_batch.unwrap().undoable);
+        batches::undo(&mut conn, auto).unwrap();
+        assert_eq!(edit_plan(&conn, project).unwrap().latest_batch, None);
+    }
+
+    /// Migration 0014 clears the applied state of scenes whose apply was undone before v16.
+    #[test]
+    fn migration_clears_scenes_applied_by_an_undone_batch() {
+        let (conn, project, scene, _) = fixture();
+        conn.execute_batch(
+            "INSERT INTO edit_batches (id, label, kind, created_at, undone_at) VALUES (41, 'Apply to Scene', 'scene_apply', 1, 2);",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE scenes SET applied_at_ms = 5, applied_params_json = '{}', applied_batch_id = 41 WHERE id = ?1",
+            [scene],
+        )
+        .unwrap();
+        conn.execute_batch(crate::db::schema::MIGRATIONS[13]).unwrap();
+        let e = &edit_plan(&conn, project).unwrap().scenes[0];
+        assert_eq!((e.applied_at_ms, e.applied_batch.clone(), e.status), (None, None, SceneEditStatus::ToEdit));
     }
 }

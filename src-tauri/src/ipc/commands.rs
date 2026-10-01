@@ -1811,6 +1811,19 @@ pub async fn get_edit_states(catalog: State<'_, Catalog>, image_ids: Vec<ImageId
     catalog.run(move |c| develop::batches::edit_states(c, &image_ids)).await
 }
 
+/// Persisted state of edit batches (v16), given order: undone, and whether
+/// `undo_edit_batch` would succeed now (`undoable`; `conflictCount` photos edited since).
+/// The UI shows a toast's / row's Undo only while its batch is `undoable`. Unknown ids ->
+/// `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_edit_batches(
+    catalog: State<'_, Catalog>,
+    batch_ids: Vec<EditBatchId>,
+) -> AppResult<Vec<EditBatchInfo>> {
+    catalog.run(move |c| develop::batches::batch_infos(c, &batch_ids)).await
+}
+
 /// Clears "needs a look" on `imageIds` without changing their settings ("Looks good") (v15).
 /// Images that do not need a look are ignored. Returns the ids that were cleared. Unknown
 /// ids -> `not_found`.
@@ -1978,6 +1991,10 @@ pub async fn apply_all_edited_scenes(
 /// `apply_style_prediction`): images still carrying what the batch wrote get their previous
 /// settings back ("Undo <label>" entry each); images edited since are left alone
 /// (`skippedIds`). Unknown batch -> `not_found`; already undone -> `invalid_argument`.
+/// Undo is linear (v16): when any photo of the batch has a later history entry (a later
+/// batch or a manual edit), nothing changes and the call fails with `conflict` ("Later edits
+/// on n photos; undo those first"). Scenes whose last apply was this batch go back to
+/// `edited` (`SceneEditEntry.appliedBatch` = null).
 #[tauri::command]
 #[specta::specta]
 pub async fn undo_edit_batch(

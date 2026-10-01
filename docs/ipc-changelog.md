@@ -839,6 +839,58 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v16 — 2026-09-30 (UX re-check P1-11: linear batch undo, persisted batch undo state)
+Schema v14 (`migrations/0014_linear_undo.sql`). Driven by `docs/ux-review-8b.md` "Re-check" P1-11 and P2 #13 (batch
+undo lost on Home -> back). **Breaking** for TS object literals typed as `SceneEditEntry` / `EditPlan` (new fields;
+only the mock builds them) and for exhaustive `switch`es over `ErrorKind` (new `conflict`). `src/ipc/bindings.ts`
+regenerated.
+
+Linear batch undo (P1-11)
+- New `ErrorKind` `"conflict"`: the operation would undo something a later edit was built on; nothing changed.
+- `undo_edit_batch(batchId)` now fails with `conflict` ("Later edits on n photos; undo those first" / "... on 1
+  photo; ...") when any photo of the batch has a history entry newer than the batch's own entry for it: a later
+  batch (apply, auto edit) or a manual edit (sliders, paste, preset, reset, Read from XMP). Exceptions that do not
+  block: undoing the later batch first (the restored entry is stamped with this batch, so it becomes undoable
+  again), a per-image undo (Cmd+Z in Develop) of the later edit, and a per-image undo of the batch's own edit
+  (that photo is then left alone and reported in `skippedIds`, the field's only meaning since v16).
+- Undoing a batch also clears the applied state of every scene whose last apply was that batch: `status`
+  `applied`/`outdated` -> `edited` (or `to_edit`), `appliedAtMs` / `appliedBatch` -> null, `appliedIds` empty
+  (members are back on their previous settings). Before v16 the real backend left such scenes `applied` (only the
+  mock cleared them); migration 0014 repairs catalogs that undid an apply before v16.
+- Verified on the real backend (Rust tests): a scene reports `applied` only while the representative's current
+  settings equal those it was applied from; a later rep edit -> `outdated` (re-apply needed), a per-image undo
+  back to those settings -> `applied`, a per-image undo past them -> `outdated`. The mock now compares settings
+  the same way (it used timestamps).
+
+Persisted batch undo state (P2 #13)
+- `EditBatchKind = "scene_apply" | "style_prediction"`.
+- `EditBatchInfo {batchId, label, kind, createdAtMs, undoneAtMs, imageCount, conflictCount, undoable}`;
+  `undoable = undoneAtMs == null && conflictCount == 0` = `undo_edit_batch` would succeed now.
+- `SceneEditEntry.appliedBatch: EditBatchInfo | null`: the batch of the scene's last apply that changed something
+  (null when never applied or that batch was undone). Persisted: survives Home -> back and reloads.
+- `EditPlan.latestBatch: EditBatchInfo | null`: the newest batch (any kind) not undone that changed a photo of the
+  project.
+- `get_edit_batches(batchIds) -> EditBatchInfo[]` (given order; unknown id -> `not_found`): refresh the
+  undoability of the batches the UI holds (toasts, session stack).
+
+Who updates what
+- architect (done): types, error kind, schema v14, `develop::batches::{conflict_ids, batch_info, batch_infos,
+  latest_batch_where}` + conflict check and scene clearing in `undo`, `scene::workflow` plan fields, command +
+  registration, Rust tests, bindings, mock backend (conflict on out-of-order undo with the same message, `undoable`
+  / `conflictCount`, `appliedBatch`, `latestBatch`, `get_edit_batches`, settings-equality scene status, undo
+  clears only scenes whose last apply was the batch).
+- frontend-dev:
+  1. P1-11: show a toast's Undo (and the row ⋯ "Undo apply") only while its batch is `undoable`: after any edit
+     commit / batch / undo, refresh with `getEditBatches(ids of the visible toasts)` (or use the refetched plan's
+     `appliedBatch` / `latestBatch`); otherwise drop the button and keep the text. Handle a `conflict` error from
+     `undoEditBatch` (e.g. a race) with an info toast showing its message, not an error.
+  2. P2 #13: row ⋯ "Undo apply" = `undoEditBatch(scene.appliedBatch.batchId)`, enabled when
+     `scene.appliedBatch?.undoable`; works after Home -> back. Optionally seed the session batch stack from
+     `plan.latestBatch` (Cmd+Z may stay session-scoped).
+  3. After `undoEditBatch` refetch the plan: undone applies now come back as `edited` from the real backend too.
+- rust-engine-dev / vision-ml-dev: nothing required. New multi-image write paths must keep going through
+  `develop::batches::commit_recorded` so their entries carry `batch_id` (linear undo relies on it).
+
 ## v15 — 2026-09-30 (Phase 8b feedback: persisted workflow state, skipped / minor scenes, apply options)
 Schema v13 (`migrations/0013_workflow_state.sql`). Driven by `docs/ux-review-8b.md` P1-2..P1-5 and the triage's P2
 backend items. **Breaking** for TS callers in two places: `get_filter_counts` has a third argument

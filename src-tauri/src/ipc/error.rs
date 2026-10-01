@@ -24,6 +24,10 @@ pub enum ErrorKind {
     DecodeFailed,
     /// The catalog is damaged and was opened read-only (`CatalogState.health`).
     CatalogReadOnly,
+    /// The operation would undo or overwrite something a later edit was built on (v16:
+    /// `undo_edit_batch` of a batch whose photos were edited since). Nothing was changed;
+    /// the message says what to undo first.
+    Conflict,
 }
 
 /// Error returned by every command. Serialized as `{ kind, message }`.
