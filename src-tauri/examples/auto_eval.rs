@@ -13,6 +13,10 @@
 //!   user's render. Without models, Auto runs without faces (skin-colour guard only).
 //! - `--no-faces`: Auto runs as on a photo that has not been analysed yet (`faces = None`);
 //!   the detected faces are still used for the face L* and skin-clipping statistics.
+//! - `--on-demand` (with `--no-faces`): the unanalysed photo gets its faces from on-demand
+//!   detection (`develop::auto::resolve_faces`, `ml::auto_faces`), as the `auto_tone`
+//!   command does; reports the detection latency (cold = first call per image on a decoded
+//!   source, warm = cached boxes) and Auto tone's total time with it.
 //! - `--both`: per frame, also compare Auto with vs without faces (exposure / Whites drop,
 //!   render mean CIELAB dE76 vs the user's render); prints the worst cases.
 
@@ -22,6 +26,7 @@ use std::time::Instant;
 use sieve_lib::develop::{auto, DevelopCache, DevelopConfig, SourceImage};
 use sieve_lib::ipc::types::{AdjustmentField, NormRect, ParametricAdjustments, WhiteBalance};
 use sieve_lib::lut::LutLibrary;
+use sieve_lib::ml::auto_faces::AutoFaces;
 use sieve_lib::ml::segment::{RgbImage, SegmentConfig, SegmentEngine};
 use sieve_lib::raw;
 use sieve_lib::xmp;
@@ -203,7 +208,8 @@ fn main() {
     }
     let no_faces = args.iter().any(|a| a == "--no-faces");
     let both = args.iter().any(|a| a == "--both");
-    println!("targets {targets:?} wb {wb_opts:?} no_faces {no_faces} both {both}");
+    let on_demand = args.iter().any(|a| a == "--on-demand");
+    println!("targets {targets:?} wb {wb_opts:?} no_faces {no_faces} on_demand {on_demand} both {both}");
     // Camera Raw's own Auto (Adobe DNG Converter with crs:AutoTone + WhiteBalance Auto;
     // `test-data/lr-auto/make_oracle.sh`): stem -> resolved values.
     let lr_auto_map: serde_json::Map<String, serde_json::Value> = arg("--lr-auto")
@@ -228,7 +234,11 @@ fn main() {
         frames.iter().filter(|f| f.2).count()
     );
 
-    let cache = DevelopCache::new(DevelopConfig { cache_bytes: 1 << 30, mask_cache: None });
+    let mut cache = DevelopCache::new(DevelopConfig { cache_bytes: 1 << 30, mask_cache: None });
+    if on_demand {
+        cache = cache.with_auto_faces(AutoFaces::new(&models));
+    }
+    let (mut od_cold, mut od_warm, mut od_total, mut od_found) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
     let luts = LutLibrary::new(std::env::temp_dir().join("sieve-auto-eval-luts"));
     let mut seg = models.join("det_10g.onnx").is_file().then(|| SegmentEngine::new(SegmentConfig::new(&models)));
     if seg.is_none() {
@@ -289,7 +299,31 @@ fn main() {
             }
             _ => Vec::new(),
         };
-        let auto_faces = (!no_faces).then_some(faces.as_slice());
+        // On-demand detection (unanalysed photo), timed cold (first call; source decoded
+        // above) and warm (cached boxes).
+        let detected = if on_demand && no_faces {
+            let t = Instant::now();
+            let d = auto::resolve_faces(&cache, &src, None);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if i == 0 {
+                println!("first on-demand detection (incl. model load): {ms:.0} ms");
+            } else {
+                od_cold.push(ms);
+            }
+            let t = Instant::now();
+            let _ = auto::resolve_faces(&cache, &src, None);
+            od_warm.push(t.elapsed().as_secs_f64() * 1000.0);
+            od_found += usize::from(d.as_ref().is_some_and(|d| !d.is_empty()));
+            if let Some(d) = &d {
+                if d.len() != faces.len() && std::env::var_os("AUTO_EVAL_ROWS").is_some() {
+                    println!("FACES {} eval {} on-demand {}", path.display(), faces.len(), d.len());
+                }
+            }
+            d
+        } else {
+            None
+        };
+        let auto_faces = if no_faces { detected.as_deref() } else { Some(faces.as_slice()) };
         let t = Instant::now();
         let a = match auto::auto_tone_opts(&cache, &src, user, AdjustmentField::AUTO_TONE, auto_faces, targets) {
             Ok(a) => a,
@@ -299,6 +333,9 @@ fn main() {
             }
         };
         times.push(t.elapsed().as_secs_f64() * 1000.0);
+        if on_demand && no_faces && i > 0 {
+            od_total.push(od_cold.last().copied().unwrap_or(0.0) + times.last().unwrap());
+        }
         let auto_adj = a.apply_to(user);
         if both {
             let tn = Instant::now();
@@ -509,6 +546,16 @@ fn main() {
                     lr_skin_lr_sum += f64::from(cl);
                     lr_skin_sieve_max = lr_skin_sieve_max.max(cs);
                     lr_skin_sieve_over += usize::from(cs > auto::SKIN_CLIP_MAX);
+                    if cs > auto::SKIN_CLIP_MAX {
+                        println!(
+                            "   LR skin clip {:.2}% on {} (Camera Raw {:.2}%), faces {} / Auto used {:?}",
+                            100.0 * cs,
+                            path.display(),
+                            100.0 * cl,
+                            faces.len(),
+                            auto_faces.map(<[NormRect]>::len)
+                        );
+                    }
                     lr_skin_lr_over += usize::from(cl > auto::SKIN_CLIP_MAX);
                 }
             }
@@ -600,6 +647,19 @@ fn main() {
         wb_asshot_temp / wn,
         wb_asshot_tint / wn
     );
+    for (name, v) in [
+        ("on-demand detection cold", &mut od_cold),
+        ("on-demand detection warm", &mut od_warm),
+        ("auto_tone + cold detection", &mut od_total),
+    ] {
+        v.sort_by(f64::total_cmp);
+        if !v.is_empty() {
+            println!("{name}: p50 {:.1} ms, p95 {:.1} ms (n {})", v[v.len() / 2], v[v.len() * 95 / 100], v.len());
+        }
+    }
+    if on_demand {
+        println!("on-demand detection found faces on {od_found} frames");
+    }
     times.sort_by(f64::total_cmp);
     if !times.is_empty() {
         println!("auto_tone time: p50 {:.0} ms, p95 {:.0} ms", times[times.len() / 2], times[times.len() * 95 / 100]);

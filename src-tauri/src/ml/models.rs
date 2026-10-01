@@ -49,13 +49,75 @@ pub struct Detection {
     pub kps: [[f32; 2]; 5],
 }
 
-pub struct Models {
+/// The SCRFD detector alone (no landmark / eye / mesh sessions): what on-demand face
+/// detection (`ml::auto_faces`) loads.
+pub struct FaceDetector {
     det: Session,
+    pub provider: Provider,
+    input: Vec<f32>,
+}
+
+impl FaceDetector {
+    pub fn load(models_dir: &Path) -> Result<Self, String> {
+        let (det, provider) = build(&models_dir.join(DET_MODEL), ("?", DET_SIZE as i64))?;
+        Ok(Self { det, provider, input: vec![0.0; 3 * DET_SIZE * DET_SIZE] })
+    }
+
+    /// Runs SCRFD on `small`, an RGB image whose long edge is <= [`DET_SIZE`]
+    /// (letterboxed top-left). Coordinates are multiplied by `to_src` to map back.
+    pub fn detect(&mut self, small: &[u8], w: usize, h: usize, to_src: f32) -> Result<Vec<Detection>, String> {
+        let s = DET_SIZE;
+        let plane = s * s;
+        self.input.iter_mut().for_each(|v| *v = 0.0);
+        for y in 0..h.min(s) {
+            for x in 0..w.min(s) {
+                let p = (y * w + x) * 3;
+                let i = y * s + x;
+                self.input[i] = (small[p] as f32 - 127.5) / 128.0;
+                self.input[plane + i] = (small[p + 1] as f32 - 127.5) / 128.0;
+                self.input[2 * plane + i] = (small[p + 2] as f32 - 127.5) / 128.0;
+            }
+        }
+        let input = TensorRef::from_array_view(([1usize, 3, s, s], &self.input[..])).map_err(|e| e.to_string())?;
+        let outputs = self.det.run(ort::inputs![input]).map_err(|e| format!("detector: {e}"))?;
+        let mut dets = Vec::new();
+        for (k, &stride) in STRIDES.iter().enumerate() {
+            let (_, scores) = outputs[k].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            let (_, boxes) = outputs[k + 3].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            let (_, kps) = outputs[k + 6].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            let cols = s / stride;
+            for (i, &score) in scores.iter().enumerate() {
+                if score < DET_SCORE {
+                    continue;
+                }
+                let loc = i / 2;
+                let (cx, cy) = (((loc % cols) * stride) as f32, ((loc / cols) * stride) as f32);
+                let st = stride as f32;
+                let b = &boxes[i * 4..i * 4 + 4];
+                let bbox = [
+                    (cx - b[0] * st) * to_src,
+                    (cy - b[1] * st) * to_src,
+                    (cx + b[2] * st) * to_src,
+                    (cy + b[3] * st) * to_src,
+                ];
+                let kp = &kps[i * 10..i * 10 + 10];
+                let mut pts = [[0.0f32; 2]; 5];
+                for (j, p) in pts.iter_mut().enumerate() {
+                    *p = [(cx + kp[2 * j] * st) * to_src, (cy + kp[2 * j + 1] * st) * to_src];
+                }
+                dets.push(Detection { bbox, score, kps: pts });
+            }
+        }
+        Ok(nms(dets, NMS_IOU))
+    }
+}
+
+pub struct Models {
+    det: FaceDetector,
     lmk: Session,
     eye: Session,
     pub det_provider: Provider,
     pub lmk_provider: Provider,
-    det_input: Vec<f32>,
     lmk_input: Vec<f32>,
     eye_input: Vec<f32>,
     mesh: Session,
@@ -103,7 +165,8 @@ fn build(path: &Path, dim: (&str, i64)) -> Result<(Session, Provider), String> {
 
 impl Models {
     pub fn load(models_dir: &Path) -> Result<Self, String> {
-        let (det, det_provider) = build(&models_dir.join(DET_MODEL), ("?", DET_SIZE as i64))?;
+        let det = FaceDetector::load(models_dir)?;
+        let det_provider = det.provider;
         let (lmk, lmk_provider) = build(&models_dir.join(LMK_MODEL), ("None", 1))?;
         // 0.0014 GFLOP: CPU is faster than a CoreML round trip.
         let eye_path = models_dir.join(EYE_MODEL);
@@ -126,7 +189,6 @@ impl Models {
             eye,
             det_provider,
             lmk_provider,
-            det_input: vec![0.0; 3 * DET_SIZE * DET_SIZE],
             lmk_input: vec![0.0; 3 * LMK_SIZE * LMK_SIZE],
             eye_input: vec![0.0; 3 * EYE_SIZE * EYE_SIZE],
             mesh,
@@ -201,52 +263,9 @@ impl Models {
         Ok(out[1] / (out[0] + out[1]).max(1e-6))
     }
 
-    /// Runs SCRFD on `small`, an RGB image whose long edge is <= [`DET_SIZE`]
-    /// (letterboxed top-left). Coordinates are multiplied by `to_src` to map back.
+    /// [`FaceDetector::detect`].
     pub fn detect(&mut self, small: &[u8], w: usize, h: usize, to_src: f32) -> Result<Vec<Detection>, String> {
-        let s = DET_SIZE;
-        let plane = s * s;
-        self.det_input.iter_mut().for_each(|v| *v = 0.0);
-        for y in 0..h.min(s) {
-            for x in 0..w.min(s) {
-                let p = (y * w + x) * 3;
-                let i = y * s + x;
-                self.det_input[i] = (small[p] as f32 - 127.5) / 128.0;
-                self.det_input[plane + i] = (small[p + 1] as f32 - 127.5) / 128.0;
-                self.det_input[2 * plane + i] = (small[p + 2] as f32 - 127.5) / 128.0;
-            }
-        }
-        let input = TensorRef::from_array_view(([1usize, 3, s, s], &self.det_input[..])).map_err(|e| e.to_string())?;
-        let outputs = self.det.run(ort::inputs![input]).map_err(|e| format!("detector: {e}"))?;
-        let mut dets = Vec::new();
-        for (k, &stride) in STRIDES.iter().enumerate() {
-            let (_, scores) = outputs[k].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            let (_, boxes) = outputs[k + 3].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            let (_, kps) = outputs[k + 6].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            let cols = s / stride;
-            for (i, &score) in scores.iter().enumerate() {
-                if score < DET_SCORE {
-                    continue;
-                }
-                let loc = i / 2;
-                let (cx, cy) = (((loc % cols) * stride) as f32, ((loc / cols) * stride) as f32);
-                let st = stride as f32;
-                let b = &boxes[i * 4..i * 4 + 4];
-                let bbox = [
-                    (cx - b[0] * st) * to_src,
-                    (cy - b[1] * st) * to_src,
-                    (cx + b[2] * st) * to_src,
-                    (cy + b[3] * st) * to_src,
-                ];
-                let kp = &kps[i * 10..i * 10 + 10];
-                let mut pts = [[0.0f32; 2]; 5];
-                for (j, p) in pts.iter_mut().enumerate() {
-                    *p = [(cx + kp[2 * j] * st) * to_src, (cy + kp[2 * j + 1] * st) * to_src];
-                }
-                dets.push(Detection { bbox, score, kps: pts });
-            }
-        }
-        Ok(nms(dets, NMS_IOU))
+        self.det.detect(small, w, h, to_src)
     }
 
     /// 106 landmarks for a face, in *crop* coordinates of the upright 192x192 crop

@@ -356,6 +356,8 @@ pub struct DevelopCache {
     /// the catalog (and its lock) entirely. Filled by the commands; see [`Self::source`].
     sources: Arc<Mutex<HashMap<ImageId, SourceImage>>>,
     inner: Arc<Inner>,
+    /// On-demand face detection for Auto tone on unanalysed photos ([`Self::with_auto_faces`]).
+    auto_faces: Option<crate::ml::auto_faces::AutoFaces>,
 }
 
 /// Remembered [`SourceImage`]s (cleared wholesale when exceeded; each is ~100 bytes).
@@ -392,11 +394,23 @@ impl DevelopCache {
                 prefetch: Mutex::new(Prefetch::default()),
                 weights: masks::render::WeightCache::default(),
             }),
+            auto_faces: None,
         }
     }
 
     pub fn config(&self) -> &DevelopConfig {
         &self.config
+    }
+
+    /// Enables on-demand face detection for Auto tone (`develop::auto::resolve_faces`).
+    pub fn with_auto_faces(mut self, faces: crate::ml::auto_faces::AutoFaces) -> Self {
+        self.auto_faces = Some(faces);
+        self
+    }
+
+    /// The on-demand face detector, if enabled.
+    pub fn auto_faces(&self) -> Option<&crate::ml::auto_faces::AutoFaces> {
+        self.auto_faces.as_ref()
     }
 
     /// The remembered catalog facts of image `id` (see [`Self::remember_source`]).
@@ -417,6 +431,9 @@ impl DevelopCache {
     /// Forgets remembered sources: `Some(ids)` (e.g. thumbnails regenerated: orientation
     /// may change) or all (`None`, e.g. after an import re-registered files).
     pub fn forget_sources(&self, ids: Option<&[ImageId]>) {
+        if let Some(f) = &self.auto_faces {
+            f.forget(ids);
+        }
         let mut map = lock(&self.sources);
         match ids {
             Some(ids) => ids.iter().for_each(|id| {

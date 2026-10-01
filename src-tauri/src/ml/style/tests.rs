@@ -194,6 +194,7 @@ fn stored_features_go_stale_when_the_preview_is_re_extracted() {
         as_shot: None,
         auto: Some(AutoAnchor { exposure: 0.5, ..Default::default() }),
         faces_known: false,
+        faces_on_demand: true,
         edited: None,
         edited_key: None,
     };
@@ -252,6 +253,9 @@ fn training_features_follow_the_frames_own_settings() {
     // The user re-edits: the measured render is stale for training only.
     frame.adjustments.exposure += 0.5;
     assert!(!f.current_for(&frame, true) && f.current_for(&frame, false));
+    // Computed before on-demand face detection existed (unanalysed frame): recompute.
+    let old = StoredFeatures { faces_on_demand: false, ..p.clone() };
+    assert!(p.faces_on_demand && !old.current_for(&frame, false));
     // Faces found by the analysis after the features were computed: recompute.
     frame.faces = Some(Vec::new());
     assert!(!f.current_for(&frame, false));

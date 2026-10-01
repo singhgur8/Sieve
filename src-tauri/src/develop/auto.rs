@@ -34,7 +34,9 @@
 //! with every Auto slider at 0, from unclipped pixels only, kept only as compact regions
 //! ([`estimate_skin`]); if it covers more than [`EST_SKIN_MAX`] of the frame it is not skin.
 //! The guard is bounded ([`ESTIMATED_GUARD`]), so Auto without faces stays close to Auto
-//! with them.
+//! with them. Callers first try on-demand detection ([`resolve_faces`], `ml::auto_faces`:
+//! the analysis' detector on the neutral render), so `None` only reaches this function when
+//! the detector is unavailable.
 //!
 //! # Auto white balance
 //! Grey-world on near-neutral pixels of the camera-space source (skin and sky chroma
@@ -378,6 +380,17 @@ pub fn face_boxes(faces: &[crate::ipc::types::FaceInfo]) -> Vec<NormRect> {
         return considered;
     }
     faces.iter().filter(|f| f.detection_score >= 0.6).map(|f| f.bbox).collect()
+}
+
+/// The face boxes Auto tone should use for `src`: the analysis' (`analysis`, `Some` once
+/// the analysis ran), else the on-demand detector's (`ml::auto_faces`, when `cache` has one
+/// and its model loads), else `None` (the bounded skin-colour estimate). Blocking.
+pub fn resolve_faces(
+    cache: &DevelopCache,
+    src: &SourceImage,
+    analysis: Option<Vec<NormRect>>,
+) -> Option<Vec<NormRect>> {
+    analysis.or_else(|| cache.auto_faces()?.detect(cache, src))
 }
 
 /// Renders `adj` for measurement: uncropped, without LUT, small.

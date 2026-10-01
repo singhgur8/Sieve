@@ -55,6 +55,7 @@ src-tauri/
     ingest/mod.rs              background pipeline (Ingest state, start/regenerate, import_status)
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
+    ml/auto_faces.rs           on-demand SCRFD face boxes for Auto tone on unanalysed photos (held by DevelopCache)
     ml/masking.rs              AI mask seam: Segmenter (managed state), SegmentModel trait (v10)
     xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
     xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
@@ -214,7 +215,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `list_styles` / `listStyles` (v14) | – | `StyleLibrary` |
 | `remove_style_group` / `removeStyleGroup` (v14) | `groupId: number` | `null` (built-ins -> `invalid_argument`) |
 | `resolve_preset` / `resolvePreset` (v14) | `id: number, presetId: number, adjustments: ParametricAdjustments \| null` | `ParametricAdjustments` (nothing saved) |
-| `auto_tone` / `autoTone` (v14) | `id: number, adjustments: ParametricAdjustments \| null, keys: AdjustmentField[] \| null` | `AutoToneValues` (nothing saved) |
+| `auto_tone` / `autoTone` (v14) | `id: number, adjustments: ParametricAdjustments \| null, keys: AdjustmentField[] \| null` | `AutoToneValues` (nothing saved; unanalysed photos: face boxes detected on demand, `ml::auto_faces`) |
 | `auto_white_balance` / `autoWhiteBalance` (v14) | `id: number, adjustments: ParametricAdjustments \| null` | `WhiteBalanceValues` (nothing saved) |
 | `style_model_status` / `styleModelStatus` (v14) | – | `StyleModelStatus` |
 | `train_style_model` / `trainStyleModel`, `cancel_style_training` (v14) | – | `null` (background; `styleModel*` events) |
