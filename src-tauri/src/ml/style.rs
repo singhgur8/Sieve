@@ -7,8 +7,12 @@
 //!   defaults), incl. edits read from Lightroom sidecars. Features per image
 //!   ([`style_model::FrameContext`]): one neutral render (`ParametricAdjustments::defaults_for`
 //!   the format) through `DevelopCache::render_image` at `scene::STATS_MAX_EDGE` measured by
-//!   [`RenderFeatures::from_render`] and the as-shot white balance of that render (cached in
-//!   `style_features` under [`FEATURES_KEY`], stale when the image's preview was re-extracted),
+//!   [`RenderFeatures::from_render`], the as-shot white balance of that render and Sieve's
+//!   Auto tone of the frame ([`auto_tone_baseline`], the per-frame anchor the tone sliders are
+//!   predicted relative to; cached in `style_features` under [`FEATURES_KEY`], stale when the
+//!   image's preview was re-extracted or the analysis found faces since); for training
+//!   samples also the user's settings rendered (no crop / masks) and measured, the stage-B
+//!   output the exposure refinement aims at (cached with a key of those settings),
 //!   EXIF from the catalog, the stored preview `scene_features` and the scene's mean
 //!   ([`SceneContext`]); the scene id is the cross-validation group.
 //! - [`StyleModel::start_training`] runs on a background thread with its own catalog
@@ -17,14 +21,17 @@
 //!   run at a time. Validation: the last [`HOLDOUT_FRAC`] of every camera's edits (capture
 //!   time, at most [`HOLDOUT_MAX`]) are held out, a model trained on the rest is rendered
 //!   against the user's settings (masks off, the user's crop on every method) with CIEDE2000,
-//!   next to "no edit" and Auto tone; the stored model is then fit on every sample.
+//!   next to "no edit" and Auto tone (the same Auto as the Develop "Auto" button and
+//!   `examples/style_eval.rs`: format defaults, as-shot WB, the analysis faces); the stored
+//!   model is then fit on every sample.
 //! - Parallel LibRaw decodes: every decoding worker here runs OpenMP single-threaded
 //!   ([`single_threaded_openmp`]) - concurrent decodes with a full OpenMP team each stall on
 //!   `copy_bayer`'s critical section (docs/decisions.md 2026-09-30) - and concurrency is
 //!   bounded ([`MAX_DECODE_THREADS`]).
 //! - `predict` returns, per image, its current adjustments with [`PREDICTED_FIELDS`] replaced
-//!   (crop, masks and other per-frame groups kept); `invalid_argument` when no model is
-//!   trained ("Train the style model first").
+//!   (crop, masks and other per-frame groups kept) by [`style_model::StyleModel::predict_refined`]
+//!   (regression + exposure refinement, renders at [`style_model::REFINE_EDGE`]);
+//!   `invalid_argument` when no model is trained ("Train the style model first").
 //! - `apply_style_prediction` (command) = `predict` + `develop::batches::commit_recorded`
 //!   (label `LABEL_STYLE`, kind `StylePrediction`), so it is undoable as one batch.
 
@@ -48,15 +55,15 @@ use crate::ipc::events::{StyleModelFinished, StyleModelProgress};
 use crate::ipc::types::*;
 use crate::lut::LutLibrary;
 use crate::ml::style_model::{
-    self, eval, FrameContext, RenderFeatures, SceneContext, StyleSample, TrainOptions, MIN_SAMPLES,
+    self, eval, AutoAnchor, FrameContext, RenderFeatures, SceneContext, StyleSample, TrainOptions, MIN_SAMPLES,
 };
 use crate::scene::{self, SceneFeatures};
 
 /// Current feature + model family (`StyleModelStatus.modelVersion`; rows of another version
 /// are ignored: retrain).
-pub const MODEL_VERSION: &str = "style-gbt@1";
+pub const MODEL_VERSION: &str = "style-gbt@2";
 /// `style_features.version` of the cached per-image features.
-pub const FEATURES_KEY: &str = "style-features-v1";
+pub const FEATURES_KEY: &str = "style-features-v2";
 /// Training needs at least this many edited photos.
 pub const MIN_EXAMPLES: u32 = MIN_SAMPLES as u32;
 /// Groups the model predicts (everything but per-frame geometry and local masks).
@@ -157,6 +164,8 @@ pub struct CatalogFrame {
     pub capture: CaptureMeta,
     pub scene_id: Option<SceneId>,
     pub adjustments: ParametricAdjustments,
+    /// Face boxes of the analysis (`develop::auto::face_boxes`); `None` = not analysed.
+    pub faces: Option<Vec<NormRect>>,
 }
 
 impl CatalogFrame {
@@ -166,6 +175,7 @@ impl CatalogFrame {
             Some(a) => a,
             None => repo::get_adjustments(conn, id)?,
         };
+        let faces = crate::develop::auto::analysis_faces(conn, id)?.map(|f| crate::develop::auto::face_boxes(&f));
         Ok(CatalogFrame {
             src: SourceImage { id, path: e.path.into(), orientation: e.orientation },
             format: e.format,
@@ -174,6 +184,7 @@ impl CatalogFrame {
             capture: e.capture,
             scene_id: e.scene_id,
             adjustments,
+            faces,
         })
     }
 }
@@ -184,6 +195,46 @@ impl CatalogFrame {
 pub struct StoredFeatures {
     pub render: RenderFeatures,
     pub as_shot: Option<WhiteBalanceValues>,
+    /// Sieve's Auto tone of the frame ([`auto_tone_baseline`]).
+    #[serde(default)]
+    pub auto: Option<AutoAnchor>,
+    /// The analysis' faces were known when `auto` was computed (features computed before
+    /// the analysis are recomputed once it has run).
+    #[serde(default)]
+    pub faces_known: bool,
+    /// The image's own settings (no crop / masks) rendered at `scene::STATS_MAX_EDGE` and
+    /// measured (training samples: the stage-B output), with [`edited_key`] of those settings.
+    #[serde(default)]
+    pub edited: Option<RenderFeatures>,
+    #[serde(default)]
+    pub edited_key: Option<String>,
+}
+
+impl StoredFeatures {
+    /// Still valid for `frame` (its faces did not become known since); `training` also
+    /// needs the measured render of the frame's current settings.
+    pub fn current_for(&self, frame: &CatalogFrame, training: bool) -> bool {
+        self.auto.is_some()
+            && (self.faces_known || frame.faces.is_none())
+            && (!training || (self.edited.is_some() && self.edited_key.as_deref() == Some(&edited_key(frame))))
+    }
+}
+
+/// Key of the settings behind [`StoredFeatures::edited`]: FNV-1a of the settings without
+/// crop / masks.
+pub fn edited_key(frame: &CatalogFrame) -> String {
+    let json = serde_json::to_string(&style_model::targets::strip_per_image(&frame.adjustments)).unwrap_or_default();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in json.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Cached features of every frame that are still current ([`StoredFeatures::current_for`]).
+fn load_current(conn: &Connection, frames: &[CatalogFrame], training: bool) -> AppResult<Vec<Option<StoredFeatures>>> {
+    frames.iter().map(|f| Ok(load_features(conn, f.src.id)?.filter(|s| s.current_for(f, training)))).collect()
 }
 
 /// Current cached features of `id` (`None` = missing, other version, or the preview was
@@ -217,11 +268,61 @@ pub fn save_features(conn: &mut Connection, items: &[(ImageId, StoredFeatures)])
     Ok(())
 }
 
-/// Neutral render of `frame` at `scene::STATS_MAX_EDGE`, measured (blocking; decodes).
-pub fn neutral_features(cache: &DevelopCache, luts: &LutLibrary, frame: &CatalogFrame) -> AppResult<StoredFeatures> {
+/// Neutral render of `frame` at `scene::STATS_MAX_EDGE`, measured, and the frame's Auto tone;
+/// with `edited` also its own settings rendered and measured (blocking; decodes).
+pub fn neutral_features(
+    cache: &DevelopCache,
+    luts: &LutLibrary,
+    frame: &CatalogFrame,
+    edited: bool,
+) -> AppResult<StoredFeatures> {
     let neutral = ParametricAdjustments::defaults_for(frame.format);
     let px = cache.render_image(&frame.src, &neutral, None, scene::STATS_MAX_EDGE, luts)?;
-    Ok(StoredFeatures { render: RenderFeatures::from_render(&px.image), as_shot: px.as_shot })
+    let auto = auto_tone_baseline(cache, luts, &frame.src, frame.format, frame.faces.as_deref())?;
+    let (edited, edited_key) = if edited {
+        let own = style_model::targets::strip_per_image(&frame.adjustments);
+        let r = cache.render_image(&frame.src, &own, None, scene::STATS_MAX_EDGE, luts)?;
+        (Some(RenderFeatures::from_render(&r.image)), Some(edited_key(frame)))
+    } else {
+        (None, None)
+    };
+    Ok(StoredFeatures {
+        render: RenderFeatures::from_render(&px.image),
+        as_shot: px.as_shot,
+        auto: Some(AutoAnchor::from_adjustments(&auto)),
+        faces_known: frame.faces.is_some(),
+        edited,
+        edited_key,
+    })
+}
+
+/// Stage-B measurement of `adjustments` on `frame` ([`style_model::StyleModel::refine`]):
+/// uncropped render at [`style_model::REFINE_EDGE`], measured like the Phase 7 statistics.
+fn refine_measure(
+    cache: &DevelopCache,
+    luts: &LutLibrary,
+    frame: &CatalogFrame,
+    adjustments: &ParametricAdjustments,
+) -> AppResult<ImageStats> {
+    let mut a = adjustments.clone();
+    a.crop = Default::default();
+    a.masks.clear();
+    let px = cache.render_image(&frame.src, &a, None, style_model::REFINE_EDGE, luts)?;
+    let mut st = scene::stats::measure(frame.src.id, &px.image, None);
+    st.white_balance = scene::stats::effective_white_balance(&a, px.as_shot);
+    st.as_shot = px.as_shot;
+    Ok(st)
+}
+
+/// [`style_model::StyleModel::predict_refined`] for a catalog frame (blocking; renders).
+pub fn predict_refined(
+    model: &style_model::StyleModel,
+    cache: &DevelopCache,
+    luts: &LutLibrary,
+    frame: &CatalogFrame,
+    ctx: &FrameContext,
+) -> AppResult<style_model::StylePrediction> {
+    model.predict_refined(ctx, &mut |a| refine_measure(cache, luts, frame, a))
 }
 
 fn preview_features(conn: &Connection, id: ImageId) -> AppResult<Option<SceneFeatures>> {
@@ -294,6 +395,8 @@ impl<'c> ContextBuilder<'c> {
             render: features.render.clone(),
             preview: preview_features(self.conn, frame.src.id)?,
             scene,
+            auto: features.auto,
+            captured_at_ms: frame.capture.captured_at_ms,
         })
     }
 }
@@ -396,8 +499,7 @@ pub fn train_catalog(
 
     // 1. Features (cached neutral-render statistics; missing ones rendered in parallel).
     let t = Instant::now();
-    let mut stored: Vec<Option<StoredFeatures>> =
-        frames.iter().map(|f| load_features(&conn, f.src.id)).collect::<AppResult<_>>()?;
+    let mut stored = load_current(&conn, &frames, true)?;
     let missing: Vec<usize> = (0..frames.len()).filter(|&i| stored[i].is_none()).collect();
     let total = frames.len() as u32;
     let cached = total - missing.len() as u32;
@@ -410,7 +512,7 @@ pub fn train_catalog(
                 if control.cancelled() {
                     return (i, Err(AppError::invalid("cancelled")));
                 }
-                let r = catch_unwind(AssertUnwindSafe(|| neutral_features(cache, luts, &frames[i])))
+                let r = catch_unwind(AssertUnwindSafe(|| neutral_features(cache, luts, &frames[i], true)))
                     .unwrap_or_else(|_| Err(AppError::internal("feature render panicked")));
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 control.progress(StyleTrainPhase::Features, d, total);
@@ -448,7 +550,7 @@ pub fn train_catalog(
             adjustments: frame.adjustments.clone(),
             group: frame.scene_id,
             captured_at_ms: frame.capture.captured_at_ms,
-            edited: None,
+            edited: feats.edited.clone(),
         };
         prepared.push(Prepared { frame, sample });
     }
@@ -535,16 +637,20 @@ pub fn holdout_split(samples: &[StyleSample]) -> Option<Vec<bool>> {
     Some(out)
 }
 
-/// Auto tone baseline for validation: Sieve's Auto (`develop::auto::auto_tone`, as-shot WB,
-/// no faces); the reference auto of [`eval::reference_auto_tone`] if it fails.
+/// Sieve's Auto tone of a frame, as the Develop "Auto" button computes it on an unedited
+/// photo: `develop::auto::auto_tone_with_faces` on the format defaults (as-shot WB) with the
+/// analysis faces (`None` = not analysed: skin-coloured pixels stand in); the reference auto
+/// of [`eval::reference_auto_tone`] if it fails. The style model's per-frame anchor and the
+/// "Auto tone" column of the validation (same as `examples/style_eval.rs`).
 pub fn auto_tone_baseline(
     cache: &DevelopCache,
     luts: &LutLibrary,
     src: &SourceImage,
     format: ImageFormat,
+    faces: Option<&[NormRect]>,
 ) -> AppResult<ParametricAdjustments> {
     let defaults = ParametricAdjustments::defaults_for(format);
-    match crate::develop::auto::auto_tone(cache, src, &defaults, AdjustmentField::AUTO_TONE) {
+    match crate::develop::auto::auto_tone_with_faces(cache, src, &defaults, AdjustmentField::AUTO_TONE, faces) {
         Ok(v) => Ok(v.apply_to(&defaults)),
         Err(_) => eval::reference_auto_tone(format, |a| {
             cache
@@ -573,7 +679,7 @@ pub fn validation_errors(
         a.masks.clear();
         a
     };
-    let auto = auto_tone_baseline(cache, luts, &frame.src, frame.format)?;
+    let auto = auto_tone_baseline(cache, luts, &frame.src, frame.format, frame.faces.as_deref())?;
     let render = |a: &ParametricAdjustments| cache.render_image(&frame.src, a, None, edge, luts).map(|p| p.image);
     let r = render(&reference)?;
     let mut out = [0.0; 3];
@@ -605,8 +711,8 @@ fn validate(
                 if control.cancelled() {
                     return None;
                 }
-                let predicted = model.predict(&p.sample.context).adjustments;
                 let r = catch_unwind(AssertUnwindSafe(|| {
+                    let predicted = predict_refined(&model, cache, luts, &p.frame, &p.sample.context)?.adjustments;
                     validation_errors(cache, luts, &p.frame, &p.frame.adjustments, &predicted, VALIDATION_EDGE)
                 }));
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -647,13 +753,13 @@ pub fn predict_frames(
     luts: &LutLibrary,
     frames: &[CatalogFrame],
 ) -> AppResult<Vec<StylePrediction>> {
-    let mut stored: Vec<Option<StoredFeatures>> =
-        frames.iter().map(|f| load_features(conn, f.src.id)).collect::<AppResult<_>>()?;
+    let mut stored = load_current(conn, frames, false)?;
     let missing: Vec<usize> = (0..frames.len()).filter(|&i| stored[i].is_none()).collect();
     let computed: Vec<(usize, AppResult<StoredFeatures>)> = if missing.len() > 1 {
-        decode_pool().install(|| missing.par_iter().map(|&i| (i, neutral_features(cache, luts, &frames[i]))).collect())
+        decode_pool()
+            .install(|| missing.par_iter().map(|&i| (i, neutral_features(cache, luts, &frames[i], false))).collect())
     } else {
-        missing.iter().map(|&i| (i, neutral_features(cache, luts, &frames[i]))).collect()
+        missing.iter().map(|&i| (i, neutral_features(cache, luts, &frames[i], false))).collect()
     };
     let mut to_save = Vec::new();
     for (i, r) in computed {
@@ -663,11 +769,22 @@ pub fn predict_frames(
     }
     save_features(conn, &to_save)?;
     let mut builder = ContextBuilder::new(conn);
-    let mut out = Vec::with_capacity(frames.len());
+    let mut contexts = Vec::with_capacity(frames.len());
     for (frame, feats) in frames.iter().zip(stored) {
         let feats = feats.ok_or_else(|| AppError::internal("style features missing"))?;
-        let ctx = builder.context(frame, &feats)?;
-        let p = model.predict(&ctx);
+        contexts.push(builder.context(frame, &feats)?);
+    }
+    drop(builder);
+    let one = |(frame, ctx): (&CatalogFrame, &FrameContext)| predict_refined(model, cache, luts, frame, ctx);
+    let predicted: Vec<AppResult<style_model::StylePrediction>> = if frames.len() > 1 {
+        decode_pool().install(|| frames.par_iter().zip(contexts.par_iter()).map(one).collect())
+    } else {
+        frames.iter().zip(&contexts).map(one).collect()
+    };
+    let mut out = Vec::with_capacity(frames.len());
+    for ((frame, ctx), p) in frames.iter().zip(&contexts).zip(predicted) {
+        let p = p?;
+        let ctx = ctx.clone();
         let mut adjustments = frame.adjustments.clone();
         adjustments.copy_fields(&p.adjustments, PREDICTED_FIELDS);
         let confidence = model.confidence(&ctx);

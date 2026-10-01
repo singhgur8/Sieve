@@ -189,7 +189,14 @@ fn stored_features_go_stale_when_the_preview_is_re_extracted() {
     let dir = tempfile::tempdir().unwrap();
     let style = catalog(dir.path(), 1, 0);
     let mut conn = db::open(&style.config().catalog_path).unwrap();
-    let f = StoredFeatures { render: ctx(1, "Sony").render, as_shot: None };
+    let f = StoredFeatures {
+        render: ctx(1, "Sony").render,
+        as_shot: None,
+        auto: Some(AutoAnchor { exposure: 0.5, ..Default::default() }),
+        faces_known: false,
+        edited: None,
+        edited_key: None,
+    };
     save_features(&mut conn, &[(1, f.clone()), (99, f.clone())]).unwrap(); // unknown id skipped
     assert_eq!(load_features(&conn, 1).unwrap(), Some(f));
     assert_eq!(load_features(&conn, 99).unwrap(), None);
@@ -228,4 +235,24 @@ fn openmp_limit_is_harmless_without_or_with_a_runtime() {
     single_threaded_openmp();
     single_threaded_openmp();
     assert!(decode_pool().current_num_threads() <= MAX_DECODE_THREADS);
+}
+
+#[test]
+fn training_features_follow_the_frames_own_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let style = catalog(dir.path(), 1, 1);
+    let conn = db::open(&style.config().catalog_path).unwrap();
+    let mut frame = CatalogFrame::load(&conn, 1, None).unwrap();
+    let f = neutral_features(&cache(), &luts(), &frame, true).unwrap();
+    assert!(f.auto.is_some() && f.edited.is_some());
+    assert!(f.current_for(&frame, true) && f.current_for(&frame, false));
+    // Prediction features do not carry the edited render: not enough for training.
+    let p = neutral_features(&cache(), &luts(), &frame, false).unwrap();
+    assert!(p.current_for(&frame, false) && !p.current_for(&frame, true));
+    // The user re-edits: the measured render is stale for training only.
+    frame.adjustments.exposure += 0.5;
+    assert!(!f.current_for(&frame, true) && f.current_for(&frame, false));
+    // Faces found by the analysis after the features were computed: recompute.
+    frame.faces = Some(Vec::new());
+    assert!(!f.current_for(&frame, false));
 }

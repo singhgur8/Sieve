@@ -21,7 +21,16 @@
 //!   a validation frame never has a same-scene sibling in training); the same CV picks each
 //!   slider's encoding. Older edits can be down-weighted (recency half-life chosen by
 //!   forward-chaining validation: styles drift).
-//! - Features ([`features`]): neutral-render statistics, camera/EXIF, scene context.
+//! - Features ([`features`]): neutral-render statistics, camera/EXIF, scene context and
+//!   Sieve's Auto tone of the frame ([`AutoAnchor`]; tone sliders may also be encoded as the
+//!   offset from it).
+//! - **Blends** ([`Blend`], v2): each slider's regression is mixed with the training edit
+//!   nearest in capture time (settings carried forward / a look revised mid-shoot) and, for
+//!   white balance and Auto offsets, the neutral anchor (as shot / Auto), with weights chosen
+//!   by forward-chaining validation (earlier part of each camera's edits -> later part).
+//! - **Exposure refinement** ([`StyleModel::predict_refined`], what the app applies): exposure
+//!   solved to the predicted brightness of the user's render (stage B, [`OUTPUTS`]) within
+//!   the exposure regression's cross-validated error.
 //! - Crop and masks are never predicted (framing and subject are per photo).
 
 pub mod eval;
@@ -34,7 +43,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-pub use features::{FrameContext, RenderFeatures, SceneContext, FEATURES_VERSION};
+pub use features::{AutoAnchor, FrameContext, RenderFeatures, SceneContext, FEATURES_VERSION};
 use learn::{Gbdt, GbdtParams, Ridge, Standardizer};
 use targets::{CameraTemplate, Target, TargetFrame, TARGETS};
 
@@ -44,7 +53,10 @@ use crate::ipc::types::{
 };
 
 /// Bump when the stored model format changes (older files are rejected -> retrain).
-pub const STYLE_MODEL_VERSION: u32 = 1;
+pub const STYLE_MODEL_VERSION: u32 = 2;
+
+/// Long edge of the measurement renders of [`StyleModel::predict_refined`].
+pub const REFINE_EDGE: u32 = 384;
 
 /// Fewest edited frames [`train`] accepts (UI: "Edit at least 20 photos").
 pub const MIN_SAMPLES: usize = 20;
@@ -84,13 +96,30 @@ pub struct TrainOptions {
     /// Only fit the template + ridge (no trees); faster, a little less accurate.
     pub linear_only: bool,
     pub recency: RecencyWeighting,
+    /// Choose each slider's [`Blend`] by forward-chaining validation (off: plain model).
+    #[serde(default = "yes")]
+    pub blends: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for TrainOptions {
     fn default() -> Self {
-        Self { folds: 5, gbdt: GbdtParams::default(), linear_only: false, recency: RecencyWeighting::Off }
+        Self { folds: 5, gbdt: GbdtParams::default(), linear_only: false, recency: RecencyWeighting::Off, blends: true }
     }
 }
+
+/// Later-in-time cuts of the forward-chaining validation that picks [`Blend`]s: per camera,
+/// the frames before the cut (capture order) train, the rest validate.
+const BLEND_CUTS: [f64; 2] = [0.6, 0.8];
+/// Candidate `(recent, anchor)` weights of [`Blend`] (`anchor` only where
+/// [`Target::has_anchor`]).
+const BLEND_CANDIDATES: [(f32, f32); 9] =
+    [(0.0, 0.0), (0.25, 0.0), (0.5, 0.0), (0.75, 0.0), (1.0, 0.0), (0.0, 0.5), (0.0, 1.0), (0.5, 0.5), (0.25, 0.75)];
+/// A blend must beat the plain model by this factor (forward-chaining MAE) to be used.
+const BLEND_MIN_GAIN: f32 = 0.97;
 
 /// Weighting of older edits. Default `Off`: on the proposal shoot `Auto` picked a 28-sample
 /// half-life that discarded one camera's history (bodies interleave in time) and lost
@@ -136,6 +165,44 @@ pub struct TargetModel {
     /// Cross-validated ridge + trees predictions of the training samples (training only).
     #[serde(skip)]
     pub cv_pred: Vec<f32>,
+    /// How the regression is mixed with the most recent edit and the neutral anchor.
+    #[serde(default)]
+    pub blend: Blend,
+}
+
+/// Final value of a slider (model units): `(1 - recent - anchor) * model + recent * (the
+/// value of the training edit nearest in capture time, same camera first) + anchor * (the
+/// value of the neutral setting: as-shot for white balance)`. Chosen per slider by
+/// forward-chaining validation (train on the earlier part of each camera's edits, score the
+/// later part): a photographer carries settings forward frame to frame and revises the look
+/// during a shoot, which scene-grouped cross-validation cannot see; and a white balance that
+/// drifts with the camera's own (fixed) setting is safest near as shot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Blend {
+    pub recent: f32,
+    pub anchor: f32,
+}
+
+/// One training edit in capture order (the [`Blend::recent`] lookup).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEntry {
+    pub captured_at_ms: i64,
+    pub camera_key: String,
+    /// Per [`StyleModel::targets`] entry, model units.
+    pub values: Vec<f32>,
+}
+
+/// The entry nearest in capture time to `t`, of camera `key` if it has any.
+fn nearest_in_time<'a>(timeline: &'a [TimelineEntry], key: &str, t: i64) -> Option<&'a TimelineEntry> {
+    let near = |same: bool| {
+        timeline
+            .iter()
+            .filter(|e| !same || e.camera_key == key)
+            .min_by_key(|e| (e.captured_at_ms.abs_diff(t), e.captured_at_ms))
+    };
+    near(true).or_else(|| near(false))
 }
 
 /// Joint nearest neighbours: the `k` training frames closest in standardized feature space
@@ -193,6 +260,9 @@ pub struct StyleModel {
     pub outputs: Vec<TargetModel>,
     pub templates: Vec<CameraTemplate>,
     pub global_template: CameraTemplate,
+    /// Training edits with a capture time ([`Blend::recent`]).
+    #[serde(default)]
+    pub timeline: Vec<TimelineEntry>,
     /// Median distance (standardized features) of a training frame to its nearest training
     /// frame of another scene fold; the scale of [`StyleModel::confidence`]. 0 = unknown.
     #[serde(default)]
@@ -448,6 +518,7 @@ fn fit_values(
         cv_mae_mean,
         knn_weight: 0.0,
         cv_pred,
+        blend: Blend::default(),
     }
 }
 
@@ -487,6 +558,113 @@ pub fn train(
     options: &TrainOptions,
     progress: &dyn Fn(f32),
 ) -> Result<(StyleModel, TrainReport), StyleError> {
+    let t0 = Instant::now();
+    let (mut model, mut report) = train_impl(samples, options, progress, None)?;
+    if options.blends {
+        let names: Vec<String> = model.targets.iter().map(|t| t.name.clone()).collect();
+        let blends = choose_blends(samples, options, &names);
+        for (tm, b) in model.targets.iter_mut().zip(blends) {
+            if let Some((b, err, plain)) = b {
+                tm.blend = b;
+                report.cv.insert(format!("{}@forward", tm.name), (err, plain));
+            }
+        }
+        report.duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok((model, report))
+}
+
+/// Capture time of a sample (the sample's, else its context's).
+fn time_of(s: &StyleSample) -> Option<i64> {
+    s.captured_at_ms.or(s.context.captured_at_ms)
+}
+
+/// Forward-chaining choice of each kept target's [`Blend`] (see there): for every cut of
+/// [`BLEND_CUTS`], a model of the same encodings is trained on the earlier part of each
+/// camera's edits and scored on the later part. Per target `Some((blend, MAE, plain MAE))`
+/// (summed absolute errors / validation frames), `None` when no cut had enough frames.
+fn choose_blends(samples: &[StyleSample], options: &TrainOptions, names: &[String]) -> Vec<Option<(Blend, f32, f32)>> {
+    let mut err = vec![vec![0.0f64; BLEND_CANDIDATES.len()]; names.len()];
+    let mut scored = 0usize;
+    for cut in BLEND_CUTS {
+        let mut per: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, s) in samples.iter().enumerate() {
+            per.entry(s.context.camera_key()).or_default().push(i);
+        }
+        let (mut old, mut new) = (Vec::new(), Vec::new());
+        for idx in per.values_mut() {
+            idx.sort_by_key(|&i| (time_of(&samples[i]).unwrap_or(i64::MAX), i));
+            let n = ((idx.len() as f64) * cut).round() as usize;
+            old.extend_from_slice(&idx[..n]);
+            new.extend_from_slice(&idx[n..]);
+        }
+        if new.len() < 5 || old.len() < MIN_SAMPLES {
+            continue;
+        }
+        let old_s: Vec<StyleSample> = old.iter().map(|&i| samples[i].clone()).collect();
+        let Ok((m, _)) = train_impl(&old_s, options, &|_| {}, Some(names)) else { continue };
+        for &j in &new {
+            let s = &samples[j];
+            let mut ctx = s.context.clone();
+            ctx.captured_at_ms = time_of(s);
+            let f = TargetFrame::of(&ctx);
+            let parts = m.parts(&ctx);
+            for (ti, name) in names.iter().enumerate() {
+                let Some(t) = targets::target(name) else { continue };
+                let Some((_, p)) = parts.iter().find(|(n, _)| n == name) else { continue };
+                let truth = t.get(&s.adjustments, &f);
+                for (k, &(r, a)) in BLEND_CANDIDATES.iter().enumerate() {
+                    err[ti][k] += f64::from((p.mix(Blend { recent: r, anchor: a }) - truth).abs());
+                }
+            }
+            scored += 1;
+        }
+    }
+    if scored == 0 {
+        return vec![None; names.len()];
+    }
+    names
+        .iter()
+        .zip(&err)
+        .map(|(name, e)| {
+            let anchored = targets::target(name).is_some_and(Target::has_anchor);
+            let plain = e[0] as f32;
+            let (k, best) = BLEND_CANDIDATES
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, a))| anchored || *a == 0.0)
+                .map(|(k, _)| (k, e[k] as f32))
+                .min_by(|a, b| a.1.total_cmp(&b.1))?;
+            let k = if best < plain * BLEND_MIN_GAIN { k } else { 0 };
+            let (recent, anchor) = BLEND_CANDIDATES[k];
+            let n = scored as f32;
+            Some((Blend { recent, anchor }, e[k] as f32 / n, plain / n))
+        })
+        .collect()
+}
+
+/// A target's prediction parts for one frame (model units).
+#[derive(Debug, Clone, Copy)]
+struct Parts {
+    model: f32,
+    recent: Option<f32>,
+    anchor: f32,
+}
+
+impl Parts {
+    fn mix(&self, b: Blend) -> f32 {
+        let recent = self.recent.unwrap_or(self.model);
+        (1.0 - b.recent - b.anchor) * self.model + b.recent * recent + b.anchor * self.anchor
+    }
+}
+
+/// [`train`] without blends; `only` restricts the encodings (one per slot) and skips stage B.
+fn train_impl(
+    samples: &[StyleSample],
+    options: &TrainOptions,
+    progress: &dyn Fn(f32),
+    only: Option<&[String]>,
+) -> Result<(StyleModel, TrainReport), StyleError> {
     if samples.len() < MIN_SAMPLES {
         return Err(StyleError::Insufficient { have: samples.len(), min: MIN_SAMPLES });
     }
@@ -511,6 +689,9 @@ pub fn train(
     let mut chosen: Vec<TargetModel> = Vec::new();
     let mut cv = BTreeMap::new();
     for (ti, t) in TARGETS.iter().enumerate() {
+        if only.is_some_and(|o| !o.iter().any(|n| n == t.name)) {
+            continue;
+        }
         let tm = fit_target(t, samples, &x, &w, &fold, k, options);
         cv.insert(t.name.to_owned(), (tm.cv_mae, tm.cv_mae_mean));
         let slot_of = |m: &TargetModel| targets::target(&m.name).map_or("", |t| t.slot);
@@ -571,13 +752,13 @@ pub fn train(
             }
             // Kept even when every blend weight is 0: [`StyleModel::confidence`] measures the
             // distance to the training frames with it.
-            knn = Some(Knn { k: kk, x: x.clone(), w: w.clone(), y: ys });
+            knn = Some(Knn { k: kk, x: x.clone(), w: w.clone(), y: ys.clone() });
         }
     }
 
     // Stage B on the samples whose edited render was measured.
     let mut outputs = Vec::new();
-    let with_out: Vec<usize> = (0..samples.len()).filter(|&i| samples[i].edited.is_some()).collect();
+    let with_out: Vec<usize> = (0..samples.len()).filter(|&i| only.is_none() && samples[i].edited.is_some()).collect();
     if with_out.len() >= MIN_SAMPLES {
         let xs: Vec<Vec<f32>> = with_out.iter().map(|&i| x[i].clone()).collect();
         let ws: Vec<f32> = with_out.iter().map(|&i| w[i]).collect();
@@ -590,6 +771,17 @@ pub fn train(
             outputs.push(tm);
         }
     }
+    let timeline: Vec<TimelineEntry> = samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            Some(TimelineEntry {
+                captured_at_ms: time_of(s)?,
+                camera_key: s.context.camera_key(),
+                values: ys.iter().map(|y| y[i]).collect(),
+            })
+        })
+        .collect();
     let model = StyleModel {
         version: STYLE_MODEL_VERSION,
         features_version: FEATURES_VERSION,
@@ -603,6 +795,7 @@ pub fn train(
         outputs,
         templates,
         global_template,
+        timeline,
         typical_nn_distance: typical_nn_distance(&x, &fold),
     };
     let report = TrainReport {
@@ -670,20 +863,36 @@ impl StyleModel {
         let key = ctx.camera_key();
         let own = self.templates.iter().find(|t| t.camera_key == key);
         let mut adj = own.unwrap_or(&self.global_template).adjustments.clone();
+        let f = TargetFrame::of(ctx);
+        for (name, p) in self.parts(ctx) {
+            let Some(t) = targets::target(&name) else { continue };
+            let blend = self.targets.iter().find(|m| m.name == name).map_or(Blend::default(), |m| m.blend);
+            let v = p.mix(blend);
+            if v.is_finite() {
+                t.set(&mut adj, v, &f);
+            }
+        }
+        StylePrediction { adjustments: adj, known_camera: own.is_some() }
+    }
+
+    /// Per kept target: the regression (+ kNN blend), the most recent training edit's value
+    /// and the neutral anchor, in model units.
+    fn parts(&self, ctx: &FrameContext) -> Vec<(String, Parts)> {
         let x = self.standardizer.apply(&features::feature_vector(ctx));
         let f = TargetFrame::of(ctx);
         let near = self.knn.as_ref().map(|k| k.predict(&x));
+        let recent = ctx.captured_at_ms.and_then(|t| nearest_in_time(&self.timeline, &ctx.camera_key(), t));
+        let mut out = Vec::with_capacity(self.targets.len());
         for (ti, tm) in self.targets.iter().enumerate() {
             let Some(t) = targets::target(&tm.name) else { continue };
             let mut v = (tm.ridge.predict(&x) + tm.gbdt.predict(&x)).clamp(tm.min, tm.max);
             if let Some(n) = near.as_ref().and_then(|n| n.get(ti)) {
                 v = tm.knn_weight * n + (1.0 - tm.knn_weight) * v;
             }
-            if v.is_finite() {
-                t.set(&mut adj, v, &f);
-            }
+            let r = recent.and_then(|e| e.values.get(ti).copied()).filter(|v| v.is_finite());
+            out.push((tm.name.clone(), Parts { model: v, recent: r, anchor: t.anchor(&f) }));
         }
-        StylePrediction { adjustments: adj, known_camera: own.is_some() }
+        out
     }
 
     /// Predicted statistics of the user's render of this frame (stage B), as the
@@ -719,6 +928,41 @@ impl StyleModel {
             as_shot: ctx.as_shot,
             lut_missing: false,
         })
+    }
+
+    /// Trust radius (EV) of the exposure refinement in [`Self::predict_refined`]: the
+    /// cross-validated error of the exposure regression. `None` without stage B.
+    pub fn refine_radius(&self) -> Option<f32> {
+        if self.outputs.is_empty() {
+            return None;
+        }
+        self.targets
+            .iter()
+            .find(|m| targets::target(&m.name).is_some_and(|t| t.slot == "exposure"))
+            .map(|m| m.cv_mae)
+            .filter(|r| r.is_finite() && *r > 0.0)
+    }
+
+    /// The prediction the app applies: [`Self::predict`], then exposure solved so the frame's
+    /// render reaches the predicted output brightness (stage B), kept within
+    /// [`Self::refine_radius`] of the regressed exposure (the solve corrects for the frame's
+    /// other predicted settings; the radius keeps a wrong brightness prediction from
+    /// overriding the regression). `measure`: see [`Self::refine`] (renders at
+    /// [`REFINE_EDGE`] suffice). 2-5 renders.
+    pub fn predict_refined(
+        &self,
+        ctx: &FrameContext,
+        measure: &mut dyn FnMut(&ParametricAdjustments) -> AppResult<ImageStats>,
+    ) -> AppResult<StylePrediction> {
+        let mut p = self.predict(ctx);
+        let Some(radius) = self.refine_radius() else { return Ok(p) };
+        let groups = RefineGroups { exposure: true, ..Default::default() };
+        let refined = self.refine(ctx, &p.adjustments, groups, measure)?;
+        let e = p.adjustments.exposure;
+        if refined.exposure.is_finite() {
+            p.adjustments.exposure = ((refined.exposure.clamp(e - radius, e + radius)) * 100.0).round() / 100.0;
+        }
+        Ok(p)
     }
 
     /// Stage B: starting from `start` (normally [`Self::predict`]), solve the groups in

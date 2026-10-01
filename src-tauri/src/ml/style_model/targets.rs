@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::FrameContext;
+use super::{AutoAnchor, FrameContext};
 use crate::ipc::types::{ParametricAdjustments, WhiteBalance, WhiteBalanceValues};
 
 /// Reference white balance when a frame has no as-shot values.
@@ -19,16 +19,23 @@ pub struct TargetFrame {
     pub as_shot: WhiteBalanceValues,
     /// log2 mean luminance of the neutral render.
     pub log_mean_luma: f32,
+    /// Sieve's Auto tone of the frame (anchor of the `<slider>Auto` encodings; zeros when
+    /// unknown, i.e. those encodings become the plain sliders).
+    pub auto: AutoAnchor,
 }
 
 impl TargetFrame {
     pub fn of(ctx: &FrameContext) -> TargetFrame {
-        TargetFrame { as_shot: ctx.as_shot.unwrap_or(REFERENCE_WB), log_mean_luma: ctx.render.log_mean_luma }
+        TargetFrame {
+            as_shot: ctx.as_shot.unwrap_or(REFERENCE_WB),
+            log_mean_luma: ctx.render.log_mean_luma,
+            auto: ctx.auto.unwrap_or_default(),
+        }
     }
 
     /// Frame-independent encoding (template reset, tests).
     pub fn reference() -> TargetFrame {
-        TargetFrame { as_shot: REFERENCE_WB, log_mean_luma: 0.0 }
+        TargetFrame { as_shot: REFERENCE_WB, log_mean_luma: 0.0, auto: AutoAnchor::default() }
     }
 }
 
@@ -56,6 +63,22 @@ impl Target {
 
     pub fn set(&self, adj: &mut ParametricAdjustments, value: f32, f: &TargetFrame) {
         (self.set)(adj, value.clamp(self.min, self.max), f)
+    }
+
+    /// Whether the encoding has a meaningful neutral anchor ([`Self::anchor`]): white balance
+    /// (as shot) and the offsets from the frame's Auto (Auto itself).
+    pub fn has_anchor(&self) -> bool {
+        self.group == "whiteBalance" || self.name.ends_with("Auto")
+    }
+
+    /// The anchor in model units: as-shot white balance, the frame's Auto value for Auto
+    /// offsets, else the slider's default.
+    pub fn anchor(&self, f: &TargetFrame) -> f32 {
+        if self.name.ends_with("Auto") {
+            0.0
+        } else {
+            self.get(&ParametricAdjustments::default(), f)
+        }
     }
 }
 
@@ -101,12 +124,30 @@ macro_rules! slider {
     };
 }
 
+/// Offset of a slider from the frame's Auto tone value (`<name>Auto` encodings).
+macro_rules! auto_offset {
+    ($name:literal, $slot:literal, $group:literal, $lo:expr, $hi:expr, $step:expr, $f:ident) => {
+        Target {
+            name: $name,
+            slot: $slot,
+            group: $group,
+            min: $lo - $hi,
+            max: $hi - $lo,
+            get: |a, f| a.$f - f.auto.$f,
+            set: |a, v, f| a.$f = round_to((f.auto.$f + v).clamp($lo, $hi), $step),
+        }
+    };
+}
+
 /// Regressed slider encodings.
 /// - Temperature: mired offset from the camera's as-shot value (cameras on auto WB) or
 ///   absolute mired (fixed camera WB / a user who dials one look temperature).
 /// - Tint: offset from as-shot, or absolute.
 /// - Exposure: the slider, or the target brightness `exposure + log2 mean luma of the neutral
 ///   render` (a user who brings frames to one brightness).
+/// - Tone + presence sliders Auto has (exposure, contrast, highlights, shadows, whites,
+///   blacks, vibrance, saturation): also as the offset from the frame's Auto tone value
+///   (a user who corrects every frame and keeps a constant "look" on top of it).
 pub const TARGETS: &[Target] = &[
     Target {
         name: "temperatureMired",
@@ -154,7 +195,15 @@ pub const TARGETS: &[Target] = &[
         get: |a, f| a.exposure + f.log_mean_luma,
         set: |a, v, f| a.exposure = round_to((v - f.log_mean_luma).clamp(-5.0, 5.0), 0.01),
     },
+    auto_offset!("exposureAuto", "exposure", "tone", -5.0, 5.0, 0.01, exposure),
     slider!("contrast", "tone", -100.0, 100.0, 1.0, contrast),
+    auto_offset!("contrastAuto", "contrast", "tone", -100.0, 100.0, 1.0, contrast),
+    auto_offset!("highlightsAuto", "highlights", "tone", -100.0, 100.0, 1.0, highlights),
+    auto_offset!("shadowsAuto", "shadows", "tone", -100.0, 100.0, 1.0, shadows),
+    auto_offset!("whitesAuto", "whites", "tone", -100.0, 100.0, 1.0, whites),
+    auto_offset!("blacksAuto", "blacks", "tone", -100.0, 100.0, 1.0, blacks),
+    auto_offset!("vibranceAuto", "vibrance", "presence", -100.0, 100.0, 1.0, vibrance),
+    auto_offset!("saturationAuto", "saturation", "presence", -100.0, 100.0, 1.0, saturation),
     slider!("highlights", "tone", -100.0, 100.0, 1.0, highlights),
     slider!("shadows", "tone", -100.0, 100.0, 1.0, shadows),
     slider!("whites", "tone", -100.0, 100.0, 1.0, whites),

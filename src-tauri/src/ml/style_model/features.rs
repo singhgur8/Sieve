@@ -8,17 +8,20 @@
 //! - camera + EXIF: make, format, ISO, shutter, aperture, focal length, the camera's as-shot
 //!   white balance, and the scene light level (EV100) derived from them;
 //! - scene context: the frame's preview `SceneFeatures` (camera rendering) and the mean over
-//!   its scene's members ([`SceneContext`]).
+//!   its scene's members ([`SceneContext`]);
+//! - Sieve's own Auto tone of the frame ([`AutoAnchor`]: `develop::auto::auto_tone` on the
+//!   format defaults, as-shot WB, analysis faces), the per-frame anchor the tone sliders are
+//!   predicted relative to (`targets`: `<slider>Auto` encodings).
 
 use serde::{Deserialize, Serialize};
 
 use crate::develop::pipeline::RenderedImage;
-use crate::ipc::types::{ImageFormat, WhiteBalanceValues};
+use crate::ipc::types::{AutoToneValues, ImageFormat, ParametricAdjustments, WhiteBalanceValues};
 use crate::scene::{color, stats, SceneFeatures};
 
 /// Bump when [`RenderFeatures`] / [`feature_vector`] change (a model trained on other
 /// features is retrained, stored features recomputed).
-pub const FEATURES_VERSION: u32 = 1;
+pub const FEATURES_VERSION: u32 = 2;
 
 /// Luma histogram bins of [`RenderFeatures::luma_hist`] (sRGB-encoded luma 0..=1).
 pub const HIST_BINS: usize = 16;
@@ -141,6 +144,65 @@ impl SceneContext {
     }
 }
 
+/// Sieve's Auto tone of a frame (`develop::auto::auto_tone` on the format defaults with the
+/// as-shot white balance and the analysis faces): absolute slider values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoAnchor {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+    pub vibrance: f32,
+    pub saturation: f32,
+}
+
+impl AutoAnchor {
+    /// From a full `auto_tone` result (missing values = 0).
+    pub fn from_values(v: &AutoToneValues) -> AutoAnchor {
+        let g = |x: Option<f32>| x.filter(|v| v.is_finite()).unwrap_or(0.0);
+        AutoAnchor {
+            exposure: g(v.exposure),
+            contrast: g(v.contrast),
+            highlights: g(v.highlights),
+            shadows: g(v.shadows),
+            whites: g(v.whites),
+            blacks: g(v.blacks),
+            vibrance: g(v.vibrance),
+            saturation: g(v.saturation),
+        }
+    }
+
+    /// From the tone + presence sliders of `adj` (e.g. a reference Auto's result).
+    pub fn from_adjustments(adj: &ParametricAdjustments) -> AutoAnchor {
+        AutoAnchor {
+            exposure: adj.exposure,
+            contrast: adj.contrast,
+            highlights: adj.highlights,
+            shadows: adj.shadows,
+            whites: adj.whites,
+            blacks: adj.blacks,
+            vibrance: adj.vibrance,
+            saturation: adj.saturation,
+        }
+    }
+
+    pub fn values(&self) -> [f32; 8] {
+        [
+            self.exposure,
+            self.contrast,
+            self.highlights,
+            self.shadows,
+            self.whites,
+            self.blacks,
+            self.vibrance,
+            self.saturation,
+        ]
+    }
+}
+
 /// Everything the model sees about one frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +222,13 @@ pub struct FrameContext {
     /// The frame's own preview features (scene detection's `scene_features` row).
     pub preview: Option<SceneFeatures>,
     pub scene: Option<SceneContext>,
+    /// Sieve's Auto tone of the frame (`None` = not computed; anchored encodings then fall
+    /// back to absolute values).
+    #[serde(default)]
+    pub auto: Option<AutoAnchor>,
+    /// Capture time (the model's "most recent edit" lookup; `None` = unknown).
+    #[serde(default)]
+    pub captured_at_ms: Option<i64>,
 }
 
 impl FrameContext {
@@ -238,6 +307,15 @@ pub fn feature_names() -> Vec<String> {
             "sceneEv100",
             "ev100MinusScene",
             "previewLumaMinusScene",
+            "autoExposure",
+            "autoContrast",
+            "autoHighlights",
+            "autoShadows",
+            "autoWhites",
+            "autoBlacks",
+            "autoVibrance",
+            "autoSaturation",
+            "autoBrightness",
         ]
         .iter()
         .map(|s| (*s).to_owned()),
@@ -291,6 +369,13 @@ pub fn feature_vector(ctx: &FrameContext) -> Vec<f32> {
             v.push(ctx.preview.as_ref().map_or(nan, |p| p.log_mean_luma - s.log_mean_luma));
         }
         None => v.extend([nan; 8]),
+    }
+    match &ctx.auto {
+        Some(a) => {
+            v.extend(a.values());
+            v.push(a.exposure + r.log_mean_luma);
+        }
+        None => v.extend([nan; 9]),
     }
     v.iter_mut().for_each(|x| {
         if x.is_infinite() {

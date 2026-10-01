@@ -4,10 +4,17 @@
 //! ```text
 //! cargo run --release --example style_eval -- --out ../test-data/style-eval   # writes heldout.json
 //! cargo run --release --example style_e2e -- --work ../test-data/style-e2e \
-//!     [--folder DIR] [--eval-rows ../test-data/style-eval/heldout.json] [--n 12]
+//!     [--folder DIR] [--eval-rows ../test-data/style-eval/heldout.json] [--n 12] \
+//!     [--models DIR] [--no-analysis]
 //! ```
 //! 1. APFS clones (`cp -c`) of every RAW of `--folder` into `<work>/raws` (no sidecars; the
-//!    originals are only read), import + ingest (previews), scene detection (Phase 7).
+//!    originals are only read), import + ingest (previews), the culling analysis (faces; the
+//!    worker with `--models`, default `src-tauri/models`; skipped with `--no-analysis` or
+//!    without `det_10g.onnx`), scene detection (Phase 7).
+//!    Faces matter: Auto tone (the validation's baseline and the style model's anchor) weighs
+//!    the analysis' faces and guards their skin; on photos that were never analysed it falls
+//!    back to skin-coloured pixels, which on this shoot darkens several frames by up to 2 EV
+//!    (`style_eval` detects faces with SCRFD, as the analysis does).
 //! 2. The user's Lightroom settings of the eval's *training* frames (every edited frame not in
 //!    `heldout.json`) are stored as catalog edits (what "Read from XMP" does); held-out frames
 //!    stay unedited.
@@ -29,11 +36,15 @@ use serde::Deserialize;
 use sieve_lib::db::{self, projects::FolderScope, repo};
 use sieve_lib::develop::{batches, DevelopCache, DevelopConfig};
 use sieve_lib::ingest::{run_until_idle, IngestConfig, IngestSink};
-use sieve_lib::ipc::events::{ImportProgress, ThumbnailFailed, ThumbnailReady};
+use sieve_lib::ipc::events::{
+    AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ImportProgress, ThumbnailFailed, ThumbnailReady,
+};
 use sieve_lib::ipc::types::{ImageId, ImportOptions, ParametricAdjustments, SceneDetectOptions, StyleTrainPhase};
 use sieve_lib::lut::LutLibrary;
 use sieve_lib::ml::style::{self, CatalogFrame, StyleModel, StyleModelConfig, TrainControl};
 use sieve_lib::ml::style_model;
+use sieve_lib::ml::worker::{self, AnalysisSink};
+use sieve_lib::ml::AnalysisConfig;
 use sieve_lib::{raw, scene, xmp};
 
 const DEFAULT_FOLDER: &str = "/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal/10060918";
@@ -55,6 +66,19 @@ impl IngestSink for Sink {
         eprintln!("thumbnail failed: image {}: {}", e.image_id, e.reason);
     }
     fn progress(&self, _: ImportProgress) {}
+}
+
+struct Analysed;
+impl AnalysisSink for Analysed {
+    fn ready(&self, _: AnalysisReady) {}
+    fn failed(&self, e: AnalysisFailed) {
+        eprintln!("analysis failed: image {}: {}", e.image_id, e.reason);
+    }
+    fn progress(&self, _: AnalysisProgress) {}
+    fn finished(&self, _: AnalysisFinished) {}
+    fn ingest_running(&self) -> bool {
+        false
+    }
 }
 
 struct Control {
@@ -89,6 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let work = PathBuf::from(arg("--work").unwrap_or_else(|| "../test-data/style-e2e".into()));
     let rows_path = PathBuf::from(arg("--eval-rows").unwrap_or_else(|| "../test-data/style-eval/heldout.json".into()));
     let n: usize = arg("--n").and_then(|v| v.parse().ok()).unwrap_or(12);
+    let models =
+        arg("--models").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+    let analyse = !args.iter().any(|a| a == "--no-analysis") && models.join("det_10g.onnx").is_file();
     std::fs::create_dir_all(&work)?;
     let work = work.canonicalize()?;
     if work.starts_with("/Users/gurjotsingh/Pictures") {
@@ -130,6 +157,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     repo::import_folder(&mut conn, &raws_dir, &ImportOptions::raw_only(false))?;
     run_until_idle(&config, &Sink, &AtomicBool::new(true))?;
     step("import + ingest", t);
+
+    if analyse {
+        let t = Instant::now();
+        let config = AnalysisConfig { catalog_path: catalog_path.clone(), models_dir: models.clone() };
+        let stats = worker::run_blocking(&config, &Analysed)?;
+        step(&format!("culling analysis ({} analysed, {} failed)", stats.analyzed, stats.failed), t);
+    } else {
+        println!("culling analysis skipped: Auto tone runs without faces (skin-coloured pixels stand in)");
+    }
 
     let t = Instant::now();
     let mut frames = scene::store::detection_frames(&conn, FolderScope::all(), false)?;
@@ -221,9 +257,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let de = style::validation_errors(&app_cache, &luts, &frame, user, &p[0].adjustments, 768)?;
         let e = held[stem.as_str()];
         rows.insert(stem.clone(), (de, [e.predicted, e.auto_tone, e.no_edit]));
+        let auto = style::auto_tone_baseline(&app_cache, &luts, &frame.src, frame.format, frame.faces.as_deref())?;
         println!(
-            "  {stem:<12} catalog: pred {:5.2} auto {:5.2} none {:5.2} | eval: pred {:5.2} auto {:5.2} none {:5.2} | conf {:.2} {:?}",
-            de[0], de[1], de[2], e.predicted, e.auto_tone, e.no_edit, p[0].confidence, p[0].notes
+            "  {stem:<12} catalog: pred {:5.2} auto {:5.2} none {:5.2} | eval: pred {:5.2} auto {:5.2} none {:5.2} | faces {} auto exposure {:+.2} whites {:+.0} | conf {:.2} {:?}",
+            de[0],
+            de[1],
+            de[2],
+            e.predicted,
+            e.auto_tone,
+            e.no_edit,
+            frame.faces.as_ref().map_or("not analysed".into(), |f| f.len().to_string()),
+            auto.exposure,
+            auto.whites,
+            p[0].confidence,
+            p[0].notes
         );
         items.push(batches::BatchItem {
             image_id: *id,
