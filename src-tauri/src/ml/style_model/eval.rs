@@ -1,6 +1,7 @@
 //! Evaluation helpers shared by `examples/style_eval.rs` and the in-app validation of
-//! `ml::style` (`StyleValidation`): mean CIEDE2000 between two renders and the reference
-//! "Auto tone" baseline used while `develop::auto::auto_tone` is not available.
+//! `ml::style` (`StyleValidation`): mean CIEDE2000 between two renders and the older
+//! reference "Auto tone" (the validation's fallback when `develop::auto::auto_tone` fails;
+//! an extra column in `style_eval`).
 
 use crate::develop::pipeline::RenderedImage;
 use crate::ipc::types::{ImageFormat, ParametricAdjustments};
