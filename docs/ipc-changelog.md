@@ -839,6 +839,13 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v17 (no contract change) — 2026-09-30 (Auto tone: on-demand faces on unanalysed photos)
+No type, command signature, event or schema change; `src/ipc/bindings.ts` unchanged (`cargo test bindings` passes).
+- Behaviour: `auto_tone` on a photo without analysis results now detects faces itself (`ml::auto_faces`, SCRFD on the neutral render, cached per image) instead of relying only on the skin-colour estimate, so skin is protected as on analysed photos; results for such photos change (usually Whites / Highlights a little lower on portraits). First call after launch loads the detector (~0.2 s); then about +30 ms per photo, 0 ms once cached. Without the model file the previous bounded estimate is used.
+- Style model: the Auto anchor of unanalysed frames uses the same path; their cached `style_features` are recomputed once (`facesOnDemand`, serde default `false`).
+- `DevelopCache::with_auto_faces` / `auto_faces()`, `develop::auto::resolve_faces`, `ml::models::FaceDetector` are new Rust APIs; `lib.rs` wires the detector (culling models dir).
+- frontend-dev / vision-ml-dev: nothing required. rust-engine-dev: any new caller of `auto_tone_with_faces` with `faces = None` should go through `develop::auto::resolve_faces` first.
+
 ## v17 — 2026-09-30 (UX re-check 2 P1-12: reset scenes, lenient Apply all, linear undo across Auto edit -> Apply)
 Schema v15 (`migrations/0015_apply_bases.sql`). Driven by `docs/ux-review-8b.md` "Re-check 2" P1-12. **Breaking** for
 exhaustive `switch`es / `Record`s over `SceneEditStatus` (new `reset`) and for TS object literals typed as

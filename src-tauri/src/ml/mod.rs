@@ -22,6 +22,7 @@
 //!   emitted *unless suppressed*; never touch suppressed rows (no resurrection) or
 //!   `source = 'user'` rows. Never write `images.rating` / `images.pick`.
 
+pub mod auto_faces;
 pub mod bursts;
 pub mod canonical_face;
 pub mod imgproc;

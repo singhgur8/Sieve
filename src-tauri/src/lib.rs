@@ -310,14 +310,19 @@ pub fn run() {
             app.manage(catalog);
             app.manage(commands::SceneApplyControl::new());
             app.manage(Ingest::new(config));
+            // On-demand face boxes for Auto tone on unanalysed photos (culling detector).
+            let auto_faces = ml::auto_faces::AutoFaces::new(models_dir.clone());
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             // Personal style model (IPC v14; training runs on its own thread + connection).
             app.manage(StyleModel::new(StyleModelConfig { catalog_path: path.clone() }));
             app.manage(XmpSync::new(XmpSyncConfig { catalog_path: path.clone() }).with_mask_cache(mask_cache.clone()));
-            app.manage(DevelopCache::new(DevelopConfig {
-                cache_bytes: develop_cache_mb * 1024 * 1024,
-                mask_cache: Some(mask_cache.clone()),
-            }));
+            app.manage(
+                DevelopCache::new(DevelopConfig {
+                    cache_bytes: develop_cache_mb * 1024 * 1024,
+                    mask_cache: Some(mask_cache.clone()),
+                })
+                .with_auto_faces(auto_faces),
+            );
             // Adobe DCPs / looks installed on this Mac, read in place (never copied).
             app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
             let luts = LutLibrary::new(luts_dir);

@@ -1682,6 +1682,8 @@ pub async fn resolve_preset(
 /// (`null` = all of `AdjustmentField::AUTO_TONE`; Shift-double-click a slider = just that one)
 /// given the live `adjustments` (`null` = stored). Nothing is saved: the UI merges the values
 /// (`applyAutoTone`) and saves one "Auto Tone" history entry. Body: rust-engine-dev.
+// Unanalysed photos get their face boxes from on-demand detection
+// (`develop::auto::resolve_faces`); a plain comment so `bindings.ts` is unchanged.
 #[tauri::command]
 #[specta::specta]
 pub async fn auto_tone(
@@ -1708,15 +1710,18 @@ pub async fn auto_tone(
                 None => repo::get_adjustments(c, id)?,
             };
             // Face boxes from the analysis (skin guard + face-weighted exposure); `None` when
-            // the photo has not been analysed yet (skin-coloured pixels stand in).
+            // the photo has not been analysed yet (detected on demand below).
             let faces = develop::auto::analysis_faces(c, id)?.map(|f| develop::auto::face_boxes(&f));
             Ok((a, faces))
         })
         .await?;
     let src = develop_source(&catalog, &develop, id).await?;
     let cache = develop.inner().clone();
-    let r = blocking(move || develop::auto::auto_tone_with_faces(&cache, &src, &adjustments, &keys, faces.as_deref()))
-        .await;
+    let r = blocking(move || {
+        let faces = develop::auto::resolve_faces(&cache, &src, faces);
+        develop::auto::auto_tone_with_faces(&cache, &src, &adjustments, &keys, faces.as_deref())
+    })
+    .await;
     note_if_missing(&catalog, id, r).await
 }
 

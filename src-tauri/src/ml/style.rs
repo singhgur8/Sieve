@@ -202,6 +202,10 @@ pub struct StoredFeatures {
     /// the analysis are recomputed once it has run).
     #[serde(default)]
     pub faces_known: bool,
+    /// `auto` of an unanalysed frame was computed with on-demand face detection tried
+    /// (`develop::auto::resolve_faces`); older entries of unanalysed frames are recomputed.
+    #[serde(default)]
+    pub faces_on_demand: bool,
     /// The image's own settings (no crop / masks) rendered at `scene::STATS_MAX_EDGE` and
     /// measured (training samples: the stage-B output), with [`edited_key`] of those settings.
     #[serde(default)]
@@ -215,7 +219,7 @@ impl StoredFeatures {
     /// needs the measured render of the frame's current settings.
     pub fn current_for(&self, frame: &CatalogFrame, training: bool) -> bool {
         self.auto.is_some()
-            && (self.faces_known || frame.faces.is_none())
+            && (self.faces_known || (frame.faces.is_none() && self.faces_on_demand))
             && (!training || (self.edited.is_some() && self.edited_key.as_deref() == Some(&edited_key(frame))))
     }
 }
@@ -291,6 +295,7 @@ pub fn neutral_features(
         as_shot: px.as_shot,
         auto: Some(AutoAnchor::from_adjustments(&auto)),
         faces_known: frame.faces.is_some(),
+        faces_on_demand: frame.faces.is_none(),
         edited,
         edited_key,
     })
@@ -639,7 +644,8 @@ pub fn holdout_split(samples: &[StyleSample]) -> Option<Vec<bool>> {
 
 /// Sieve's Auto tone of a frame, as the Develop "Auto" button computes it on an unedited
 /// photo: `develop::auto::auto_tone_with_faces` on the format defaults (as-shot WB) with the
-/// analysis faces (`None` = not analysed: skin-coloured pixels stand in); the reference auto
+/// analysis faces (`None` = not analysed: detected on demand, `develop::auto::resolve_faces`;
+/// skin-coloured pixels stand in if the detector is unavailable); the reference auto
 /// of [`eval::reference_auto_tone`] if it fails. The style model's per-frame anchor and the
 /// "Auto tone" column of the validation (same as `examples/style_eval.rs`).
 pub fn auto_tone_baseline(
@@ -650,7 +656,14 @@ pub fn auto_tone_baseline(
     faces: Option<&[NormRect]>,
 ) -> AppResult<ParametricAdjustments> {
     let defaults = ParametricAdjustments::defaults_for(format);
-    match crate::develop::auto::auto_tone_with_faces(cache, src, &defaults, AdjustmentField::AUTO_TONE, faces) {
+    let faces = crate::develop::auto::resolve_faces(cache, src, faces.map(<[NormRect]>::to_vec));
+    match crate::develop::auto::auto_tone_with_faces(
+        cache,
+        src,
+        &defaults,
+        AdjustmentField::AUTO_TONE,
+        faces.as_deref(),
+    ) {
         Ok(v) => Ok(v.apply_to(&defaults)),
         Err(_) => eval::reference_auto_tone(format, |a| {
             cache
@@ -898,10 +911,11 @@ impl StyleModel {
             *run = Run { training: true, cancelled: false, progress: Some(0.0), error: None };
         }
         let develop_config = app.state::<DevelopCache>().config().clone();
+        let auto_faces = app.state::<DevelopCache>().auto_faces().cloned();
         let luts = app.state::<LutLibrary>().inner().clone();
         let (this, app) = (self.clone(), app.clone());
         let spawned = std::thread::Builder::new().name("style-train".into()).spawn(move || {
-            this.run_training(&app, develop_config, &luts);
+            this.run_training(&app, develop_config, auto_faces, &luts);
         });
         if let Err(e) = spawned {
             *lock(&self.run) = Run::default();
@@ -918,9 +932,19 @@ impl StyleModel {
         })
     }
 
-    fn run_training(&self, app: &AppHandle, develop_config: DevelopConfig, luts: &LutLibrary) {
+    fn run_training(
+        &self,
+        app: &AppHandle,
+        develop_config: DevelopConfig,
+        auto_faces: Option<super::auto_faces::AutoFaces>,
+        luts: &LutLibrary,
+    ) {
         single_threaded_openmp();
-        let cache = Self::training_cache(&develop_config);
+        let mut cache = Self::training_cache(&develop_config);
+        // The editor's on-demand face detector (one session + cache shared with Auto tone).
+        if let Some(f) = auto_faces {
+            cache = cache.with_auto_faces(f);
+        }
         let control = AppControl { state: self, app, last: Mutex::new((None, None)) };
         let result =
             catch_unwind(AssertUnwindSafe(|| train_catalog(&self.config.catalog_path, &cache, luts, &control)))
