@@ -65,13 +65,14 @@ export function GridToolbar(p: Props) {
         </select>
       </label>
       <button
-          className={seg(p.query.sortDescending)}
+          className={`${seg(p.query.sortDescending)} self-start`}
           data-testid="sort-dir"
           aria-label={p.query.sortDescending ? "Descending" : "Ascending"}
           onClick={() => p.setQuery((q) => ({ ...q, sortDescending: !q.sortDescending }))}
           title={p.query.sortDescending ? "Descending (click for ascending)" : "Ascending (click for descending)"}
         >
           {p.query.sortDescending ? <ArrowUpAZ className="size-3.5" /> : <ArrowDownAZ className="size-3.5" />}
+          {p.query.sortDescending ? "Descending" : "Ascending"}
         </button>
       <label className="flex items-center gap-1.5" title="Advance to the next photo after flagging/rating (Shift+P / Shift+X always advance)">
         <input type="checkbox" checked={p.autoAdvance || !!p.capsLock} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />

@@ -46,6 +46,8 @@ export interface EditorOptions {
   onError: (e: unknown) => void;
   /** Called after a history entry was saved / changed, so the library can refresh `hasEdits`. */
   onChanged: (id: number) => void;
+  /** A user commit / undo / redo wrote history (not a plain reload): batch Undo offers become unsafe. */
+  onCommitted?: (id: number) => void;
   /** Source format of the image (selects the neutral defaults); RAW when unknown. */
   format?: ImageFormat;
   /** Render the full, uncropped frame (crop tool active). */
@@ -191,6 +193,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
+      optsRef.current.onCommitted?.(p.id);
       // Profile / look availability warnings depend on the saved settings.
       const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
@@ -283,6 +286,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       setHistory(s.history);
       schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
       optsRef.current.onChanged(forId);
+      optsRef.current.onCommitted?.(forId);
     },
     [setAdjBoth, schedule],
   );

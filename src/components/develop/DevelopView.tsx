@@ -83,6 +83,8 @@ interface Props {
   onNotice: (s: string) => void;
   /** Toast with an Undo action (multi-photo reset / preset). */
   onUndoToast: (msg: string, undo: () => void) => void;
+  /** Photos whose history was just written by the user (commit, undo, batch edit): scene batch Undo offers must not outlive it. */
+  onCommitted?: (ids: number[]) => void;
   onBack: () => void;
   /** "Locate folder…" for the folder of image `imageId` (IPC v13 relocate_folder). */
   onLocate: (imageId: number) => void;
@@ -147,7 +149,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -174,6 +176,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   const { refresh } = lib;
   const onChanged = useCallback((changed: number) => void refresh([changed]).catch(() => {}), [refresh]);
+  const onCommittedRef = useRef(onCommitted);
+  onCommittedRef.current = onCommitted;
+  const noteCommitted = useCallback((i: number) => onCommittedRef.current?.([i]), []);
   const entry = id != null ? lib.getEntry(id) : undefined;
   // Compare: one editor per pane (A = Select, B = Candidate); `editor` is the active pane's, so every panel edits it.
   const focusB = !!compare && compare.focus === "b";
@@ -189,6 +194,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     wantBefore: beforeOn && !focusB,
     onError,
     onChanged,
+    onCommitted: noteCommitted,
   });
   const editorB = useEditor(idB, {
     format: (idB != null ? lib.getEntry(idB) : undefined)?.format,
@@ -198,6 +204,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     wantBefore: false,
     onError,
     onChanged,
+    onCommitted: noteCommitted,
   });
   const editor = focusB ? editorB : editorA;
   const { info } = editor;
@@ -298,6 +305,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   const afterBatch = useCallback(
     async (t: number[]) => {
+      onCommittedRef.current?.(t);
       await lib.refresh(t.filter((x) => lib.getEntry(x)).slice(0, 2000)).catch(() => {});
       if (id != null && t.includes(id)) await editor.reload();
     },

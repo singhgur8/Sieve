@@ -138,7 +138,7 @@ export function EditContextBar(p: Props) {
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {wf.busy?.kind === "scene" && (
           <span className="flex h-6 items-center rounded bg-emerald-950 px-2 text-xs text-emerald-200" data-testid="edit-applying">
-            {wf.cancelling ? "Stopping…" : `Applying… ${wf.busy.done}/${wf.busy.total}`}
+            {wf.cancelling ? "Stopping…" : (wf.busy.total > 0 ? `Applying… ${wf.busy.done}/${wf.busy.total}` : "Applying…")}
             <button className="ml-1 rounded p-0.5 hover:bg-emerald-900 disabled:opacity-40" data-testid="edit-apply-cancel" aria-label="Stop applying" title="Stop applying. Scenes already applied stay applied" disabled={wf.cancelling} onClick={wf.cancelApply}>
               <X className="size-3" />
             </button>
@@ -170,11 +170,12 @@ export function EditContextBar(p: Props) {
             disabled={!row}
           >
             {(close) => {
-              const item = (testid: string, label: string, fn: () => void, disabled = false) => (
+              const item = (testid: string, label: string, fn: () => void, disabled = false, why?: string) => (
                 <button
                   className={menuItem}
                   data-testid={testid}
                   disabled={disabled}
+                  title={why}
                   onClick={() => {
                     close();
                     fn();
@@ -187,7 +188,7 @@ export function EditContextBar(p: Props) {
                 <div className="w-60 py-1">
                   {item("edit-apply-options", "Apply with options…", () => row && p.onApplyOptions(row.entry.sceneId), !canApply)}
                   {item("edit-apply-exact", "Copy exactly (no matching)", () => row && void wf.applyScene(row.entry.sceneId, "exact", p.onReview), !canApply || busy)}
-                  {item("edit-undo-apply", "Undo apply", () => last && void wf.undoBatch(last), !last)}
+                  {item("edit-undo-apply", "Undo apply", () => last && void wf.undoBatch(last), !last || !!wf.undoReason(last), last ? (wf.undoReason(last) ?? undefined) : "Nothing to undo in this session")}
                 </div>
               );
             }}

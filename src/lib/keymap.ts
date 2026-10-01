@@ -47,6 +47,8 @@ export type ActionId =
   | "nextScene"
   | "prevScene"
   | "applyScene"
+  | "planSkip"
+  | "planStop"
   | "autoEdit"
   | "before"
   | "split"
@@ -154,6 +156,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "nextScene", group: "Workflow", label: "Next scene to edit (or next frame to review)", chords: [c("n")], modes: ["grid", "develop"], display: ["N"], where: "Edit step: Plan, Develop" },
   { id: "prevScene", group: "Workflow", label: "Previous scene", chords: [c("n", { shift: true })], modes: ["grid", "develop"], display: ["Shift+N"], where: "Edit step: Plan, Develop" },
   { id: "applyScene", group: "Workflow", label: "Apply to scene", chords: [c("Enter", { mod: true, shift: true })], modes: ["grid", "develop"], display: ["Cmd+Shift+Enter"], where: "Edit step: Plan, Develop" },
+  { id: "planSkip", group: "Workflow", label: "Skip / include the focused scene", chords: [], modes: ALL, display: ["S"], where: "Edit step: Plan", external: true },
+  { id: "planStop", group: "Workflow", label: "Stop applying", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Plan (while applying)", external: true },
   { id: "autoEdit", group: "Workflow", label: "Auto edit (my style)", chords: [c("u", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+U"], where: "Edit step: Plan, Develop" },
 
   // ---- navigation ----

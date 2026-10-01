@@ -1,5 +1,5 @@
 // Transient messages: bottom-centre, above the filmstrip, never shift the layout.
-// Info toasts fade after 4 s (8 s when they carry an action); errors are sticky.
+// Info toasts fade after 4 s (10 s when they carry an action; Undo stays reachable from the scene row menu); errors are sticky.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import type { ErrorInfo } from "../lib/errors";
@@ -23,6 +23,8 @@ export interface ToastApi {
   toasts: Toast[];
   push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; kind?: "info" | "error" }) => number;
   dismiss: (id: number) => void;
+  /** Drops the toast's Undo (kept text), e.g. when a newer edit made it unsafe. */
+  retract: (id: number) => void;
 }
 
 export function useToasts(): ToastApi {
@@ -36,13 +38,17 @@ export function useToasts(): ToastApi {
     setToasts((all) => all.filter((t) => t.id !== id));
   }, []);
 
+  const retract = useCallback((id: number) => {
+    setToasts((all) => all.map((t) => (t.id === id ? { ...t, action: undefined } : t)));
+  }, []);
+
   const push = useCallback(
     (message: string, opts: { action?: ToastAction; secondary?: ToastAction; kind?: "info" | "error" } = {}) => {
       const id = next.current++;
       const kind = opts.kind ?? "info";
       // A new message replaces plain older ones; toasts carrying an action (Undo) stay until they expire.
       setToasts((all) => [...all.filter((t) => t.action).slice(-1), { id, message, kind, action: opts.action, secondary: opts.secondary }]);
-      if (kind === "info") timers.current.set(id, setTimeout(() => dismiss(id), opts.action ? 8000 : 4000));
+      if (kind === "info") timers.current.set(id, setTimeout(() => dismiss(id), opts.action ? 10000 : 4000));
       return id;
     },
     [dismiss],
@@ -53,7 +59,7 @@ export function useToasts(): ToastApi {
     return () => t.forEach((h) => clearTimeout(h));
   }, []);
 
-  return { toasts, push, dismiss };
+  return { toasts, push, dismiss, retract };
 }
 
 /** Persistent inline banner (top of the window) for problems that do not go away by themselves. */
@@ -77,9 +83,10 @@ export function IssueBanner({ issue, onDismiss, onRestore }: { issue: ErrorInfo;
   );
 }
 
-export function Toasts({ api, error, onDismissError, onLocate }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void }) {
+/** `top`: Develop, where the bottom edge of the viewer carries the Before / Split / Compare / flag toolbar. */
+export function Toasts({ api, error, onDismissError, onLocate, placement = "bottom" }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void; placement?: "bottom" | "top" }) {
   return (
-    <div className="pointer-events-none fixed bottom-24 left-1/2 z-40 flex w-[min(480px,92vw)] -translate-x-1/2 flex-col items-stretch gap-2" data-testid="toasts">
+    <div className={`pointer-events-none fixed ${placement === "top" ? "top-[88px]" : "bottom-24"} left-1/2 z-40 flex w-[min(480px,92vw)] -translate-x-1/2 flex-col items-stretch gap-2`} data-testid="toasts" data-placement={placement}>
       {error && (
         <div role="alert" className="pointer-events-auto flex items-start justify-between gap-3 rounded-lg border border-red-800 bg-red-950 px-3 py-2 text-sm text-red-200 shadow-xl" data-testid="error" data-category={error.category}>
           <span className="min-w-0 break-words">{error.message}</span>

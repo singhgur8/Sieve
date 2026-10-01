@@ -5,6 +5,7 @@ import { ArrowRight, ChevronDown, ChevronRight, MoreHorizontal, X } from "lucide
 import type { KeeperRule } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import { rowInTab, type PlanTab, type SceneRow, type Workflow } from "../../hooks/useWorkflow";
+import { hint } from "../../lib/keymap";
 import { Menu, menuItem } from "../Menu";
 import { Dialog } from "../Dialog";
 import { AutoEditButton, StatusIcon, statusLine, Thumb, useWide } from "./bits";
@@ -194,7 +195,7 @@ export function PlanView(p: Props) {
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {(busy?.kind === "all" || busy?.kind === "scene") && (
             <span className="flex items-center gap-1 rounded-full bg-emerald-950 py-0.5 pl-2.5 pr-1 text-xs text-emerald-300" data-testid="plan-applying">
-              {wf.cancelling ? "Stopping…" : `Applying… ${busy.done}/${busy.total}`}
+              {wf.cancelling ? "Stopping…" : (busy.total > 0 ? `Applying… ${busy.done}/${busy.total}` : "Applying…")}
               <button className="rounded-full p-0.5 hover:bg-emerald-900 disabled:opacity-40" data-testid="plan-apply-cancel" aria-label="Stop applying (Esc)" title="Stop applying (Esc). Scenes already applied stay applied" disabled={wf.cancelling} onClick={wf.cancelApply}>
                 <X className="size-3" />
               </button>
@@ -213,7 +214,7 @@ export function PlanView(p: Props) {
             <button className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600" data-testid="plan-continue-export" onClick={p.onContinueExport}>
               Continue to Export <ArrowRight className="size-3.5" /> {keeperCount}
             </button>
-          ) : (
+          ) : pending.length === 0 && (counts?.toEdit ?? 0) === 0 ? null : (
             <button
               className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
               data-testid="plan-apply-all"
@@ -401,7 +402,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           {plural(e.imageIds.length, "keeper")}
         </p>
         <p className={`text-xs ${line.cls}`} data-testid={`plan-status-${id}`}>
-          {busyHere ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : line.text}
+          {busyHere ? (wf.busy!.total > 0 ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : "Applying…") : line.text}
           {!busyHere && line.extra && <span className="text-amber-300">{line.extra}</span>}
         </p>
         <p className="truncate text-[11px] text-neutral-400" title={e.representativeReason}>
@@ -455,11 +456,12 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         )}
         <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
           {(close) => {
-            const item = (testid: string, label: string, fn: () => void, disabled = false) => (
+            const item = (testid: string, label: string, fn: () => void, disabled = false, why?: string) => (
               <button
                 className={menuItem}
                 data-testid={testid}
                 disabled={disabled}
+                title={why}
                 onClick={() => {
                   close();
                   fn();
@@ -473,9 +475,9 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
                 {item(`plan-change-rep-${id}`, "Change representative…", () => p.onChangeRep(id))}
                 {item(`plan-options-${id}`, "Apply with options…", () => p.onApplyOptions(id), r.ui === "todo")}
                 {item(`plan-exact-${id}`, "Copy exactly (no matching)", () => void wf.applyScene(id, "exact", p.onReview), r.ui === "todo" || anyBusy || r.targets === 0)}
-                {item(`plan-skip-${id}`, r.skipped ? "Include this scene" : "Skip this scene (S)", () => void wf.setSkipped(id, !r.skipped))}
+                {item(`plan-skip-${id}`, r.skipped ? `Include this scene${hint("planSkip")}` : `Skip this scene${hint("planSkip")}`, () => void wf.setSkipped(id, !r.skipped))}
                 {item(`plan-show-${id}`, `Show all ${e.memberCount} photos`, () => p.onShowScene(id))}
-                {item(`plan-undo-${id}`, "Undo apply", () => last && void wf.undoBatch(last), !last)}
+                {item(`plan-undo-${id}`, "Undo apply", () => last && void wf.undoBatch(last), !last || !!wf.undoReason(last), last ? (wf.undoReason(last) ?? undefined) : "Nothing to undo in this session")}
               </div>
             );
           }}

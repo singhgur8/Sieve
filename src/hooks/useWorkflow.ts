@@ -41,6 +41,8 @@ export interface LastBatch {
   batchId: number;
   label: string;
   sceneIds: number[];
+  /** Photos the batch wrote (a later edit to any of them makes its Undo unsafe). */
+  imageIds: number[];
   at: number;
 }
 
@@ -96,8 +98,32 @@ export function useWorkflow(d: Deps) {
   const bindToast = (b: LastBatch | null, toastId: number) => {
     if (b) batchToast.current.set(b.batchId, toastId);
   };
+  /** Batches a later user edit touched (their Undo is no longer safe). */
+  const [touched, setTouched] = useState<Set<number>>(new Set());
+  /** Why a batch cannot be undone from a toast / row menu right now; null = it can. Undo is strictly linear. */
+  const undoReason = (b: LastBatch): string | null => {
+    if (touched.has(b.batchId)) return "Later edits touched these photos. Undo those first";
+    const top = batchStack[batchStack.length - 1];
+    if (top && top.batchId !== b.batchId) return `A newer apply (${top.label}) is on top. Undo that first`;
+    return null;
+  };
   /** Newest batch that touched a scene (row menus: Undo apply). */
   const batchForScene = (sceneId: number): LastBatch | null => [...batchStack].reverse().find((b) => b.sceneIds.includes(sceneId)) ?? null;
+  /** The user committed an adjustment (or batch-edited photos) in Develop: batches covering them lose their Undo. */
+  const noteCommit = useCallback((ids: number[]) => {
+    const set = new Set(ids);
+    const hit = batchStackRef.current.filter((b) => b.imageIds.some((i) => set.has(i)) && !touchedRef.current.has(b.batchId));
+    if (hit.length === 0) return;
+    hit.forEach((b) => {
+      touchedRef.current.add(b.batchId);
+      const tid = batchToast.current.get(b.batchId);
+      if (tid != null) dref.current.toasts.retract(tid);
+    });
+    setTouched(new Set(touchedRef.current));
+  }, []);
+  const touchedRef = useRef(new Set<number>());
+  const batchStackRef = useRef<LastBatch[]>([]);
+  batchStackRef.current = batchStack;
   const seq = useRef(0);
   const dref = useRef(d);
   dref.current = d;
@@ -172,6 +198,8 @@ export function useWorkflow(d: Deps) {
     setTab("all");
     setMinorOpen(false);
     setBatchStack([]);
+    setTouched(new Set());
+    touchedRef.current = new Set();
     batchToast.current.clear();
   }, [projectId]);
 
@@ -283,6 +311,14 @@ export function useWorkflow(d: Deps) {
         await afterChange([...r.restoredIds, ...r.skippedIds]);
         toasts.push(`Undid ${batch.label} on ${plural(r.restoredIds.length, "photo")}${r.skippedIds.length > 0 ? ` · ${r.skippedIds.length} changed since, kept` : ""}`);
       } catch (e) {
+        // v16 `conflict`: later edits touched these photos. Say so, and stop offering this Undo.
+        if ((e as { kind?: unknown } | null)?.kind === "conflict") {
+          touchedRef.current.add(batch.batchId);
+          setTouched(new Set(touchedRef.current));
+          const tid = batchToast.current.get(batch.batchId);
+          if (tid != null) toasts.retract(tid);
+          return void toasts.push(describeError(e).message, { kind: "error" });
+        }
         onError(e);
       }
     },
@@ -293,9 +329,11 @@ export function useWorkflow(d: Deps) {
     if (lastBatch) void undoBatch(lastBatch);
   }, [lastBatch, undoBatch]);
 
-  const remember = (batchId: number | null, label: string, sceneIds: number[]): LastBatch | null => {
+  const remember = (batchId: number | null, label: string, sceneIds: number[], imageIds: number[] = []): LastBatch | null => {
     if (batchId == null) return null;
-    const b = { batchId, label, sceneIds, at: Date.now() };
+    // Undo is linear: every older batch's toast loses its Undo button (the text stays).
+    batchToast.current.forEach((tid) => toasts.retract(tid));
+    const b = { batchId, label, sceneIds, imageIds, at: Date.now() };
     setBatchStack((st) => [...st, b].slice(-20));
     return b;
   };
@@ -318,7 +356,7 @@ export function useWorkflow(d: Deps) {
         const n = out ? out.changedIds.length : 0;
         const need = out ? out.notConvergedIds.length : 0;
         const label = labelOf(sceneId);
-        const b = remember(r.batch.batchId, `Apply ${label}`, [sceneId]);
+        const b = remember(r.batch.batchId, `Apply ${label}`, [sceneId], r.batch.changedIds);
         await afterChange(r.batch.changedIds);
         if (r.cancelled) {
           const tid = toasts.push(r.scenes.length === 0 ? `Stopped. Nothing was applied to ${label}` : `Stopped after ${plural(r.scenes.length, "scene")}`, {
@@ -356,7 +394,7 @@ export function useWorkflow(d: Deps) {
         const n = r.scenes.reduce((a, s) => a + s.changedIds.length, 0);
         const need = r.scenes.filter((s) => s.notConvergedIds.length > 0);
         const needN = need.reduce((a, s) => a + s.notConvergedIds.length, 0);
-        const b = remember(r.batch.batchId, `Apply ${plural(r.scenes.length, "scene")}`, r.scenes.map((s) => s.sceneId));
+        const b = remember(r.batch.batchId, `Apply ${plural(r.scenes.length, "scene")}`, r.scenes.map((s) => s.sceneId), r.batch.changedIds);
         await afterChange(r.batch.changedIds);
         const head = r.cancelled ? `Stopped after ${plural(r.scenes.length, "scene")} (${plural(n, "photo")})` : `Applied ${plural(r.scenes.length, "scene")} to ${plural(n, "photo")}`;
         const tid = toasts.push(`${head}${needN > 0 ? ` · ${needN} need a look` : ""}`, {
@@ -420,7 +458,7 @@ export function useWorkflow(d: Deps) {
       setBusy({ kind: "auto", done: 0, total: reps.length });
       try {
         const r = await unwrap(commands.applyStylePrediction(reps));
-        const b = remember(r.batchId, "Auto Edit (My Style)", []);
+        const b = remember(r.batchId, "Auto Edit (My Style)", [], reps);
         await afterChange(reps);
         const tid = toasts.push(`Auto edited ${plural(sceneIds.length, "scene")}. Review ${sceneIds.length === 1 ? "it" : "each one"}, then apply.`, {
           action: b ? { label: "Undo", testid: "auto-undo", onClick: () => void undoBatch(b) } : undefined,
@@ -513,6 +551,8 @@ export function useWorkflow(d: Deps) {
     busy,
     lastBatch,
     batchForScene,
+    undoReason,
+    noteCommit,
     learnFor,
     setLearnFor,
     replaceFor,

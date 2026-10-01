@@ -29,6 +29,11 @@ interface Props {
   sceneNumber: number;
   progress: SceneProgress | null;
   fileName: (id: number) => string;
+  /**
+   * Edit step: the project's keepers. Targets are the scene's keepers minus the representative (the same set as the plan's
+   * `Apply to N`); non-keepers join only through `Include non-keepers`. Omitted outside the Edit step.
+   */
+  keeperIds?: number[];
   onClose: () => void;
   /** Apply with the panel's options: the caller runs `apply_scene_edit` (one undoable batch, plan status, needs-a-look) and closes the panel. */
   onApply: (options: SceneApplyOptions) => void;
@@ -41,7 +46,7 @@ interface Props {
 
 const RENDER_EDGE = 360;
 
-export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, onClose, onApply, onApplied }: Props) {
+export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, keeperIds, onClose, onApply, onApplied }: Props) {
   const [rows, setRows] = useState<Map<number, RawImageEntry>>(new Map());
   const fileName = useCallback((id: number) => rows.get(id)?.fileName ?? libName(id), [rows, libName]);
   useEffect(() => {
@@ -76,7 +81,39 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
   const [includeRejected, setIncludeRejected] = useState(false);
   const nonAnchors = useMemo(() => scene.imageIds.filter((i) => !scene.anchorIds.includes(i)), [scene]);
   const rejectedCount = useMemo(() => nonAnchors.filter((i) => rows.get(i)?.pick === "reject").length, [nonAnchors, rows]);
-  const targetIds = useMemo(() => (includeRejected ? nonAnchors : nonAnchors.filter((i) => rows.get(i)?.pick !== "reject")), [nonAnchors, rows, includeRejected]);
+  const keeperSet = useMemo(() => (keeperIds ? new Set(keeperIds) : null), [keeperIds]);
+  const [includeNonKeepers, setIncludeNonKeepers] = useState(false);
+  const nonKeeperCount = useMemo(() => (keeperSet ? nonAnchors.filter((i) => !keeperSet.has(i)).length : 0), [nonAnchors, keeperSet]);
+  const targetIds = useMemo(
+    () =>
+      keeperSet
+        ? nonAnchors.filter((i) => includeNonKeepers || keeperSet.has(i))
+        : includeRejected
+          ? nonAnchors
+          : nonAnchors.filter((i) => rows.get(i)?.pick !== "reject"),
+    [nonAnchors, rows, includeRejected, keeperSet, includeNonKeepers],
+  );
+  // Frames the user retouched by hand start unticked (an explicit tick still overrides).
+  const [editedByUser, setEditedByUser] = useState<Set<number>>(new Set());
+  useEffect(() => {
+    if (!keeperSet) return;
+    let live = true;
+    (async () => {
+      const out = new Set<number>();
+      for (let i = 0; i < scene.imageIds.length; i += 200) {
+        try {
+          const st = await unwrap(commands.getEditStates(scene.imageIds.slice(i, i + 200)));
+          st.forEach((s) => (s.editSource === "user" || s.editSource === "pasted") && out.add(s.imageId));
+        } catch {
+          return;
+        }
+      }
+      if (live) setEditedByUser(out);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [scene.imageIds, keeperSet]);
 
   const change = (patch: Partial<MatchOptions>, needsSolve = true) => {
     setOpts((o) => ({ ...o, ...patch }));
@@ -89,7 +126,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
     try {
       const res = await unwrap(commands.matchScene(scene.anchorIds, targetIds, opts));
       setPreviews(res);
-      setExcluded(new Set());
+      setExcluded(new Set(res.filter((p) => editedByUser.has(p.targetId)).map((p) => p.targetId)));
       setStale(false);
     } catch (e) {
       setError(formatError(e));
@@ -114,9 +151,10 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
       return onApply({
         ...(DEFAULT_SCENE_APPLY_OPTIONS as unknown as SceneApplyOptions),
         matchOptions: opts,
-        includeNonKeepers: true,
+        includeNonKeepers: keeperSet ? includeNonKeepers : true,
         skipUserEdited: false,
-        excludeIds: scene.imageIds.filter((i) => !keep.has(i)),
+        // Non-keepers are not listed when they are not part of the apply at all.
+        excludeIds: scene.imageIds.filter((i) => !keep.has(i) && (!keeperSet || includeNonKeepers || keeperSet.has(i))),
       });
     }
     try {
@@ -185,7 +223,21 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
           <button className="text-sky-400 hover:underline" onClick={() => setFieldsOpen(true)} data-testid="match-copy-fields">
             Also copy from anchor: {opts.copyFields.length === ALL_ADJUSTMENT_FIELDS.length ? "All settings" : opts.copyFields.length === DEFAULT_SYNC_FIELDS.length && !opts.copyFields.includes("crop") ? "All settings except crop" : opts.copyFields.length === 0 ? "Nothing" : `${opts.copyFields.length} groups`} ▾
           </button>
-          {rejectedCount > 0 && (
+          {keeperSet && nonKeeperCount > 0 && (
+            <label className="flex items-center gap-1.5" title="Photos outside the keepers (culled out) are left alone unless you tick this">
+              <input
+                type="checkbox"
+                checked={includeNonKeepers}
+                data-testid="match-include-nonkeepers"
+                onChange={(e) => {
+                  setIncludeNonKeepers(e.target.checked);
+                  if (previews) setStale(true);
+                }}
+              />
+              Include non-keepers ({nonKeeperCount})
+            </label>
+          )}
+          {!keeperSet && rejectedCount > 0 && (
             <label className="flex items-center gap-1.5">
               <input
                 type="checkbox"
@@ -241,7 +293,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
           {previews && (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", opacity: stale ? 0.5 : 1 }}>
               {previews.map((p) => (
-                <MatchCard key={p.targetId} p={p} strength={strength} adjustments={predicted(p)} name={fileName(p.targetId)} included={!excluded.has(p.targetId)} onToggle={toggle} />
+                <MatchCard key={p.targetId} p={p} strength={strength} adjustments={predicted(p)} name={fileName(p.targetId)} included={!excluded.has(p.targetId)} edited={editedByUser.has(p.targetId)} onToggle={toggle} />
               ))}
             </div>
           )}
@@ -252,6 +304,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, on
             <>
               <span data-testid="match-selected-count">
                 {selected.length} of {previews.length} selected
+                {previews.some((p) => editedByUser.has(p.targetId)) && ` · ${previews.filter((p) => editedByUser.has(p.targetId)).length} edited by you (unticked)`}
               </span>
               <button className="text-sky-400 hover:underline" onClick={() => setExcluded(new Set())} data-testid="match-select-all">
                 Select all
@@ -299,6 +352,7 @@ const MatchCard = memo(function MatchCard({
   adjustments,
   name,
   included,
+  edited,
   onToggle,
 }: {
   p: MatchPreview;
@@ -306,6 +360,7 @@ const MatchCard = memo(function MatchCard({
   adjustments: ParametricAdjustments;
   name: string;
   included: boolean;
+  edited: boolean;
   onToggle: (id: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -372,6 +427,11 @@ const MatchCard = memo(function MatchCard({
       <div className="mb-1.5 flex items-center gap-2">
         <input type="checkbox" checked={included} onChange={() => onToggle(p.targetId)} data-testid={`match-include-${p.targetId}`} aria-label={`Apply to ${name}`} />
         <span className="truncate font-medium text-neutral-200">{name}</span>
+        {edited && (
+          <span className="shrink-0 rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-300" data-testid={`match-edited-${p.targetId}`} title="You edited this photo yourself. Tick it to overwrite">
+            Edited by you
+          </span>
+        )}
         {p.anchorIds.length > 1 && <span className="text-[10px] text-neutral-400">blend {Math.round(p.anchorWeight * 100)}%</span>}
         {p.converged ? (
           <span className="ml-auto flex items-center gap-0.5 text-emerald-400" title="Within tolerance of the anchor at full strength">

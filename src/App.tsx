@@ -756,12 +756,17 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const reviewFrames = useCallback(
     (sceneId: number, reviewIds?: number[]) => {
       const row = rowOfScene(sceneId);
-      const first = (reviewIds && reviewIds.length > 0 ? reviewIds : row?.review)?.[0];
+      // Develop never opens on a frame outside the plan's keepers (an apply with options can report others).
+      const keepers = new Set(wf.plan?.keeperIds ?? []);
+      const wanted = reviewIds && reviewIds.length > 0 ? reviewIds : row?.review;
+      const kept = wanted?.filter((i) => keepers.has(i));
+      if (wanted && wanted.length > 0 && (kept?.length ?? 0) === 0) return setNotice("The frames that need a look are not keepers");
+      const first = kept?.[0];
       if (first == null) return setNotice("Nothing to review in this scene");
       setReviewScene(sceneId);
       openScene(sceneId, first);
     },
-    [rowOfScene, openScene, setNotice],
+    [rowOfScene, openScene, setNotice, wf.plan],
   );
   const nextReview = useCallback(() => {
     const plan = wf.plan;
@@ -1450,6 +1455,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             sel={sel}
             onError={reportError}
             onNotice={setNotice}
+            onCommitted={wf.noteCommit}
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBack={() => changeMode("grid")}
             onLocate={locateFolder}
@@ -1547,6 +1553,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           // In the Edit step the scene's representative is the single anchor of the preview (no anchors are graded there).
           scene={step === "edit" && matchScene.anchorIds.length === 0 ? { ...matchScene, anchorIds: [rowOfScene(matchScene.id)?.entry.representativeId ?? matchScene.imageIds[0]] } : matchScene}
           sceneNumber={scenes.number(matchScene.id)}
+          keeperIds={step === "edit" ? wf.plan?.keeperIds : undefined}
           progress={scenes.progress}
           fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
           onClose={() => setMatchOpen(null)}
@@ -1583,7 +1590,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           }}
         />
       )}
-      <Toasts api={toasts} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
     </main>
   );
 }
