@@ -3,19 +3,24 @@
 //! ```text
 //! cargo run --release --example style_eval -- [--folder DIR] [--out DIR] [--size PX]
 //!     [--train-frac 0.6] [--split camera|time] [--rebuild] [--limit N] [--linear-only]
-//!     [--save-sheets N] [--sheet-stems A,B] [--models DIR] [--latency N]
+//!     [--save-sheets N] [--sheet-stems A,B] [--models DIR] [--latency N] [--no-auto-anchor]
+//!     [--half-life off|auto|N]
 //! ```
 //! - `--folder`: RAWs + Lightroom `<stem>.xmp` sidecars, read in place and never written
 //!   (default: `$SIEVE_SAMPLE_XMP_DIR`, then the user's proposal shoot).
 //! - Dataset (`<out>/dataset.json`, reused unless `--rebuild`): every RAW's embedded preview
 //!   -> scene features -> scenes (Phase 7 `detect::group`, default options); every edited
 //!   frame (sidecar with develop settings, `is_style_sample`) -> a neutral render at
-//!   `STATS_MAX_EDGE` -> `FrameContext` + the user's settings.
+//!   `STATS_MAX_EDGE` + Sieve's Auto tone of the frame (the model's anchor, same call and
+//!   faces as the "auto tone" column) -> `FrameContext` + the user's settings (+ their render
+//!   measured: stage B). `--no-auto-anchor` drops the Auto anchor (ablation).
 //! - Split: capture-time order, first `--train-frac` train, the rest held out (a later part
 //!   of the shoot, i.e. later scenes / light): per camera (default) or one global cut.
 //! - Held-out frames are rendered at `--size` (default 768) with: the user's settings (masks
-//!   removed: the plain pipeline cannot evaluate Lightroom mattes here), the prediction,
-//!   "no edit" (format defaults), Sieve's Auto (`develop::auto`, what the Develop "Auto"
+//!   removed: the plain pipeline cannot evaluate Lightroom mattes here), "predicted" (what
+//!   the app applies: `StyleModel::predict_refined`, regression + exposure refinement with
+//!   renders at `REFINE_EDGE`), "stage A" (`predict`, the regression alone), "no edit"
+//!   (format defaults), Sieve's Auto (`develop::auto`, what the Develop "Auto"
 //!   buttons return; see [`real_auto`]): "auto tone" (Basic Auto tone, as-shot WB) and
 //!   "auto tone+wb" (Auto white balance, then Auto tone on it), the older "ref auto"
 //!   (`style_model::eval::reference_auto_tone`, the in-app validation's fallback), and
@@ -52,7 +57,7 @@ use sieve_lib::raw;
 use sieve_lib::scene::{self, detect, DetectFrame, SceneFeatures};
 use sieve_lib::xmp;
 
-const NM: usize = 8;
+const NM: usize = 7;
 const DEFAULT_FOLDER: &str = "/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal/10060918";
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -272,11 +277,25 @@ fn build_dataset(folder: &Path, limit: usize) -> Dataset {
         .collect();
     let t = Instant::now();
     let done = AtomicUsize::new(0);
+    let dev = DevelopCache::new(DevelopConfig { cache_bytes: 4 << 30, mask_cache: None });
     let entries: Vec<Entry> = edited
         .par_iter()
         .map(|(i, user)| {
             let f = &frames[*i];
             let d = decode(&f.path);
+            // The style model's anchor: Sieve's Auto tone (as the app: format defaults,
+            // as-shot WB, analysis faces), the same call as the "auto tone" column.
+            let faces = detect_faces(&d, f.format);
+            let src = SourceImage { id: *i as i64 + 1, path: f.path.clone(), orientation: Some(d.orientation) };
+            let auto = auto::auto_tone_with_faces(
+                &dev,
+                &src,
+                &ParametricAdjustments::defaults_for(f.format),
+                AdjustmentField::AUTO_TONE,
+                faces.as_deref(),
+            )
+            .expect("auto_tone");
+            dev.forget_images(&[src.id]);
             let neutral = ParametricAdjustments::defaults_for(f.format);
             let render_features = RenderFeatures::from_render(&render(&d, &neutral, scene::STATS_MAX_EDGE));
             let mut plain = style_model::targets::strip_per_image(user);
@@ -294,6 +313,8 @@ fn build_dataset(folder: &Path, limit: usize) -> Dataset {
                 render: render_features,
                 preview: f.features.clone(),
                 scene: contexts[scene_of[*i] as usize].clone(),
+                auto: Some(style_model::AutoAnchor::from_values(&auto)),
+                captured_at_ms: f.meta.captured_at_ms,
             };
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_multiple_of(50) {
@@ -366,7 +387,8 @@ fn main() {
     let cache = out.join("dataset.json");
     let ds: Dataset = match std::fs::read(&cache).ok().filter(|_| !flag("--rebuild")) {
         Some(b)
-            if serde_json::from_slice::<Dataset>(&b).is_ok_and(|d| d.entries.iter().all(|e| e.edited.is_some())) =>
+            if serde_json::from_slice::<Dataset>(&b)
+                .is_ok_and(|d| d.entries.iter().all(|e| e.edited.is_some() && e.context.auto.is_some())) =>
         {
             serde_json::from_slice(&b).expect("dataset.json")
         }
@@ -377,6 +399,12 @@ fn main() {
         }
     };
     let mut entries = ds.entries.clone();
+    for e in &mut entries {
+        e.context.captured_at_ms = e.captured_at_ms;
+        if flag("--no-auto-anchor") {
+            e.context.auto = None;
+        }
+    }
     entries.sort_by_key(|e| (e.captured_at_ms.unwrap_or(i64::MAX), e.path.clone()));
     // Split: `--split camera` (default) = capture-time split within each camera (the first
     // `train_frac` of every body's edits train, its later frames are held out); `--split time`
@@ -446,12 +474,15 @@ fn main() {
     println!("kept:");
     for tm in &model.targets {
         println!(
-            "  {:<17} {:>8.3} vs {:>8.3}  (lambda {}, {} trees)",
+            "  {:<17} {:>8.3} vs {:>8.3}  (lambda {}, {} trees, knn {}, recent {}, anchor {})",
             tm.name,
             tm.cv_mae,
             tm.cv_mae_mean,
             tm.lambda,
-            tm.gbdt.trees.len()
+            tm.gbdt.trees.len(),
+            tm.knn_weight,
+            tm.blend.recent,
+            tm.blend.anchor
         );
     }
     for tpl in &model.templates {
@@ -490,16 +521,8 @@ fn main() {
     };
 
     // Held-out renders.
-    const METHODS: [&str; NM] = [
-        "stage A",
-        "A+refine exp",
-        "A+refine exp+wb",
-        "no edit",
-        "auto tone",
-        "auto tone+wb",
-        "ref auto",
-        "preset+mean",
-    ];
+    const METHODS: [&str; NM] =
+        ["predicted", "stage A", "no edit", "auto tone", "auto tone+wb", "ref auto", "preset+mean"];
     // Sieve's Auto runs through the app's develop cache (sources forgotten after each frame).
     let dev = DevelopCache::new(DevelopConfig { cache_bytes: 4 << 30, mask_cache: None });
     struct Row {
@@ -539,26 +562,23 @@ fn main() {
                 a
             };
             let stage_a = model.predict(&e.context).adjustments;
+            // What the app applies: stage A + the exposure refinement (`predict_refined`).
             let mut measure = |a: &ParametricAdjustments| -> sieve_lib::ipc::error::AppResult<ImageStats> {
-                let img = render(&d, a, scene::STATS_MAX_EDGE);
+                let img = render(&d, a, style_model::REFINE_EDGE);
                 let mut st = scene::stats::measure(0, &img, None);
                 st.white_balance = scene::stats::effective_white_balance(a, e.context.as_shot);
                 st.as_shot = e.context.as_shot;
                 Ok(st)
             };
             let t_r = Instant::now();
-            let exp = style_model::RefineGroups { exposure: true, ..Default::default() };
-            let exp_wb = style_model::RefineGroups { exposure: true, white_balance: true, tone: false };
-            let refined = model.refine(&e.context, &stage_a, exp, &mut measure).expect("refine");
+            let predicted = model.predict_refined(&e.context, &mut measure).expect("refine").adjustments;
             let refine_ms = t_r.elapsed().as_secs_f64() * 1000.0;
-            let refined_tone = model.refine(&e.context, &stage_a, exp_wb, &mut measure).expect("refine");
             let faces = detect_faces(&d, e.format);
             let src = SourceImage { id: k as i64 + 1, path: e.path.clone(), orientation: Some(d.orientation) };
             let ([auto_tone, auto_tone_wb], auto_ms) = real_auto(&dev, &src, e.format, faces.as_deref());
             let adjs = vec![
+                with_crop(predicted),
                 with_crop(stage_a),
-                with_crop(refined),
-                with_crop(refined_tone),
                 with_crop(ParametricAdjustments::defaults_for(e.format)),
                 with_crop(auto_tone),
                 with_crop(auto_tone_wb),
@@ -591,7 +611,7 @@ fn main() {
                 let (w, h) = (reference.width as usize, reference.height as usize);
                 // user | stage A | no edit | auto
                 let mut px = vec![0u8; w * 4 * h * 3];
-                for (c, img) in [&reference, &rendered[0], &rendered[3], &rendered[4]].iter().enumerate() {
+                for (c, img) in [&reference, &rendered[0], &rendered[2], &rendered[3]].iter().enumerate() {
                     for y in 0..h {
                         px[(y * w * 4 + c * w) * 3..(y * w * 4 + c * w + w) * 3]
                             .copy_from_slice(&img.rgb[y * w * 3..(y + 1) * w * 3]);
@@ -626,12 +646,12 @@ fn main() {
     // Per-frame results for `style_e2e` (same frames through the catalog / command layer).
     let dump: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| serde_json::json!({"stem": r.stem, "predicted": r.de[0], "noEdit": r.de[3], "autoTone": r.de[4], "autoToneWb": r.de[5], "referenceAuto": r.de[6]}))
+        .map(|r| serde_json::json!({"stem": r.stem, "predicted": r.de[0], "stageA": r.de[1], "noEdit": r.de[2], "autoTone": r.de[3], "autoToneWb": r.de[4], "referenceAuto": r.de[5]}))
         .collect();
     std::fs::write(out.join("heldout.json"), serde_json::to_vec_pretty(&dump).unwrap()).unwrap();
 
     println!("\n== Held-out dE2000 (vs the user's own settings rendered by Sieve), {} frames ==", rows.len());
-    println!("  {:<14} {:>6} {:>6} {:>6}   stage A better on", "method", "mean", "median", "p90");
+    println!("  {:<14} {:>6} {:>6} {:>6}   predicted better on", "method", "mean", "median", "p90");
     for (m, name) in METHODS.iter().enumerate() {
         let v: Vec<f64> = rows.iter().map(|r| r.de[m]).collect();
         let w = rows.iter().filter(|r| r.de[0] < r.de[m]).count();
@@ -639,7 +659,7 @@ fn main() {
         println!("  {:<14} {:>6.2} {:>6.2} {:>6.2}   {}", name, mean(&v), pct(&v, 0.5), pct(&v, 0.9), wins);
     }
     for (k, name) in ["user WB", "user exposure", "user basic tone"].iter().enumerate() {
-        println!("  (diagnostic) stage A + {name}: {:.2}", mean(&rows.iter().map(|r| r.diag[k]).collect::<Vec<_>>()));
+        println!("  (diagnostic) predicted + {name}: {:.2}", mean(&rows.iter().map(|r| r.diag[k]).collect::<Vec<_>>()));
     }
     for (label, filt) in [
         ("ARW", Box::new(|r: &Row| r.format == ImageFormat::Arw) as Box<dyn Fn(&Row) -> bool>),
@@ -660,7 +680,7 @@ fn main() {
 
     // Per camera body: prediction vs Sieve's Auto vs no edit (mean / median / p90).
     println!("\n== Held-out dE2000 per camera: mean / median / p90 ==");
-    let shown = [0usize, 4, 5, 6, 3];
+    let shown = [0usize, 1, 3, 4, 5, 2];
     let head: Vec<String> = shown.iter().map(|&m| format!("{:>21}", METHODS[m])).collect();
     println!("  {:<28} {:>4}{}", "camera", "n", head.join(""));
     let mut cams: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
@@ -738,18 +758,19 @@ fn main() {
     let rm: Vec<f64> = rows.iter().map(|r| r.refine_ms).collect();
     let am: Vec<f64> = rows.iter().map(|r| r.auto_ms).collect();
     println!(
-        "\n== Timing ==\n  train {train_ms:.0} ms ({} samples); predict {predict_us:.1} us/frame; neutral 640 px render + features {:.0} ms median; refine (exposure+WB solve) {:.0} ms median (parallel eval, {} threads, decode excluded)",
+        "\n== Timing ==\n  train {train_ms:.0} ms ({} samples); predict {predict_us:.1} us/frame; neutral 640 px render + features {:.0} ms median; refine (exposure solve, {} px) {:.0} ms median (parallel eval, {} threads, decode excluded)",
         samples.len(),
         pct(&nm, 0.5),
+        style_model::REFINE_EDGE,
         pct(&rm, 0.5),
         rayon::current_num_threads()
     );
     let worst: Vec<String> = {
         let mut r: Vec<&Row> = rows.iter().collect();
         r.sort_by(|a, b| b.de[0].total_cmp(&a.de[0]));
-        r.iter().take(8).map(|r| format!("{} {:.2} (no edit {:.2})", r.stem, r.de[0], r.de[3])).collect()
+        r.iter().take(8).map(|r| format!("{} {:.2} (auto {:.2})", r.stem, r.de[0], r.de[3])).collect()
     };
-    println!("  worst stage A: {}", worst.join(", "));
+    println!("  worst predicted: {}", worst.join(", "));
     println!("  auto_tone (warm, under the parallel eval) p50 {:.0} ms p95 {:.0} ms", pct(&am, 0.5), pct(&am, 0.95));
 
     let n_lat: usize = arg("--latency").and_then(|v| v.parse().ok()).unwrap_or(0);
