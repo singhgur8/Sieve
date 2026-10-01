@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example style_eval -- [--folder DIR] [--out DIR] [--size PX]
 //!     [--train-frac 0.6] [--split camera|time] [--rebuild] [--limit N] [--linear-only]
-//!     [--save-sheets N] [--sheet-stems A,B]
+//!     [--save-sheets N] [--sheet-stems A,B] [--models DIR] [--latency N]
 //! ```
 //! - `--folder`: RAWs + Lightroom `<stem>.xmp` sidecars, read in place and never written
 //!   (default: `$SIEVE_SAMPLE_XMP_DIR`, then the user's proposal shoot).
@@ -15,10 +15,20 @@
 //!   of the shoot, i.e. later scenes / light): per camera (default) or one global cut.
 //! - Held-out frames are rendered at `--size` (default 768) with: the user's settings (masks
 //!   removed: the plain pipeline cannot evaluate Lightroom mattes here), the prediction,
-//!   "no edit" (format defaults), a reference Auto tone (see [`auto_tone`]; Sieve has no
-//!   Auto yet), and "preset" (the camera template + training-mean sliders). The user's crop
-//!   is applied to all so only colour/tone differ. Reports CIEDE2000 mean vs the user's
-//!   render (3x3 box filter, every 3rd pixel as `parity_eval`) and slider MAE per group.
+//!   "no edit" (format defaults), Sieve's Auto (`develop::auto`, what the Develop "Auto"
+//!   buttons return; see [`real_auto`]): "auto tone" (Basic Auto tone, as-shot WB) and
+//!   "auto tone+wb" (Auto white balance, then Auto tone on it), the older "ref auto"
+//!   (`style_model::eval::reference_auto_tone`, the in-app validation's fallback), and
+//!   "preset" (the camera template + training-mean sliders). The user's crop is applied to
+//!   all so only colour/tone differ. Reports CIEDE2000 mean vs the user's render (3x3 box
+//!   filter, every 3rd pixel as `parity_eval`) and slider MAE per group.
+//! - `--models DIR` (default `src-tauri/models`): SCRFD (`det_10g.onnx`) face boxes for Auto
+//!   tone, detected on the neutral render as the analysis does on the preview (score >= 0.6,
+//!   height >= 4%). Without the model Auto runs with `faces = None` (skin-colour guard), as
+//!   in-app for photos that were not analysed.
+//! - `--latency N`: afterwards, `auto_tone` latency on the first N held-out frames, one at a
+//!   time (cold = source not decoded yet; warm = decoded), split into the exposure stage and
+//!   the slider models + skin guard, in units of one 384 px measurement render.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,8 +38,12 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use sieve_lib::develop::{camera, pipeline, source};
-use sieve_lib::ipc::types::{ImageFormat, ImageStats, ParametricAdjustments, SceneDetectOptions};
+use sieve_lib::develop::{auto, camera, pipeline, source, DevelopCache, DevelopConfig, SourceImage};
+use sieve_lib::ipc::types::{
+    AdjustmentField, ImageFormat, ImageStats, NormRect, ParametricAdjustments, SceneDetectOptions, WhiteBalance,
+};
+use sieve_lib::lut::LutLibrary;
+use sieve_lib::ml::segment::{RgbImage, SegmentConfig, SegmentEngine};
 use sieve_lib::ml::style_model::{
     self, features, slider_values, targets, FrameContext, RenderFeatures, SceneContext, StyleSample, TrainOptions,
 };
@@ -38,7 +52,7 @@ use sieve_lib::raw;
 use sieve_lib::scene::{self, detect, DetectFrame, SceneFeatures};
 use sieve_lib::xmp;
 
-const NM: usize = 6;
+const NM: usize = 8;
 const DEFAULT_FOLDER: &str = "/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal/10060918";
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -114,13 +128,72 @@ fn as_shot(d: &Decoded, adj: &ParametricAdjustments) -> Option<sieve_lib::ipc::t
     camera::as_shot_values(&d.img.color, &profile)
 }
 
-/// Reference "Auto tone" baseline (`style_model::eval::reference_auto_tone`, shared with the
-/// in-app validation; used while `develop::auto::auto_tone` is a stub).
-fn auto_tone(d: &Decoded, format: ImageFormat) -> ParametricAdjustments {
+/// Older reference "Auto tone" (`style_model::eval::reference_auto_tone`, the in-app
+/// validation's fallback when `develop::auto::auto_tone` fails); an extra column.
+fn reference_auto(d: &Decoded, format: ImageFormat) -> ParametricAdjustments {
     style_model::eval::reference_auto_tone(format, |a| {
         Ok::<_, ()>(RenderFeatures::from_render(&render(d, a, style_model::eval::AUTO_MEASURE_EDGE)))
     })
     .expect("infallible")
+}
+
+/// Directory of the SCRFD model (`--models`), set once in `main`.
+static MODELS: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+thread_local! {
+    static FACE_ENGINE: std::cell::RefCell<Option<SegmentEngine>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Face boxes as the analysis would store them (`FaceInfo.bbox`: oriented, uncropped
+/// preview frame): SCRFD on the neutral render. `None` without the model.
+fn detect_faces(d: &Decoded, format: ImageFormat) -> Option<Vec<NormRect>> {
+    let dir = MODELS.get()?.as_ref()?;
+    let img = render(d, &ParametricAdjustments::defaults_for(format), 1024);
+    FACE_ENGINE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let engine = slot.get_or_insert_with(|| SegmentEngine::new(SegmentConfig::new(dir)));
+        let (w, h) = (img.width as f32, img.height as f32);
+        let dets = engine
+            .detect_faces(RgbImage { data: &img.rgb, width: img.width as usize, height: img.height as usize })
+            .ok()?;
+        Some(
+            dets.into_iter()
+                .filter(|f| f.score >= 0.6 && (f.bbox[3] - f.bbox[1]) / h >= 0.04)
+                .map(|f| NormRect {
+                    x: f.bbox[0] / w,
+                    y: f.bbox[1] / h,
+                    width: (f.bbox[2] - f.bbox[0]) / w,
+                    height: (f.bbox[3] - f.bbox[1]) / h,
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Sieve's Auto on the format defaults through the app's develop cache: `[auto tone (as-shot
+/// WB), auto WB then auto tone]` and the wall time of the auto-tone call (source decoded).
+fn real_auto(
+    cache: &DevelopCache,
+    src: &SourceImage,
+    format: ImageFormat,
+    faces: Option<&[NormRect]>,
+) -> ([ParametricAdjustments; 2], f64) {
+    let defaults = ParametricAdjustments::defaults_for(format);
+    let mut with_wb = defaults.clone();
+    // Auto WB first: also decodes the source, so the timed auto tone below is warm.
+    if let Ok(w) = auto::auto_white_balance(cache, src, &defaults) {
+        with_wb.white_balance = WhiteBalance::Custom { temperature_k: w.temperature_k, tint: w.tint };
+    }
+    let t = Instant::now();
+    let tone = auto::auto_tone_with_faces(cache, src, &defaults, AdjustmentField::AUTO_TONE, faces)
+        .expect("auto_tone")
+        .apply_to(&defaults);
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let tone_wb = auto::auto_tone_with_faces(cache, src, &with_wb, AdjustmentField::AUTO_TONE, faces)
+        .expect("auto_tone")
+        .apply_to(&with_wb);
+    cache.forget_images(&[src.id]);
+    ([tone, tone_wb], ms)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -271,6 +344,14 @@ fn main() {
     let size: u32 = arg("--size").and_then(|v| v.parse().ok()).unwrap_or(768);
     let train_frac: f64 = arg("--train-frac").and_then(|v| v.parse().ok()).unwrap_or(0.6);
     let limit: usize = arg("--limit").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let models =
+        arg("--models").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+    let models = models.join("det_10g.onnx").is_file().then_some(models);
+    match &models {
+        Some(m) => println!("faces: SCRFD from {}", m.display()),
+        None => println!("faces: no det_10g.onnx (--models): Auto runs with faces = None"),
+    }
+    MODELS.set(models).expect("once");
     std::fs::create_dir_all(&out).expect("out dir");
     if out.canonicalize().unwrap().starts_with("/Users/gurjotsingh/Pictures") {
         panic!("--out must not be under ~/Pictures");
@@ -409,7 +490,18 @@ fn main() {
     };
 
     // Held-out renders.
-    const METHODS: [&str; NM] = ["stage A", "A+refine exp", "A+refine exp+wb", "no edit", "auto tone", "preset+mean"];
+    const METHODS: [&str; NM] = [
+        "stage A",
+        "A+refine exp",
+        "A+refine exp+wb",
+        "no edit",
+        "auto tone",
+        "auto tone+wb",
+        "ref auto",
+        "preset+mean",
+    ];
+    // Sieve's Auto runs through the app's develop cache (sources forgotten after each frame).
+    let dev = DevelopCache::new(DevelopConfig { cache_bytes: 4 << 30, mask_cache: None });
     struct Row {
         stem: String,
         format: ImageFormat,
@@ -419,6 +511,9 @@ fn main() {
         diag: [f64; 3],
         neutral_ms: f64,
         refine_ms: f64,
+        auto_ms: f64,
+        faces: Option<usize>,
+        camera: String,
         adjs: Vec<ParametricAdjustments>,
         user: ParametricAdjustments,
         as_shot: Option<sieve_lib::ipc::types::WhiteBalanceValues>,
@@ -457,12 +552,17 @@ fn main() {
             let refined = model.refine(&e.context, &stage_a, exp, &mut measure).expect("refine");
             let refine_ms = t_r.elapsed().as_secs_f64() * 1000.0;
             let refined_tone = model.refine(&e.context, &stage_a, exp_wb, &mut measure).expect("refine");
+            let faces = detect_faces(&d, e.format);
+            let src = SourceImage { id: k as i64 + 1, path: e.path.clone(), orientation: Some(d.orientation) };
+            let ([auto_tone, auto_tone_wb], auto_ms) = real_auto(&dev, &src, e.format, faces.as_deref());
             let adjs = vec![
                 with_crop(stage_a),
                 with_crop(refined),
                 with_crop(refined_tone),
                 with_crop(ParametricAdjustments::defaults_for(e.format)),
-                with_crop(auto_tone(&d, e.format)),
+                with_crop(auto_tone),
+                with_crop(auto_tone_wb),
+                with_crop(reference_auto(&d, e.format)),
                 with_crop(preset(&e.context)),
             ];
             let reference = render(&d, &user, size);
@@ -513,6 +613,9 @@ fn main() {
                 diag,
                 neutral_ms,
                 refine_ms,
+                auto_ms,
+                faces: faces.as_ref().map(Vec::len),
+                camera: e.context.camera_key(),
                 adjs,
                 user: e.user.clone(),
                 as_shot: e.context.as_shot,
@@ -523,7 +626,7 @@ fn main() {
     // Per-frame results for `style_e2e` (same frames through the catalog / command layer).
     let dump: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| serde_json::json!({"stem": r.stem, "predicted": r.de[0], "noEdit": r.de[3], "autoTone": r.de[4]}))
+        .map(|r| serde_json::json!({"stem": r.stem, "predicted": r.de[0], "noEdit": r.de[3], "autoTone": r.de[4], "autoToneWb": r.de[5], "referenceAuto": r.de[6]}))
         .collect();
     std::fs::write(out.join("heldout.json"), serde_json::to_vec_pretty(&dump).unwrap()).unwrap();
 
@@ -553,6 +656,44 @@ fn main() {
             .map(|k| format!("{} {:.2}", METHODS[k], mean(&sel.iter().map(|r| r.de[k]).collect::<Vec<_>>())))
             .collect();
         println!("  {label:<10} n={:<4} {}", sel.len(), m.join(" | "));
+    }
+
+    // Per camera body: prediction vs Sieve's Auto vs no edit (mean / median / p90).
+    println!("\n== Held-out dE2000 per camera: mean / median / p90 ==");
+    let shown = [0usize, 4, 5, 6, 3];
+    let head: Vec<String> = shown.iter().map(|&m| format!("{:>21}", METHODS[m])).collect();
+    println!("  {:<28} {:>4}{}", "camera", "n", head.join(""));
+    let mut cams: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    for r in &rows {
+        cams.entry(r.camera.as_str()).or_default().push(r);
+    }
+    cams.insert("(all)", rows.iter().collect());
+    for (cam, sel) in &cams {
+        let cols: Vec<String> = shown
+            .iter()
+            .map(|&m| {
+                let v: Vec<f64> = sel.iter().map(|r| r.de[m]).collect();
+                format!("{:>21}", format!("{:.2} / {:.2} / {:.2}", mean(&v), pct(&v, 0.5), pct(&v, 0.9)))
+            })
+            .collect();
+        println!("  {:<28} {:>4}{}", cam, sel.len(), cols.join(""));
+    }
+    let with_faces = rows.iter().filter(|r| r.faces.is_some_and(|n| n > 0)).count();
+    let analysed = rows.iter().filter(|r| r.faces.is_some()).count();
+    println!(
+        "  faces: {with_faces} of {analysed} frames with SCRFD boxes ({} without the model)",
+        rows.len() - analysed
+    );
+    for (label, f) in [("with faces", true), ("without faces", false)] {
+        let sel: Vec<&Row> = rows.iter().filter(|r| r.faces.is_some_and(|n| n > 0) == f).collect();
+        if sel.is_empty() {
+            continue;
+        }
+        let m: Vec<String> = shown
+            .iter()
+            .map(|&k| format!("{} {:.2}", METHODS[k], mean(&sel.iter().map(|r| r.de[k]).collect::<Vec<_>>())))
+            .collect();
+        println!("  {label:<14} n={:<4} {}", sel.len(), m.join(" | "));
     }
 
     // Slider MAE per group.
@@ -595,6 +736,7 @@ fn main() {
 
     let nm: Vec<f64> = rows.iter().map(|r| r.neutral_ms).collect();
     let rm: Vec<f64> = rows.iter().map(|r| r.refine_ms).collect();
+    let am: Vec<f64> = rows.iter().map(|r| r.auto_ms).collect();
     println!(
         "\n== Timing ==\n  train {train_ms:.0} ms ({} samples); predict {predict_us:.1} us/frame; neutral 640 px render + features {:.0} ms median; refine (exposure+WB solve) {:.0} ms median (parallel eval, {} threads, decode excluded)",
         samples.len(),
@@ -608,4 +750,100 @@ fn main() {
         r.iter().take(8).map(|r| format!("{} {:.2} (no edit {:.2})", r.stem, r.de[0], r.de[3])).collect()
     };
     println!("  worst stage A: {}", worst.join(", "));
+    println!("  auto_tone (warm, under the parallel eval) p50 {:.0} ms p95 {:.0} ms", pct(&am, 0.5), pct(&am, 0.95));
+
+    let n_lat: usize = arg("--latency").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if n_lat > 0 {
+        auto_latency(&test_e[..n_lat.min(test_e.len())]);
+    }
+}
+
+/// `auto_tone` latency, one frame at a time on a fresh develop cache (as the app's command:
+/// default settings, analysis faces). Per frame: cold call (decode included), one 384 px
+/// measurement render (warm), the exposure stage alone (`exposure_features`) and the warm
+/// full call; the remainder after the exposure stage is the slider models + skin guard.
+fn auto_latency(entries: &[Entry]) {
+    let dev = DevelopCache::new(DevelopConfig { cache_bytes: 2 << 30, mask_cache: None });
+    let luts = LutLibrary::new(std::env::temp_dir().join("sieve-style-eval-luts"));
+    struct Lat {
+        stem: String,
+        faces: usize,
+        cold: f64,
+        render: f64,
+        stage1: f64,
+        warm: f64,
+        skin_clip: Option<f32>,
+    }
+    let mut out = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let d = decode(&e.path);
+        let faces = detect_faces(&d, e.format);
+        let src = SourceImage { id: 100_000 + i as i64, path: e.path.clone(), orientation: Some(d.orientation) };
+        let defaults = ParametricAdjustments::defaults_for(e.format);
+        let keys = AdjustmentField::AUTO_TONE;
+        let t = Instant::now();
+        let v = auto::auto_tone_with_faces(&dev, &src, &defaults, keys, faces.as_deref()).expect("auto_tone");
+        let cold = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        for _ in 0..3 {
+            let mut a = defaults.clone();
+            a.exposure += 0.5;
+            std::hint::black_box(dev.render_image(&src, &a, None, 384, &luts).expect("render"));
+        }
+        let render = t.elapsed().as_secs_f64() * 1000.0 / 3.0;
+        let t = Instant::now();
+        auto::exposure_features(&dev, &src, &defaults, faces.as_deref(), auto::AutoParams::default()).expect("stage 1");
+        let stage1 = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        auto::auto_tone_with_faces(&dev, &src, &defaults, keys, faces.as_deref()).expect("auto_tone");
+        let warm = t.elapsed().as_secs_f64() * 1000.0;
+        let result = v.apply_to(&defaults);
+        let skin_clip = auto::skin_clipped_fraction(&dev, &src, &result, faces.as_deref()).ok().flatten();
+        dev.forget_images(&[src.id]);
+        out.push(Lat {
+            stem: e.path.file_stem().unwrap().to_string_lossy().into_owned(),
+            faces: faces.map_or(0, |f| f.len()),
+            cold,
+            render,
+            stage1,
+            warm,
+            skin_clip,
+        });
+    }
+    let col = |f: &dyn Fn(&Lat) -> f64| -> Vec<f64> { out.iter().map(f).collect() };
+    println!(
+        "\n== auto_tone latency, {} frames one at a time ({} rayon threads idle) ==",
+        out.len(),
+        rayon::current_num_threads()
+    );
+    for (name, v) in [
+        ("cold call (decode incl.)", col(&|l| l.cold)),
+        ("warm call", col(&|l| l.warm)),
+        ("  exposure stage", col(&|l| l.stage1)),
+        ("  models + skin guard", col(&|l| (l.warm - l.stage1).max(0.0))),
+        ("one 384 px render", col(&|l| l.render)),
+        ("warm call / render", col(&|l| l.warm / l.render)),
+        ("exposure stage / render", col(&|l| l.stage1 / l.render)),
+        ("cold - warm (decode)", col(&|l| (l.cold - l.warm).max(0.0))),
+    ] {
+        println!("  {name:<26} p50 {:>7.1}  p95 {:>7.1}  max {:>7.1}", pct(&v, 0.5), pct(&v, 0.95), pct(&v, 1.0));
+    }
+    let mut slow: Vec<&Lat> = out.iter().collect();
+    slow.sort_by(|a, b| b.warm.total_cmp(&a.warm));
+    println!("  slowest warm calls (ms; renders = time / one render):");
+    for l in slow.iter().take(8) {
+        println!(
+            "    {:<14} faces {} warm {:>6.0} (~{:>4.1} renders) exposure stage {:>5.0} (~{:>4.1}) rest {:>5.0} (~{:>4.1}) cold {:>6.0}  skin clip after {}",
+            l.stem,
+            l.faces,
+            l.warm,
+            l.warm / l.render,
+            l.stage1,
+            l.stage1 / l.render,
+            l.warm - l.stage1,
+            (l.warm - l.stage1) / l.render,
+            l.cold,
+            l.skin_clip.map_or("-".into(), |c| format!("{:.3}%", c * 100.0)),
+        );
+    }
 }

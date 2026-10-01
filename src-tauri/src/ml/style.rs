@@ -535,8 +535,8 @@ pub fn holdout_split(samples: &[StyleSample]) -> Option<Vec<bool>> {
     Some(out)
 }
 
-/// Auto tone baseline for validation: `develop::auto::auto_tone` when available, else the
-/// reference auto of [`eval::reference_auto_tone`].
+/// Auto tone baseline for validation: Sieve's Auto (`develop::auto::auto_tone`, as-shot WB,
+/// no faces); the reference auto of [`eval::reference_auto_tone`] if it fails.
 pub fn auto_tone_baseline(
     cache: &DevelopCache,
     luts: &LutLibrary,
