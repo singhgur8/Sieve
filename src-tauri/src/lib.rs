@@ -171,6 +171,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::set_project_cover,
             commands::set_project_shoot_type,
             commands::remove_project,
+            // IPC v15
+            commands::set_scene_skipped,
+            commands::get_edit_states,
+            commands::mark_reviewed,
+            commands::cancel_scene_apply,
+            commands::list_xmp_failures,
         ])
         .events(collect_events![
             ImportProgress,
@@ -209,6 +215,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         .constant("PASTE_PREVIOUS_FIELDS", ipc::types::AdjustmentField::PASTE_PREVIOUS.to_vec())
         .constant("DEFAULT_KEEPER_RULE", ipc::types::KeeperRule::default())
         .constant("DEFAULT_SCENE_APPLY_OPTIONS", ipc::types::SceneApplyOptions::default())
+        // IPC v15: scenes with at most this many keepers are `minor`.
+        .constant("MINOR_SCENE_MAX_KEEPERS", ipc::types::MINOR_SCENE_MAX_KEEPERS)
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -298,6 +306,7 @@ pub fn run() {
             let catalog = Catalog::open(path.clone())?;
             let auto_analyze = catalog.auto_analyze_blocking()?;
             app.manage(catalog);
+            app.manage(commands::SceneApplyControl::new());
             app.manage(Ingest::new(config));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             // Personal style model (IPC v14; training runs on its own thread + connection).

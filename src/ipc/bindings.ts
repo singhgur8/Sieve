@@ -116,9 +116,10 @@ export const commands = {
 	listImageIds: (query: ImageQuery) => typedError<number[], AppError>(__TAURI_INVOKE("list_image_ids", { query })),
 	/**
 	 *  Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
-	 *  inside a project pass its id). Unknown project -> `not_found`.
+	 *  inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
+	 *  (`ImageQuery.keepersOnly`, the Edit / Export steps). Unknown project -> `not_found`.
 	 */
-	getFilterCounts: (folderId: number | null, projectId: number | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId })),
+	getFilterCounts: (folderId: number | null, projectId: number | null, keepersOnly: boolean | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId, keepersOnly })),
 	/**
 	 *  Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
 	 *  preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
@@ -627,7 +628,10 @@ export const commands = {
 	 *  normalised per frame, `SceneApplyOptions.matchOptions`), skipping frames the user retouched
 	 *  after the last apply (`skipUserEdited`). One undoable batch (`undo_edit_batch`); one "Apply
 	 *  to Scene" history entry per changed image. Blocking until done (`sceneProgress` task
-	 *  `apply`). Representative without edits -> `invalid_argument`.
+	 *  `apply`; `cancel_scene_apply` stops it). Representative without edits ->
+	 *  `invalid_argument`. v15: `excludeIds` are left alone; non-converged targets are stored as
+	 *  "needs a look" (`ImageEditState`); a skipped scene is included again; the scene's coverage
+	 *  is recorded (`SceneEditEntry.unappliedKeeperIds`).
 	 */
 	applySceneEdit: (sceneId: number, options: {
 	/**
@@ -643,10 +647,18 @@ export const commands = {
 	 *  (their current settings differ from what that apply wrote) (default `true`).
 	 */
 	skipUserEdited: boolean,
+	/**
+	 *  Frames to leave alone ("Apply with options" per-photo checkboxes) (v15; default
+	 *  empty). They count as covered by the apply (not `unappliedKeeperIds`). The
+	 *  representative and ids outside the scene are ignored.
+	 */
+	excludeIds?: number[],
 } | null) => typedError<ApplyScenesResult, AppError>(__TAURI_INVOKE("apply_scene_edit", { sceneId, options })),
 	/**
-	 *  `apply_scene_edit` for every scene of `projectId` whose status is `edited` or `outdated`,
-	 *  as one undoable batch. No such scene -> empty result (`batch.batchId = null`).
+	 *  `apply_scene_edit` for every scene of `projectId` that is not skipped and whose status is
+	 *  `edited` or `outdated`, or `applied` with `unappliedKeeperIds` (v15), as one undoable
+	 *  batch. No such scene -> empty result (`batch.batchId = null`). `excludeIds` apply to every
+	 *  scene.
 	 */
 	applyAllEditedScenes: (projectId: number, options: {
 	/**
@@ -662,6 +674,12 @@ export const commands = {
 	 *  (their current settings differ from what that apply wrote) (default `true`).
 	 */
 	skipUserEdited: boolean,
+	/**
+	 *  Frames to leave alone ("Apply with options" per-photo checkboxes) (v15; default
+	 *  empty). They count as covered by the apply (not `unappliedKeeperIds`). The
+	 *  representative and ids outside the scene are ignored.
+	 */
+	excludeIds?: number[],
 } | null) => typedError<ApplyScenesResult, AppError>(__TAURI_INVOKE("apply_all_edited_scenes", { projectId, options })),
 	/**
 	 *  Undoes an edit batch (`apply_scene_edit`, `apply_all_edited_scenes`,
@@ -736,6 +754,36 @@ export const commands = {
 	 *  photos back with what the sidecars hold. Unknown id -> `not_found`.
 	 */
 	removeProject: (projectId: number) => typedError<RemoveProjectResult, AppError>(__TAURI_INVOKE("remove_project", { projectId })),
+	/**
+	 *  Skips scene `sceneId` in the Edit step (`skipped = true`: counts as done, nothing is
+	 *  copied to it, `apply_all_edited_scenes` leaves it alone) or includes it again (v15).
+	 *  Settings are never touched; applying the scene includes it again. Unknown scene ->
+	 *  `not_found`; a scene without keepers -> `invalid_argument`.
+	 */
+	setSceneSkipped: (sceneId: number, skipped: boolean) => typedError<SceneEditEntry, AppError>(__TAURI_INVOKE("set_scene_skipped", { sceneId, skipped })),
+	/**
+	 *  Per-photo workflow state of `imageIds` (given order): edit source, the batch / scene the
+	 *  current settings were applied from, "needs a look" (v15). Unknown ids -> `not_found`.
+	 */
+	getEditStates: (imageIds: number[]) => typedError<ImageEditState[], AppError>(__TAURI_INVOKE("get_edit_states", { imageIds })),
+	/**
+	 *  Clears "needs a look" on `imageIds` without changing their settings ("Looks good") (v15).
+	 *  Images that do not need a look are ignored. Returns the ids that were cleared. Unknown
+	 *  ids -> `not_found`.
+	 */
+	markReviewed: (imageIds: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("mark_reviewed", { imageIds })),
+	/**
+	 *  Stops the running `apply_scene_edit` / `apply_all_edited_scenes` (v15; no-op when none):
+	 *  scenes whose matching finished are committed as the call's batch, the rest are left
+	 *  alone; that call resolves with `cancelled: true`.
+	 */
+	cancelSceneApply: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_scene_apply")),
+	/**
+	 *  Every image whose last sidecar write / read failed (`XmpSyncState.error`), in capture
+	 *  order, scoped like `get_filter_counts` (`projectId` `null` = whole catalog) (v15). Unknown
+	 *  project -> `not_found`.
+	 */
+	listXmpFailures: (projectId: number | null) => typedError<XmpFailure[], AppError>(__TAURI_INVOKE("list_xmp_failures", { projectId })),
 };
 
 /** Events */
@@ -771,9 +819,11 @@ export const DEFAULT_KEEPER_RULE = {"minRating":1,"useSuggestions":true} as cons
 
 export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"hue":0.0,"saturation":0.0},"contrast":0.0,"curveRefineSaturation":100.0,"defringe":0.0,"dehaze":0.0,"exposure":0.0,"highlights":0.0,"hue":0.0,"moire":0.0,"noise":0.0,"saturation":0.0,"shadows":0.0,"sharpness":0.0,"temperature":0.0,"texture":0.0,"tint":0.0,"toneCurve":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]},"whites":0.0} as const;
 
-export const DEFAULT_SCENE_APPLY_OPTIONS = {"includeNonKeepers":false,"matchOptions":{"copyFields":["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","process_version"],"matchExposure":true,"matchTone":false,"matchWhiteBalance":true,"strength":1.0},"skipUserEdited":true} as const;
+export const DEFAULT_SCENE_APPLY_OPTIONS = {"excludeIds":[],"includeNonKeepers":false,"matchOptions":{"copyFields":["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","process_version"],"matchExposure":true,"matchTone":false,"matchWhiteBalance":true,"strength":1.0},"skipUserEdited":true} as const;
 
 export const LUT_LIBRARY_GROUP_ID = 2 as const;
+
+export const MINOR_SCENE_MAX_KEEPERS = 2 as const;
 
 export const MODEL_GROUP_SEGMENTATION = "segmentation" as const;
 
@@ -1061,7 +1111,13 @@ export type AppError = {
 /**  Result of `apply_scene_edit` / `apply_all_edited_scenes`: one batch for the whole call. */
 export type ApplyScenesResult = {
 	batch: EditBatchResult,
+	/**  Scenes committed, in apply order. After a cancel only the scenes finished before it. */
 	scenes: SceneApplyOutcome[],
+	/**
+	 *  `cancel_scene_apply` stopped the call (v15): scenes in `scenes` were applied (one
+	 *  batch); the scene being matched and the ones after it were not touched.
+	 */
+	cancelled: boolean,
 };
 
 /**  Result of `apply_suggestions`. */
@@ -1543,7 +1599,61 @@ export type EditPlan = {
 	unassignedKeeperIds: number[],
 	/**  Scenes with at least one keeper in the project, capture order. */
 	scenes: SceneEditEntry[],
+	/**
+	 *  The plan no longer covers every keeper (v15): keepers outside every scene
+	 *  (`unassignedKeeperIds`) or keepers added to an applied scene since its apply
+	 *  (`SceneEditEntry.unappliedKeeperIds`, scenes not skipped). "All scenes done" needs
+	 *  `!outdated` and every scene applied or skipped.
+	 */
+	outdated: boolean,
+	counts: EditPlanCounts,
+	/**  One per keeper (`keeperIds` order) (v15). */
+	editStates: ImageEditState[],
+	/**  Keepers that need a look, capture order (v15). */
+	needsReviewIds: number[],
 };
+
+/**  Scene counts of an `EditPlan` (v15). Status counts are over scenes that are not skipped. */
+export type EditPlanCounts = {
+	scenes: number,
+	toEdit: number,
+	edited: number,
+	applied: number,
+	outdated: number,
+	skipped: number,
+	/**  Minor scenes (skipped or not). */
+	minor: number,
+	/**  Keepers that need a look (`EditPlan.needsReviewIds.length`). */
+	needsReview: number,
+	/**  Sum of `unappliedKeeperIds` over the scenes that are not skipped. */
+	unappliedKeepers: number,
+	/**  `EditPlan.unassignedKeeperIds.length`. */
+	unassignedKeepers: number,
+};
+
+/**
+ *  Where an image's current develop settings came from (v15). Derived from the history
+ *  entry the image's edit history points at, so per-image undo / redo follow it.
+ */
+export type EditSource = 
+/**  Neutral settings (never edited, or reset). */
+"none" | 
+/**  The user's own edit: sliders and tools, presets, profiles, Auto Tone / WB. */
+"user" | 
+/**  Paste Settings, Sync Settings, Paste from Previous. */
+"pasted" | 
+/**  "Auto edit (my style)" (`apply_style_prediction`). */
+"auto_style" | 
+/**
+ *  Apply to Scene (`apply_scene_edit` / `apply_all_edited_scenes`) or Match Scene
+ *  (`apply_scene_match`).
+ */
+"scene_apply" | 
+/**
+ *  Settings that came from outside Sieve's history: read from the XMP sidecar (import,
+ *  Read from XMP), e.g. edited in Lightroom.
+ */
+"sidecar";
 
 /**  Adjustments + history after an undo/redo/jump. */
 export type EditState = {
@@ -1882,6 +1992,34 @@ export type HslChannels = {
 	magenta: number,
 };
 
+/**  Per-photo workflow state (v15; `EditPlan.editStates`, `get_edit_states`). */
+export type ImageEditState = {
+	imageId: number,
+	editSource: EditSource,
+	/**
+	 *  The edit batch that wrote the current settings (`scene_apply` from an apply,
+	 *  `auto_style`); `null` otherwise. Undoable with `undo_edit_batch` while not undone.
+	 */
+	batchId: number | null,
+	/**
+	 *  `scene_apply` from `apply_scene_edit`: the scene the settings were applied for (`null`
+	 *  once that scene was re-detected away, or for Match Scene).
+	 */
+	appliedSceneId: number | null,
+	/**
+	 *  The apply that wrote the current settings did not match this frame within tolerance
+	 *  (`SceneApplyOutcome.notConvergedIds`) and the user has not looked at it yet. Cleared
+	 *  by any later edit of the image (it no longer carries the applied settings) or
+	 *  `mark_reviewed`; comes back when a per-image undo returns to the applied settings.
+	 */
+	needsReview: boolean,
+	/**
+	 *  User-facing reason while `needsReview`, e.g. "Exposure did not match the
+	 *  representative".
+	 */
+	reviewReason: string | null,
+};
+
 /**
  *  Supported file formats: RAW containers in pipeline priority order, then non-RAW
  *  ("raster", display-referred) sources (Phase 7b). Renamed from `RawFormat` in IPC v9
@@ -1942,6 +2080,8 @@ export type ImageQuery = {
 	 *  with `folderId` (AND) a folder of another project matches nothing.
 	 */
 	projectId?: number | null,
+	/**  Only keepers under the catalog's `KeeperRule` (v15; the Edit / Export steps' grid). */
+	keepersOnly?: boolean,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -3181,6 +3321,12 @@ export type SceneApplyOptions = {
 	 *  (their current settings differ from what that apply wrote) (default `true`).
 	 */
 	skipUserEdited: boolean,
+	/**
+	 *  Frames to leave alone ("Apply with options" per-photo checkboxes) (v15; default
+	 *  empty). They count as covered by the apply (not `unappliedKeeperIds`). The
+	 *  representative and ids outside the scene are ignored.
+	 */
+	excludeIds?: number[],
 };
 
 /**  Per-scene result of an apply. */
@@ -3191,6 +3337,8 @@ export type SceneApplyOutcome = {
 	changedIds: number[],
 	/**  Targets left alone (`skipUserEdited`). */
 	skippedIds: number[],
+	/**  Targets left alone because they were in `SceneApplyOptions.excludeIds` (v15). */
+	excludedIds: number[],
 	/**
 	 *  Targets whose match did not converge within tolerance (`MatchPreview.converged`); their
 	 *  settings were still applied. Show them for review.
@@ -3231,7 +3379,43 @@ export type SceneEditEntry = {
 	editedAtMs: number | null,
 	/**  Last `apply_scene_edit` / `apply_all_edited_scenes` of this scene (`null` = never). */
 	appliedAtMs: number | null,
+	/**
+	 *  Checklist status of the representative's edit. Skipped scenes keep their status;
+	 *  read `skipped` first.
+	 */
 	status: SceneEditStatus,
+	/**
+	 *  The user skipped this scene in the Edit step (`set_scene_skipped`, v15): it counts as
+	 *  done, nothing is copied to it, `apply_all_edited_scenes` leaves it alone.
+	 */
+	skipped: boolean,
+	/**
+	 *  A small scene: at most [`MINOR_SCENE_MAX_KEEPERS`] keepers (v15). The plan lists them
+	 *  last, folded.
+	 */
+	minor: boolean,
+	/**
+	 *  The representative's current settings came from the style model ("Auto edit (my
+	 *  style)") (v15).
+	 */
+	autoEdited: boolean,
+	/**
+	 *  Members whose current settings were written by an apply (`ImageEditState.editSource`
+	 *  = `scene_apply`), capture order (v15; non-keepers included when they were applied to).
+	 */
+	appliedIds: number[],
+	/**
+	 *  Keepers of this scene that need a look (`ImageEditState.needsReview`), capture order
+	 *  (v15).
+	 */
+	needsReviewIds: number[],
+	/**
+	 *  Applied scenes only (`appliedAtMs` set, not skipped): keepers that the last apply did
+	 *  not cover (added to the scene or made keepers since), are not the representative, and
+	 *  have no edit of their own (`editSource` `none` or `auto_style`). Non-empty = "Apply to
+	 *  N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
+	 */
+	unappliedKeeperIds: number[],
 };
 
 /**  Progress of one scene in the Edit step checklist. */

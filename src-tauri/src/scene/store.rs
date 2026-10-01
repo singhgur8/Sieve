@@ -409,7 +409,8 @@ pub fn save_features(conn: &mut Connection, items: &[(ImageId, SceneFeatures)]) 
 /// if `replace_manual`) with a member in `scope`, then creates one `auto` scene per group.
 /// Anchor flags of regrouped images survive (up to `Scene::MAX_ANCHORS` per new scene, capture
 /// order), and so does the edit plan: a new scene containing an old scene's representative
-/// takes over its `representative_*` and `applied_*` (user choice first, then an applied one).
+/// takes over its `representative_*`, `applied_*` and `skipped` (user choice first, then an
+/// applied one).
 /// Returns `list_scenes(scope)`.
 pub fn replace_scenes(
     conn: &mut Connection,
@@ -486,7 +487,8 @@ pub fn replace_scenes(
         if let Some(p) = carried {
             tx.execute(
                 "UPDATE scenes SET representative_id = ?2, representative_source = ?3, representative_reason = ?4,
-                     applied_at_ms = ?5, applied_params_json = ?6, applied_batch_id = ?7
+                     applied_at_ms = ?5, applied_params_json = ?6, applied_batch_id = ?7,
+                     applied_covered_json = ?8, skipped = ?9
                  WHERE id = ?1",
                 params![
                     id,
@@ -495,7 +497,9 @@ pub fn replace_scenes(
                     p.reason,
                     p.applied_at_ms,
                     p.applied_params_json,
-                    p.applied_batch_id
+                    p.applied_batch_id,
+                    p.applied_covered_json,
+                    p.skipped
                 ],
             )?;
         }
@@ -514,13 +518,16 @@ struct PlanState {
     applied_at_ms: Option<i64>,
     applied_params_json: Option<String>,
     applied_batch_id: Option<i64>,
+    /// v15: coverage of the last apply and the Edit-step skip flag.
+    applied_covered_json: Option<String>,
+    skipped: bool,
 }
 
 /// Plan state of the `scenes` that have a representative.
 fn plan_states(conn: &Connection, scenes: &[SceneId]) -> AppResult<Vec<PlanState>> {
     let mut stmt = conn.prepare_cached(
         "SELECT representative_id, representative_source, representative_reason, applied_at_ms,
-                applied_params_json, applied_batch_id
+                applied_params_json, applied_batch_id, applied_covered_json, skipped
          FROM scenes WHERE id = ?1 AND representative_id IS NOT NULL",
     )?;
     let mut out = Vec::new();
@@ -535,6 +542,8 @@ fn plan_states(conn: &Connection, scenes: &[SceneId]) -> AppResult<Vec<PlanState
                     applied_at_ms: r.get(3)?,
                     applied_params_json: r.get(4)?,
                     applied_batch_id: r.get(5)?,
+                    applied_covered_json: r.get(6)?,
+                    skipped: r.get(7)?,
                 })
             })
             .optional()?;

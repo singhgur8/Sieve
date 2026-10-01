@@ -26,7 +26,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db::{now_ms, repo};
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    AdjustmentField, AdjustmentHistory, EditState, HistoryEntry, HistoryEntryId, ImageId, ParametricAdjustments,
+    AdjustmentField, AdjustmentHistory, EditSource, EditState, HistoryEntry, HistoryEntryId, ImageId,
+    ParametricAdjustments,
 };
 
 pub const ORIGINAL_LABEL: &str = "Original";
@@ -47,6 +48,19 @@ pub const LABEL_RESET: &str = "Reset";
 pub const LABEL_READ_XMP: &str = "Read from XMP";
 /// Preset label: `format!("{LABEL_PRESET_PREFIX}{name}")`.
 pub const LABEL_PRESET_PREFIX: &str = "Preset: ";
+
+/// `adjustment_history.source` of an entry labelled `label` (v15, migration 0013 mirrors
+/// it for older entries). Entries written by `batches::undo` are re-sourced from the batch
+/// item afterwards.
+pub fn source_for_label(label: &str) -> EditSource {
+    match label {
+        ORIGINAL_LABEL | LABEL_READ_XMP => EditSource::Sidecar,
+        super::batches::LABEL_APPLY_SCENE | crate::scene::LABEL_MATCH => EditSource::SceneApply,
+        super::batches::LABEL_STYLE => EditSource::AutoStyle,
+        LABEL_PASTE | LABEL_SYNC | LABEL_PASTE_PREVIOUS => EditSource::Pasted,
+        _ => EditSource::User,
+    }
+}
 
 fn validate_label(label: &str) -> AppResult<()> {
     let n = label.chars().count();
@@ -86,9 +100,9 @@ fn cursor(conn: &Connection, id: ImageId) -> AppResult<Option<Option<HistoryEntr
 
 fn insert_entry(conn: &Connection, id: ImageId, label: &str, adj: &ParametricAdjustments, now: i64) -> AppResult<i64> {
     conn.execute(
-        "INSERT INTO adjustment_history (image_id, label, params_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?4)",
-        params![id, label, serde_json::to_string(adj)?, now],
+        "INSERT INTO adjustment_history (image_id, label, params_json, created_at, updated_at, source)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        params![id, label, serde_json::to_string(adj)?, now, source_for_label(label).as_str()],
     )?;
     Ok(conn.last_insert_rowid())
 }

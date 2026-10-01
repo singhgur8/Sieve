@@ -2218,6 +2218,9 @@ pub struct ImageQuery {
     /// with `folderId` (AND) a folder of another project matches nothing.
     #[serde(default)]
     pub project_id: Option<ProjectId>,
+    /// Only keepers under the catalog's `KeeperRule` (v15; the Edit / Export steps' grid).
+    #[serde(default)]
+    pub keepers_only: bool,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2246,6 +2249,7 @@ impl Default for ImageQuery {
             missing_only: false,
             folder_id: None,
             project_id: None,
+            keepers_only: false,
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
@@ -3818,7 +3822,95 @@ pub struct SceneEditEntry {
     pub edited_at_ms: Option<i64>,
     /// Last `apply_scene_edit` / `apply_all_edited_scenes` of this scene (`null` = never).
     pub applied_at_ms: Option<i64>,
+    /// Checklist status of the representative's edit. Skipped scenes keep their status;
+    /// read `skipped` first.
     pub status: SceneEditStatus,
+    /// The user skipped this scene in the Edit step (`set_scene_skipped`, v15): it counts as
+    /// done, nothing is copied to it, `apply_all_edited_scenes` leaves it alone.
+    pub skipped: bool,
+    /// A small scene: at most [`MINOR_SCENE_MAX_KEEPERS`] keepers (v15). The plan lists them
+    /// last, folded.
+    pub minor: bool,
+    /// The representative's current settings came from the style model ("Auto edit (my
+    /// style)") (v15).
+    pub auto_edited: bool,
+    /// Members whose current settings were written by an apply (`ImageEditState.editSource`
+    /// = `scene_apply`), capture order (v15; non-keepers included when they were applied to).
+    pub applied_ids: Vec<ImageId>,
+    /// Keepers of this scene that need a look (`ImageEditState.needsReview`), capture order
+    /// (v15).
+    pub needs_review_ids: Vec<ImageId>,
+    /// Applied scenes only (`appliedAtMs` set, not skipped): keepers that the last apply did
+    /// not cover (added to the scene or made keepers since), are not the representative, and
+    /// have no edit of their own (`editSource` `none` or `auto_style`). Non-empty = "Apply to
+    /// N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
+    pub unapplied_keeper_ids: Vec<ImageId>,
+}
+
+/// Scenes with at most this many keepers are `SceneEditEntry.minor` (v15).
+pub const MINOR_SCENE_MAX_KEEPERS: u32 = 2;
+
+string_enum! {
+    /// Where an image's current develop settings came from (v15). Derived from the history
+    /// entry the image's edit history points at, so per-image undo / redo follow it.
+    pub enum EditSource {
+        /// Neutral settings (never edited, or reset).
+        None => "none",
+        /// The user's own edit: sliders and tools, presets, profiles, Auto Tone / WB.
+        User => "user",
+        /// Paste Settings, Sync Settings, Paste from Previous.
+        Pasted => "pasted",
+        /// "Auto edit (my style)" (`apply_style_prediction`).
+        AutoStyle => "auto_style",
+        /// Apply to Scene (`apply_scene_edit` / `apply_all_edited_scenes`) or Match Scene
+        /// (`apply_scene_match`).
+        SceneApply => "scene_apply",
+        /// Settings that came from outside Sieve's history: read from the XMP sidecar (import,
+        /// Read from XMP), e.g. edited in Lightroom.
+        Sidecar => "sidecar",
+    }
+}
+
+/// Per-photo workflow state (v15; `EditPlan.editStates`, `get_edit_states`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageEditState {
+    pub image_id: ImageId,
+    pub edit_source: EditSource,
+    /// The edit batch that wrote the current settings (`scene_apply` from an apply,
+    /// `auto_style`); `null` otherwise. Undoable with `undo_edit_batch` while not undone.
+    pub batch_id: Option<EditBatchId>,
+    /// `scene_apply` from `apply_scene_edit`: the scene the settings were applied for (`null`
+    /// once that scene was re-detected away, or for Match Scene).
+    pub applied_scene_id: Option<SceneId>,
+    /// The apply that wrote the current settings did not match this frame within tolerance
+    /// (`SceneApplyOutcome.notConvergedIds`) and the user has not looked at it yet. Cleared
+    /// by any later edit of the image (it no longer carries the applied settings) or
+    /// `mark_reviewed`; comes back when a per-image undo returns to the applied settings.
+    pub needs_review: bool,
+    /// User-facing reason while `needsReview`, e.g. "Exposure did not match the
+    /// representative".
+    pub review_reason: Option<String>,
+}
+
+/// Scene counts of an `EditPlan` (v15). Status counts are over scenes that are not skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditPlanCounts {
+    pub scenes: u32,
+    pub to_edit: u32,
+    pub edited: u32,
+    pub applied: u32,
+    pub outdated: u32,
+    pub skipped: u32,
+    /// Minor scenes (skipped or not).
+    pub minor: u32,
+    /// Keepers that need a look (`EditPlan.needsReviewIds.length`).
+    pub needs_review: u32,
+    /// Sum of `unappliedKeeperIds` over the scenes that are not skipped.
+    pub unapplied_keepers: u32,
+    /// `EditPlan.unassignedKeeperIds.length`.
+    pub unassigned_keepers: u32,
 }
 
 /// `get_edit_plan(projectId)`: the Edit step of one project.
@@ -3834,6 +3926,16 @@ pub struct EditPlan {
     pub unassigned_keeper_ids: Vec<ImageId>,
     /// Scenes with at least one keeper in the project, capture order.
     pub scenes: Vec<SceneEditEntry>,
+    /// The plan no longer covers every keeper (v15): keepers outside every scene
+    /// (`unassignedKeeperIds`) or keepers added to an applied scene since its apply
+    /// (`SceneEditEntry.unappliedKeeperIds`, scenes not skipped). "All scenes done" needs
+    /// `!outdated` and every scene applied or skipped.
+    pub outdated: bool,
+    pub counts: EditPlanCounts,
+    /// One per keeper (`keeperIds` order) (v15).
+    pub edit_states: Vec<ImageEditState>,
+    /// Keepers that need a look, capture order (v15).
+    pub needs_review_ids: Vec<ImageId>,
 }
 
 /// Options of `apply_scene_edit` / `apply_all_edited_scenes`. `null` on the wire = default.
@@ -3849,11 +3951,21 @@ pub struct SceneApplyOptions {
     /// Leave targets alone whose adjustments the user changed after this scene's last apply
     /// (their current settings differ from what that apply wrote) (default `true`).
     pub skip_user_edited: bool,
+    /// Frames to leave alone ("Apply with options" per-photo checkboxes) (v15; default
+    /// empty). They count as covered by the apply (not `unappliedKeeperIds`). The
+    /// representative and ids outside the scene are ignored.
+    #[serde(default)]
+    pub exclude_ids: Vec<ImageId>,
 }
 
 impl Default for SceneApplyOptions {
     fn default() -> Self {
-        Self { match_options: MatchOptions::default(), include_non_keepers: false, skip_user_edited: true }
+        Self {
+            match_options: MatchOptions::default(),
+            include_non_keepers: false,
+            skip_user_edited: true,
+            exclude_ids: Vec::new(),
+        }
     }
 }
 
@@ -3867,6 +3979,8 @@ pub struct SceneApplyOutcome {
     pub changed_ids: Vec<ImageId>,
     /// Targets left alone (`skipUserEdited`).
     pub skipped_ids: Vec<ImageId>,
+    /// Targets left alone because they were in `SceneApplyOptions.excludeIds` (v15).
+    pub excluded_ids: Vec<ImageId>,
     /// Targets whose match did not converge within tolerance (`MatchPreview.converged`); their
     /// settings were still applied. Show them for review.
     pub not_converged_ids: Vec<ImageId>,
@@ -3890,7 +4004,11 @@ pub struct EditBatchResult {
 #[serde(rename_all = "camelCase")]
 pub struct ApplyScenesResult {
     pub batch: EditBatchResult,
+    /// Scenes committed, in apply order. After a cancel only the scenes finished before it.
     pub scenes: Vec<SceneApplyOutcome>,
+    /// `cancel_scene_apply` stopped the call (v15): scenes in `scenes` were applied (one
+    /// batch); the scene being matched and the ones after it were not touched.
+    pub cancelled: bool,
 }
 
 /// Result of `undo_edit_batch`.

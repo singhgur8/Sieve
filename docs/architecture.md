@@ -21,6 +21,8 @@ src-tauri/
   migrations/0012_workflow_styles.sql v12: projects (+ folders.project_id, export_jobs.project_id), style library
                                (style_groups, style_profiles, presets per group), edit_batches, scene edit plan
                                columns, style_models/style_features, keeper_rule, XMP auto-sync on
+  migrations/0013_workflow_state.sql v13: adjustment_history.source/batch_id (per-photo edit source), batch item
+                               provenance + review flags, scenes.skipped/applied_covered_json
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -214,6 +216,14 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `train_style_model` / `trainStyleModel`, `cancel_style_training` (v14) | – | `null` (background; `styleModel*` events) |
 | `predict_style` / `predictStyle` (v14) | `imageIds: number[]` | `StylePrediction[]` (nothing saved) |
 | `apply_style_prediction` / `applyStylePrediction` (v14) | `imageIds: number[]` | `EditBatchResult` |
+| `set_scene_skipped` / `setSceneSkipped` (v15) | `sceneId: number, skipped: boolean` | `SceneEditEntry` |
+| `get_edit_states` / `getEditStates` (v15) | `imageIds: number[]` | `ImageEditState[]` |
+| `mark_reviewed` / `markReviewed` (v15) | `imageIds: number[]` | `number[]` (ids whose needs-a-look was cleared) |
+| `cancel_scene_apply` / `cancelSceneApply` (v15) | – | `null` (running apply resolves with `cancelled: true`) |
+| `list_xmp_failures` / `listXmpFailures` (v15) | `projectId: number \| null` | `XmpFailure[]` (capture order) |
+
+v15: `get_filter_counts(folderId, projectId, keepersOnly)` and `ImageQuery.keepersOnly` (keepers only);
+`SceneApplyOptions.excludeIds`.
 
 v14 project scoping: `import_folder(path, options, projectId | null)`, `get_filter_counts(folderId, projectId)`,
 `list_burst_groups(folderId, projectId)`, `list_scenes(folderId, projectId)`, `detect_scenes(folderId, projectId,
@@ -712,15 +722,15 @@ migrations tracked by `PRAGMA user_version`.
 | `burst_groups` | time/similarity clusters, optional keeper |
 | `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
 | `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
-| `adjustment_history` | per-image snapshots (label, params JSON, created/updated) |
+| `adjustment_history` | per-image snapshots (label, params JSON, created/updated); v13: `source` (who produced it) and `batch_id` (edit batch that wrote it) |
 | `presets` | `group_id` (style group, v12), name (unique per group, NOCASE), params JSON, fields JSON, `source_format`, `settings_json` + `setting_keys_json` (imported crs: settings), `supports_amount`, `warnings_json` |
 | `style_groups` / `style_profiles` | style library (v12): groups per imported source folder + built-ins 1 "User Presets" / 2 "LUTs"; looks / DCPs (read in place) / LUTs (library copies) |
-| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene) |
+| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene); v13: `before_source` / `before_batch_id` (restored by undo), `review_reason` / `reviewed_at` (needs a look) |
 | `style_models` / `style_features` | personal style model blobs + validation; per-image features (v12, owned by `ml::style`) |
 | `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
 | `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps, `project_id` (v12: all images in one project, else NULL) |
 | `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
-| `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`); v12 edit plan: `representative_id/_source/_reason`, `applied_at_ms`, `applied_params_json`, `applied_batch_id` |
+| `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`); v12 edit plan: `representative_id/_source/_reason`, `applied_at_ms`, `applied_params_json`, `applied_batch_id`; v13: `skipped`, `applied_covered_json` (ids the last apply considered) |
 | `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
 | `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
 
@@ -769,6 +779,24 @@ cascade; empty burst groups and scenes are deleted; the command removes the imag
 
 The guided-workflow step (`projects.workflow_step`) is per project; the edit plan, keepers and the Export step's
 jobs (`export_jobs.project_id`) are per project too.
+
+### Edit step state (v15)
+Per-photo state is never stored as a flag that must be cleared: it is derived from the history entry the image's
+cursor points at (`develop::batches::edit_states`). `adjustment_history.source` is set from the label on insert
+(`history::source_for_label`: Original / Read from XMP -> sidecar, Apply to Scene / Match Scene -> scene_apply,
+Auto Edit (My Style) -> auto_style, Paste / Sync / Paste from Previous -> pasted, everything else -> user);
+`commit_recorded` stamps the batch's entries with `batch_id`; `batches::undo` re-stamps the restored entries with
+the item's `before_source` / `before_batch_id`. Neutral settings are always `none`; settings without history are
+`sidecar`. Needs a look = cursor entry from a scene apply whose batch item has `review_reason` and no
+`reviewed_at`. So any edit clears it, per-image undo brings it back, and nothing is lost on reload.
+
+Plan (`scene::workflow::edit_plan`): per scene `skipped`, `minor` (<= `MINOR_SCENE_MAX_KEEPERS` keepers),
+`appliedIds` / `needsReviewIds` / `autoEdited` from the states, `unappliedKeeperIds` = keepers outside
+`applied_covered_json` (representative, targets, frames left alone and `excludeIds` of the last apply) with
+source none / auto_style. `outdated` = unassigned keepers or unapplied keepers in a scene that is not skipped.
+`replace_scenes` carries `skipped` and the coverage with the rest of the plan state. Applies run per scene in steps
+of 32 targets and check `SceneApplyControl` (managed state, `cancel_scene_apply`) between steps; finished scenes
+are committed as one batch.
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

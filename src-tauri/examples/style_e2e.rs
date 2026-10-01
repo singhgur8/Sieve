@@ -225,7 +225,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {stem:<12} catalog: pred {:5.2} auto {:5.2} none {:5.2} | eval: pred {:5.2} auto {:5.2} none {:5.2} | conf {:.2} {:?}",
             de[0], de[1], de[2], e.predicted, e.auto_tone, e.no_edit, p[0].confidence, p[0].notes
         );
-        items.push(batches::BatchItem { image_id: *id, adjustments: p[0].adjustments.clone(), scene_id: None });
+        items.push(batches::BatchItem {
+            image_id: *id,
+            adjustments: p[0].adjustments.clone(),
+            scene_id: None,
+            review_reason: None,
+        });
     }
     let col = |k: usize, eval: bool| -> f64 {
         mean(&rows.values().map(|(c, e)| if eval { e[k] } else { c[k] }).collect::<Vec<_>>())
