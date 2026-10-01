@@ -4,6 +4,8 @@
 //! The AI-mask segmentation models (~560 MB) are downloaded on first use into
 //! `<app_data_dir>/models`, which is also the directory the segmenter reads: the bundled face
 //! models are symlinked into it by [`link_bundled`] (people / person-part masks need them).
+//! Those links are absolute paths into the bundle, so [`link_bundled`] re-validates them on
+//! every release start (dangling / stale links are repointed or removed; regular files kept).
 //!
 //! Downloads go through the system `curl` (TLS, proxies, redirects, resume) into `<name>.part`,
 //! are verified against the pinned SHA-256 in `models/checksums.sha256` (compiled in), and only
@@ -166,28 +168,92 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Symlinks the bundled culling models into `dir` (the writable models dir), replacing stale
-/// links (e.g. after the app was moved). Real files already in `dir` are left alone.
+/// What [`link_bundled`] does (or, via [`plan_bundled_links`], would do) for one bundled model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkAction {
+    /// Already a symlink to the current bundled model.
+    Keep,
+    /// No entry yet: link it.
+    Create,
+    /// A symlink to somewhere else (an older app location, a cleaned `target/` bundle):
+    /// repoint it at the current bundled model.
+    Repoint { from: PathBuf },
+    /// A dangling symlink and no bundled model to point it at: remove it so nothing mistakes
+    /// it for an installed model (it is relinked on the next start with resources present).
+    RemoveDangling { from: PathBuf },
+    /// A regular file (a downloaded / hand-installed model): never touched.
+    KeepRegular,
+    /// Nothing usable either way (no entry, no bundled model), or a working symlink elsewhere
+    /// while the bundled model is missing (kept: better than no model).
+    Skip,
+}
+
+/// Read-only: the action [`link_bundled`] would take for each [`BUNDLED`] model.
+pub fn plan_bundled_links(bundled_dir: &Path, dir: &Path) -> Vec<(&'static str, LinkAction)> {
+    BUNDLED
+        .iter()
+        .map(|&name| {
+            let target = bundled_dir.join(name);
+            let link = dir.join(name);
+            let have_target = target.is_file();
+            let action = match fs::symlink_metadata(&link) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    let from = fs::read_link(&link).unwrap_or_default();
+                    // `is_file` follows the link: false for a dangling one.
+                    let resolves = link.is_file();
+                    if from == target && resolves {
+                        LinkAction::Keep
+                    } else if have_target {
+                        LinkAction::Repoint { from }
+                    } else if !resolves {
+                        LinkAction::RemoveDangling { from }
+                    } else {
+                        LinkAction::Skip
+                    }
+                }
+                Ok(_) => LinkAction::KeepRegular,
+                Err(_) if have_target => LinkAction::Create,
+                Err(_) => LinkAction::Skip,
+            };
+            (name, action)
+        })
+        .collect()
+}
+
+/// Symlinks the bundled culling models into `dir` (the writable models dir the segmenter
+/// reads), repairing links left dangling or stale by a moved app / repo or a cleaned `target/`
+/// (links are absolute paths into the bundle, so this runs at every release start).
+/// Regular files in `dir` (downloaded models) are never touched. Every model is attempted;
+/// the first error is returned. Repairs are logged to stderr.
 pub fn link_bundled(bundled_dir: &Path, dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    for name in BUNDLED {
+    let mut first_err = None;
+    for (name, action) in plan_bundled_links(bundled_dir, dir) {
         let target = bundled_dir.join(name);
         let link = dir.join(name);
-        match fs::symlink_metadata(&link) {
-            Ok(m) if m.file_type().is_symlink() => {
-                if fs::read_link(&link).ok().as_deref() == Some(target.as_path()) {
-                    continue;
-                }
-                fs::remove_file(&link)?;
+        let result = match &action {
+            LinkAction::Keep | LinkAction::KeepRegular | LinkAction::Skip => Ok(()),
+            LinkAction::Create => std::os::unix::fs::symlink(&target, &link),
+            LinkAction::Repoint { from } => {
+                eprintln!("models: repointing {} ({} -> {})", link.display(), from.display(), target.display());
+                fs::remove_file(&link).and_then(|()| std::os::unix::fs::symlink(&target, &link))
             }
-            Ok(_) => continue,
-            Err(_) => {}
-        }
-        if target.is_file() {
-            std::os::unix::fs::symlink(&target, &link)?;
+            LinkAction::RemoveDangling { from } => {
+                eprintln!(
+                    "models: removing dangling {} -> {} (bundled model missing at {})",
+                    link.display(),
+                    from.display(),
+                    target.display()
+                );
+                fs::remove_file(&link)
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("models: {name}: {action:?} failed: {e}");
+            first_err.get_or_insert(e);
         }
     }
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
 fn curl() -> PathBuf {
@@ -571,26 +637,6 @@ mod tests {
         assert_eq!(fs::read(dest.join("r.onnx")).unwrap(), body);
     }
 
-    #[test]
-    fn link_bundled_symlinks_and_repairs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        let data = tmp.path().join("data");
-        fs::create_dir_all(&bundle).unwrap();
-        for name in BUNDLED {
-            fs::write(bundle.join(name), name.as_bytes()).unwrap();
-        }
-        // A stale link from a previous app location is repointed.
-        fs::create_dir_all(&data).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("old/det_10g.onnx"), data.join("det_10g.onnx")).unwrap();
-        link_bundled(&bundle, &data).unwrap();
-        link_bundled(&bundle, &data).unwrap();
-        for name in BUNDLED {
-            assert_eq!(fs::read(data.join(name)).unwrap(), name.as_bytes());
-            assert_eq!(fs::read_link(data.join(name)).unwrap(), bundle.join(name));
-        }
-    }
-
     // ---- ModelDownloads (IPC v12) ----
 
     use std::sync::mpsc;
@@ -737,5 +783,132 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("birefnet_lite.onnx"), b"stand-in").unwrap();
         assert_eq!(subject(&segmenter), Some(true));
+    }
+
+    fn bundle_with_models(root: &Path) -> PathBuf {
+        let bundle = root.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        for name in BUNDLED {
+            fs::write(bundle.join(name), name.as_bytes()).unwrap();
+        }
+        bundle
+    }
+
+    #[test]
+    fn link_bundled_symlinks_and_repairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = bundle_with_models(tmp.path());
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        // Dangling link from a moved repo / cleaned `target/`.
+        std::os::unix::fs::symlink(tmp.path().join("old/det_10g.onnx"), data.join("det_10g.onnx")).unwrap();
+        // Working link to another (older) app location.
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("2d106det.onnx"), b"old").unwrap();
+        std::os::unix::fs::symlink(other.join("2d106det.onnx"), data.join("2d106det.onnx")).unwrap();
+
+        let plan = plan_bundled_links(&bundle, &data);
+        assert_eq!(plan[0], ("det_10g.onnx", LinkAction::Repoint { from: tmp.path().join("old/det_10g.onnx") }));
+        assert_eq!(plan[1], ("2d106det.onnx", LinkAction::Repoint { from: other.join("2d106det.onnx") }));
+        assert_eq!(plan[2], ("open_closed_eye.onnx", LinkAction::Create));
+        // Planning is read-only.
+        assert!(data.join("det_10g.onnx").symlink_metadata().is_ok() && !data.join("det_10g.onnx").exists());
+
+        link_bundled(&bundle, &data).unwrap();
+        link_bundled(&bundle, &data).unwrap();
+        for name in BUNDLED {
+            assert_eq!(fs::read(data.join(name)).unwrap(), name.as_bytes());
+            assert_eq!(fs::read_link(data.join(name)).unwrap(), bundle.join(name));
+        }
+        assert!(plan_bundled_links(&bundle, &data).iter().all(|(_, a)| *a == LinkAction::Keep));
+    }
+
+    #[test]
+    fn link_bundled_never_touches_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = bundle_with_models(tmp.path());
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("det_10g.onnx"), b"user copy").unwrap();
+        fs::write(data.join("birefnet_lite.onnx"), b"downloaded").unwrap();
+        assert_eq!(plan_bundled_links(&bundle, &data)[0].1, LinkAction::KeepRegular);
+        link_bundled(&bundle, &data).unwrap();
+        assert!(!data.join("det_10g.onnx").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(data.join("det_10g.onnx")).unwrap(), b"user copy");
+        assert_eq!(fs::read(data.join("birefnet_lite.onnx")).unwrap(), b"downloaded");
+
+        // Same with no bundle at all.
+        link_bundled(&tmp.path().join("no-bundle"), &data).unwrap();
+        assert_eq!(fs::read(data.join("det_10g.onnx")).unwrap(), b"user copy");
+        assert_eq!(fs::read(data.join("birefnet_lite.onnx")).unwrap(), b"downloaded");
+    }
+
+    #[test]
+    fn link_bundled_with_missing_resources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle"); // not created yet
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        // Dangling: removed (nothing to repoint it at), even when it names the current target.
+        let gone = tmp.path().join("old/det_10g.onnx");
+        std::os::unix::fs::symlink(&gone, data.join("det_10g.onnx")).unwrap();
+        std::os::unix::fs::symlink(bundle.join("2d106det.onnx"), data.join("2d106det.onnx")).unwrap();
+        // Working link elsewhere: kept (better than no model).
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("open_closed_eye.onnx"), b"eye").unwrap();
+        std::os::unix::fs::symlink(other.join("open_closed_eye.onnx"), data.join("open_closed_eye.onnx")).unwrap();
+
+        let plan = plan_bundled_links(&bundle, &data);
+        assert_eq!(plan[0].1, LinkAction::RemoveDangling { from: gone });
+        assert_eq!(plan[1].1, LinkAction::RemoveDangling { from: bundle.join("2d106det.onnx") });
+        assert_eq!(plan[2].1, LinkAction::Skip);
+        assert_eq!(plan[3].1, LinkAction::Skip);
+
+        link_bundled(&bundle, &data).unwrap();
+        assert!(data.join("det_10g.onnx").symlink_metadata().is_err());
+        assert!(data.join("2d106det.onnx").symlink_metadata().is_err());
+        assert_eq!(fs::read(data.join("open_closed_eye.onnx")).unwrap(), b"eye");
+        assert!(data.join(BUNDLED[3]).symlink_metadata().is_err());
+
+        // Resources appear (next start from a real bundle): everything linked.
+        let bundle = bundle_with_models(tmp.path());
+        link_bundled(&bundle, &data).unwrap();
+        for name in BUNDLED {
+            assert_eq!(fs::read_link(data.join(name)).unwrap(), bundle.join(name));
+        }
+    }
+
+    #[test]
+    fn dangling_links_are_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models");
+        let a = local(tmp.path(), "a.onnx", b"model a");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone/a.onnx"), dir.join("a.onnx")).unwrap();
+        let dl = ModelDownloads::with_groups(dir.clone(), vec![group("seg", vec![a.clone()])]);
+        let g = dl.status().groups.remove(0);
+        assert!(!g.installed && !g.files[0].installed);
+        // A link that resolves to the right file counts.
+        fs::remove_file(dir.join("a.onnx")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("src-a.onnx"), dir.join("a.onnx")).unwrap();
+        assert!(dl.status().groups[0].installed);
+    }
+
+    /// Read-only dry run against the real app-data dir (never modifies it):
+    /// `SIEVE_RESOURCE_MODELS=<app>/Contents/Resources/models cargo test real_app_data_dry_run -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_app_data_dry_run() {
+        let home = std::env::var_os("HOME").unwrap();
+        let data = Path::new(&home).join("Library/Application Support/com.sieve.app/models");
+        let bundled = std::env::var_os("SIEVE_RESOURCE_MODELS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Applications/Sieve.app/Contents/Resources/models"));
+        println!("resource models: {} (exists: {})", bundled.display(), bundled.is_dir());
+        for (name, action) in plan_bundled_links(&bundled, &data) {
+            println!("{name}: {action:?}");
+        }
     }
 }
