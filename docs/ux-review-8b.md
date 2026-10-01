@@ -301,3 +301,96 @@ Still open:
 
 ### No change needed
 The Plan layout, skip and minor presentation, the unassigned banner, the Applying pill with × and Esc, the New project dialog, the 1280 View menu, the cheat sheet's keyboard model, the Develop context bar's `Apply to 1 new`, the XMP failures popover, and Export.
+
+## Re-check 2 (2026-09-30, `phase-8b-feedback` @ 50e7457)
+
+Author: ux-designer (read-only). Evidence: mock backend (`vite --port 1933`, `/?mock=201&style=ready`), Chromium at 1280×800 and 1728×1117.
+Drivers: `test-data/ux-review-8b/recheck2/{p10_11,p11b,p11c,p11d,walk}.spec.ts` (config `pw.config.ts`). Logs: `p10_11.log`, `p11b.log`, `p11c.log`, `p11d.log`, `walk.log`.
+Screenshots: `test-data/ux-review-8b/recheck2/{1280,1728}-NN-*.png`.
+
+**Result: P1-10 and P1-11 are resolved, and none of the earlier P0/P1 items has regressed. One new P1 (P1-12 [ARCH]) is open, so the gate "no open P0/P1" is still not met.**
+P1-12 is a state that the P1-11 fix exposes and that a plain Reset can also reach: a scene whose representative goes back to unedited after an apply. That scene then blocks **Apply all** for the whole project.
+
+### P1-10 / P1-11
+
+| Item | Status | Evidence |
+|---|---|---|
+| P1-10 Options apply edits non-keepers | **Resolved** (both sizes) | Scene 3: the plan says `Apply to 9`. The panel lists 9 cards (81, 85, 86, 87, 89, 93, 99, 100, 101) with no non-keepers, and its button reads `Apply to 9 photos`. `Include non-keepers (11)` starts unticked (`*-01/02`). After the apply, the row reads `Applied to 9` and the toast reads `Applied Scene 3 to 9 photos`, so the counts agree. Scene 1 via Options: the row reads `Applied to 15 · 1 need a look`, and toast Review opens Develop on keeper 21 with `chip=review` (`*-36-options-review-develop.png`). A member I edited by hand (56) starts unticked with the `Edited by you` badge, and the footer reads `15 of 16 selected · 1 edited by you (unticked)` (`1728-05`). The suite covers the non-keeper Review guard. |
+| P1-11 Older toast Undo silently breaks a scene | **Resolved** as designed in v16 (a per-photo conflict rule, not toast order) | Exact repro (Auto edit 3 scenes → Apply Scene 1 → Undo on the older `Auto edited 3 scenes` toast): the undo is still allowed, because the apply did not write the reps. Scene 1 now **says so**: the status is `stale`, the line reads `Changed since it was applied` (amber), the button reads `Re-apply to 15`, the step pill reads `0 of 3 scenes`, and `Continue to Export` is hidden (`*-11-after-older-undo.png`). The silent inconsistency is gone. Conflict path: Apply Scene 2, then edit member 56 in Develop. The apply toast loses Undo at once (Review stays). The row ⋯ and Develop `Undo apply` are disabled with `Later edits on 1 photo. Undo those first` (`1280-18-row-undo-disabled.png`). Cmd+Z in Develop is linear: it undoes the apply first, then the rep (`p11c.log`). After Home and back, the row `Undo apply` is enabled from `appliedBatch`, and Cmd+Z in the Plan undoes it through `latestBatch` (`*-19`). **However**, `Re-apply to 15` in that state fails. See P1-12. |
+
+### Earlier P0/P1: regression spot-check (both sizes, `walk.log`)
+
+| Item | Status |
+|---|---|
+| P0-1 Scene nav | No regression. `›`=55, N=96, Shift+N=55, checklist jump to Scene 3 = 96, all `chip=rep`. |
+| P0-2 Profile hover | No regression. `Preview: Adobe Standard` → Esc → label count 0, and the view stays in Develop. |
+| P1-1 Toast Review | No regression. It works for Apply to scene and for Options (21, `chip=review`). |
+| P1-2 Persisted needs-a-look | No regression. `Applied to 15 · 1 need a look` survives Home and back. |
+| P1-3 New keepers | No regression. Picking 4 → `· 1 new keeper not edited`, `Apply to 1 new`, `Continue to Export` hidden (`*-39`). |
+| P1-4 Skip (S) | No regression. S toggles skip on and off. The cheat sheet filter `skip` now lists `S · Skip / include the focused scene · Edit step: Plan` (`*-33`). |
+| P1-5 / P1-6 | No regression. Options goes through the batch path, and the batch stack is backend-driven. |
+| P1-7 Toolbar at 1280 | No regression. scrollWidth 1044 = clientWidth 1044, and the sort control reads `Ascending`. Nothing overflows in Cull, Plan, Develop, Match or Export. |
+| P1-8 Cheat sheet | No regression. PgDn + Space scroll it (894 px at 1280) and the sheet stays open. Esc twice closes it. |
+| P1-9 New project options | Not touched since re-check 1 (no related commits). |
+
+**End-to-end walk** (both sizes): Home → open → cull (P, 3, →, X, Cmd+Z ×3) → `Continue to Edit` → Auto edit remaining → `Apply 2 edited scenes (25)` → pill `All scenes applied` → `Continue to Export` opens `Export 43 keepers` (`*-37`, `*-38`). This is unchanged and still the shortest path: 4 clicks plus a folder.
+
+### New P1
+
+#### P1-12 A scene whose representative is back to unedited after an apply is a dead end, and it blocks Apply all for every scene **[ARCH]**
+- **Repro** (either path):
+  - (a) The P1-11 repro: Auto edit 3 scenes → Apply Scene 1 → Undo on the older `Auto edited` toast.
+  - (b) Auto edit Scene 1 → Apply → `Edit ▸` → Cmd+Shift+R (Reset) on the representative.
+- **Evidence** (`p11b.log`, `p11d.log`, `1280-15-reapply-stale.png`, `1280-23-plan-stuck-reset.png`): the row reads `Changed since it was applied` and its primary green button reads `Re-apply to 15`. The tab and the header count it as `Edited 1` and `Apply 1 edited scene (15)`. Clicking Re-apply gives the red error `The representative has no edits yet. Edit it first.`, and nothing else changes. Worse, after Auto edit on scenes 2 and 3, `Apply 3 edited scenes (40)` fails with the same error and applies **nothing**, so `Continue to Export` never appears. The error does not say which scene is the problem. In path (a), the 15 members also keep the earlier look while the rep is back to the original.
+- **Why it matters**: resetting the representative to start the look over is a normal move. After it, the main button of the step ("apply everything") stops working for the whole shoot, with an error that does not point to the cause. The row's call to action (`Re-apply`) can never succeed.
+- **Cause (real backend too)**: `scene/workflow.rs::entry_for` reports `Outdated` whenever `applied_params_json` differs from the rep's settings, even when the rep has no edits. `edited_scenes` includes every `Outdated` scene. `apply_inputs` returns `invalid_argument` on the first unedited rep, and that aborts the whole Apply all.
+- **Fix, [ARCH]**:
+  1. `edited_scenes` excludes scenes whose `edited` is false.
+  2. In `apply_all_edited_scenes`, a scene that cannot be applied is skipped, not fatal. Where a single-scene error remains, it names the scene: `Scene 1: edit its representative first, then apply.`
+  3. Recommended, for truly linear undo on the P1-11 path: count a scene apply made from a representative's batch entry as a later edit of that batch, so that `undo_edit_batch(autoEdit)` returns `conflict` while that apply stands. Undo the apply first, then the auto edit, as in Lightroom.
+- **Fix, frontend** (`useWorkflow` `SceneUi`, `PlanView`, `EditContextBar`, `bits.tsx`):
+  - Add `ui = "reset"` when `entry.status === "outdated" && !entry.edited`.
+  - Row: amber `RefreshCw` icon. Status line `Representative reset · 15 photos keep the earlier look` (amber). Actions: primary `Edit ▸` (blue, as for To do). A secondary button `Undo apply` (`plan-undo-inline-<id>`) appears when `appliedBatch?.undoable` and restores the members. No `Re-apply` button.
+  - The scene counts under the **To do** tab and as "to do" in the header and progress. It is excluded from `Apply N edited scenes`.
+  - Develop context bar: the chip reads `Reset since applied · representative`, and `Apply to scene` is disabled with the visible hint `Edit this photo first`.
+- **Acceptance**: after either repro, the row shows `Edit ▸` and no Re-apply, and the header reads `Apply 2 edited scenes (25)` once scenes 2 and 3 are auto-edited. Apply all then applies those 2 scenes with no error.
+
+### Remaining P2 (none block the gate)
+
+Done since re-check 1:
+- #10: S and Esc are in the cheat sheet, and the menu shows `(S)`.
+- #11: the pill shows `Applying…` until progress arrives.
+- #12: `Apply 0` is hidden in the unassigned-only case.
+- #13: row `Undo apply` comes from persisted plan state and works after Home and back.
+- #14: the sort direction is labelled `Ascending` / `Descending`.
+- P2-9: toasts sit at the top in Develop and Undo toasts auto-dismiss after 10 s.
+
+Still open from earlier (not touched by the commits since; not re-verified unless noted):
+1. P2-3: the histogram is hidden while Masks is open.
+2. P2-7: Shift+S in the Edit step toggles the scene strip, not `This scene only`.
+3. P2-8: disabled controls explain themselves only through `title`. This now also applies to the disabled row/Develop `Undo apply` with `Later edits on 1 photo…` (`1280-18`). Show the reason as a second muted line inside the menu item.
+4. P2-11: the XMP `pending` pill is amber with a ring.
+5. P2-12: the keeper rule menu has no `Applies to all projects` footer.
+6. P2-13: home keyboard (Cmd+Shift+I, Cmd+F or `/`, arrow keys between cards) and Cmd+Shift+O are not bound.
+7. P2-14: the plan member strip is fixed at 8 thumbs, leaving about 110 px empty at 1728 (`1728-11`).
+8. P2-15: the `S1` badge appears on every filmstrip cell (still visible in `1280-36`).
+9. #15 (noted): the Library-scope Match panel still uses the per-photo undo loop.
+
+New (P2):
+
+10. **Stale "touched" hint keeps Undo disabled after a per-image undo.** `useWorkflow.syncBatches` keeps a client hint while the backend says the batch is undoable:
+
+    ```ts
+    touchedRef.current = new Set([...touchedRef.current].filter((id) => m.get(id)?.undoable !== false))
+    ```
+
+    Repro: Apply Scene 2 → edit member 56 → Cmd+Z on 56 in Develop (back to the applied value) → the row `Undo apply` stays disabled with `Later edits touched these photos…`. After Home and back it is enabled and works (`p11b.log`). Fix: once the backend has answered for a batch, drop the hint: `filter((id) => !m.has(id))`.
+11. **Cmd+Z in the Plan says `Nothing to undo`** when the newest batch is blocked by a later per-photo edit, even though something exists to undo (`p11b.log`). Show the conflict reason instead: `Later edits on 1 photo (DSC00056.ARW). Undo those in Develop first`.
+12. **The undo toast label changes after Home and back**: it reads `Undid Apply to Scene on 16 photos` (backend label) instead of `Undid Apply Scene 2…`. Build the label from the plan's scene number.
+13. **Top-placed toasts in Develop cover open dialogs and the top of the photo.** With the Match panel opened from Develop, the `Auto edited` toast covers the panel header (`1 anchor … · 16 targets`, `1728-05`). Without a dialog, it sits over the top-centre of the photo (`1280-36`). Spec: while a modal is open, place the stack `bottom-4 left-4` (clear of the dialog header and footer). In Develop without a modal, align it to the viewer's top-right (`right: rightPanel + 12px`, `top: 88px`, `w-[400px]`) so it does not sit on faces in the centre of the frame.
+
+### Keyboard
+No change needed. Cmd+Z is linear in Develop (batch first, then per-image) and conflict-aware in the Plan. S, Esc and Shift+S in the Plan behave as in re-check 1, and no new chords were added.
+
+### No change needed
+The Match panel layout in Edit-step mode (keeper targets, the `Include non-keepers (n)` opt-in, the `Edited by you` badge and footer count), backend-driven toast Undo retraction, the info toast for `conflict`, row `Undo apply` after Home and back, the `Applying…` pill, the cheat sheet's Plan rows, the disabled `Apply 0 edited scenes (0)` preview on a fresh plan, and Export.
