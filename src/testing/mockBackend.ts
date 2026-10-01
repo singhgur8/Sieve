@@ -57,6 +57,7 @@ import type {
   SceneEditEntry,
   SceneApplyOptions,
   SceneApplyOutcome,
+  SkippedScene,
   ApplyScenesResult,
   EditBatchResult,
   EditPlanCounts,
@@ -228,6 +229,8 @@ declare global {
     __mockXmpFlush?: () => void;
     /** Test hook: ms per progress step of mock `detect_scenes` / `match_scene` (default 30). */
     __mockSceneDelay?: number;
+    /** Test hook (v17): scene ids whose matching fails in apply (`file_missing` for one scene; reported in `skippedScenes` by apply all). */
+    __mockApplyFailScenes?: number[];
     /** Makes get_edit_plan fail (plan error state). */
     __mockFailPlan?: boolean;
     /** Test hook: ms `compute_ai_mask` takes in the mock (default 250). */
@@ -824,7 +827,11 @@ export function installMockBackend(count: number) {
     reviewReason: string | null;
     reviewed: boolean;
   }
-  const batches = new Map<number, { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[] }>();
+  // v17: `bases` = representatives the batch (an apply) was made from, with the batch that wrote their settings.
+  const batches = new Map<
+    number,
+    { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[]; bases: { imageId: number; base: number }[] }
+  >();
   let batchSeq = 0;
   // IPC v15: skipped scenes, frames the last apply covered, apply cancel flag.
   const sceneSkipped = new Set<number>();
@@ -863,15 +870,31 @@ export function installMockBackend(count: number) {
   function recordItems(label: string, items: MockBatchItem[], sceneIds: number[]): number | null {
     if (items.length === 0) return null;
     const batchId = ++batchSeq;
-    batches.set(batchId, { label, items, undone: false, undoneAt: null, createdAt: Date.now(), sceneIds });
+    batches.set(batchId, { label, items, undone: false, undoneAt: null, createdAt: Date.now(), sceneIds, bases: [] });
     for (const it of items) {
       const e = cursorEntry(it.id);
       if (e) e.batchId = batchId;
     }
     return batchId;
   }
-  /** v16 (Rust `batches::conflict_ids`): images of the batch edited after it. */
+  /** v17 (Rust `batches::dependent_ids`): images of the batch a later apply (not undone) was made from. */
+  function batchDependents(batchId: number): number[] {
+    const b = batches.get(batchId);
+    if (!b) return [];
+    const used = new Set<number>();
+    for (const o of batches.values()) if (!o.undone) for (const x of o.bases) if (x.base === batchId) used.add(x.imageId);
+    return b.items.map((i) => i.id).filter((id) => used.has(id));
+  }
+  /** v17 (Rust `batches::conflict_ids`): edited after the batch, or a later apply was made from it. */
   function batchConflicts(batchId: number): number[] {
+    const b = batches.get(batchId);
+    if (!b) return [];
+    const edited = new Set(batchEditedAfter(batchId));
+    const deps = new Set(batchDependents(batchId));
+    return b.items.map((i) => i.id).filter((id) => edited.has(id) || deps.has(id));
+  }
+  /** v16 (Rust `batches::edited_after_ids`): images of the batch edited after it. */
+  function batchEditedAfter(batchId: number): number[] {
     const b = batches.get(batchId);
     if (!b) return [];
     const out: number[] = [];
@@ -926,7 +949,16 @@ export function installMockBackend(count: number) {
       const applied = sceneApplied.get(sc.id);
       const editedAt = rep.hasEdits ? lastEditAt(rep.id) : null;
       // Rust: applied while the representative's settings equal those the apply was made from.
-      const status: SceneEditEntry["status"] = applied ? (JSON.stringify(getAdj(rep.id)) === applied.repSnap ? "applied" : "outdated") : rep.hasEdits ? "edited" : "to_edit";
+      // v17: applied, then the representative went back to no edits -> "reset" (a to-do scene).
+      const status: SceneEditEntry["status"] = applied
+        ? !rep.hasEdits
+          ? "reset"
+          : JSON.stringify(getAdj(rep.id)) === applied.repSnap
+            ? "applied"
+            : "outdated"
+        : rep.hasEdits
+          ? "edited"
+          : "to_edit";
       const appliedBatch = applied?.batchId != null ? batchInfo(applied.batchId) : null;
       const skipped = sceneSkipped.has(sc.id);
       const covered = sceneCovered.get(sc.id) ?? [];
@@ -938,7 +970,7 @@ export function installMockBackend(count: number) {
         appliedIds: sc.imageIds.filter((id) => id !== rep.id && src(id) === "scene_apply"),
         needsReviewIds: ks.filter((r) => editState(r.id).needsReview).map((r) => r.id),
         unappliedKeeperIds:
-          applied && !skipped ? ks.filter((r) => r.id !== rep.id && !covered.includes(r.id) && (src(r.id) === "none" || src(r.id) === "auto_style")).map((r) => r.id) : [],
+          applied && !skipped && status !== "reset" ? ks.filter((r) => r.id !== rep.id && !covered.includes(r.id) && (src(r.id) === "none" || src(r.id) === "auto_style")).map((r) => r.id) : [],
         sceneId: sc.id,
         imageIds: ks.map((r) => r.id),
         memberCount: sc.imageIds.length,
@@ -964,28 +996,62 @@ export function installMockBackend(count: number) {
     const batchId = recordItems(label, items, sceneIds);
     return { batchId, label, changedIds: items.map((i) => i.id) };
   }
-  async function applyScenes(sceneIds: number[], o: SceneApplyOptions, label: string): Promise<ApplyScenesResult> {
+  /** v17 (Rust `workflow::scene_label`): "Scene N" by plan position, "This scene" outside a plan. */
+  function sceneLabel(sid: number): string {
+    const sc = sceneOf(sid);
+    const first = sc.imageIds.map((i) => byId.get(i)).find((r) => r != null);
+    const pid = first ? projectOfFolder(first.folderId) : null;
+    if (pid == null) return "This scene";
+    const i = planEntries(rows.filter((r) => inScope(r, null, pid) && keeper(r))).findIndex((e) => e.sceneId === sid);
+    return i >= 0 ? `Scene ${i + 1}` : "This scene";
+  }
+  /**
+   * Rust `apply_scenes`. `lenient` (apply all, v17): scenes that cannot be applied are reported in
+   * `skippedScenes` instead of failing; errors name the scene ("Scene 1: ...").
+   */
+  async function applyScenes(sceneIds: number[], o: SceneApplyOptions, label: string, lenient = false): Promise<ApplyScenesResult> {
     applyCancel = false;
     const exclude = new Set(o.excludeIds ?? []);
     const items: MockBatchItem[] = [];
     const outcomes: SceneApplyOutcome[] = [];
-    const plans = sceneIds.map((sid) => {
+    const skippedScenes: SkippedScene[] = [];
+    const bases: { imageId: number; base: number; forIds: number[] }[] = [];
+    const plans = sceneIds.flatMap((sid) => {
       const sc = sceneOf(sid);
+      const name = sceneLabel(sid);
       const ks = rows.filter((r) => r.sceneId === sid && (o.includeNonKeepers || keeper(r)));
       const { rep } = repOf(ks.filter(keeper), sid);
-      if (!rep) throw { kind: "invalid_argument", message: `scene ${sid} has no keepers` };
-      if (!rep.hasEdits) throw { kind: "invalid_argument", message: "The representative has no edits yet. Edit it first." };
-      return { sc, rep, prev: sceneApplied.get(sid), targets: ks.filter((r) => r.id !== rep.id) };
+      const cannot = (reason: SkippedScene["reason"], message: string) => {
+        if (!lenient) throw { kind: "invalid_argument", message };
+        skippedScenes.push({ sceneId: sid, reason, message });
+        return [];
+      };
+      if (!rep) return cannot("no_keepers", `${name} has no keepers.`);
+      if (!rep.hasEdits)
+        return cannot(
+          "not_edited",
+          sceneApplied.has(sid) ? `${name}: its representative was reset after the last apply. Edit it first, then apply.` : `${name}: edit its representative first, then apply.`,
+        );
+      const e = cursorEntry(rep.id);
+      const base = e?.batchId != null && batches.get(e.batchId)?.undone === false ? e.batchId : null;
+      return [{ sc, rep, name, base, prev: sceneApplied.get(sid), targets: ks.filter((r) => r.id !== rep.id) }];
     });
     const total = plans.reduce((n, p) => n + p.targets.length, 0);
     let done = 0;
     let cancelled = false;
-    for (const { sc, rep, prev, targets } of plans) {
+    for (const { sc, rep, name, base, prev, targets } of plans) {
       // One progress step per scene; `cancel_scene_apply` takes effect between scenes.
       await sleep(window.__mockSceneDelay ?? 30);
       if (applyCancel) {
         cancelled = true;
         break;
+      }
+      if (targets.length && window.__mockApplyFailScenes?.includes(sc.id)) {
+        const message = `${name}: ${rep.fileName} is missing`;
+        if (!lenient) throw { kind: "file_missing", message };
+        skippedScenes.push({ sceneId: sc.id, reason: "failed", message });
+        done += targets.length;
+        continue;
       }
       const changedIds: number[] = [];
       const skippedIds: number[] = [];
@@ -1015,6 +1081,7 @@ export function installMockBackend(count: number) {
       done += targets.length;
       void emit("scene-progress", { task: "apply", done, total });
       sceneApplied.set(sc.id, { at: Date.now(), snaps, repSnap: JSON.stringify(getAdj(rep.id)), batchId: prev?.batchId ?? null });
+      if (base != null) bases.push({ imageId: rep.id, base, forIds: changedIds });
       sceneCovered.set(sc.id, [rep.id, ...targets.map((t) => t.id)]);
       sceneSkipped.delete(sc.id);
       outcomes.push({ sceneId: sc.id, representativeId: rep.id, changedIds, skippedIds, excludedIds, notConvergedIds, notes: [] });
@@ -1022,7 +1089,9 @@ export function installMockBackend(count: number) {
     const batchId = recordItems(label, items, outcomes.map((x) => x.sceneId));
     // Rust keeps the previous batch id when the apply changed nothing.
     if (batchId != null) outcomes.forEach((x) => { const a = sceneApplied.get(x.sceneId); if (a) a.batchId = batchId; });
-    return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, scenes: outcomes, cancelled };
+    // v17: what the apply was built on (Rust `edit_batch_bases`), when it changed a frame of that scene.
+    if (batchId != null) batches.get(batchId)!.bases = bases.filter((x) => x.forIds.length > 0).map(({ imageId, base }) => ({ imageId, base }));
+    return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, scenes: outcomes, cancelled, skippedScenes };
   }
 
   // ---- scenes (v7) emulation ----
@@ -1817,10 +1886,11 @@ export function installMockBackend(count: number) {
           const live = entries.filter((e) => !e.skipped);
           const counts: EditPlanCounts = {
             scenes: entries.length,
-            toEdit: live.filter((e) => e.status === "to_edit").length,
+            toEdit: live.filter((e) => e.status === "to_edit" || e.status === "reset").length,
             edited: live.filter((e) => e.status === "edited").length,
             applied: live.filter((e) => e.status === "applied").length,
             outdated: live.filter((e) => e.status === "outdated").length,
+            reset: live.filter((e) => e.status === "reset").length,
             skipped: entries.length - live.length,
             minor: entries.filter((e) => e.minor).length,
             needsReview: needsReviewIds.length,
@@ -1864,9 +1934,9 @@ export function installMockBackend(count: number) {
           const o = (args.options as SceneApplyOptions | null) ?? (DEFAULT_APPLY as unknown as SceneApplyOptions);
           const keepers = rows.filter((r) => inScope(r, null, pid) && keeper(r));
           const due = planEntries(keepers)
-            .filter((e) => !e.skipped && (e.status === "edited" || e.status === "outdated" || (e.status === "applied" && e.unappliedKeeperIds.length > 0)))
+            .filter((e) => !e.skipped && e.edited && (e.status === "edited" || e.status === "outdated" || (e.status === "applied" && e.unappliedKeeperIds.length > 0)))
             .map((e) => e.sceneId);
-          return applyScenes(due, o, "Apply to Scene");
+          return applyScenes(due, o, "Apply to Scene", true);
         }
         case "list_styles": {
           const user: StylePreset[] = presets.map((p) => ({
@@ -1982,8 +2052,18 @@ export function installMockBackend(count: number) {
           if (b.undone) throw { kind: "invalid_argument", message: "batch already undone" };
           // v16: linear undo; later edits on the batch's photos block it (nothing changes).
           const conflicts = batchConflicts(args.batchId as number);
-          if (conflicts.length)
+          const edited = batchEditedAfter(args.batchId as number);
+          if (edited.length)
             throw { kind: "conflict", message: `Later edits on ${conflicts.length} photo${conflicts.length === 1 ? "" : "s"}; undo those first` };
+          // v17: an apply made from this batch's settings (Auto edit -> Apply to scene) is a later edit too.
+          if (conflicts.length)
+            throw {
+              kind: "conflict",
+              message:
+                conflicts.length === 1
+                  ? "A scene was applied from this edit since; undo that apply first"
+                  : `${conflicts.length} scenes were applied from this edit since; undo those applies first`,
+            };
           b.undone = true;
           b.undoneAt = Date.now();
           const restoredIds: number[] = [];

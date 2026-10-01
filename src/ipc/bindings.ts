@@ -631,7 +631,10 @@ export const commands = {
 	 *  `apply`; `cancel_scene_apply` stops it). Representative without edits ->
 	 *  `invalid_argument`. v15: `excludeIds` are left alone; non-converged targets are stored as
 	 *  "needs a look" (`ImageEditState`); a skipped scene is included again; the scene's coverage
-	 *  is recorded (`SceneEditEntry.unappliedKeeperIds`).
+	 *  is recorded (`SceneEditEntry.unappliedKeeperIds`). v17: error messages name the scene by
+	 *  its plan number ("Scene 1: edit its representative first, then apply."); an apply from a
+	 *  representative whose settings came from an edit batch (Auto edit) blocks that batch's undo
+	 *  until the apply is undone.
 	 */
 	applySceneEdit: (sceneId: number, options: {
 	/**
@@ -657,8 +660,10 @@ export const commands = {
 	/**
 	 *  `apply_scene_edit` for every scene of `projectId` that is not skipped and whose status is
 	 *  `edited` or `outdated`, or `applied` with `unappliedKeeperIds` (v15), as one undoable
-	 *  batch. No such scene -> empty result (`batch.batchId = null`). `excludeIds` apply to every
-	 *  scene.
+	 *  batch (never `to_edit` / `reset` scenes, v17). No such scene -> empty result
+	 *  (`batch.batchId = null`). `excludeIds` apply to every scene. v17: a scene that cannot be
+	 *  applied (e.g. its original is missing) is left out and reported in `skippedScenes`; the
+	 *  others are applied. Catalog-level errors still fail the call, named after the scene.
 	 */
 	applyAllEditedScenes: (projectId: number, options: {
 	/**
@@ -689,7 +694,9 @@ export const commands = {
 	 *  Undo is linear (v16): when any photo of the batch has a later history entry (a later
 	 *  batch or a manual edit), nothing changes and the call fails with `conflict` ("Later edits
 	 *  on n photos; undo those first"). Scenes whose last apply was this batch go back to
-	 *  `edited` (`SceneEditEntry.appliedBatch` = null).
+	 *  `edited` (`SceneEditEntry.appliedBatch` = null). v17: a scene apply (not undone) made from
+	 *  a representative whose settings this batch wrote is a later edit too ("A scene was applied
+	 *  from this edit since; undo that apply first").
 	 */
 	undoEditBatch: (batchId: number) => typedError<UndoBatchResult, AppError>(__TAURI_INVOKE("undo_edit_batch", { batchId })),
 	/**
@@ -1129,6 +1136,12 @@ export type ApplyScenesResult = {
 	 *  batch); the scene being matched and the ones after it were not touched.
 	 */
 	cancelled: boolean,
+	/**
+	 *  `apply_all_edited_scenes` only (v17; always empty for `apply_scene_edit`, which fails
+	 *  instead): scenes it was going to apply but could not, plan order. Nothing was written
+	 *  to them; the other scenes were applied.
+	 */
+	skippedScenes: SkippedScene[],
 };
 
 /**  Result of `apply_suggestions`. */
@@ -1594,6 +1607,8 @@ export type DevelopWarningCode =
  *  while none of its photos has a history entry newer than the batch's own (a later batch or
  *  a manual edit); undoing a later batch restores the photos to this batch's settings and
  *  makes it undoable again. Per-image undo (Cmd+Z in Develop) of the later edit also does.
+ *  v17: a scene apply made from a representative whose settings this batch wrote (e.g. Auto
+ *  edit, then Apply to scene) is a later edit of this batch too: undo the apply first.
  */
 export type EditBatchInfo = {
 	batchId: number,
@@ -1606,8 +1621,9 @@ export type EditBatchInfo = {
 	/**  Photos the batch changed. */
 	imageCount: number,
 	/**
-	 *  Photos edited after the batch (0 when undone): `undo_edit_batch` refuses with
-	 *  `conflict` while this is > 0.
+	 *  Photos of the batch edited after it, or (v17) whose settings from this batch a later
+	 *  scene apply that is not undone was made from (the representative of an auto-edited
+	 *  scene) (0 when undone): `undo_edit_batch` refuses with `conflict` while this is > 0.
 	 */
 	conflictCount: number,
 	/**  Not undone and `conflictCount == 0`: `undo_edit_batch` would succeed now. */
@@ -1666,10 +1682,13 @@ export type EditPlan = {
 /**  Scene counts of an `EditPlan` (v15). Status counts are over scenes that are not skipped. */
 export type EditPlanCounts = {
 	scenes: number,
+	/**  Scenes to do: status `to_edit` or `reset` (v17: `reset` scenes count here too). */
 	toEdit: number,
 	edited: number,
 	applied: number,
 	outdated: number,
+	/**  Status `reset` (v17); included in `toEdit`. */
+	reset: number,
 	skipped: number,
 	/**  Minor scenes (skipped or not). */
 	minor: number,
@@ -3466,10 +3485,11 @@ export type SceneEditEntry = {
 	 */
 	needsReviewIds: number[],
 	/**
-	 *  Applied scenes only (`appliedAtMs` set, not skipped): keepers that the last apply did
-	 *  not cover (added to the scene or made keepers since), are not the representative, and
-	 *  have no edit of their own (`editSource` `none` or `auto_style`). Non-empty = "Apply to
-	 *  N new" (`apply_scene_edit`; already applied frames come out unchanged) (v15).
+	 *  Applied scenes only (`appliedAtMs` set, not skipped, status not `reset` (v17)):
+	 *  keepers that the last apply did not cover (added to the scene or made keepers since),
+	 *  are not the representative, and have no edit of their own (`editSource` `none` or
+	 *  `auto_style`). Non-empty = "Apply to N new" (`apply_scene_edit`; already applied frames
+	 *  come out unchanged) (v15).
 	 */
 	unappliedKeeperIds: number[],
 	/**
@@ -3490,7 +3510,14 @@ export type SceneEditStatus =
 /**  Applied, and the representative has not changed since. */
 "applied" | 
 /**  Applied, but the representative was edited again since (apply again). */
-"outdated";
+"outdated" | 
+/**
+ *  The scene was applied, but its representative has no edits any more (v17: reset,
+ *  or its edit undone, after the apply). The members keep the look of the last apply
+ *  (`appliedBatch` stays undoable when nothing blocks it). A to-do scene: edit the
+ *  representative, then apply; not applied by `apply_all_edited_scenes`.
+ */
+"reset";
 
 /**  How a scene's membership was decided. */
 export type SceneMethod = 
@@ -3512,6 +3539,18 @@ export type SceneProgress = {
 	done: number,
 	total: number,
 };
+
+/**  Why `apply_all_edited_scenes` left a scene out (v17). */
+export type SceneSkipReason = 
+/**  The representative has no edits (edit it first). */
+"not_edited" | 
+/**  The scene has no keepers (any more). */
+"no_keepers" | 
+/**
+ *  Reading or matching the scene failed (e.g. an original is missing or cannot be
+ *  decoded); `message` says why.
+ */
+"failed";
 
 /**  Long-running scene operation reported by the `sceneProgress` event. */
 export type SceneTask = "detect" | "match" | 
@@ -3555,6 +3594,17 @@ export type Sharpening = {
 
 /**  Shoot context; biases subject prioritization and tag thresholds. */
 export type ShootType = "wedding" | "portrait" | "sports" | "event" | "landscape" | "general";
+
+/**  A scene `apply_all_edited_scenes` could not apply (v17). */
+export type SkippedScene = {
+	sceneId: number,
+	reason: SceneSkipReason,
+	/**
+	 *  User-facing, names the scene by its plan number, e.g. "Scene 2: edit its representative
+	 *  first, then apply." / "Scene 3: DSC01234.ARW is missing ...".
+	 */
+	message: string,
+};
 
 /**
  *  A folder of presets/profiles (grouped by source folder name, Lightroom-style), the user

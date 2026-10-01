@@ -95,9 +95,10 @@ test.describe("P1-11 toast Undo is linear", () => {
     await expect(page.getByTestId("auto-undo")).toBeVisible();
     await page.getByTestId("plan-apply-1").click();
     await expect(row(page, 1)).toHaveAttribute("data-status", "applied");
-    // The apply wrote other photos than the auto edit: both batches stay undoable (get_edit_batches says so).
+    // v17: the apply was made from the auto edit of Scene 1's representative, so it is a later edit of
+    // that batch (strictly linear): the auto edit's toast Undo retires, the apply's stays (get_edit_batches).
     await expect.poll(async () => (await calls(page, "get_edit_batches")).length).toBeGreaterThan(0);
-    await expect(page.getByTestId("auto-undo")).toBeVisible();
+    await expect(page.getByTestId("auto-undo")).toHaveCount(0);
     await expect(page.getByTestId("apply-undo-batch")).toHaveCount(1);
     await page.getByTestId("plan-apply-2").click();
     await expect(row(page, 2)).toHaveAttribute("data-status", "applied");

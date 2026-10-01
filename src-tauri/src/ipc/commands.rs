@@ -1847,8 +1847,9 @@ pub async fn cancel_scene_apply(control: State<'_, SceneApplyControl>) -> AppRes
 const APPLY_CANCEL_CHUNK: usize = 32;
 
 /// Matches every job's targets to its representative (`match_scene` machinery) off the
-/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets. On cancel
-/// returns the jobs finished before it (and `true`).
+/// catalog lock, with one `sceneProgress {task: "apply"}` stream over all targets
+/// (`scene::workflow::match_jobs`: cancel between steps of [`APPLY_CANCEL_CHUNK`] targets;
+/// with `skip_failures` (apply all, v17) a scene whose matching fails is reported, not fatal).
 async fn match_scene_jobs(
     app: AppHandle,
     develop: &DevelopCache,
@@ -1856,50 +1857,34 @@ async fn match_scene_jobs(
     control: SceneApplyControl,
     jobs: Vec<scene::workflow::SceneApplyJob>,
     options: MatchOptions,
-) -> AppResult<(Vec<scene::workflow::SceneApplyJob>, Vec<Vec<MatchPreview>>, bool)> {
+    skip_failures: bool,
+) -> AppResult<scene::workflow::MatchedJobs> {
     let cache = develop.clone();
     let luts = luts.clone();
     blocking(move || {
         let emit = scene::progress_emitter(app, SceneTask::Apply);
         let total: u32 = jobs.iter().map(|j| j.targets.len() as u32).sum();
-        let mut offset = 0u32;
-        let mut previews = Vec::with_capacity(jobs.len());
-        let mut cancelled = false;
-        'jobs: for job in &jobs {
-            if control.cancelled() {
-                cancelled = true;
-                break;
-            }
-            if job.targets.is_empty() {
-                previews.push(Vec::new());
-                continue;
-            }
-            let mut out = Vec::with_capacity(job.targets.len());
-            for chunk in job.targets.chunks(APPLY_CANCEL_CHUNK) {
-                if control.cancelled() {
-                    cancelled = true;
-                    break 'jobs;
-                }
-                let base = offset + out.len() as u32;
+        let matched = scene::workflow::match_jobs(
+            jobs,
+            skip_failures,
+            APPLY_CANCEL_CHUNK,
+            &|| control.cancelled(),
+            &mut |job, chunk, base| {
                 let progress = |done: u32, _: u32| emit(base + done, total);
-                out.extend(scene::matching::match_images(
+                scene::matching::match_images(
                     &cache,
                     &luts,
                     std::slice::from_ref(&job.representative),
                     chunk,
                     &options,
                     &progress,
-                )?);
-            }
-            offset += job.targets.len() as u32;
-            previews.push(out);
-        }
-        if !cancelled {
+                )
+            },
+        )?;
+        if !matched.cancelled {
             emit(total, total);
         }
-        let mut jobs = jobs;
-        jobs.truncate(previews.len());
-        Ok((jobs, previews, cancelled))
+        Ok(matched)
     })
     .await
 }
@@ -1919,18 +1904,17 @@ async fn apply_scenes(
     let options = options.unwrap_or_default();
     options.match_options.validate().map_err(AppError::invalid)?;
     let opts = options.clone();
-    let jobs = catalog
-        .run(move |c| {
-            let ids = match scene_ids {
-                SceneIds::One(id) => vec![id],
-                SceneIds::EditedIn(folder) => scene::workflow::edited_scenes(c, folder)?,
-            };
-            scene::workflow::apply_inputs(c, &ids, &opts)
+    let all = matches!(scene_ids, SceneIds::EditedIn(_));
+    let (jobs, mut skipped) = catalog
+        .run(move |c| match scene_ids {
+            SceneIds::One(id) => Ok((scene::workflow::apply_inputs(c, &[id], &opts)?, Vec::new())),
+            SceneIds::EditedIn(project) => scene::workflow::apply_all_inputs(c, project, &opts),
         })
         .await?;
-    let (jobs, previews, cancelled) =
-        match_scene_jobs(app.clone(), develop, luts, control.clone(), jobs, options.match_options).await?;
-    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews, cancelled)).await?;
+    let m = match_scene_jobs(app.clone(), develop, luts, control.clone(), jobs, options.match_options, all).await?;
+    skipped.extend(m.failed);
+    let (jobs, previews, cancelled) = (m.jobs, m.previews, m.cancelled);
+    let result = catalog.run(move |c| scene::workflow::commit_apply(c, &jobs, &previews, cancelled, skipped)).await?;
     if !result.batch.changed_ids.is_empty() {
         xmp.notify(&app);
     }
@@ -1950,7 +1934,10 @@ enum SceneIds {
 /// `apply`; `cancel_scene_apply` stops it). Representative without edits ->
 /// `invalid_argument`. v15: `excludeIds` are left alone; non-converged targets are stored as
 /// "needs a look" (`ImageEditState`); a skipped scene is included again; the scene's coverage
-/// is recorded (`SceneEditEntry.unappliedKeeperIds`).
+/// is recorded (`SceneEditEntry.unappliedKeeperIds`). v17: error messages name the scene by
+/// its plan number ("Scene 1: edit its representative first, then apply."); an apply from a
+/// representative whose settings came from an edit batch (Auto edit) blocks that batch's undo
+/// until the apply is undone.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -1969,8 +1956,10 @@ pub async fn apply_scene_edit(
 
 /// `apply_scene_edit` for every scene of `projectId` that is not skipped and whose status is
 /// `edited` or `outdated`, or `applied` with `unappliedKeeperIds` (v15), as one undoable
-/// batch. No such scene -> empty result (`batch.batchId = null`). `excludeIds` apply to every
-/// scene.
+/// batch (never `to_edit` / `reset` scenes, v17). No such scene -> empty result
+/// (`batch.batchId = null`). `excludeIds` apply to every scene. v17: a scene that cannot be
+/// applied (e.g. its original is missing) is left out and reported in `skippedScenes`; the
+/// others are applied. Catalog-level errors still fail the call, named after the scene.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -1994,7 +1983,9 @@ pub async fn apply_all_edited_scenes(
 /// Undo is linear (v16): when any photo of the batch has a later history entry (a later
 /// batch or a manual edit), nothing changes and the call fails with `conflict` ("Later edits
 /// on n photos; undo those first"). Scenes whose last apply was this batch go back to
-/// `edited` (`SceneEditEntry.appliedBatch` = null).
+/// `edited` (`SceneEditEntry.appliedBatch` = null). v17: a scene apply (not undone) made from
+/// a representative whose settings this batch wrote is a later edit too ("A scene was applied
+/// from this edit since; undo that apply first").
 #[tauri::command]
 #[specta::specta]
 pub async fn undo_edit_batch(

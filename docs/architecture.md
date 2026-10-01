@@ -24,6 +24,8 @@ src-tauri/
   migrations/0013_workflow_state.sql v13: adjustment_history.source/batch_id (per-photo edit source), batch item
                                provenance + review flags, scenes.skipped/applied_covered_json
   migrations/0014_linear_undo.sql v14: clears the applied state of scenes whose apply batch was undone (IPC v16)
+  migrations/0015_apply_bases.sql v15: edit_batch_bases (the batch a scene apply's representative settings came
+                               from; linear undo across Auto edit -> Apply, IPC v17)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -204,8 +206,8 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `get_edit_plan` / `getEditPlan` (v14) | `projectId: number` | `EditPlan` |
 | `set_scene_representative` / `setSceneRepresentative` (v14) | `sceneId: number, imageId: number \| null` | `SceneEditEntry` |
 | `apply_scene_edit` / `applySceneEdit` (v14) | `sceneId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (one undoable batch) |
-| `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` |
-| `undo_edit_batch` / `undoEditBatch` (v14; linear since v16: `conflict` when photos were edited after the batch) | `batchId: number` | `UndoBatchResult` |
+| `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (v17: scenes it cannot apply are left out and listed in `skippedScenes`) |
+| `undo_edit_batch` / `undoEditBatch` (v14; linear since v16: `conflict` when photos were edited after the batch, v17: or a scene apply was made from its settings) | `batchId: number` | `UndoBatchResult` |
 | `get_edit_batches` / `getEditBatches` (v16) | `batchIds: number[]` | `EditBatchInfo[]` |
 | `paste_previous` / `pastePrevious` (v14) | `targetIds: number[], previousId: number, fields: AdjustmentField[] \| null` | `null` |
 | `import_style_folder` / `importStyleFolder` (v14) | `path: string` | `ImportStyleReport` |
@@ -727,7 +729,7 @@ migrations tracked by `PRAGMA user_version`.
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated); v13: `source` (who produced it) and `batch_id` (edit batch that wrote it) |
 | `presets` | `group_id` (style group, v12), name (unique per group, NOCASE), params JSON, fields JSON, `source_format`, `settings_json` + `setting_keys_json` (imported crs: settings), `supports_amount`, `warnings_json` |
 | `style_groups` / `style_profiles` | style library (v12): groups per imported source folder + built-ins 1 "User Presets" / 2 "LUTs"; looks / DCPs (read in place) / LUTs (library copies) |
-| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene); v13: `before_source` / `before_batch_id` (restored by undo), `review_reason` / `reviewed_at` (needs a look) |
+| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene); v13: `before_source` / `before_batch_id` (restored by undo), `review_reason` / `reviewed_at` (needs a look); v15: `edit_batch_bases` (batch, representative, base batch): an apply made from settings another batch wrote blocks that batch's undo (IPC v17) |
 | `style_models` / `style_features` | personal style model blobs + validation; per-image features (v12, owned by `ml::style`) |
 | `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
 | `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps, `project_id` (v12: all images in one project, else NULL) |

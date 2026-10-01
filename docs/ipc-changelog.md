@@ -839,6 +839,87 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v17 — 2026-09-30 (UX re-check 2 P1-12: reset scenes, lenient Apply all, linear undo across Auto edit -> Apply)
+Schema v15 (`migrations/0015_apply_bases.sql`). Driven by `docs/ux-review-8b.md` "Re-check 2" P1-12. **Breaking** for
+exhaustive `switch`es / `Record`s over `SceneEditStatus` (new `reset`) and for TS object literals typed as
+`EditPlanCounts` / `ApplyScenesResult` (new fields; only the mock builds them). `src/ipc/bindings.ts` regenerated.
+No frontend compile fix was needed (`useWorkflow`'s status ternary falls through to `edited` / `auto` for `reset`,
+which is wrong UI but compiles; see frontend-dev 1).
+
+Reset scenes (P1-12 fix 1)
+- New `SceneEditStatus` `"reset"`: the scene was applied (`appliedAtMs` set) but its representative has no edits any
+  more (reset in Develop, per-image undo of its only edit, or its auto edit undone). Before v17 such a scene was
+  `outdated` with `edited: false`, so Re-apply / Apply all failed with "The representative has no edits yet".
+  - The members keep the last apply's look (`appliedIds` unchanged); `appliedBatch` stays as is (undoable unless a
+    later edit blocks it), so "Undo apply" restores the members. Undoing it makes the scene `to_edit`.
+  - Editing the representative again: `outdated` (re-apply), or `applied` if it lands on the applied settings.
+  - `unappliedKeeperIds` is always empty for `reset` scenes (nothing can be applied to them yet).
+  - Not applied by `apply_all_edited_scenes` (it also requires `edited` now).
+- `EditPlanCounts.reset` (new): `reset` scenes not skipped. **`EditPlanCounts.toEdit` now counts `to_edit` and
+  `reset` scenes** (both are "to do"), so the To do tab / header / progress need no extra sum; status counts no longer
+  partition the scenes (`toEdit + edited + applied + outdated` = not-skipped scenes; `reset` is a subset of `toEdit`).
+- `isEditPlanDone` is unchanged (a `reset` scene is not `applied`, so the plan is not done).
+
+Apply all skips what it cannot apply; errors name the scene (P1-12 fix 2)
+- `ApplyScenesResult.skippedScenes: SkippedScene[]` (new; plan order): scenes `apply_all_edited_scenes` was going to
+  apply but could not. Nothing was written to them; every other scene was applied (one batch, as before).
+  `SkippedScene {sceneId, reason: SceneSkipReason, message}`; `SceneSkipReason = "not_edited" | "no_keepers" |
+  "failed"`. `failed` = reading or matching the scene failed with a per-scene error (`not_found`, `invalid_argument`,
+  `io`, `file_missing`, `decode_failed`, e.g. its representative's original is missing); catalog-level errors
+  (`database`, `internal`, `disk_full`, `read_only`, `catalog_read_only`) still fail the whole call. With the
+  candidate filter fixed, `not_edited` / `no_keepers` are defensive; `failed` is the realistic case.
+- `apply_scene_edit` keeps failing (never `skippedScenes`), and every per-scene error message now starts with the
+  scene's plan number, the same number the Edit step shows (`EditPlan.scenes` index + 1; "This scene" when it is
+  not in a plan):
+  - representative never edited: `invalid_argument` "Scene 2: edit its representative first, then apply."
+  - `reset` scene: `invalid_argument` "Scene 1: its representative was reset after the last apply. Edit it first,
+    then apply."
+  - matching errors keep their kind: e.g. `file_missing` "Scene 3: DSC01234.ARW is missing ...".
+
+Linear undo across Auto edit -> Apply (P1-12 fix 3, the UX recommendation; decision in `docs/decisions.md`)
+- A scene apply made from a representative whose current settings were written by an edit batch (in practice
+  "Auto edit (my style)") records that batch as its base (`edit_batch_bases`). While the apply is not undone, the
+  base batch counts that representative as a conflict: `EditBatchInfo.conflictCount` includes it, `undoable` is
+  false, and `undo_edit_batch(base)` fails with `conflict`:
+  - only applies block it: "A scene was applied from this edit since; undo that apply first" (n > 1: "n scenes were
+    applied from this edit since; undo those applies first");
+  - photos were also edited after it: the v16 message, counting both ("Later edits on n photos; undo those first").
+- Undo the apply first (it is the newer batch, `EditPlan.latestBatch`), then the auto edit, as in Lightroom. The exact
+  P1-11 repro (Auto edit 3 scenes -> Apply Scene 1 -> Undo on the older "Auto edited 3 scenes" toast) now gets the
+  `conflict` instead of silently putting Scene 1 into the inconsistent state. Applies made before v17 record no base
+  and do not block (no backfill). An apply that changed nothing in the scene records no base; an apply from a
+  hand-graded representative has none.
+
+Who updates what
+- architect (done): types, schema v15, `develop::batches::{BatchBase, commit_recorded_with_bases, base_of,
+  dependent_ids, edited_after_ids, applied_from_message}` + `conflict_ids` / `undo` / `batch_info` counting
+  dependents, `scene::workflow::{scene_label, named, skippable, apply_all_inputs, match_jobs, MatchedJobs}` +
+  `reset` status / counts / `edited_scenes`, `commands::apply_scenes` (lenient for apply all, matching moved to the
+  testable `workflow::match_jobs`), Rust tests (both P1-12 repros, the apply-all skip / failure / cancel paths, the
+  message variants), bindings, mock backend (everything above; test hook `window.__mockApplyFailScenes = [sceneId]`
+  makes that scene's matching fail with `file_missing`), `tests/ui/ipc-v17-mock.spec.ts` (invoke-level contract
+  check of the mock), and `tests/ui/recheck-fixes.spec.ts` "toast and row Undo follow the backend's undoable flag"
+  updated: after Auto edit -> Apply Scene 1 the auto edit's toast Undo now retires (it asserted the v16 behaviour).
+- frontend-dev (`useWorkflow` `SceneUi`, `PlanView`, `EditContextBar`, `bits.tsx`; spec in the review's P1-12):
+  1. `ui = "reset"` when `entry.status === "reset"` (replaces the review's `outdated && !edited` test). Row: amber
+     `RefreshCw`, status line `Representative reset · N photos keep the earlier look` (N = `appliedIds.length`),
+     primary `Edit ▸`, secondary `Undo apply` (`plan-undo-inline-<id>`) while `appliedBatch?.undoable`, no Re-apply.
+     It sits under the To do tab; tab / header / progress counts come from `counts.toEdit` (already includes reset).
+  2. `Apply N edited scenes` must not count `reset` scenes: use `counts.edited + counts.outdated` (+ applied scenes
+     with `unappliedKeeperIds`), or the client filter `!skipped && edited && (edited|outdated|applied with new
+     keepers)` = `workflow::edited_scenes`.
+  3. Develop context bar on a `reset` scene's representative: chip `Reset since applied · representative`,
+     `Apply to scene` disabled with the visible hint `Edit this photo first`.
+  4. After `applyAllEditedScenes`, when `result.skippedScenes` is non-empty: keep the success toast for the applied
+     scenes and add an info toast listing each `message` (e.g. "Scene 2: DSC00056.ARW is missing"), with a
+     `Show` / jump to the first skipped scene's row. Errors from `applySceneEdit` already name the scene: show the
+     message as is.
+  5. Conflict handling: the auto edit's toast Undo / Plan Cmd+Z now also retire after an apply built on it
+     (`getEditBatches` / `latestBatch` say `undoable: false`); a `conflict` from `undoEditBatch` with the new message
+     goes to the existing info toast.
+- rust-engine-dev / vision-ml-dev: nothing required. Other multi-image write paths built from one image's settings
+  may pass `BatchBase`s to `commit_recorded_with_bases` to join the linear-undo chain.
+
 ## v16 — 2026-09-30 (UX re-check P1-11: linear batch undo, persisted batch undo state)
 Schema v14 (`migrations/0014_linear_undo.sql`). Driven by `docs/ux-review-8b.md` "Re-check" P1-11 and P2 #13 (batch
 undo lost on Home -> back). **Breaking** for TS object literals typed as `SceneEditEntry` / `EditPlan` (new fields;
