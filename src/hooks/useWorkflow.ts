@@ -2,7 +2,7 @@
 // the personal style model, and the batch actions (auto edit, apply to scene, apply all, undo). Every call goes through the typed wrappers;
 // Markers ("needs a look", "auto edited", "applied", skipped) come from the persisted plan (IPC v15), never from session state.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditPlan, type ImageEditState, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
+import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditBatchInfo, type EditPlan, type ImageEditState, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
 import { describeError } from "../lib/errors";
 import type { ToastApi } from "../components/Toasts";
 
@@ -92,38 +92,61 @@ export function useWorkflow(d: Deps) {
   const [learnFor, setLearnFor] = useState<number[] | null>(null);
   const [replaceFor, setReplaceFor] = useState<number[] | null>(null);
   const [batchStack, setBatchStack] = useState<LastBatch[]>([]);
-  const lastBatch: LastBatch | null = batchStack.length > 0 ? batchStack[batchStack.length - 1] : null;
-  /** Batch id -> id of the toast offering its Undo (dismissed once the batch is undone). */
+  /** Batch id -> toast offering its Undo (dismissed once the batch is undone). */
   const batchToast = useRef(new Map<number, number>());
   const bindToast = (b: LastBatch | null, toastId: number) => {
     if (b) batchToast.current.set(b.batchId, toastId);
   };
-  /** Batches a later user edit touched (their Undo is no longer safe). */
+  /** Backend truth (`get_edit_batches`) for the session's batches: whether `undo_edit_batch` would succeed now. */
+  const [infos, setInfos] = useState<Map<number, EditBatchInfo>>(new Map());
+  /** Batches a later user edit touched: an immediate hint until the next backend refresh says otherwise. */
   const [touched, setTouched] = useState<Set<number>>(new Set());
-  /** Why a batch cannot be undone from a toast / row menu right now; null = it can. Undo is strictly linear. */
-  const undoReason = (b: LastBatch): string | null => {
-    if (touched.has(b.batchId)) return "Later edits touched these photos. Undo those first";
-    const top = batchStack[batchStack.length - 1];
-    if (top && top.batchId !== b.batchId) return `A newer apply (${top.label}) is on top. Undo that first`;
-    return null;
-  };
-  /** Newest batch that touched a scene (row menus: Undo apply). */
-  const batchForScene = (sceneId: number): LastBatch | null => [...batchStack].reverse().find((b) => b.sceneIds.includes(sceneId)) ?? null;
-  /** The user committed an adjustment (or batch-edited photos) in Develop: batches covering them lose their Undo. */
-  const noteCommit = useCallback((ids: number[]) => {
-    const set = new Set(ids);
-    const hit = batchStackRef.current.filter((b) => b.imageIds.some((i) => set.has(i)) && !touchedRef.current.has(b.batchId));
-    if (hit.length === 0) return;
-    hit.forEach((b) => {
-      touchedRef.current.add(b.batchId);
-      const tid = batchToast.current.get(b.batchId);
-      if (tid != null) dref.current.toasts.retract(tid);
-    });
-    setTouched(new Set(touchedRef.current));
-  }, []);
   const touchedRef = useRef(new Set<number>());
   const batchStackRef = useRef<LastBatch[]>([]);
   batchStackRef.current = batchStack;
+  const reasonOf = (i: EditBatchInfo): string | null =>
+    i.undoneAtMs != null ? "Already undone" : i.conflictCount > 0 ? `Later edits on ${plural(i.conflictCount, "photo")}. Undo those first` : null;
+  /** Why a session batch cannot be undone right now; null = it can. */
+  const undoReason = (b: Pick<LastBatch, "batchId">): string | null => {
+    const i = infos.get(b.batchId);
+    if (i) return reasonOf(i);
+    return touched.has(b.batchId) ? "Later edits touched these photos. Undo those first" : null;
+  };
+  /** Row menus: the scene's persisted last apply (works after Home and back). */
+  const sceneUndo = (sceneId: number): { batch: Pick<LastBatch, "batchId" | "label"> | null; enabled: boolean; reason: string | undefined } => {
+    const ab = planRef.current?.scenes.find((x) => x.sceneId === sceneId)?.appliedBatch ?? null;
+    if (!ab) return { batch: null, enabled: false, reason: "Nothing to undo" };
+    const i = infos.get(ab.batchId) ?? ab;
+    const hint = touched.has(ab.batchId) && i.undoable;
+    return { batch: { batchId: ab.batchId, label: ab.label }, enabled: i.undoable && !hint, reason: reasonOf(i) ?? (hint ? "Later edits touched these photos. Undo those first" : undefined) };
+  };
+  const latest = plan?.latestBatch ?? null;
+  const stackTop = batchStack.length > 0 ? batchStack[batchStack.length - 1] : null;
+  /** What Cmd+Z undoes: the session's newest batch, else the project's newest batch from the plan. */
+  const lastBatch: LastBatch | null = stackTop
+    ? (infos.get(stackTop.batchId)?.undoable ?? !touched.has(stackTop.batchId))
+      ? stackTop
+      : null
+    : latest && latest.undoable && !touched.has(latest.batchId)
+      ? { batchId: latest.batchId, label: latest.label, sceneIds: [], imageIds: [], at: latest.createdAtMs }
+      : null;
+  /** The user committed an adjustment (or batch-edited photos) in Develop: batches covering them lose their Undo (hint; the backend confirms on the next refresh). */
+  const noteCommit = useCallback((ids: number[]) => {
+    const set = new Set(ids);
+    const hit = batchStackRef.current.filter((b) => b.imageIds.some((i) => set.has(i)) && !touchedRef.current.has(b.batchId));
+    if (hit.length > 0) {
+      hit.forEach((b) => {
+        touchedRef.current.add(b.batchId);
+        const tid = batchToast.current.get(b.batchId);
+        if (tid != null) dref.current.toasts.retract(tid);
+      });
+      setTouched(new Set(touchedRef.current));
+    }
+    clearTimeout(commitTimer.current);
+    commitTimer.current = setTimeout(() => refreshRef.current(), 300);
+  }, []);
+  const commitTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const refreshRef = useRef<() => void>(() => {});
   const seq = useRef(0);
   const dref = useRef(d);
   dref.current = d;
@@ -137,11 +160,39 @@ export function useWorkflow(d: Deps) {
     return i >= 0 ? `Scene ${i + 1}` : "the scene";
   };
 
+  /** Refreshes the undoability of the batches the UI holds (session stack + toasts) from the backend. */
+  const syncBatches = async (p: EditPlan) => {
+    const ids = new Set<number>([...batchStackRef.current.map((b) => b.batchId), ...batchToast.current.keys()]);
+    if (ids.size === 0) return setInfos(new Map());
+    try {
+      const list = await unwrap(commands.getEditBatches([...ids]));
+      const m = new Map(list.map((i) => [i.batchId, i]));
+      p.scenes.forEach((x) => x.appliedBatch && !m.has(x.appliedBatch.batchId) && m.set(x.appliedBatch.batchId, x.appliedBatch));
+      touchedRef.current = new Set([...touchedRef.current].filter((id) => m.get(id)?.undoable !== false));
+      setTouched(new Set(touchedRef.current));
+      setInfos(m);
+      list.forEach((i) => {
+        const tid = batchToast.current.get(i.batchId);
+        if (tid == null) return;
+        if (i.undoneAtMs != null) {
+          dref.current.toasts.dismiss(tid);
+          batchToast.current.delete(i.batchId);
+        } else if (!i.undoable) dref.current.toasts.retract(tid);
+      });
+      setBatchStack((st) => st.filter((b) => m.get(b.batchId)?.undoneAtMs == null));
+    } catch {
+      // Keep the client-side hints when the refresh fails.
+    }
+  };
+
   const fetchPlan = useCallback(async () => {
     if (projectId == null) return null;
     const my = ++seq.current;
     const p = await unwrap(commands.getEditPlan(projectId));
-    if (my === seq.current) setPlan(p);
+    if (my === seq.current) {
+      setPlan(p);
+      void syncBatches(p);
+    }
     return p;
   }, [projectId]);
 
@@ -192,6 +243,7 @@ export function useWorkflow(d: Deps) {
 
   // Silent re-read (after edits / culling): keeps the current plan on screen and swallows errors.
   const refreshPlan = useCallback(() => void fetchPlan().catch(() => {}), [fetchPlan]);
+  refreshRef.current = refreshPlan;
 
   useEffect(() => {
     setPlan(null);
@@ -201,6 +253,7 @@ export function useWorkflow(d: Deps) {
     setTouched(new Set());
     touchedRef.current = new Set();
     batchToast.current.clear();
+    setInfos(new Map());
   }, [projectId]);
 
   // ---- style model ----
@@ -299,7 +352,7 @@ export function useWorkflow(d: Deps) {
 
   // ---- undo ----
   const undoBatch = useCallback(
-    async (batch: LastBatch) => {
+    async (batch: Pick<LastBatch, "batchId" | "label">) => {
       try {
         const r = await unwrap(commands.undoEditBatch(batch.batchId));
         setBatchStack((st) => st.filter((b) => b.batchId !== batch.batchId));
@@ -311,18 +364,17 @@ export function useWorkflow(d: Deps) {
         await afterChange([...r.restoredIds, ...r.skippedIds]);
         toasts.push(`Undid ${batch.label} on ${plural(r.restoredIds.length, "photo")}${r.skippedIds.length > 0 ? ` · ${r.skippedIds.length} changed since, kept` : ""}`);
       } catch (e) {
-        // v16 `conflict`: later edits touched these photos. Say so, and stop offering this Undo.
+        // v16 `conflict`: later edits touched these photos. Say so (info, nothing changed) and re-read the plan.
         if ((e as { kind?: unknown } | null)?.kind === "conflict") {
-          touchedRef.current.add(batch.batchId);
-          setTouched(new Set(touchedRef.current));
           const tid = batchToast.current.get(batch.batchId);
           if (tid != null) toasts.retract(tid);
-          return void toasts.push(describeError(e).message, { kind: "error" });
+          void fetchPlan().catch(() => {});
+          return void toasts.push(describeError(e).message);
         }
         onError(e);
       }
     },
-    [afterChange, toasts, onError],
+    [afterChange, fetchPlan, toasts, onError],
   );
 
   const undoLast = useCallback(() => {
@@ -331,8 +383,7 @@ export function useWorkflow(d: Deps) {
 
   const remember = (batchId: number | null, label: string, sceneIds: number[], imageIds: number[] = []): LastBatch | null => {
     if (batchId == null) return null;
-    // Undo is linear: every older batch's toast loses its Undo button (the text stays).
-    batchToast.current.forEach((tid) => toasts.retract(tid));
+    // Older toasts keep their Undo until the backend says it would conflict (`get_edit_batches` after the plan refetch).
     const b = { batchId, label, sceneIds, imageIds, at: Date.now() };
     setBatchStack((st) => [...st, b].slice(-20));
     return b;
@@ -550,7 +601,7 @@ export function useWorkflow(d: Deps) {
     style,
     busy,
     lastBatch,
-    batchForScene,
+    sceneUndo,
     undoReason,
     noteCommit,
     learnFor,

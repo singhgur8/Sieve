@@ -33,7 +33,7 @@ export function EditContextBar(p: Props) {
   const idx = row ? rows.indexOf(row) : -1;
   const isRep = !!row && row.entry.representativeId === p.activeId;
   const busy = wf.busy != null;
-  const last = row ? wf.batchForScene(row.entry.sceneId) : null;
+  const undo = row ? wf.sceneUndo(row.entry.sceneId) : null;
   const canApply = !!row && row.ui !== "todo" && row.targets > 0 && !row.skipped;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
 
@@ -188,7 +188,7 @@ export function EditContextBar(p: Props) {
                 <div className="w-60 py-1">
                   {item("edit-apply-options", "Apply with options…", () => row && p.onApplyOptions(row.entry.sceneId), !canApply)}
                   {item("edit-apply-exact", "Copy exactly (no matching)", () => row && void wf.applyScene(row.entry.sceneId, "exact", p.onReview), !canApply || busy)}
-                  {item("edit-undo-apply", "Undo apply", () => last && void wf.undoBatch(last), !last || !!wf.undoReason(last), last ? (wf.undoReason(last) ?? undefined) : "Nothing to undo in this session")}
+                  {item("edit-undo-apply", "Undo apply", () => undo?.batch && void wf.undoBatch(undo.batch), !undo?.enabled, undo?.reason)}
                 </div>
               );
             }}

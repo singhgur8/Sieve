@@ -366,7 +366,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const more = others.length - shown.length;
   const busyHere = wf.busy?.kind === "scene" && wf.busy.sceneId === id;
   const anyBusy = wf.busy != null;
-  const last = wf.batchForScene(id);
+  const undo = wf.sceneUndo(id);
   const newKeepers = r.ui === "applied" ? r.unapplied.length : 0;
   const applyLabel = newKeepers > 0 ? `Apply to ${newKeepers} new` : r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
   const canApply = r.ui !== "todo" && r.targets > 0 && !r.skipped;
@@ -477,7 +477,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
                 {item(`plan-exact-${id}`, "Copy exactly (no matching)", () => void wf.applyScene(id, "exact", p.onReview), r.ui === "todo" || anyBusy || r.targets === 0)}
                 {item(`plan-skip-${id}`, r.skipped ? `Include this scene${hint("planSkip")}` : `Skip this scene${hint("planSkip")}`, () => void wf.setSkipped(id, !r.skipped))}
                 {item(`plan-show-${id}`, `Show all ${e.memberCount} photos`, () => p.onShowScene(id))}
-                {item(`plan-undo-${id}`, "Undo apply", () => last && void wf.undoBatch(last), !last || !!wf.undoReason(last), last ? (wf.undoReason(last) ?? undefined) : "Nothing to undo in this session")}
+                {item(`plan-undo-${id}`, "Undo apply", () => undo?.batch && void wf.undoBatch(undo.batch), !undo?.enabled, undo?.reason)}
               </div>
             );
           }}

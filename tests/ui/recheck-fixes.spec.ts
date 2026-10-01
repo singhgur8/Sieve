@@ -88,26 +88,45 @@ test.describe("P1-10 Apply with options targets keepers", () => {
 test.describe("P1-11 toast Undo is linear", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("an older toast loses its Undo once a newer apply exists; the row Undo follows the same rule", async ({ page }) => {
+  test("toast and row Undo follow the backend's undoable flag, not the order of the applies", async ({ page }) => {
     await openPlan(page);
     await page.getByTestId("plan-auto-remaining").click();
     await expect(row(page, 1)).toHaveAttribute("data-status", "auto");
     await expect(page.getByTestId("auto-undo")).toBeVisible();
     await page.getByTestId("plan-apply-1").click();
     await expect(row(page, 1)).toHaveAttribute("data-status", "applied");
-    await expect(page.getByTestId("auto-undo")).toHaveCount(0);
+    // The apply wrote other photos than the auto edit: both batches stay undoable (get_edit_batches says so).
+    await expect.poll(async () => (await calls(page, "get_edit_batches")).length).toBeGreaterThan(0);
+    await expect(page.getByTestId("auto-undo")).toBeVisible();
     await expect(page.getByTestId("apply-undo-batch")).toHaveCount(1);
-    await page.getByTestId("plan-menu-1").click();
-    await expect(page.getByTestId("plan-undo-1")).toBeEnabled();
-    await page.keyboard.press("Escape");
-    // Applying a second scene makes the first scene's row Undo unavailable, with a reason.
     await page.getByTestId("plan-apply-2").click();
     await expect(row(page, 2)).toHaveAttribute("data-status", "applied");
     await page.getByTestId("plan-menu-1").click();
-    await expect(page.getByTestId("plan-undo-1")).toBeDisabled();
-    await expect(page.getByTestId("plan-undo-1")).toHaveAttribute("title", /Undo that first/);
+    await expect(page.getByTestId("plan-undo-1")).toBeEnabled();
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("apply-undo-batch")).toHaveCount(1); // only the newest toast keeps Undo
+  });
+
+  test("row Undo apply survives Home and back (scene.appliedBatch)", async ({ page }) => {
+    await openPlan(page);
+    await page.getByTestId("plan-auto-1").click();
+    await expect(row(page, 1)).toHaveAttribute("data-status", "auto");
+    await page.getByTestId("plan-apply-1").click();
+    await expect(row(page, 1)).toHaveAttribute("data-status", "applied");
+    await page.getByTestId("home-button").click();
+    await expect(page.getByTestId("home-page")).toBeVisible();
+    await page.getByTestId("project-open-1").click();
+    if (!(await page.getByTestId("plan-view").isVisible())) {
+      await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+      await page.getByTestId("continue-edit").click();
+    }
+    await expect(row(page, 1)).toHaveAttribute("data-status", "applied");
+    await clearCalls(page);
+    await page.getByTestId("plan-menu-1").click();
+    await expect(page.getByTestId("plan-undo-1")).toBeEnabled();
+    await page.getByTestId("plan-undo-1").click();
+    await expect.poll(async () => (await calls(page, "undo_edit_batch")).length).toBe(1);
+    await expect(row(page, 1)).not.toHaveAttribute("data-status", "applied");
+    expect((await calls(page, "get_edit_plan")).length).toBeGreaterThan(0); // refetched after the undo
   });
 
   test("a later edit in Develop retires the Undo of the batch that wrote the photo", async ({ page }) => {
@@ -128,9 +147,10 @@ test.describe("P1-11 toast Undo is linear", () => {
     await expect(page.getByTestId("plan-view")).toBeVisible();
     await page.getByTestId("plan-menu-1").click();
     await expect(page.getByTestId("plan-undo-1")).toBeDisabled();
+    await expect(page.getByTestId("plan-undo-1")).toHaveAttribute("title", /Later edits on \d+ photos?/);
   });
 
-  test("a conflict error from undo_edit_batch shows its message and retires the Undo", async ({ page }) => {
+  test("a conflict error from undo_edit_batch shows its message as an info toast and retires the Undo", async ({ page }) => {
     await openPlan(page);
     await page.getByTestId("plan-auto-1").click();
     await expect(row(page, 1)).toHaveAttribute("data-status", "auto");
@@ -139,7 +159,9 @@ test.describe("P1-11 toast Undo is linear", () => {
     });
     await page.getByTestId("auto-undo").click();
     await expect(page.getByTestId("notice").filter({ hasText: "Later edits on 3 photos; undo those first" })).toBeVisible();
+    await expect(page.getByTestId("notice").filter({ hasText: "Later edits on 3 photos" })).not.toHaveClass(/red-/);
     await expect(page.getByTestId("auto-undo")).toHaveCount(0);
+    expect((await calls(page, "get_edit_plan")).length).toBeGreaterThan(1); // refetched after the conflict
   });
 });
 
