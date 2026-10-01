@@ -143,13 +143,13 @@ the user asked for "auto edit based on what the model thinks I like".
   counts and export only see that project's photos; a project switcher in the TopBar returns home or jumps to another.
   Existing catalogs migrate one project per imported root folder. Acceptance: two projects imported, switching shows
   only each project's photos, counts right, relaunch reopens the home page, removing a project leaves files intact.
-- [ ] **Preset & profile library** (rust-engine-dev + frontend-dev): "Import presets & profiles…" takes a whole folder
+- [x] **Preset & profile library** (rust-engine-dev + frontend-dev): "Import presets & profiles…" takes a whole folder
   (recursive); items appear in every project under their folder groups (Develop left panel "Presets", profile browser
   next to Profile); applying a preset sets only the keys it contains (Lightroom semantics); creative profiles apply
   their look table with an Amount slider; `.cube` files appear as profiles, not a separate LUT concept; hover preview.
   Acceptance: import the user's Lightroom preset/profile folders (read-only copy in `test-data/`), each preset
   applies exactly its keys; profile amount 0/100/200 behaves like Lightroom.
-- [ ] **Auto tone + Auto WB** (rust-engine-dev): Lightroom-style "Auto" in Basic (Exposure, Contrast, Highlights,
+- [x] **Auto tone + Auto WB** (rust-engine-dev): Lightroom-style "Auto" in Basic (Exposure, Contrast, Highlights,
   Shadows, Whites, Blacks, Vibrance, Saturation) and "Auto" white balance; Shift-double-click a slider = auto that
   slider. Acceptance: on the user's frames auto results land near the user's own edits (report deltas) and never clip
   skin; one undo step.
@@ -169,18 +169,18 @@ the user asked for "auto edit based on what the model thinks I like".
   Calibration; bottom-left "Copy…" / "Paste", bottom-right "Previous" / "Reset"; Copy… dialog with every setting group
   as checkboxes (Check All / Check None, remembers last choice); Cmd+Shift+C / Cmd+Shift+V / Cmd+Alt+V (paste from
   previous); Sync… for multi-selection; filmstrip at the bottom.
-- [ ] **Guided workflow: Cull → Edit → Export** (architect → frontend-dev, vision-ml-dev): a step bar per project
+- [x] **Guided workflow: Cull → Edit → Export** (architect → frontend-dev, vision-ml-dev): a step bar per project
   (AfterShoot-style). Cull step = today's culling. Edit step: keepers are grouped into scenes; for each scene the app
   proposes one representative photo to edit (best keeper, most typical lighting); a checklist shows scenes to edit /
   edited / applied; "Auto edit (my style)" pre-fills the representative; once edited, "Apply to scene" copies the
   edit to the rest of the scene with relative scene matching (exposure/WB normalised per frame), reviewable and
   undoable; "Apply all edited scenes". Export step = export dialog for keepers.
-- [ ] **Style learning / auto edit** (vision-ml-dev; was Future Phase 10): learn the user's style from their edited
+- [x] **Style learning / auto edit** (vision-ml-dev; was Future Phase 10): learn the user's style from their edited
   frames (the 394 proposal XMPs + future edits in the catalog) and predict full ParametricAdjustments for a new frame
   (features: develop-source stats, scene context, camera; model on-device, retrainable from the catalog). Acceptance:
   on held-out user edits, predicted-vs-user render ΔE2000 clearly better than Auto tone and than "no edit" (report
   both), and slider-level errors per group.
-- [ ] **XMP auto-save** (rust-engine-dev + frontend-dev): auto-sync on by default (debounced write of ratings, flags,
+- [x] **XMP auto-save** (rust-engine-dev + frontend-dev): auto-sync on by default (debounced write of ratings, flags,
   tags and edits to sidecars, existing sidecar fields preserved); clear status (saved / pending / error) and a
   one-time explanation of how Sieve reads existing XMP as the starting point and merges changes into it.
 - [ ] **UX review** (ux-designer): re-check the new workflow end to end; no open P0/P1.
@@ -242,3 +242,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-30 — Phase 8b Compare view, Masks UX, Small fixes complete (f1b291f, merged 463976d): QA PASS — 376 Rust + 177 Playwright (fixes8b 9/9); Compare in Library + Develop (filmstrip Select/Candidate, arrows/click, swap Down / make-select Up, sliders edit active pane, synced zoom); mask overlay #c00000 @ 0.58, auto-show/fade, O pins, portal menus verified in a 640 px window; stars clickable in cell/loupe/Develop/filmstrip (click current clears); Shift+S scenes toggle; size slider track 7.8:1 / thumb 19:1. Stale `src-tauri/target` from the old checkout path cleaned.
 - 2026-09-30 — Phase 8b Contract complete (cacd536, merged 85dd2b5): IPC v14 — Projects (list/get/create/open/rename/cover/shoot type/remove; migration 0012 one project per folder; projectId scoping on queries, counts, bursts, scenes, analysis, export), workflow step per project, edit plan + apply-to-scene batches, catalog-wide style/profile library, auto_tone / auto_white_balance (stubs), style model train/status/predict, Copy groups + paste-from-previous, XMP auto-sync default on. Gate on phase branch: 384 Rust, clippy 0, fmt, build, 177 Playwright. Repo disk cleanup at the user's request (80 GB → 16 GB; test outputs + RAW copies + merged worktree + stale target removed; rule added to CLAUDE.md).
 - 2026-09-30 — Phase 8b Projects + home page and Lightroom-style Develop layout complete (merged fe45b42): QA PASS — 384 Rust, clippy 0, fmt, build, 204 Playwright. Projects on the real backend: two imported projects scoped correctly (queries 10/10, filter counts, scenes; cross-scope 0), remove_project leaves 30 files (20 ARW + 10 XMP) byte-identical, FK check clean; migration 0012 on a copy of the live v11 catalog → 2 projects (396 / 39) = one per root folder. Develop: panel order, Copy Settings dialog (25 fields, tri-state, Check All/None/Modified, remembered), Cmd+Shift+C/V, Cmd+Alt+V, Sync…, Previous/Reset, presets/profile browser/Auto wired to v14. Deviations accepted: Snapshots + disabled (no backend command yet), histogram yields to the Masks panel.
+- 2026-09-30 — Phase 8b Preset & profile library, Auto tone + Auto WB, Guided workflow, Style learning, XMP auto-save complete (merged up to 0eb51b5): QA PASS — 419 Rust, clippy 0, fmt, build, 226 Playwright. Presets: 535 real presets × 2 bases, 29,606 keys, 0 outside a preset's keys; profile Amount vs Camera Raw (Vintage 09 ΔE 2.10/2.67/3.62 at 0/100/200). Auto vs Camera Raw Auto (oracle via DNG Converter, 374 frames): exposure 0.17 EV, render ΔL* 2.82 (none 5.69), Auto WB 565 K (as-shot 1142 K); skin clip 0/202 face frames > 0.3%; vs user's edits exposure 0.53 EV (contrast/blacks are the user's preset look → style model's job); one history entry. Style model: held-out 149 frames ΔE2000 7.46 vs no edit 9.42 vs reference auto 9.61 (121/149 better than no edit); through the catalog with the real auto_tone (12 frames) 6.33 vs auto 12.21 vs none 8.78; in-app validation 4.43 / 5.81 / 7.97; WB temperature the weak group (329 K vs 129 K). Workflow: UI spec + scene/workflow + batch round-trip tests; batch undo exact on a real catalog (12/12); per-frame exposure normalisation covered by Phase 7 matching tests only. XMP: auto-sync default on, sidecar fields preserved, status + explainer, exiftool round trips pass. Also merged: analysis skips images removed mid-pass (7bd3424), flaky style-import/mask-timing tests fixed (12 green runs).
