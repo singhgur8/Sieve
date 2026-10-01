@@ -58,7 +58,7 @@ export function PlanView(p: Props) {
   const rows = wf.rows;
   const keeperCount = wf.plan?.keeperIds.length ?? 0;
   const counts = wf.plan?.counts;
-  const todo = rows.filter((r) => r.ui === "todo" && !r.skipped);
+  const todo = rows.filter((r) => (r.ui === "todo" || r.ui === "reset") && !r.skipped);
   // Scenes the "Apply" button handles: edited ones, and applied ones that gained keepers since.
   const pending = rows.filter((r) => !r.skipped && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
   const pendingTargets = pending.reduce((a, r) => a + (r.ui === "applied" ? r.unapplied.length : r.targets), 0);
@@ -220,7 +220,7 @@ export function PlanView(p: Props) {
               data-testid="plan-apply-all"
               disabled={pending.length === 0 || busy != null}
               title={pending.length === 0 ? "Edit or auto edit a scene first" : "Copies each edited scene's edit to the rest of its scene, matching exposure and white balance per photo"}
-              onClick={() => void wf.applyAll(p.onReview)}
+              onClick={() => void wf.applyAll(p.onReview, p.onFocus)}
             >
               Apply {plural(pending.length, "edited scene")} ({pendingTargets})
               <ArrowRight className="size-3.5" />
@@ -369,7 +369,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const undo = wf.sceneUndo(id);
   const newKeepers = r.ui === "applied" ? r.unapplied.length : 0;
   const applyLabel = newKeepers > 0 ? `Apply to ${newKeepers} new` : r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
-  const canApply = r.ui !== "todo" && r.targets > 0 && !r.skipped;
+  const canApply = r.ui !== "todo" && r.ui !== "reset" && r.targets > 0 && !r.skipped;
   const reviewSet = new Set(r.review);
   const appliedSet = new Set(e.appliedIds);
 
@@ -445,13 +445,24 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           </button>
         )}
         <button
-          className={`h-7 whitespace-nowrap rounded-md px-3 text-xs font-medium ${r.ui === "todo" ? "bg-sky-700 text-white hover:bg-sky-600" : "bg-neutral-800 text-neutral-200 hover:bg-neutral-700"}`}
+          className={`h-7 whitespace-nowrap rounded-md px-3 text-xs font-medium ${r.ui === "todo" || r.ui === "reset" ? "bg-sky-700 text-white hover:bg-sky-600" : "bg-neutral-800 text-neutral-200 hover:bg-neutral-700"}`}
           data-testid={`plan-edit-${id}`}
           onClick={() => p.onEdit(id)}
         >
           {r.ui === "auto" ? "Review" : "Edit"} ▸
         </button>
-        {!r.skipped && (r.ui === "todo" || r.ui === "edited") && (
+        {r.ui === "reset" && !r.skipped && undo.batch && (
+          <button
+            className="h-7 whitespace-nowrap rounded-md bg-neutral-800 px-3 text-xs font-medium text-neutral-200 hover:bg-neutral-700 disabled:opacity-40"
+            data-testid={`plan-undo-inline-${id}`}
+            disabled={!undo.enabled || anyBusy}
+            title={undo.reason ?? "Restore the photos to how they were before the apply"}
+            onClick={() => void wf.undoBatch(undo.batch!)}
+          >
+            Undo apply
+          </button>
+        )}
+        {!r.skipped && (r.ui === "todo" || r.ui === "reset" || r.ui === "edited") && (
           <AutoEditButton style={wf.style} testid={`plan-auto-${id}`} label="Auto edit" disabled={anyBusy} onClick={() => wf.requestAutoEdit([id])} className="px-2" />
         )}
         <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
@@ -473,8 +484,8 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
             return (
               <div className="w-64 py-1">
                 {item(`plan-change-rep-${id}`, "Change representative…", () => p.onChangeRep(id))}
-                {item(`plan-options-${id}`, "Apply with options…", () => p.onApplyOptions(id), r.ui === "todo")}
-                {item(`plan-exact-${id}`, "Copy exactly (no matching)", () => void wf.applyScene(id, "exact", p.onReview), r.ui === "todo" || anyBusy || r.targets === 0)}
+                {item(`plan-options-${id}`, "Apply with options…", () => p.onApplyOptions(id), r.ui === "todo" || r.ui === "reset")}
+                {item(`plan-exact-${id}`, "Copy exactly (no matching)", () => void wf.applyScene(id, "exact", p.onReview), r.ui === "todo" || r.ui === "reset" || anyBusy || r.targets === 0)}
                 {item(`plan-skip-${id}`, r.skipped ? `Include this scene${hint("planSkip")}` : `Skip this scene${hint("planSkip")}`, () => void wf.setSkipped(id, !r.skipped))}
                 {item(`plan-show-${id}`, `Show all ${e.memberCount} photos`, () => p.onShowScene(id))}
                 {item(`plan-undo-${id}`, "Undo apply", () => undo?.batch && void wf.undoBatch(undo.batch), !undo?.enabled, undo?.reason)}

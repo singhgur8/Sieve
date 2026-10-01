@@ -188,7 +188,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
       label={`Match Scene ${sceneNumber}`}
       testid="match-panel"
       overlayClass="z-40 bg-black/70"
-      className="flex h-[88vh] w-[min(1200px,94vw)] flex-col rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl"
+      className="flex h-[84vh] w-[min(1200px,94vw)] flex-col rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl"
       onCancel={onClose}
     >
       <>

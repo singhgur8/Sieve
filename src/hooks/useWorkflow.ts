@@ -7,7 +7,7 @@ import { describeError } from "../lib/errors";
 import type { ToastApi } from "../components/Toasts";
 
 /** What the checklist shows for a scene (the backend status plus "auto edited, not reviewed yet"). */
-export type SceneUi = "todo" | "auto" | "edited" | "applied" | "stale";
+export type SceneUi = "todo" | "auto" | "edited" | "applied" | "stale" | "reset";
 
 export interface SceneRow {
   entry: SceneEditEntry;
@@ -28,7 +28,7 @@ export interface SceneRow {
 
 export type PlanTab = "all" | "todo" | "edited" | "applied" | "skipped";
 export const rowInTab = (r: SceneRow, t: PlanTab) =>
-  t === "skipped" ? r.skipped : t === "all" ? true : r.skipped ? false : t === "todo" ? r.ui === "todo" : t === "applied" ? r.ui === "applied" : r.ui === "edited" || r.ui === "auto" || r.ui === "stale";
+  t === "skipped" ? r.skipped : t === "all" ? true : r.skipped ? false : t === "todo" ? r.ui === "todo" || r.ui === "reset" : t === "applied" ? r.ui === "applied" : r.ui === "edited" || r.ui === "auto" || r.ui === "stale";
 
 export interface Busy {
   kind: "scene" | "all" | "auto";
@@ -118,7 +118,15 @@ export function useWorkflow(d: Deps) {
     if (!ab) return { batch: null, enabled: false, reason: "Nothing to undo" };
     const i = infos.get(ab.batchId) ?? ab;
     const hint = touched.has(ab.batchId) && i.undoable;
-    return { batch: { batchId: ab.batchId, label: ab.label }, enabled: i.undoable && !hint, reason: reasonOf(i) ?? (hint ? "Later edits touched these photos. Undo those first" : undefined) };
+    return { batch: { batchId: ab.batchId, label: batchLabel(ab.batchId, ab.label) }, enabled: i.undoable && !hint, reason: reasonOf(i) ?? (hint ? "Later edits touched these photos. Undo those first" : undefined) };
+  };
+  /** Scene-aware label for a persisted batch ("Apply Scene 2"), so it reads the same after Home and back. */
+  const batchLabel = (batchId: number, fallback: string): string => {
+    const ss = plan?.scenes ?? [];
+    const hit = ss.map((x, i) => ({ x, i })).filter(({ x }) => x.appliedBatch?.batchId === batchId);
+    if (hit.length === 1) return `Apply Scene ${hit[0].i + 1}`;
+    if (hit.length > 1) return `Apply ${plural(hit.length, "scene")}`;
+    return fallback;
   };
   const latest = plan?.latestBatch ?? null;
   const stackTop = batchStack.length > 0 ? batchStack[batchStack.length - 1] : null;
@@ -128,8 +136,18 @@ export function useWorkflow(d: Deps) {
       ? stackTop
       : null
     : latest && latest.undoable && !touched.has(latest.batchId)
-      ? { batchId: latest.batchId, label: latest.label, sceneIds: [], imageIds: [], at: latest.createdAtMs }
+      ? { batchId: latest.batchId, label: batchLabel(latest.batchId, latest.label), sceneIds: [], imageIds: [], at: latest.createdAtMs }
       : null;
+  /** Newest batch (session, else the plan's) that exists but cannot be undone: Cmd+Z explains why instead of "Nothing to undo". */
+  const blockedUndo = (): { at: number; reason: string } | null => {
+    const top = stackTop ? { batchId: stackTop.batchId, at: stackTop.at } : latest ? { batchId: latest.batchId, at: latest.createdAtMs } : null;
+    if (!top || lastBatch) return null;
+    const i = infos.get(top.batchId) ?? (latest && latest.batchId === top.batchId ? latest : null);
+    if (i && i.undoneAtMs != null) return null;
+    const n = i?.conflictCount ?? 0;
+    const reason = n > 0 ? `Later edits on ${plural(n, "photo")}. Undo those in Develop first` : "Later edits touched these photos. Undo those in Develop first";
+    return { at: top.at, reason };
+  };
   /** The user committed an adjustment (or batch-edited photos) in Develop: batches covering them lose their Undo (hint; the backend confirms on the next refresh). */
   const noteCommit = useCallback((ids: number[]) => {
     const set = new Set(ids);
@@ -168,7 +186,7 @@ export function useWorkflow(d: Deps) {
       const list = await unwrap(commands.getEditBatches([...ids]));
       const m = new Map(list.map((i) => [i.batchId, i]));
       p.scenes.forEach((x) => x.appliedBatch && !m.has(x.appliedBatch.batchId) && m.set(x.appliedBatch.batchId, x.appliedBatch));
-      touchedRef.current = new Set([...touchedRef.current].filter((id) => m.get(id)?.undoable !== false));
+      touchedRef.current = new Set([...touchedRef.current].filter((id) => !m.has(id)));
       setTouched(new Set(touchedRef.current));
       setInfos(m);
       list.forEach((i) => {
@@ -315,7 +333,7 @@ export function useWorkflow(d: Deps) {
   const rows = useMemo<SceneRow[]>(() => {
     if (!plan) return [];
     return plan.scenes.map((entry, i) => {
-      const ui: SceneUi = entry.status === "to_edit" ? "todo" : entry.status === "applied" ? "applied" : entry.status === "outdated" ? "stale" : entry.autoEdited ? "auto" : "edited";
+      const ui: SceneUi = entry.status === "to_edit" ? "todo" : entry.status === "reset" ? "reset" : entry.status === "applied" ? "applied" : entry.status === "outdated" ? "stale" : entry.autoEdited ? "auto" : "edited";
       return {
         entry,
         number: i + 1,
@@ -432,14 +450,24 @@ export function useWorkflow(d: Deps) {
   );
 
   const applyAll = useCallback(
-    async (onReview?: (sceneId: number, ids?: number[]) => void) => {
+    async (onReview?: (sceneId: number, ids?: number[]) => void, onShow?: (sceneId: number) => void) => {
       if (projectId == null || busyRef.current) return;
       setBusy({ kind: "all", done: 0, total: 0 });
       setCancelling(false);
       try {
         const r = await unwrap(commands.applyAllEditedScenes(projectId, null));
+        const skipped = r.skippedScenes ?? [];
+        const noteSkipped = () => {
+          if (skipped.length === 0) return;
+          const first = skipped[0];
+          const known = planRef.current?.scenes.some((x) => x.sceneId === first.sceneId);
+          toasts.push(`Not applied: ${skipped.map((x) => x.message).join(" ")}`, {
+            action: known && onShow ? { label: "Show", testid: "apply-skipped-show", onClick: () => onShow(first.sceneId) } : undefined,
+          });
+        };
         if (r.scenes.length === 0) {
           toasts.push(r.cancelled ? "Stopped. Nothing was applied" : "No edited scenes to apply");
+          noteSkipped();
           return;
         }
         const n = r.scenes.reduce((a, s) => a + s.changedIds.length, 0);
@@ -453,6 +481,7 @@ export function useWorkflow(d: Deps) {
           secondary: needN > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId, need[0].notConvergedIds) } : undefined,
         });
         bindToast(b, tid);
+        noteSkipped();
       } catch (e) {
         onError(e);
       } finally {
@@ -601,6 +630,7 @@ export function useWorkflow(d: Deps) {
     style,
     busy,
     lastBatch,
+    blockedUndo,
     sceneUndo,
     undoReason,
     noteCommit,

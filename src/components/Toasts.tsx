@@ -83,10 +83,28 @@ export function IssueBanner({ issue, onDismiss, onRestore }: { issue: ErrorInfo;
   );
 }
 
-/** `top`: Develop, where the bottom edge of the viewer carries the Before / Split / Compare / flag toolbar. */
+/** True while a modal dialog is open (toasts then move clear of its header and footer). */
+function useDialogOpen(): boolean {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const check = () => setOpen(document.querySelector('[role="dialog"][aria-modal="true"]') != null);
+    check();
+    const mo = new MutationObserver(check);
+    mo.observe(document.body, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, []);
+  return open;
+}
+
+/**
+ * `top`: Develop. Without a dialog the stack sits at the viewer's top-right (left of the adjustment panel) so it stays off the
+ * photo's centre and the viewer toolbar; while a dialog is open it moves to the bottom-left, clear of the dialog.
+ */
 export function Toasts({ api, error, onDismissError, onLocate, placement = "bottom" }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void; placement?: "bottom" | "top" }) {
+  const modal = useDialogOpen();
+  const pos = modal ? "bottom-3 left-4 w-[min(400px,92vw)]" : placement === "top" ? "top-[88px] right-[300px] w-[min(400px,92vw)] min-[1600px]:right-[332px]" : "bottom-24 left-1/2 w-[min(480px,92vw)] -translate-x-1/2";
   return (
-    <div className={`pointer-events-none fixed ${placement === "top" ? "top-[88px]" : "bottom-24"} left-1/2 z-40 flex w-[min(480px,92vw)] -translate-x-1/2 flex-col items-stretch gap-2`} data-testid="toasts" data-placement={placement}>
+    <div className={`pointer-events-none fixed ${pos} z-[60] flex flex-col items-stretch gap-2`} data-testid="toasts" data-placement={modal ? "modal" : placement}>
       {error && (
         <div role="alert" className="pointer-events-auto flex items-start justify-between gap-3 rounded-lg border border-red-800 bg-red-950 px-3 py-2 text-sm text-red-200 shadow-xl" data-testid="error" data-category={error.category}>
           <span className="min-w-0 break-words">{error.message}</span>
