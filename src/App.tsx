@@ -993,7 +993,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "applyScene": {
         if (step !== "edit") return;
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
-        if (!row || row.ui === "todo" || row.targets === 0) return setNotice("Edit this scene's representative first");
+        if (!row || row.ui === "todo" || row.ui === "reset" || row.targets === 0) return setNotice("Edit this scene's representative first");
         if (row.skipped) return setNotice("This scene is skipped. Include it first (S in the Plan)");
         return void wf.applyScene(row.entry.sceneId, "match", reviewFrames);
       }
@@ -1018,6 +1018,11 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return void setKeeper(active ?? null, false);
       case "undoCull":
         if (wf.lastBatch && wf.lastBatch.at > cull.undoAt()) return wf.undoLast();
+        {
+          // A newer batch exists but later edits block it: say why instead of "Nothing to undo".
+          const blocked = wf.blockedUndo();
+          if (blocked && blocked.at > cull.undoAt()) return void toasts.push(blocked.reason);
+        }
         return void cull.undo();
       case "redoCull":
         return void cull.redo();

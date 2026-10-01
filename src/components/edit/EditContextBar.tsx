@@ -25,6 +25,7 @@ const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
   edited: { text: "Edited · representative", cls: "bg-sky-950 text-sky-200" },
   applied: { text: "Applied · representative", cls: "bg-emerald-950 text-emerald-200" },
   stale: { text: "Changed since applied · representative", cls: "bg-amber-950 text-amber-200" },
+  reset: { text: "Reset since applied · representative", cls: "bg-amber-950 text-amber-200" },
 };
 
 export function EditContextBar(p: Props) {
@@ -34,7 +35,7 @@ export function EditContextBar(p: Props) {
   const isRep = !!row && row.entry.representativeId === p.activeId;
   const busy = wf.busy != null;
   const undo = row ? wf.sceneUndo(row.entry.sceneId) : null;
-  const canApply = !!row && row.ui !== "todo" && row.targets > 0 && !row.skipped;
+  const canApply = !!row && row.ui !== "todo" && row.ui !== "reset" && row.targets > 0 && !row.skipped;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
 
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
@@ -48,7 +49,8 @@ export function EditContextBar(p: Props) {
           {c.text}
         </span>
       );
-      if (row.ui === "todo" || row.ui === "edited") hintText = `Edit this photo, then apply it to the other ${row.targets}.`;
+      if (row.ui === "reset") hintText = "Edit this photo first";
+      else if (row.ui === "todo" || row.ui === "edited") hintText = `Edit this photo, then apply it to the other ${row.targets}.`;
     } else if (wf.needsReviewSet.has(p.activeId)) {
       const reason = wf.stateById.get(p.activeId)?.reviewReason;
       chip = (
@@ -156,7 +158,7 @@ export function EditContextBar(p: Props) {
             className="flex h-6 items-center whitespace-nowrap rounded-l-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid="edit-apply"
             disabled={!canApply || busy}
-            title={row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
+            title={row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
             onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview)}
           >
             {newKeepers > 0 ? `Apply to ${newKeepers} new` : `Apply to scene${row ? ` (${row.targets})` : ""}`}
