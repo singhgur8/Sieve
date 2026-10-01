@@ -394,3 +394,80 @@ No change needed. Cmd+Z is linear in Develop (batch first, then per-image) and c
 
 ### No change needed
 The Match panel layout in Edit-step mode (keeper targets, the `Include non-keepers (n)` opt-in, the `Edited by you` badge and footer count), backend-driven toast Undo retraction, the info toast for `conflict`, row `Undo apply` after Home and back, the `Applying…` pill, the cheat sheet's Plan rows, the disabled `Apply 0 edited scenes (0)` preview on a fresh plan, and Export.
+
+## Re-check 3 (2026-09-30, `phase-8b-feedback` @ 335e161)
+
+Author: ux-designer (read-only). Evidence: mock backend (`vite --port 1933`, `/?mock=201&style=ready`), Chromium at 1280×800 and 1728×1117.
+Drivers: `test-data/ux-review-8b/recheck3/{p112,walk}.spec.ts` (config `pw.config.ts`). Logs: `p112.log`, `walk.log`.
+Screenshots: `test-data/ux-review-8b/recheck3/{1280,1728}-NN-*.png`. `tests/ui/p1-12.spec.ts`: 10/10 pass.
+
+**Result: P1-12 is resolved at both sizes, and none of the earlier P0/P1 items has regressed. There are no new P0 or P1 findings, so the gate "no open P0/P1" is met.** Only P2 items remain.
+
+### P1-12
+
+| Check | Status | Evidence |
+|---|---|---|
+| Repro (a): Auto edit 3 scenes → Apply Scene 1 → Undo on the older toast | **Resolved** (linear) | Once Scene 1 is applied, the older `Auto edited 3 scenes` toast has no Undo button (`olderUndoBtns=0`, `*-01-a-after-apply1.png`). The first Cmd+Z undoes the apply (`Undid Apply Scene 1 on 15 photos`, scenes back to `auto`). The second Cmd+Z undoes the auto edit (all scenes `todo`). Then Auto edit remaining → `Apply 3 edited scenes (40)` applies all 3, with no error, and `Continue to Export` appears (`*-03-a-done.png`). The dead-end state can no longer be reached from this path. |
+| Repro (b): Auto edit Scene 1 → Apply → Edit ▸ → Cmd+Shift+R | **Resolved** | Row: amber ↻ icon, `Representative reset · 15 photos keep the earlier look`, primary `Edit ▸` (blue), `Undo apply`, `Auto edit`, and no Apply or Re-apply button. The row counts under `To do 3`, and the step pill reads `0 of 3 scenes` (`*-11-b-plan-reset.png`). In the row ⋯ menu, `Apply with options…` and `Copy exactly` are disabled and `Undo apply` is enabled (`1280-12-b-row-menu.png`). After auto editing scenes 2 and 3, the header reads `Apply 2 edited scenes (25)`. Apply all applies both with no error. Scene 1 stays `reset` and `Continue to Export` stays hidden, which is correct (`*-13`). |
+| Develop on a reset rep | **Resolved** | The chip reads `Reset since applied · representative`, and `Apply to scene (15)` is disabled with the title `Edit this photo first`. Cmd+Shift+Enter shows the toast `Edit this scene's representative first`. At 1728 the hint `Edit this photo first` is visible next to the chip (`1728-10`). At 1280 it is hidden (see P2 #14). |
+| Ways out of the reset state | **Work** | (1) Inline `Undo apply`, which also works after Home and back: the scene returns to `todo` and member 24 is back to exposure 0 (`*-14`). (2) `Auto edit` on the row: the scene returns to `applied` and `Continue to Export` appears. (3) Hand-editing the rep: the chip changes to `Changed since applied` and `Apply to scene (15)` becomes enabled. Cmd+Z steps back through `reset`, then `Applied · representative` (exposure 0.3). |
+| Apply all skips scenes it cannot apply | **Verified** in the suite (`p1-12.spec.ts`, `skipped scenes toast`): the toast reads `Not applied: Scene 2: …` with `Show`, and the other scenes still apply. The real backend has `SceneEditStatus::Reset` and `skipped_scenes`, with Rust tests (`scene/workflow.rs`), so this is not mock-only. |
+
+### Re-check 2 P2 bugs
+
+| # | Status | Evidence |
+|---|---|---|
+| #10 Stale touched hint | **Resolved** | After a per-image Cmd+Z on member 56, the row `Undo apply` is enabled again, with no reason title. |
+| #11 Cmd+Z in the Plan says nothing to undo | **Resolved** | The toast reads `Later edits on 1 photo. Undo those in Develop first` (`*-31`). It does not name the file, which is acceptable. |
+| #12 Toast label after Home and back | **Resolved** | `Undid Apply Scene 2 on 16 photos`. |
+| #13 Toast placement | **Resolved** | In Develop the stack sits at the viewer's top-right (x 580–980 at 1280, 996–1396 at 1728, y 88), clear of the toolbar and the right panel. While a modal is open it sits bottom-left (y 750 at 1280), below the Match panel footer (`1280-32-modal-toast.png`). |
+
+### Earlier P0/P1: regression spot-check (both sizes, `walk.log`)
+
+| Item | Status |
+|---|---|
+| P0-1 Scene nav | No regression. Start 23, `›`=55, N=96, Shift+N=55, checklist jump to Scene 3 = 96, all `chip=rep`. |
+| P0-2 Profile hover | No regression. `Preview: Adobe Standard` → Esc → label count 0, and the view stays in Develop. |
+| P1-1 Toast Review | No regression. Options apply on Scene 1, then toast Review opens 21 with `chip=review`. |
+| P1-2 Persisted needs-a-look | No regression. `Applied to 15 · 1 need a look` survives Home and back. |
+| P1-3 New keepers | No regression. Picking 4 gives `· 1 new keeper not edited`, `Apply to 1 new`, and `Continue to Export` is hidden. |
+| P1-4 Skip (S) | No regression. S toggles skip on and off, and the cheat sheet lists it. |
+| P1-5 / P1-6 / P1-11 | No regression. Options goes through the batch path, the undo stack is linear, and older toasts lose Undo. |
+| P1-7 Toolbar | No regression. scrollWidth equals clientWidth (1044 at 1280, 1492 at 1728). Nothing overflows in Cull, Plan, Develop, Match or Export. |
+| P1-8 Cheat sheet | No regression. PgDn + Space scroll it and the sheet stays open. Esc twice closes it. |
+| P1-9 New project options | No related commits since re-check 1. |
+| P1-10 Options targets | No regression. Scene 1 gives `Apply to 15 photos`, and `Include non-keepers` is present and unticked. |
+
+**End-to-end walk** (both sizes): Home → open → cull (P, 3, →, X, Cmd+Z ×3) → `Continue to Edit` → Auto edit remaining → `Apply 2 edited scenes (25)` → pill `All scenes applied` → `Continue to Export` opens `Export 43 keepers`. This is unchanged: 4 clicks plus a folder.
+
+### New P0/P1
+None.
+
+### Remaining P2 (none block the gate)
+
+Done since re-check 2: #10, #11, #12 and #13 (above).
+
+Still open from earlier (not touched since):
+1. P2-3: the histogram is hidden while Masks is open.
+2. P2-7: Shift+S in the Edit step toggles the scene strip, not `This scene only`.
+3. P2-8: disabled controls explain themselves only through `title`. This includes the disabled `Undo apply` (`Later edits on 1 photo…`) and the reset rep's disabled `Apply to scene`.
+4. P2-11: the XMP `pending` pill is amber with a ring.
+5. P2-12: the keeper rule menu has no `Applies to all projects` footer.
+6. P2-13: home keyboard (Cmd+Shift+I, Cmd+F or `/`, arrow keys between cards) and Cmd+Shift+O are not bound.
+7. P2-14: the plan member strip is fixed at 8 thumbs, which leaves empty space at 1728.
+8. P2-15: the `S1` badge appears on every filmstrip cell (`*-10-b-develop-reset.png`).
+9. #15 (noted): the Library-scope Match panel still uses the per-photo undo loop.
+
+New (P2):
+
+10. **The header shows `Apply 0 edited scenes (0)` (disabled) when the only open scene is a reset one** (`1280-13-b-after-apply-all.png`), next to `Auto edit 1 remaining`. #12 from re-check 1 already hides it in the unassigned-only case. Extend the rule: hide `plan-apply-all` whenever `pending.length === 0` and at least one scene is applied. Keep the disabled preview only on a fresh plan (nothing applied yet), where it shows the next step.
+11. **The member strip of a reset row is clipped mid-thumbnail at 1280, with no `+N` chip** (`1280-11-b-plan-reset.png`: thumb 15 is cut by `Review 1`). The reset row has 5 actions (Review, Edit, Undo apply, Auto edit, ⋯), against 2 or 3 on other rows. Compute `memberShown` from the strip width that remains after the actions (as in P2-14), so that the strip always ends on a whole thumb plus `+N`.
+12. **`Undo apply` appears twice on a reset row**: as the inline button and in the ⋯ menu. This is harmless. Optional: drop the menu item while the inline button is visible.
+13. **The reset row keeps `Review 1`** for the needs-a-look member. Those members still carry the earlier look, so reviewing them before the scene is re-edited is wasted effort. Hide `plan-review-<id>` while `ui === "reset"`, and show it again once the scene is re-applied.
+14. **At 1280 the Develop hint `Edit this photo first` is hidden** (`max-[1439px]:hidden` in `EditContextBar.tsx` l. 139), so the reason only lives in the disabled button's title (`1280-10-b-develop-reset.png`). The chip `Reset since applied` and the Cmd+Shift+Enter toast cover it, so this is P2. Spec: for `ui === "reset"` only, show the hint at every width (it is short), or append `· edit first` to the chip text below 1440.
+
+### Keyboard
+No change needed. Cmd+Z is strictly linear across Auto edit → Apply (newest batch first, older toasts lose Undo). Cmd+Shift+Enter on a reset scene explains itself in both the Plan and Develop. S, Esc and Shift+S in the Plan are unchanged.
+
+### No change needed
+The reset row's copy, icon, tab and header accounting, the reset chip in Develop, the inline `Undo apply` (including after Home and back), the skipped-scenes toast with `Show`, the toast placement in Develop and with modals, the conflict message for Cmd+Z in the Plan, and Export.
