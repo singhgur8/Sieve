@@ -659,7 +659,7 @@ fn png_round_trip_keeps_bounds_and_pixels() {
 
 const REAL_DIR: &str = "/Users/gurjotsingh/Pictures/Jasmit Natalie Proposal";
 /// Overlays and round-trip copies (gitignored `test-data/` of the main checkout).
-const OUT_DIR: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data/mask-check";
+const OUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data/mask-check");
 
 fn sidecars() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = walkdir::WalkDir::new(REAL_DIR)

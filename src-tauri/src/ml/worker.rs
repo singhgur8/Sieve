@@ -825,7 +825,7 @@ mod tests {
     #[ignore = "needs models (scripts/fetch-models.sh) and test-data previews"]
     fn real_previews_end_to_end() {
         let models = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
-        let thumbs = Path::new("/Users/gurjotsingh/Documents/GitHub/Sieve/test-data/qa-phase2/cache/thumbs");
+        let thumbs = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data/qa-phase2/cache/thumbs"));
         let dir = tempfile::tempdir().unwrap();
         let mut previews = Vec::new();
         for id in [1, 2, 3, 36, 43, 54, 144, 218] {

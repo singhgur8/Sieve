@@ -30,7 +30,7 @@ use sieve_lib::lut::LutLibrary;
 use sieve_lib::raw::turbo;
 use sieve_lib::scene::{self, detect, features, matching, stats, store, MatchImage};
 
-const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
+const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data");
 /// Default picks (a member file name per scene), chosen from `--list` + the previews:
 /// bright ceremony/outdoor, warm reception, dark dance floor, portrait session, ...
 const DEFAULT_PICKS: &str =

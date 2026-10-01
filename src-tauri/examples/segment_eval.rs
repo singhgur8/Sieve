@@ -23,7 +23,7 @@ use std::time::Instant;
 use sieve_lib::ml::segment::{Mask, RgbImage, SegmentConfig, SegmentEngine};
 use sieve_lib::raw::turbo;
 
-const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
+const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data");
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())

@@ -147,7 +147,7 @@ fn real_masked_sidecars_minimal_diff() {
     );
     let out_dir = PathBuf::from(
         std::env::var("SIEVE_TEST_OUT")
-            .unwrap_or_else(|_| "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data/xmp-minimal".into()),
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data/xmp-minimal").into()),
     );
     assert!(!out_dir.starts_with(&src_dir), "never write next to the originals");
     std::fs::create_dir_all(&out_dir).unwrap();

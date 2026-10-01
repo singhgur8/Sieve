@@ -25,7 +25,7 @@ use sieve_lib::ipc::types::{CullThresholds, ShootType};
 use sieve_lib::ml::worker::{self, AnalysisSink};
 use sieve_lib::ml::{AnalysisConfig, Analyzer};
 
-const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
+const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data");
 
 #[derive(Default)]
 struct Counter {

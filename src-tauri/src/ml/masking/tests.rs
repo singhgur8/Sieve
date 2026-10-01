@@ -330,7 +330,7 @@ mod real {
     use crate::ml::segment_models::registry;
     use crate::raw::turbo;
 
-    const ROOT: &str = "/Users/gurjotsingh/Documents/GitHub/Sieve/test-data";
+    const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-data");
     /// Frames without visible sky (indoor, night, close-ups against walls/foliage).
     const NO_SKY: [&str; 6] = ["MON04829", "MON04849", "MON05151", "MON05322", "AZA06793", "IMG_5697"];
 
