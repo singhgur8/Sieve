@@ -13,12 +13,12 @@ async function openProject(page: Page) {
   await expect(page.getByTestId("cull-summary")).toBeVisible();
 }
 
-/** "Suggestions: 20 picks · 8 rejects · 3 star-rated — Apply…" -> the sum of the parts. */
+/** "Suggestions: 20 picks · 8 rejects · 3 stars only — Apply…" -> the sum of the parts. */
 async function suggestedTotal(page: Page): Promise<number> {
   const text = (await page.getByTestId("cull-sum-suggest").textContent()) ?? "";
   expect(text).toMatch(/^Suggestions: .+ — Apply…$/);
   expect(text).not.toMatch(/(^|[ :·])0 /); // zero parts are dropped
-  return [...text.matchAll(/(\d+) (picks?|rejects?|star-rated)/g)].reduce((a, m) => a + Number(m[1]), 0);
+  return [...text.matchAll(/(\d+) (picks?|rejects?|stars only)/g)].reduce((a, m) => a + Number(m[1]), 0);
 }
 
 async function applyWithDefaults(page: Page) {
@@ -69,7 +69,7 @@ test.describe("cull summary: suggestions and flag origin (v18.1)", () => {
     await expect(auto).toHaveAttribute("aria-pressed", "true");
     await expect(byYou).toHaveAttribute("aria-pressed", "false");
     await expect(readout).toContainText(`Showing ${nAuto} of 101`);
-    await expect(page.getByTestId("filter-origin")).toHaveText(/^Auto-rejected/);
+    await expect(page.getByTestId("filter-origin")).toHaveText(/^Auto/);
     await expect(page.getByTestId("pick-reject")).toContainText(String(nAuto)); // get_filter_counts honours the origin
     expect((await calls(page, "get_filter_counts")).some((c) => c.args.pickOrigin === "auto")).toBe(true);
     expect((await calls(page, "list_image_ids")).at(-1)!.args.query).toMatchObject({ picks: ["reject"], pickOrigin: "auto" });
@@ -80,7 +80,7 @@ test.describe("cull summary: suggestions and flag origin (v18.1)", () => {
     await expect(byYou).toHaveAttribute("aria-pressed", "true");
     await expect(auto).toHaveAttribute("aria-pressed", "false");
     await expect(readout).toContainText(`Showing ${nYou} of 101`);
-    await expect(page.getByTestId("filter-origin")).toHaveText(/^Rejected by you/);
+    await expect(page.getByTestId("filter-origin")).toHaveText(/^By you/);
     for (const el of await page.locator('[data-testid^="reject-reason-"]').all()) await expect(el).toHaveAttribute("data-origin", "user");
 
     // The chip's × drops the origin only: every reject again.

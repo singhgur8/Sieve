@@ -73,22 +73,23 @@ export function useFilterCounts(folderId: number | null, projectId: number | nul
 const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
 
 /** "Metadata" button (opens the Lightroom-style column row, remembered for the session) plus chips of the active values. */
-function MetaToggle({ query, setQuery }: Pick<Props, "query" | "setQuery">) {
+function MetaToggle({ query }: Pick<Props, "query">) {
   const open = useMetaRowOpen();
   const n = metaChips(query.metadata, null).length;
   return (
-    <div className="flex shrink-0 items-center gap-1" data-testid="filter-meta-group">
+    <>
       <button
         data-testid="meta-toggle"
         aria-pressed={open}
         onClick={() => setMetaRowOpen(!open)}
-        title="Filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar"
+        aria-label="Metadata"
+        title="Metadata: filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar"
         className={`${chip} flex items-center gap-1 ${open ? "bg-sky-800 text-sky-100" : off}`}
       >
-        <ListFilter className="size-3" /> Metadata{n > 0 && <span className="opacity-80" data-testid="meta-active-count">{n}</span>}
+        <ListFilter className="size-3" /> <span className="hidden min-[1440px]:inline">Metadata</span>
+        {n > 0 && <span className="opacity-80" data-testid="meta-active-count">{n}</span>}
       </button>
-      <MetaChips query={query} setQuery={setQuery} />
-    </div>
+    </>
   );
 }
 
@@ -108,7 +109,7 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
   return (
     <div className={`${rowClass} min-w-0`} data-testid="filter-bar">
       <Filter className="size-3.5 shrink-0 text-neutral-400" aria-hidden />
-      <div className="flex shrink-0 items-center gap-1" data-testid="filter-tags">
+      <div className="flex min-w-0 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,black_calc(100%-12px),transparent)]" data-testid="filter-tags">
         {ALL_TAGS.map((t) => {
           const inc = query.includeTags.includes(t);
           const exc = query.excludeTags.includes(t);
@@ -141,6 +142,7 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
           <button
             key={p.key}
             data-testid={`pick-${p.key}`}
+            title={query.pickOrigin != null ? `${p.label} ${pickCount(p.key)} (${query.pickOrigin === "auto" ? "auto" : "by you"} only — clear "${query.pickOrigin === "auto" ? "Auto" : "By you"} ×" to see all)` : undefined}
             onClick={() => setQuery((q) => ({ ...q, picks: toggle(q.picks, p.key) }))}
             className={`${chip} ${query.picks.includes(p.key) ? "bg-sky-800 text-sky-100" : off}`}
           >
@@ -152,15 +154,15 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
             data-testid="filter-origin"
             data-origin={query.pickOrigin}
             onClick={() => setQuery((q) => ({ ...q, pickOrigin: null }))}
-            title={query.pickOrigin === "auto" ? "Only flags set by Apply suggestions (not changed by you since). Click to show every flag" : "Only flags you set yourself. Click to show every flag"}
+            title={query.pickOrigin === "auto" ? `${originLabel(query)}: only flags set by Apply suggestions (not changed by you since). Click to show every flag` : `${originLabel(query)}: only flags you set yourself. Click to show every flag`}
             className={`${chip} flex items-center gap-1 bg-sky-800 text-sky-100 ring-1 ring-white/30`}
           >
-            {originLabel(query)} <X className="size-3" aria-label="Remove" />
+            {query.pickOrigin === "auto" ? "Auto" : "By you"} <X className="size-3" aria-label="Remove" />
           </button>
         )}
       </div>
 
-      <MetaToggle query={query} setQuery={setQuery} />
+      <MetaChips query={query} setQuery={setQuery} />
 
       {((counts?.missing ?? 0) > 0 || query.missingOnly) && (
         <div className="flex shrink-0 items-center gap-1" data-testid="filter-missing-group">
@@ -181,16 +183,21 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
         </div>
       )}
 
-      {isFiltered(query) && (
-        <button
-          onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
-          className="ml-auto flex shrink-0 items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
-          data-testid="clear-filters"
-        >
-          <RotateCcw className="size-3" />
-          Clear
-        </button>
-      )}
+      <div className="ml-auto flex shrink-0 items-center gap-1" data-testid="filter-trailing">
+        <MetaToggle query={query} />
+        {isFiltered(query) && (
+          <button
+            onClick={() => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }))}
+            className="flex shrink-0 items-center gap-1 rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
+            data-testid="clear-filters"
+            aria-label="Clear"
+            title="Clear all filters"
+          >
+            <RotateCcw className="size-3" />
+            <span className="hidden min-[1440px]:inline">Clear</span>
+          </button>
+        )}
+      </div>
     </div>
   );
 }

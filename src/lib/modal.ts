@@ -1,6 +1,6 @@
 // Modal layer stack. While any layer is open the global shortcut handler is inert (`modalCount() > 0`);
 // only the topmost layer reacts to Esc (cancel), Enter (confirm when enabled) and Tab (focus trap).
-import { useEffect, useRef, type RefObject } from "react";
+import { useEffect, useRef, useSyncExternalStore, type RefObject } from "react";
 
 interface Layer {
   id: number;
@@ -20,6 +20,15 @@ let installed = false;
 
 /** Number of open modal layers (dialogs and popover menus). */
 export const modalCount = () => stack.length;
+
+const listeners = new Set<() => void>();
+const notify = () => listeners.forEach((l) => l());
+const subscribe = (l: () => void) => {
+  listeners.add(l);
+  return () => void listeners.delete(l);
+};
+/** Reactive `modalCount()`: re-renders when a layer is pushed or removed. */
+export const useModalCount = () => useSyncExternalStore(subscribe, modalCount, modalCount);
 
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -104,6 +113,7 @@ export function useModalLayer(o: ModalLayerOptions) {
       trap: () => opts.current.trap ?? true,
     };
     stack.push(layer);
+    notify();
     const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (opts.current.focusFirst !== false) {
       const root = opts.current.ref.current;
@@ -115,6 +125,7 @@ export function useModalLayer(o: ModalLayerOptions) {
     return () => {
       const i = stack.findIndex((l) => l.id === layer.id);
       if (i >= 0) stack.splice(i, 1);
+      notify();
       if (prev && document.contains(prev) && prev !== document.body && document.activeElement === document.body) prev.focus();
     };
   }, []);

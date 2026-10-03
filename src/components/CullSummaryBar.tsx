@@ -24,12 +24,12 @@ const onlyRejectedBy = (q: Query, o: PickOrigin) => !q.keepersOnly && q.pickOrig
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-/** "20 picks · 8 rejects · 3 star-rated", zero parts dropped (UX 8c P1-1). */
+/** "20 picks · 8 rejects · 3 stars only", zero parts dropped (UX 8c P1-1). */
 export function suggestionParts(s: CullSummary): string {
   return [
     s.suggestedPickPending > 0 && plural(s.suggestedPickPending, "pick"),
     s.suggestedRejectPending > 0 && plural(s.suggestedRejectPending, "reject"),
-    s.suggestedRatingPending > 0 && `${s.suggestedRatingPending} star-rated`,
+    s.suggestedRatingPending > 0 && `${s.suggestedRatingPending} stars only`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -42,7 +42,23 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
   const keepersOn = !!query.keepersOnly;
   const formula = keeperEquation(s);
   const suggestions = suggestionParts(s);
-  const splitBtn = (active: boolean) => `whitespace-nowrap rounded px-1 transition-colors ${active ? on : "hover:bg-neutral-800 hover:text-neutral-200"}`;
+  const splitPart = (n: number, o: PickOrigin, label: string) => {
+    const who = o === "user" ? "you rejected yourself (flag keys, sidecars, undo)" : "rejected by Apply suggestions (and not changed by you since)";
+    // A zero part is plain text: it would only show an empty grid.
+    if (n === 0 && !onlyRejectedBy(query, o)) return <span className="px-0.5" data-testid={`cull-sum-${o === "user" ? "by-you" : "auto"}`}>{label}</span>;
+    return (
+      <button
+        className={splitBtn(onlyRejectedBy(query, o))}
+        aria-pressed={onlyRejectedBy(query, o)}
+        data-testid={`cull-sum-${o === "user" ? "by-you" : "auto"}`}
+        title={`Show only the ${n} photos ${who}, each with the reason`}
+        onClick={() => toggleRejectedBy(o)}
+      >
+        {label}
+      </button>
+    );
+  };
+  const splitBtn = (active: boolean) => `whitespace-nowrap rounded px-0.5 transition-colors ${active ? on : "hover:bg-neutral-800 hover:text-neutral-200"}`;
   return (
     <div className="flex shrink-0 flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
       <button
@@ -66,25 +82,8 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
       </button>
       <span className="text-neutral-400" data-testid="cull-sum-reject-split">
         (
-        <button
-          className={splitBtn(onlyRejectedBy(query, "user"))}
-          aria-pressed={onlyRejectedBy(query, "user")}
-          data-testid="cull-sum-by-you"
-          title={`Show only the ${s.rejectedByUser} photos you rejected yourself (flag keys, sidecars, undo), each with the reason`}
-          onClick={() => toggleRejectedBy("user")}
-        >
-          {s.rejectedByUser} by you
-        </button>
-        ,{" "}
-        <button
-          className={splitBtn(onlyRejectedBy(query, "auto"))}
-          aria-pressed={onlyRejectedBy(query, "auto")}
-          data-testid="cull-sum-auto"
-          title={`Show only the ${s.rejectedAuto} photos rejected by Apply suggestions (and not changed by you since), each with the reason`}
-          onClick={() => toggleRejectedBy("auto")}
-        >
-          {s.rejectedAuto} auto
-        </button>
+        {splitPart(s.rejectedByUser, "user", `${s.rejectedByUser} by you,`)}{" "}
+        {splitPart(s.rejectedAuto, "auto", `${s.rejectedAuto} auto`)}
         )
       </span>
       <span className="mx-1 h-4 w-px bg-neutral-700" />
