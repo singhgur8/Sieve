@@ -7,6 +7,8 @@ export interface View {
   scale: number;
   cx: number;
   cy: number;
+  /** True while the view is 1:1 (100%) of the decoded preview: re-derived when the preview finishes decoding. */
+  actual?: boolean;
 }
 export const FIT: View = { scale: 1, cx: 0.5, cy: 0.5 };
 
@@ -28,10 +30,12 @@ interface Props {
   testId?: string;
   onFocus?: () => void;
   maxScale?: number;
+  /** Re-derive a 1:1 zoom when the preview decodes (Compare: only the pane that owns the shared metrics). */
+  rescaleActual?: boolean;
 }
 
 /** Fit / zoom / pan surface for one preview (uses the 2048px preview, thumbnail underneath while loading). */
-export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 16 }: Props) {
+export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 16, rescaleActual = true }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   // The preview is decoded off-screen first; it is only mounted once it can paint in full. Until then the
@@ -82,6 +86,15 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
   const y = clampPos(size.h / 2 - view.cy * dh, size.h, dh);
   metricsRef.current = { fitW, fitH, natW: nat?.w ?? nw, natH: nat?.h ?? nh, cw: size.w, ch: size.h };
 
+  // 1:1 was chosen against the thumbnail's dimensions if Space came before the preview decoded: re-derive it
+  // against the real pixels (and after a resize) so "100%" stays 100%.
+  const wantScale = fitW > 0 ? Math.max(1, (nat?.w ?? nw) / fitW) : 1;
+  useEffect(() => {
+    if (!rescaleActual || !view.actual || !nat || Math.abs(view.scale - wantScale) < 0.001) return;
+    onView({ ...view, scale: wantScale });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nat?.w, nat?.h, wantScale, view.actual, rescaleActual]);
+
   const latest = useRef({ view, dw, dh, x, y, size, onView, maxScale });
   latest.current = { view, dw, dh, x, y, size, onView, maxScale };
 
@@ -119,7 +132,7 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
     if (!d) return;
     const nx = d.x + e.clientX - d.sx;
     const ny = d.y + e.clientY - d.sy;
-    onView({ scale: view.scale, cx: (size.w / 2 - nx) / dw, cy: (size.h / 2 - ny) / dh });
+    onView({ scale: view.scale, actual: view.actual, cx: (size.w / 2 - nx) / dw, cy: (size.h / 2 - ny) / dh });
   };
   const onPointerUp = () => {
     drag.current = null;
@@ -136,7 +149,7 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onDoubleClick={() => onView(view.scale > 1 ? FIT : { scale: Math.max(1, (metricsRef.current?.natW ?? fitW) / fitW), cx: 0.5, cy: 0.5 })}
+      onDoubleClick={() => onView(view.scale > 1 ? FIT : { scale: Math.max(1, (metricsRef.current?.natW ?? fitW) / fitW), cx: 0.5, cy: 0.5, actual: true })}
     >
       {thumbUrl && <img key={thumbUrl} src={thumbUrl} alt="" draggable={false} className={imgClass} style={style} data-testid="zoom-thumb" />}
       {t?.status === "failed" && (

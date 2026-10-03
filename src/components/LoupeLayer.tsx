@@ -90,7 +90,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         if (!m) return;
         const v = viewRef.current;
         if (v.scale > 1.01) setView(FIT);
-        else setView({ scale: Math.max(1.5, m.natW / m.fitW), cx: v.cx, cy: v.cy });
+        else setView({ scale: Math.max(1.5, m.natW / m.fitW), cx: v.cx, cy: v.cy, actual: true });
       },
       cycleFace: (dir) => {
         const m = metrics.current;
@@ -141,7 +141,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-testid={`compare-pane-${k}`}
                   data-image-id={id}
                 >
-                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} />
+                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} rescaleActual={k === "b"} />
                   <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
                 </div>
               );
