@@ -188,11 +188,11 @@ the user asked for "auto edit based on what the model thinks I like".
 
 ---
 
-## Phase 8c — User feedback round 2: culling clarity + Lightroom interop (user request 2026-10-03)
+## Phase 8c — User feedback round 2: culling clarity + Lightroom interop (user request 2026-10-03) ✅
 Runs in a Linux cloud container (no user RAWs, no CoreML, no macOS bundle): acceptance uses tests,
 synthetic / downloaded sample files and Playwright on the mock backend; anything that needs the user's Mac is listed
 under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origin` (user permission 2026-10-03).
-- [ ] **Contract v18** (architect): (a) `KeeperRule` gains a mode "everything not rejected" and it becomes the default
+- [x] **Contract v18** (architect): (a) `KeeperRule` gains a mode "everything not rejected" and it becomes the default
   (user: "I would want to keep everything that's not rejected"); the old pick/stars/suggestion rule stays as an option.
   (b) `get_cull_summary(projectId)`: picked / unflagged / rejected (by you vs. auto-applied) / keepers, with the keeper
   formula broken down. (c) Human-readable suggestion reasons per image (`QualityScore.reasons`: kind + text, e.g.
@@ -202,16 +202,16 @@ under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origi
   distinct values with counts for the current scope. (e) A generic background-activity event (kind, label,
   done / total, finished/error) for import, analysis, XMP save, paste/sync, apply to scene, export, model download.
   Migration if needed; bindings regenerated; ipc-changelog entry.
-- [ ] **Culling shortcuts, Lightroom one-hand** (frontend-dev): Z = Pick, X = Reject (Shift = and advance), P stays
+- [x] **Culling shortcuts, Lightroom one-hand** (frontend-dev): Z = Pick, X = Reject (Shift = and advance), P stays
   as an alias, U unflags. Space: Grid → Loupe; in Loupe / Compare / Develop Space toggles Fit ↔ 1:1 zoom and never
   leaves the view (Esc / G / E / Enter go back to Grid). Z no longer zooms anywhere (crop tool keeps X = swap). Cheat
   sheet, tooltips and hints follow the keymap. Acceptance: Playwright covers every changed chord in each mode.
-- [ ] **Arrow-key navigation glitch** (frontend-dev): with two filters on, holding / tapping Left/Right shows a
+- [x] **Arrow-key navigation glitch** (frontend-dev): with two filters on, holding / tapping Left/Right shows a
   transition-like flash. Find the cause (CSS transitions, image swap without decode, re-mount, stale preview,
   filter re-query on each move) and fix it. Acceptance: Playwright at 25 key presses/s with two filters: each
   displayed frame belongs to the current photo (no previous-photo flash, no opacity animation), main-thread work per
   keypress measured before/after and recorded.
-- [ ] **XMP that Lightroom reads, both ways** (rust-engine-dev): Lightroom Classic (13.2+) stores flags in
+- [x] **XMP that Lightroom reads, both ways** (rust-engine-dev): Lightroom Classic (13.2+) stores flags in
   `xmpDM:pick` (1 / 0 / -1) and `xmpDM:good` (True / False / absent); `xmp:Label "Pick"` shows up as a bogus colour
   label and `xmp:Rating -1` is Bridge-only. Write flags as `xmpDM:pick` / `xmpDM:good`, stars as `xmp:Rating 0–5`
   (kept when rejected), real colour labels in `xmp:Label`, tags as keywords; remove a `Label "Pick"` written by older
@@ -219,16 +219,16 @@ under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origi
   another app when a project opens and when the window regains focus (newer wins). Acceptance: fixture of a
   Lightroom Classic sidecar with pick / reject / stars / label round-trips; exiftool shows `XMP-xmpDM:Pick/Good`;
   unrelated fields byte-identical; externally edited sidecar picked up.
-- [ ] **"database is locked" on Save** (rust-engine-dev): Cmd+S over 2,389 photos while auto-sync ran gave "Saved
+- [x] **"database is locked" on Save** (rust-engine-dev): Cmd+S over 2,389 photos while auto-sync ran gave "Saved
   metadata for 685 photos; 1704 sidecars could not be written. database is locked". Cause: catalog connections have
   no `busy_timeout`, so the auto-sync connection and the explicit save collide. Fix: busy timeout on every catalog
   connection, short write transactions, explicit save waits for / merges with a running auto-sync pass.
   Acceptance: test with ≥ 2,400 images running an explicit save while auto-sync and UI writes run → 0 failures;
   catalog errors reported separately from per-file errors.
-- [ ] **Suggestion reasons** (vision-ml-dev): fill `QualityScore.reasons` for every non-pick suggestion and every
+- [x] **Suggestion reasons** (vision-ml-dev): fill `QualityScore.reasons` for every non-pick suggestion and every
   tag from the existing metrics (blink, missed focus, motion blur, under/over exposure, burst duplicate naming the
   keeper). Acceptance: unit tests per reason; every reject suggestion in the test catalogs has ≥ 1 reason.
-- [ ] **Culling clarity: counts, keepers, rejected pile, icons** (frontend-dev): always-visible grid readout
+- [x] **Culling clarity: counts, keepers, rejected pile, icons** (frontend-dev): always-visible grid readout
   "Showing N of M photos" that follows every filter (and the selection count); a cull summary (picked / unflagged /
   rejected / keepers = formula, each clickable as a filter) in the Cull step and where the app says how many photos
   go on to Edit; Edit / Export say what the keepers are made of and link to the keeper rule; a "Rejected" view whose
@@ -236,20 +236,20 @@ under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origi
   changes, that you review after, undoable). Every icon / badge on cells, loupe, filmstrip and toolbars has a
   hover description. Acceptance: Playwright on mock data: counts match the grid for 3 filter combos, summary
   formula adds up, reasons shown on rejected cells, every icon has a non-empty accessible title.
-- [ ] **Lightroom-style metadata filters** (frontend-dev, after the contract): Library Filter-style row (file type,
+- [x] **Lightroom-style metadata filters** (frontend-dev, after the contract): Library Filter-style row (file type,
   camera, lens, ISO, focal length, aperture, shutter, date, edited, sidecar) with counts per value, combined with the
   existing tag / flag / star filters. Acceptance: Rust tests per filter; Playwright: filter by extension changes the
   grid and the count readout.
-- [ ] **Background activity indicator** (frontend-dev): a small corner indicator (spinner / progress bar + label +
+- [x] **Background activity indicator** (frontend-dev): a small corner indicator (spinner / progress bar + label +
   count) while long work runs (import, analysis, XMP save, paste / sync to many, apply to scene, export, model
   download); conflicting buttons disabled meanwhile; finished / error states. Acceptance: Playwright with a slow mock.
-- [ ] **Help & FAQ** (frontend-dev, content reviewed by ux-designer): in-app guide (Help button + F1) covering the
+- [x] **Help & FAQ** (frontend-dev, content reviewed by ux-designer): in-app guide (Help button + F1) covering the
   culling workflow, what Auto / Apply suggestions does, keepers, auto-advance, what each icon means, where auto-save
   writes (XMP sidecars next to the RAWs, shown with the path) and how to see Sieve's culling in Lightroom (on import;
   for photos already in a catalog: Metadata → Read Metadata from Files; Lightroom writes back with Cmd+S or "Automatically
   write changes into XMP"); controls such as Auto-advance link to their FAQ entry.
-- [ ] **UX review** (ux-designer): re-check the cull → edit flow with the above; no open P0/P1.
-- [ ] **QA gate**.
+- [x] **UX review** (ux-designer): re-check the cull → edit flow with the above; no open P0/P1.
+- [x] **QA gate**.
 
 ---
 
@@ -312,3 +312,4 @@ Orchestrator appends one entry per completed task/phase: date, what was done, ve
 - 2026-09-30 — Phase 8b Style learning complete after fix round 1 (style model v2, merged a74cd04): Auto-tone anchor + forward-chained recency/as-shot blends + bounded exposure refinement. QA re-run (independent): per-camera held-out 149 frames ΔE2000 predicted 5.82 / median 4.26 vs real Auto tone (with faces) 7.19 / 6.06 vs no edit 9.42 / 9.03; wins 108/149 vs Auto, 139/149 vs none; time-cut split 7.53 vs 8.57 vs 9.86 (101/149). Per camera vs Auto: Sony 5.08 vs 6.55, Fuji 3.76 vs 8.34 (n=8), Canon 8.75 vs 8.98 (≈ tie). Slider MAE predicted / Auto / none: tone 16.7 / 42.7 / 42.3, presence 2.40 / 4.81 / 7.67, detail 0.10 / 7.02, HSL 0.16 / 7.55, WB 128 K / 130 / 130 (WB not meaningfully learned; shadows and saturation worse than Auto / none). Through the catalog: in-app validation 3.14 vs 6.81 vs 8.13; 12 frames 6.69 vs 8.11 vs 9.37; predict 223 ms cold / 19 ms warm; train 32.5 s cold / 20 s retrain; apply + undo exact (12/12). style_e2e Auto discrepancy explained (unanalysed catalog → no faces; Auto without faces fix in progress). Caveat: one shoot only.
 - 2026-09-30 — Phase 8b UX review complete (335e161): review found P0 2 / P1 9 / P2 15 (docs/ux-review-8b.md); three fix rounds — (1) frontend P0-1 scene nav → representative, P0-2 hover preview, P1-1/6/7/8/9 + IPC v15 (persisted per-photo workflow state, unapplied/unassigned keepers, skip/minor scenes, options apply as batch, plan outdated, apply cancel, keepersOnly, listXmpFailures) and UI; (2) re-check 1 new P1-10 (options apply hit non-keepers) / P1-11 (older Undo broke a scene) → IPC v16 linear batch undo with `conflict`, persisted appliedBatch/latestBatch, real-backend bug fixed (undo of an apply left the scene applied; migration 0014); (3) re-check 2 new P1-12 (reset representative blocked Apply all) → IPC v17 `reset` status, lenient Apply all with skippedScenes, linear undo across Auto edit → Apply (migration 0015). Re-check 3: all P0/P1 resolved, no new P0/P1, P2s listed. Gate 446 Rust + 276 Playwright. Also fixed: rescore test race (waits for AnalysisFinished).
 - 2026-09-30 — Phase 8b complete (QA gate PASS at 0bc45d4): 450 Rust + 279 Playwright, clippy 0, fmt; ignored real-sample tests touched in 8b pass (two need specific folders/fixtures, not bugs); release bundle app 64 MB / dmg 37 MB, hdiutil VALID, bundle smoke PASS (CoreML analysis, render, export inside Sieve.app), startup repaired the stale bundled-model links; real backend: project → analysis 10/10 → edit plan (9 keepers, 2 scenes) → auto_tone analysed + unanalysed (on-demand face found) → XMP auto-sync 7 sidecars with Lightroom crs: preserved; live v11 catalog copy migrates to v15 (2 projects, 435 images, quick_check ok). Also: Auto on unanalysed photos uses on-demand SCRFD (skin-clip frames 16 → 1 of 202), test/example paths made relative to the crate. Repo cleanup at the user's request (80 GB → ~19 GB incl. release build).
+- 2026-10-03 — Phase 8c complete (QA gate PASS, `docs/qa-8c.md`), run in a Linux cloud container (CoreML EP made macOS-only, TurboJPEG 3 / ONNX Runtime from GitHub, `scripts/linux-cloud-env.sh`). Keys: Z pick / X reject (P alias), Space = Loupe from Grid and Fit↔1:1 zoom elsewhere (+ a real bug fixed: 1:1 chosen before the preview decoded gave e.g. 354%). Arrow-key glitch: previous photo painted while the next decoded (43/126 frames → 0), late zoom reset, blank Develop on switch, heavy re-renders (Loupe ≈131 → ≈80–95 ms per key). XMP: flags as `xmpDM:pick` / `xmpDM:good` (Lightroom Classic 13.2+), stars kept on reject, legacy `Label "Pick"` / `Rating -1` migrated, `refresh_sidecars` on project open / focus; "database is locked" root cause = deferred savepoint spanning the sidecar write + no busy timeout (2,400-image repro 287 ok / 2,113 locked → 2,400 / 0). IPC v18 / v18.1: keeper rule `not_rejected` default (migration 0016), cull summary, pick origin + filter, suggestion reasons, metadata filters + facets, activity events. UI: cull summary + keeper formula, "Showing N of M", rejected pile with who/why, icon titles, metadata filter row, corner activity stack, Help & FAQ (F1 / Cmd+?). UX review P1 9 → re-check 1 P1 5 → re-check 2 P1 0. Gate: 479 Rust, clippy 0, fmt, build, Playwright 318/319 (load-sensitive Phase 8b mask test → hardening). Verify on the Mac: see `docs/qa-8c.md`.
