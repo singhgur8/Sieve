@@ -16,7 +16,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_specta::Event;
 
-use super::bursts::{apply_pins, demote, group_bursts};
+use super::bursts::{add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts};
 use super::store::{self, BurstRow};
 use super::{score, AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
 use crate::db::{self, now_ms, projects, repo};
@@ -397,10 +397,18 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
         let plain: Vec<BurstFrame> = frames.iter().map(|(f, _)| *f).collect();
         for mut b in group_bursts(&plain, window, burst_hash_distance) {
             apply_pins(&mut b, &pins, |m| scored[index[&m]].quality.overall);
-            let keeper_rating = scored[index[&b.keeper]].quality.suggested_rating;
+            let keeper = scored[index[&b.keeper]].quality.clone();
+            let keeper_name = display_name(conn, b.keeper)?;
+            let pinned = pins.contains(&b.keeper);
+            let best_face =
+                b.members.iter().filter_map(|m| scored[index[m]].quality.face_sharpness).fold(0.0, f32::max);
             for &m in &b.members {
+                let q = &mut scored[index[&m]].quality;
+                annotate_soft_face(q, best_face);
                 if m != b.keeper {
-                    demote(&mut scored[index[&m]].quality, keeper_rating);
+                    demote(q, keeper.suggested_rating);
+                    let reason = duplicate_reason(q, &keeper, b.keeper, &keeper_name, pinned);
+                    add_reason(q, reason);
                 }
             }
             rows.push(BurstRow {
@@ -419,6 +427,12 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let n = store::write_bursts(&tx, &rows)?;
     tx.commit()?;
     Ok(n)
+}
+
+/// How reasons name another photo: its file name without the extension ("DSC0123").
+fn display_name(conn: &Connection, id: ImageId) -> AppResult<String> {
+    let file: String = conn.query_row("SELECT file_name FROM images WHERE id = ?1", [id], |r| r.get(0))?;
+    Ok(Path::new(&file).file_stem().map_or_else(|| file.clone(), |s| s.to_string_lossy().into_owned()))
 }
 
 /// Shoot type + thresholds per image, from its project (`db::projects::shoot_type_of_image`;
@@ -478,7 +492,7 @@ pub fn run_blocking(config: &AnalysisConfig, sink: &dyn AnalysisSink) -> AppResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::types::ShootType;
+    use crate::ipc::types::{ShootType, SuggestionReason, SuggestionReasonKind};
     use crate::ml::scoring::tests::{face, metrics};
     use crate::ml::MODEL_VERSION;
     use std::path::PathBuf;
@@ -563,6 +577,12 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    fn reasons_of(conn: &Connection, id: ImageId) -> Vec<SuggestionReason> {
+        let json: String =
+            conn.query_row("SELECT reasons_json FROM quality_scores WHERE image_id = ?1", [id], |r| r.get(0)).unwrap();
+        serde_json::from_str(&json).unwrap()
     }
 
     fn store_metrics(conn: &Connection, id: ImageId, m: &ImageMetrics) {
@@ -673,6 +693,13 @@ mod tests {
         // Burst non-keepers are not rejected for being duplicates (never a pick either).
         assert_eq!(pick1, "unflagged");
         assert_ne!(pick2, "reject");
+        // ... and say why, pointing at the keeper (file "2.arw").
+        let dup = reasons_of(&conn, 1);
+        assert_eq!(dup.len(), 1, "{dup:?}");
+        assert_eq!((dup[0].kind, dup[0].related_image_id), (SuggestionReasonKind::DuplicateBurst, Some(2)));
+        assert_eq!(dup[0].text, "Similar to 2 in this burst \u{2014} that one is sharper");
+        assert!(reasons_of(&conn, 2).is_empty(), "the clean keeper needs no reason");
+        assert_eq!(reasons_of(&conn, 4)[0].kind, SuggestionReasonKind::Blink);
         // The engine never writes the user's rating / pick.
         let untouched: u32 =
             conn.query_row("SELECT COUNT(*) FROM images WHERE rating = 2 AND pick = 'pick'", [], |r| r.get(0)).unwrap();
@@ -697,6 +724,12 @@ mod tests {
             .unwrap();
         assert_eq!(pick2, "unflagged");
         assert!(stars2 < stars1 && pick1 != "reject", "{pick1} {stars1} / {pick2} {stars2}");
+        // Reasons are refreshed by the rescore: they follow the pinned keeper.
+        assert!(reasons_of(&conn, 1).iter().all(|r| r.kind != SuggestionReasonKind::DuplicateBurst));
+        let dup = reasons_of(&conn, 2);
+        assert_eq!(dup.len(), 1, "{dup:?}");
+        assert_eq!(dup[0].related_image_id, Some(1));
+        assert_eq!(dup[0].text, "Similar to 1 in this burst \u{2014} you chose that one as the keeper");
 
         // Narrower burst window (rescore) dissolves the group and its duplicate tag.
         repo::set_burst_window(&conn, 400).unwrap();
