@@ -13,6 +13,8 @@ export default defineConfig({
     baseURL: `http://localhost:${port}`,
     viewport: { width: 1440, height: 900 },
     browserName: "chromium",
+    // PW_CHROMIUM: a preinstalled Chromium when the bundled build is missing (cloud containers, see scripts/linux-cloud-env.sh).
+    launchOptions: process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {},
   },
   webServer: {
     command: `pnpm exec vite --port ${port}`,
