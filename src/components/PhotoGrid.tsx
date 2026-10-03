@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Library } from "../hooks/useLibrary";
 import { FolderOpen } from "lucide-react";
@@ -24,7 +24,9 @@ interface Props {
   onClearFilters: () => void;
 }
 
-export function PhotoGrid({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, onRate, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
+export const PhotoGrid = memo(PhotoGridImpl);
+
+function PhotoGridImpl({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, onRate, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const { ids } = lib;

@@ -223,7 +223,7 @@ test.describe("keyboard", () => {
 });
 
 test.describe("loupe", () => {
-  test("Space opens the loupe, Z toggles 100%, F cycles faces, arrows navigate, G returns", async ({ page }) => {
+  test("Space opens the loupe, Space toggles 100%, F cycles faces, arrows navigate, G returns", async ({ page }) => {
     await openApp(page, 1000);
     await page.getByTestId("cell-4").click();
     await page.keyboard.press("Space");
@@ -233,10 +233,10 @@ test.describe("loupe", () => {
     await expect(page.getByTestId("zoom-a").locator("img").nth(1)).toBeVisible();
     await shot(page, "05-loupe-fit");
 
-    await page.keyboard.press("z");
+    await page.keyboard.press("Space");
     await expect(page.getByTestId("zoom-label")).toContainText("100%");
     await shot(page, "06-loupe-100");
-    await page.keyboard.press("z");
+    await page.keyboard.press("Space");
     await expect(page.getByTestId("zoom-label")).toContainText("Fit");
 
     await page.keyboard.press("f");
@@ -291,7 +291,7 @@ test.describe("compare", () => {
     await expect(page.getByTestId("zoom-a").locator("img").last()).toBeVisible();
     await shot(page, "08-compare");
 
-    await page.keyboard.press("z");
+    await page.keyboard.press("Space");
     await expect(page.getByTestId("zoom-label")).toContainText("100%");
     const a = await page.getByTestId("zoom-a").getAttribute("data-scale");
     const b = await page.getByTestId("zoom-b").getAttribute("data-scale");

@@ -333,8 +333,9 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   }, []);
   const canRedo = useCallback(() => !!historyRef.current?.canRedo, []);
 
+  const defaults = useMemo(() => defaultAdjustments(opts.format), [opts.format]);
   return useMemo(
-    () => ({ adj, defaults: defaultAdjustments(opts.format), history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
-    [adj, opts.format, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
+    () => ({ adj, defaults, history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
+    [adj, defaults, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
   );
 }

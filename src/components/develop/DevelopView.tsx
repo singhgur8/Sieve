@@ -1,6 +1,7 @@
 // Develop module: filmstrip + viewer (before/after, split, 100% detail) + presets/history + adjustment sliders.
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
+import { usePrefetchNeighbours } from "../../hooks/usePrefetch";
 import { applyAutoTone, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
@@ -689,8 +690,18 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const thumb = entry?.thumbnail;
   const thumbUrl = thumb?.status === "ready" ? `${convertFileSrc(thumb.path)}?v=${id != null ? lib.version(id) : 0}` : null;
 
-  const mkViewer = (ed: Editor, active: boolean) => (
+  /** Embedded preview of a photo: shown (fit view) until its first render arrives, so switching photos never goes blank. */
+  const placeholderFor = (pid: number | null): string | null => {
+    const t = pid != null ? lib.getEntry(pid)?.thumbnail : undefined;
+    return t?.status === "ready" ? `${convertFileSrc(t.previewPath ?? t.path)}?v=${lib.version(pid!)}` : null;
+  };
+  usePrefetchNeighbours(lib, id);
+
+  const mkViewer = (ed: Editor, active: boolean) => {
+    const pid = ed === editorB ? idB : idA;
+    return (
     <Viewer
+      imageId={pid}
       main={ed.main}
       before={active ? ed.before : null}
       detail={ed.detail}
@@ -704,6 +715,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       fw={ed.info?.fullWidth ?? 0}
       fh={ed.info?.fullHeight ?? 0}
       loading={ed.loading}
+      placeholder={placeholderFor(pid)}
       onSize={setSize}
       onPan={setZoom}
       onPanEnd={onPanEnd}
@@ -711,7 +723,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       inset={active && cropTool ? CROP_INSET : 0}
       rotate={active && cropTool ? previewRotation(cropTool.angle, orientation) : 0}
     />
-  );
+    );
+  };
   const activeLayers = (
     <>
       {hover.preview?.to === "viewer" && (
@@ -763,7 +776,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const nTargets = targets().length;
   const prevId = usePreviousPhoto();
   const filmCell = wide ? 88 : FILM;
-  const modified = modifiedFields(editor.adj, editor.defaults);
+  // Walking ~30 fields through completeAdjustments is costly; only redo it when the settings actually change.
+  const modified = useMemo(() => modifiedFields(editor.adj, editor.defaults), [editor.adj, editor.defaults]);
   const dialogProps = { modified, hasLut: !!editor.adj.lut, hasMasks: editor.adj.masks.length > 0 };
   const filmIdx = id != null ? lib.ids.indexOf(id) : -1;
 
@@ -793,10 +807,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       </div>
       {entry && (
         <span className="ml-2 flex items-center gap-1" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
-          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "pick")} title="Pick (P)" aria-pressed={entry.pick === "pick"} data-testid="develop-pick">
+          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "pick")} title={`Pick${hint("pick")}`} aria-pressed={entry.pick === "pick"} data-testid="develop-pick">
             <Flag className={`size-3.5 ${entry.pick === "pick" ? "fill-green-500 text-green-500" : "text-neutral-400"}`} />
           </button>
-          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "reject")} title="Reject (X)" aria-pressed={entry.pick === "reject"} data-testid="develop-reject">
+          <button className="rounded p-0.5 hover:bg-neutral-800" onClick={() => onFlag?.(entry.id, "reject")} title={`Reject${hint("reject")}`} aria-pressed={entry.pick === "reject"} data-testid="develop-reject">
             <X className={`size-4 ${entry.pick === "reject" ? "text-red-500" : "text-neutral-400"}`} strokeWidth={entry.pick === "reject" ? 3 : 2} />
           </button>
           <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId="develop-stars" />

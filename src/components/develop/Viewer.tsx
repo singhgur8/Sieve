@@ -45,6 +45,10 @@ interface Props {
   fw: number;
   fh: number;
   loading: boolean;
+  /** Embedded preview of the photo shown (fit view only) until its first render arrives, so a photo switch never goes blank. */
+  placeholder?: string | null;
+  /** The photo this viewer belongs to: renders of any other photo (left over for a commit after a switch) are never painted. */
+  imageId?: number | null;
   onSize: (s: Size) => void;
   onPan: (z: Zoom) => void;
   onPanEnd: () => void;
@@ -103,7 +107,11 @@ export function Viewer(p: Props) {
     }
   };
 
-  const shown = p.showBefore ? p.before : p.main;
+  const own = (v: RenderView | null) => (v && (p.imageId == null || v.imageId === p.imageId) ? v : null);
+  const main = own(p.main);
+  const before = own(p.before);
+  const detail = own(p.detail);
+  const shown = p.showBefore ? before : main;
   const alt = (v: RenderView | null) => (v ? `Render ${v.imageId} #${v.seq}` : "");
   return (
     <div
@@ -122,10 +130,10 @@ export function Viewer(p: Props) {
       {zoomed ? (
         <div className="absolute" style={{ left: off.x, top: off.y, width: p.fw, height: p.fh }}>
           {shown && <img src={shown.url} alt={alt(shown)} draggable={false} className={`${img} inset-0 size-full`} data-testid="view-main" />}
-          {!p.showBefore && p.detail && p.detailRegion && (
+          {!p.showBefore && detail && p.detailRegion && (
             <img
-              src={p.detail.url}
-              alt={alt(p.detail)}
+              src={detail.url}
+              alt={alt(detail)}
               draggable={false}
               data-testid="view-detail"
               className={img}
@@ -133,12 +141,12 @@ export function Viewer(p: Props) {
             />
           )}
         </div>
-      ) : p.split && p.before && p.main ? (
+      ) : p.split && before && main ? (
         <>
-          <img src={p.main.url} alt={alt(p.main)} draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid="view-main" />
+          <img src={main.url} alt={alt(main)} draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid="view-main" />
           <img
-            src={p.before.url}
-            alt={alt(p.before)}
+            src={before.url}
+            alt={alt(before)}
             draggable={false}
             className={`${img} inset-0 size-full object-contain`}
             style={{ ...insetStyle, clipPath: `inset(0 ${(1 - p.splitPos) * 100}% 0 0)` }}
@@ -160,7 +168,9 @@ export function Viewer(p: Props) {
           <span className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-1.5 text-[10px] text-white">After</span>
         </>
       ) : (
-        shown && (
+        !shown && p.placeholder ? (
+          <img key={p.placeholder} src={p.placeholder} alt="" draggable={false} className={`${img} inset-0 size-full object-contain`} style={insetStyle} data-testid="view-placeholder" />
+        ) : shown && (
           <img
             src={shown.url}
             alt={alt(shown)}
@@ -173,7 +183,7 @@ export function Viewer(p: Props) {
         )
       )}
       {p.showBefore && <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-1.5 text-xs text-white" data-testid="before-badge">Before</span>}
-      {p.loading && !shown && (
+      {p.loading && !shown && !p.placeholder && (
         <div className="absolute inset-0 flex items-center justify-center">
           <Loader2 className="size-6 animate-spin text-neutral-400" />
         </div>

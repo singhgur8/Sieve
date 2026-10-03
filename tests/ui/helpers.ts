@@ -52,7 +52,7 @@ export async function openApp(page: Page, count = 5000, query = "") {
 async function routeImages(page: Page) {
   await page.route(/\/mock\/(thumb|preview)\/\d+\.jpg/, (route) => {
     const m = /\/mock\/(thumb|preview)\/(\d+)\.jpg/.exec(route.request().url())!;
-    return route.fulfill({ contentType: "image/svg+xml", body: svg(m[1] as "thumb" | "preview", Number(m[2])) });
+    return route.fulfill({ contentType: "image/svg+xml", headers: { "cache-control": "max-age=3600" }, body: svg(m[1] as "thumb" | "preview", Number(m[2])) });
   });
   await page.route(/\/mock\/render\//, (route) => {
     const u = new URL(route.request().url());
