@@ -221,12 +221,13 @@ test.describe("P0-2 apply suggestions", () => {
       )
       .toEqual(before);
 
-    // Unchecking "skip" overwrites everything (onlyUnset false).
+    // Unchecking "skip" overwrites everything (onlyUnset false) that differs from its suggestion: one of the
+    // five already matches its suggestion (after the undo) and is left alone (IPC v18.1).
     await page.getByTestId("more-menu").click();
     await page.getByTestId("apply-suggestions").click();
     await page.getByTestId("apply-only-unset").uncheck();
-    await expect(page.getByTestId("apply-count-skipped")).toHaveText("0");
-    await expect(page.getByTestId("apply-count-apply")).toHaveText("5");
+    await expect(page.getByTestId("apply-count-skipped")).toHaveText("1");
+    await expect(page.getByTestId("apply-count-apply")).toHaveText("4");
     await clearCalls(page);
     await page.getByTestId("apply-confirm").click();
     expect((await calls(page, "apply_suggestions"))[0].args.onlyUnset).toBe(false);

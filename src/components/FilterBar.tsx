@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Filter, FolderSearch, Layers, ListFilter, RotateCcw, Unplug } from "lucide-react";
-import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type MetadataFilter, type PickFlag } from "../ipc";
+import { Filter, FolderSearch, Layers, ListFilter, RotateCcw, Unplug, X } from "lucide-react";
+import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type MetadataFilter, type PickFlag, type PickOrigin } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
 import { BASE_QUERY } from "../hooks/useLibrary";
@@ -31,6 +31,7 @@ export function isFiltered(q: Query): boolean {
     q.includeTags.length > 0 ||
     q.excludeTags.length > 0 ||
     q.picks.length > 0 ||
+    q.pickOrigin != null ||
     q.minRating != null ||
     q.maxRating != null ||
     q.colorLabels.length > 0 ||
@@ -42,20 +43,30 @@ export function isFiltered(q: Query): boolean {
   );
 }
 
+/** "Auto-rejected" / "Rejected by you" (v18.1 `ImageQuery.pickOrigin`), worded after the pick filter it narrows; `null` without an origin. */
+export function originLabel(q: Pick<Query, "picks" | "pickOrigin">): string | null {
+  const o = q.pickOrigin;
+  if (o == null) return null;
+  const only = q.picks.length === 1 ? q.picks[0] : null;
+  if (only === "reject") return o === "auto" ? "Auto-rejected" : "Rejected by you";
+  if (only === "pick") return o === "auto" ? "Auto-picked" : "Picked by you";
+  return o === "auto" ? "Flagged automatically" : "Flagged by you";
+}
+
 /** Filter counts for the current folder; refreshed whenever the library changes (`epoch`). */
-export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number, keepersOnly = false, metadata?: MetadataFilter): FilterCounts | null {
+export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number, keepersOnly = false, metadata?: MetadataFilter, pickOrigin?: PickOrigin | null): FilterCounts | null {
   const metaKey = JSON.stringify(metadata ?? null);
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   useEffect(() => {
     let stale = false;
-    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null, metadata ?? null))
+    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null, metadata ?? null, pickOrigin ?? null))
       .then((c) => !stale && setCounts(c))
       .catch(() => {});
     return () => {
       stale = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [folderId, projectId, epoch, keepersOnly, metaKey]);
+  }, [folderId, projectId, epoch, keepersOnly, metaKey, pickOrigin]);
   return counts;
 }
 
@@ -136,6 +147,17 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
             {p.label} <span className="opacity-70">{pickCount(p.key)}</span>
           </button>
         ))}
+        {query.pickOrigin != null && (
+          <button
+            data-testid="filter-origin"
+            data-origin={query.pickOrigin}
+            onClick={() => setQuery((q) => ({ ...q, pickOrigin: null }))}
+            title={query.pickOrigin === "auto" ? "Only flags set by Apply suggestions (not changed by you since). Click to show every flag" : "Only flags you set yourself. Click to show every flag"}
+            className={`${chip} flex items-center gap-1 bg-sky-800 text-sky-100 ring-1 ring-white/30`}
+          >
+            {originLabel(query)} <X className="size-3" aria-label="Remove" />
+          </button>
+        )}
       </div>
 
       <MetaToggle query={query} setQuery={setQuery} />
@@ -261,7 +283,9 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   const parts: string[] = [];
   q.includeTags.forEach((t) => parts.push(tagName(t)));
   q.excludeTags.forEach((t) => parts.push(`no ${tagName(t)}`));
-  q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));
+  const origin = originLabel(q);
+  if (origin) parts.push(origin);
+  else q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));
   if (q.minRating != null || q.maxRating != null) parts.push(`${q.minRating ?? 0}-${q.maxRating ?? 5}★`);
   q.colorLabels.forEach((l) => parts.push(l));
   if (q.collapseBursts) parts.push("bursts collapsed");

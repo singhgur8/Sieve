@@ -2257,6 +2257,12 @@ pub struct ImageQuery {
     pub tag_match: TagMatch,
     /// Image's pick flag is one of these (e.g. `["pick", "unflagged"]` hides rejects).
     pub picks: Vec<PickFlag>,
+    /// Who set the flag (v18.1; `null` = anyone). `user` = flagged (pick or reject) by the
+    /// user (`RawImageEntry.pickOrigin` `user`, or a flag from before v18); `auto` = flagged
+    /// by `apply_suggestions` and not changed since. Unflagged images never match, so with
+    /// `picks = ["reject"]` and `auto` the query returns `CullSummary.rejectedAuto` images.
+    #[serde(default)]
+    pub pick_origin: Option<PickOrigin>,
     /// Inclusive star range, 0..=5.
     pub min_rating: Option<u8>,
     pub max_rating: Option<u8>,
@@ -2302,6 +2308,7 @@ impl Default for ImageQuery {
             exclude_tags: Vec::new(),
             tag_match: TagMatch::Any,
             picks: Vec::new(),
+            pick_origin: None,
             min_rating: None,
             max_rating: None,
             color_labels: Vec::new(),
@@ -3598,9 +3605,11 @@ pub struct MatchApplication {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplySuggestionsResult {
-    /// Images whose rating/pick were set from the suggestions.
+    /// Images whose rating and/or pick changed (v18.1: an image already matching its
+    /// suggestion is not counted, it counts as skipped).
     pub applied: u32,
-    /// Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated.
+    /// Images left alone: unanalyzed, already matching their suggestion, or (with
+    /// `onlyUnset`) already flagged or rated.
     pub skipped: u32,
 }
 
@@ -4059,10 +4068,17 @@ pub struct CullSummary {
     pub keeper_breakdown: KeeperBreakdown,
     /// The rule `keepers` was counted with (= `CatalogState.keeperRule`).
     pub keeper_rule: KeeperRule,
-    /// Analysed photos the engine suggests rejecting that are still unflagged (not acted on).
+    /// What Apply suggestions would change with its default settings, part 1 (v18.1):
+    /// untouched photos (analysed, unflagged **and** rated 0) the engine suggests `reject`.
+    /// `apply_suggestions(every image in scope, onlyUnset = true)` changes exactly
+    /// `suggestedRejectPending + suggestedPickPending + suggestedRatingPending` photos.
     pub suggested_reject_pending: u32,
-    /// Analysed photos the engine suggests picking that are still unflagged.
+    /// Part 2 (v18.1): untouched photos the engine suggests `pick`.
     pub suggested_pick_pending: u32,
+    /// Part 3 (v18.1): untouched photos the engine suggests no flag for but stars
+    /// (`suggestedRating > 0`). Untouched photos whose suggestion is "unflagged, 0 stars"
+    /// would not change and are not counted anywhere.
+    pub suggested_rating_pending: u32,
     /// Photos without a `QualityScore` yet (not analysed, or analysis failed).
     pub unanalyzed: u32,
 }

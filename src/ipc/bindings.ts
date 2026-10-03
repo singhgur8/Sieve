@@ -99,8 +99,10 @@ export const commands = {
 	listBurstGroups: (folderId: number | null, projectId: number | null) => typedError<BurstGroup[], AppError>(__TAURI_INVOKE("list_burst_groups", { folderId, projectId })),
 	/**
 	 *  Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
-	 *  Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
-	 *  (`pick != unflagged` or `rating != 0`). Atomic; unknown ids -> `not_found`.
+	 *  Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
+	 *  `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
+	 *  With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
+	 *  photos. Atomic; unknown ids -> `not_found`.
 	 *  For undo, take `get_cull_snapshot(ids)` first.
 	 */
 	applySuggestions: (ids: number[], onlyUnset: boolean) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset })),
@@ -119,8 +121,9 @@ export const commands = {
 	 *  inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
 	 *  (`ImageQuery.keepersOnly`, the Edit / Export steps). `metadata` (v18; `null` = none) counts
 	 *  only images passing the Library Filter metadata constraints (`ImageQuery.metadata`), so
-	 *  the facet counts follow the metadata row. Unknown project -> `not_found`; an invalid
-	 *  constraint -> `invalid_argument`.
+	 *  the facet counts follow the metadata row. `pickOrigin` (v18.1; `null` = anyone) counts
+	 *  only images flagged by that origin (`ImageQuery.pickOrigin`). Unknown project ->
+	 *  `not_found`; an invalid constraint -> `invalid_argument`.
 	 */
 	getFilterCounts: (folderId: number | null, projectId: number | null, keepersOnly: boolean | null, metadata: {
 	/**  File type (Lightroom "File Type"): image's `format` is one of these. */
@@ -146,7 +149,15 @@ export const commands = {
 	edited?: boolean | null,
 	/**  `true` = has an XMP sidecar (`XmpSyncState.hasSidecar`), `false` = none known. */
 	hasSidecar?: boolean | null,
-} | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId, keepersOnly, metadata })),
+} | null, pickOrigin: 
+/**
+ *  The user: flag commands, undo/redo of the user's flags, sidecar reads (a flag
+ *  found in an XMP file counts as a person's decision). Flags set before v18 count as
+ *  `user`.
+ */
+"user" | 
+/**  `apply_suggestions` ("Auto"), not changed by the user since. */
+"auto" | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId, keepersOnly, metadata, pickOrigin })),
 	/**
 	 *  Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
 	 *  preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
@@ -832,8 +843,8 @@ export const commands = {
 	/**
 	 *  Cull step summary for `projectId` (`null` = whole catalog) (v18): picked / unflagged /
 	 *  rejected (by you vs. "Auto") / keepers with the breakdown under the catalog's keeper rule /
-	 *  suggestions not acted on. `keepers` equals a `keepersOnly` query's total over the same
-	 *  scope. Unknown project -> `not_found`.
+	 *  what Apply suggestions would change with its defaults (v18.1). `keepers` equals a
+	 *  `keepersOnly` query's total over the same scope. Unknown project -> `not_found`.
 	 */
 	getCullSummary: (projectId: number | null) => typedError<CullSummary, AppError>(__TAURI_INVOKE("get_cull_summary", { projectId })),
 	/**
@@ -1245,9 +1256,15 @@ export type ApplyScenesResult = {
 
 /**  Result of `apply_suggestions`. */
 export type ApplySuggestionsResult = {
-	/**  Images whose rating/pick were set from the suggestions. */
+	/**
+	 *  Images whose rating and/or pick changed (v18.1: an image already matching its
+	 *  suggestion is not counted, it counts as skipped).
+	 */
 	applied: number,
-	/**  Images left alone: unanalyzed, or (with `onlyUnset`) already flagged or rated. */
+	/**
+	 *  Images left alone: unanalyzed, already matching their suggestion, or (with
+	 *  `onlyUnset`) already flagged or rated.
+	 */
 	skipped: number,
 };
 
@@ -1601,10 +1618,21 @@ export type CullSummary = {
 	keeperBreakdown: KeeperBreakdown,
 	/**  The rule `keepers` was counted with (= `CatalogState.keeperRule`). */
 	keeperRule: KeeperRule,
-	/**  Analysed photos the engine suggests rejecting that are still unflagged (not acted on). */
+	/**
+	 *  What Apply suggestions would change with its default settings, part 1 (v18.1):
+	 *  untouched photos (analysed, unflagged **and** rated 0) the engine suggests `reject`.
+	 *  `apply_suggestions(every image in scope, onlyUnset = true)` changes exactly
+	 *  `suggestedRejectPending + suggestedPickPending + suggestedRatingPending` photos.
+	 */
 	suggestedRejectPending: number,
-	/**  Analysed photos the engine suggests picking that are still unflagged. */
+	/**  Part 2 (v18.1): untouched photos the engine suggests `pick`. */
 	suggestedPickPending: number,
+	/**
+	 *  Part 3 (v18.1): untouched photos the engine suggests no flag for but stars
+	 *  (`suggestedRating > 0`). Untouched photos whose suggestion is "unflagged, 0 stars"
+	 *  would not change and are not counted anywhere.
+	 */
+	suggestedRatingPending: number,
 	/**  Photos without a `QualityScore` yet (not analysed, or analysis failed). */
 	unanalyzed: number,
 };
@@ -2313,6 +2341,13 @@ export type ImageQuery = {
 	tagMatch: TagMatch,
 	/**  Image's pick flag is one of these (e.g. `["pick", "unflagged"]` hides rejects). */
 	picks: PickFlag[],
+	/**
+	 *  Who set the flag (v18.1; `null` = anyone). `user` = flagged (pick or reject) by the
+	 *  user (`RawImageEntry.pickOrigin` `user`, or a flag from before v18); `auto` = flagged
+	 *  by `apply_suggestions` and not changed since. Unflagged images never match, so with
+	 *  `picks = ["reject"]` and `auto` the query returns `CullSummary.rejectedAuto` images.
+	 */
+	pickOrigin?: PickOrigin | null,
 	/**  Inclusive star range, 0..=5. */
 	minRating: number | null,
 	maxRating: number | null,

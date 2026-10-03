@@ -249,8 +249,9 @@ pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> A
 /// inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
 /// (`ImageQuery.keepersOnly`, the Edit / Export steps). `metadata` (v18; `null` = none) counts
 /// only images passing the Library Filter metadata constraints (`ImageQuery.metadata`), so
-/// the facet counts follow the metadata row. Unknown project -> `not_found`; an invalid
-/// constraint -> `invalid_argument`.
+/// the facet counts follow the metadata row. `pickOrigin` (v18.1; `null` = anyone) counts
+/// only images flagged by that origin (`ImageQuery.pickOrigin`). Unknown project ->
+/// `not_found`; an invalid constraint -> `invalid_argument`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_filter_counts(
@@ -259,19 +260,21 @@ pub async fn get_filter_counts(
     project_id: Option<ProjectId>,
     keepers_only: Option<bool>,
     metadata: Option<MetadataFilter>,
+    pick_origin: Option<PickOrigin>,
 ) -> AppResult<FilterCounts> {
     catalog
         .run(move |c| {
             let scope = FolderScope::resolve(c, folder_id, project_id)?;
-            repo::filter_counts_with(c, scope, keepers_only.unwrap_or(false), &metadata.unwrap_or_default())
+            let metadata = metadata.unwrap_or_default();
+            repo::filter_counts_with(c, scope, keepers_only.unwrap_or(false), &metadata, pick_origin)
         })
         .await
 }
 
 /// Cull step summary for `projectId` (`null` = whole catalog) (v18): picked / unflagged /
 /// rejected (by you vs. "Auto") / keepers with the breakdown under the catalog's keeper rule /
-/// suggestions not acted on. `keepers` equals a `keepersOnly` query's total over the same
-/// scope. Unknown project -> `not_found`.
+/// what Apply suggestions would change with its defaults (v18.1). `keepers` equals a
+/// `keepersOnly` query's total over the same scope. Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_cull_summary(catalog: State<'_, Catalog>, project_id: Option<ProjectId>) -> AppResult<CullSummary> {
@@ -964,8 +967,10 @@ pub async fn list_burst_groups(
 }
 
 /// Copies the engine's suggested rating/pick into the user's rating/pick for `ids`.
-/// Unanalyzed images are skipped; with `onlyUnset`, so are images already flagged or rated
-/// (`pick != unflagged` or `rating != 0`). Atomic; unknown ids -> `not_found`.
+/// Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
+/// `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
+/// With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
+/// photos. Atomic; unknown ids -> `not_found`.
 /// For undo, take `get_cull_snapshot(ids)` first.
 #[tauri::command]
 #[specta::specta]

@@ -839,6 +839,34 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v18.1 — 2026-10-03 (UX review 8c P1-1, P1-6)
+
+Suggestions pending = what Apply changes (P1-1)
+- `CullSummary.suggestedRejectPending` / `suggestedPickPending` now count only **untouched** photos: analysed,
+  `pick = unflagged` **and** `rating = 0` (was: unflagged with any stars). New **required**
+  `CullSummary.suggestedRatingPending`: untouched photos whose suggestion is no flag but `suggestedRating > 0`.
+  `apply_suggestions(every image in scope, onlyUnset = true)` changes exactly the sum of the three
+  (`repo::tests::suggestions_pending_equals_default_apply`).
+- `apply_suggestions` skips images that already match their suggestion (same flag and stars): they count as
+  `skipped`, not `applied`, and their rows are not rewritten (no spurious XMP dirty). TS signature unchanged.
+- Frontend (done here): `CullSummaryBar` copy `Suggestions: 20 picks · 8 rejects · 3 star-rated — Apply…`
+  (zero parts dropped, hidden when nothing is pending); `ApplySuggestionsDialog` counts a photo already matching
+  its suggestion as "left as they are", so its default count equals the bar. Mock mirrors both.
+
+Flag origin filter (P1-6)
+- `ImageQuery.pickOrigin?: PickOrigin | null` (`null` / missing = anyone). `user` = flagged (pick or reject) with
+  origin `user` (or a pre-v18 flag), `auto` = flagged by `apply_suggestions` and unchanged since. Unflagged images
+  never match; combined with `picks` (AND), so `{picks: ["reject"], pickOrigin: "auto"}` returns
+  `CullSummary.rejectedAuto` images. Honoured by `list_images`, `list_image_ids`, `get_metadata_filter_options`.
+- `get_filter_counts(folderId, projectId, keepersOnly, metadata, pickOrigin)` — **new fifth argument** (`null` =
+  anyone): facet counts over images flagged by that origin only.
+- Frontend (done here): the summary's "N by you" / "M auto" toggle `{picks: ["reject"], pickOrigin}` with an
+  active state; filter-bar chip `Auto-rejected ×` / `Rejected by you ×` (`filter-origin`, clears the origin);
+  `isFiltered` / `describeFilters` / `useFilterCounts` / `membershipSensitive` know the field. Summary bar is one
+  row (`flex-nowrap`, formula truncates with the full text in its title; UX P2 #10).
+- Other agents: nothing required. Code that builds `ImageQuery` objects by hand keeps working (optional field);
+  direct callers of `commands.getFilterCounts` must pass the fifth argument (only `FilterBar.useFilterCounts`).
+
 ## v18 — 2026-10-03 (Phase 8c: culling clarity, metadata filters, background activity)
 
 Keeper rule (a)

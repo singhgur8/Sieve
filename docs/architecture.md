@@ -232,6 +232,9 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `refresh_sidecars` / `refreshSidecars` (v18) | `projectId: number \| null` | `number[]` (images changed by sidecars another app edited; call on project open / window focus) |
 | `get_metadata_filter_options` / `getMetadataFilterOptions` (v18) | `query: ImageQuery` | `MetadataFilterOptions` (distinct values + counts per metadata facet; each facet ignores its own constraint) |
 
+v18.1: `ImageQuery.pickOrigin?: PickOrigin | null` (flagged by the user / by Apply suggestions; AND with `picks`) and
+`get_filter_counts(.., metadata, pickOrigin: PickOrigin | null)`; `CullSummary.suggested{Pick,Reject,Rating}Pending`
+= exactly what `apply_suggestions(onlyUnset)` changes.
 v18: `get_filter_counts(folderId, projectId, keepersOnly, metadata: MetadataFilter | null)`;
 `ImageQuery.metadata?: MetadataFilter` (file type, extension, camera, lens, ISO / focal length / aperture / shutter
 ranges, capture date range, edited, has sidecar; SQL in `repo::metadata_clauses`); `KeeperRule.mode`

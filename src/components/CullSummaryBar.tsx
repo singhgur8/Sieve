@@ -1,6 +1,6 @@
 // Cull step readout: picked / unflagged / rejected (by you vs. auto) and how the keepers add up, every number a filter.
 import { Sparkles } from "lucide-react";
-import type { CullSummary, KeeperRule } from "../ipc";
+import type { CullSummary, KeeperRule, PickOrigin } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { keeperEquation } from "../lib/cull";
 import { KeeperRuleMenu } from "./KeeperRule";
@@ -17,14 +17,34 @@ const base = "whitespace-nowrap rounded px-1.5 py-0.5 text-xs transition-colors"
 const idle = "bg-neutral-800 text-neutral-200 hover:bg-neutral-700";
 const on = "bg-sky-800 text-sky-100 ring-1 ring-white/30";
 
-/** Exactly this pick filter (and nothing else about picks / keepers) is on. */
-const onlyPicks = (q: Query, ...p: string[]) => !q.keepersOnly && q.picks.length === p.length && p.every((x) => (q.picks as string[]).includes(x));
+/** Exactly this pick filter (and nothing else about picks / keepers / flag origin) is on. */
+const onlyPicks = (q: Query, ...p: string[]) => !q.keepersOnly && q.pickOrigin == null && q.picks.length === p.length && p.every((x) => (q.picks as string[]).includes(x));
+/** Exactly "rejected by `o`" is on (v18.1 `ImageQuery.pickOrigin`). */
+const onlyRejectedBy = (q: Query, o: PickOrigin) => !q.keepersOnly && q.pickOrigin === o && q.picks.length === 1 && q.picks[0] === "reject";
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** "20 picks · 8 rejects · 3 star-rated", zero parts dropped (UX 8c P1-1). */
+export function suggestionParts(s: CullSummary): string {
+  return [
+    s.suggestedPickPending > 0 && plural(s.suggestedPickPending, "pick"),
+    s.suggestedRejectPending > 0 && plural(s.suggestedRejectPending, "reject"),
+    s.suggestedRatingPending > 0 && `${s.suggestedRatingPending} star-rated`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
 
 export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions }: Props) {
-  const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
+  const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, pickOrigin: null, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
+  const toggleRejectedBy = (o: PickOrigin) =>
+    setQuery((q) => (onlyRejectedBy(q, o) ? { ...q, picks: [], pickOrigin: null } : { ...q, keepersOnly: false, picks: ["reject"], pickOrigin: o }));
   const keepersOn = !!query.keepersOnly;
+  const formula = keeperEquation(s);
+  const suggestions = suggestionParts(s);
+  const splitBtn = (active: boolean) => `whitespace-nowrap rounded px-1 transition-colors ${active ? on : "hover:bg-neutral-800 hover:text-neutral-200"}`;
   return (
-    <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
+    <div className="flex shrink-0 flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
       <button
         className={`${base} ${onlyPicks(query, "pick") ? on : idle}`}
         data-testid="cull-sum-picked"
@@ -46,11 +66,23 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
       </button>
       <span className="text-neutral-400" data-testid="cull-sum-reject-split">
         (
-        <button className="underline-offset-2 hover:underline" data-testid="cull-sum-by-you" title="Rejected by you (flag keys, sidecars, undo). Shown in the Rejected view with the reason" onClick={() => toggle("reject")}>
+        <button
+          className={splitBtn(onlyRejectedBy(query, "user"))}
+          aria-pressed={onlyRejectedBy(query, "user")}
+          data-testid="cull-sum-by-you"
+          title={`Show only the ${s.rejectedByUser} photos you rejected yourself (flag keys, sidecars, undo), each with the reason`}
+          onClick={() => toggleRejectedBy("user")}
+        >
           {s.rejectedByUser} by you
         </button>
         ,{" "}
-        <button className="underline-offset-2 hover:underline" data-testid="cull-sum-auto" title="Rejected by Apply suggestions and not changed by you since. Shown in the Rejected view with the reason" onClick={() => toggle("reject")}>
+        <button
+          className={splitBtn(onlyRejectedBy(query, "auto"))}
+          aria-pressed={onlyRejectedBy(query, "auto")}
+          data-testid="cull-sum-auto"
+          title={`Show only the ${s.rejectedAuto} photos rejected by Apply suggestions (and not changed by you since), each with the reason`}
+          onClick={() => toggleRejectedBy("auto")}
+        >
           {s.rejectedAuto} auto
         </button>
         )
@@ -64,11 +96,15 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
       >
         Keepers <b>{s.keepers}</b>
       </button>
-      <span data-testid="cull-sum-formula" title="Edit and Export work on the keepers only. Nothing is deleted: left-out photos stay in the catalog and can be flagged again at any time">
-        {keeperEquation(s)}
+      <span
+        className="min-w-0 truncate"
+        data-testid="cull-sum-formula"
+        title={`${formula}. Edit and Export work on the keepers only. Nothing is deleted: left-out photos stay in the catalog and can be flagged again at any time`}
+      >
+        {formula}
       </span>
       <KeeperRuleMenu current={s.keeperRule} onPick={onKeeperRule} testid="cull-sum-rule" />
-      {(s.suggestedRejectPending > 0 || s.suggestedPickPending > 0) && (
+      {suggestions && (
         <button
           className="ml-auto flex items-center gap-1 whitespace-nowrap rounded bg-neutral-800 px-1.5 py-0.5 text-sky-200 hover:bg-neutral-700"
           data-testid="cull-sum-suggest"
@@ -76,7 +112,7 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
           onClick={onApplySuggestions}
         >
           <Sparkles className="size-3" />
-          Sieve suggests {s.suggestedPickPending} pick{s.suggestedPickPending === 1 ? "" : "s"} and {s.suggestedRejectPending} reject{s.suggestedRejectPending === 1 ? "" : "s"} you have not acted on. Apply…
+          Suggestions: {suggestions} — Apply…
         </button>
       )}
     </div>

@@ -50,6 +50,12 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
         out.skipped++;
         continue;
       }
+      // Already what Sieve suggests: `apply_suggestions` leaves it alone (IPC v18.1), so the
+      // default count equals the Cull summary's "Suggestions: …" numbers.
+      if (r.pick === q.suggestedPick && r.rating === q.suggestedRating) {
+        out.skipped++;
+        continue;
+      }
       out.apply++;
       if (q.suggestedPick === "pick") out.picks++;
       else if (q.suggestedPick === "reject") out.rejects++;
@@ -97,7 +103,7 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
               <span data-testid="apply-count-apply">{c.apply}</span> will be updated: {c.picks} picked, {c.rejects} rejected, {c.rated} star-rated
             </li>
             <li>
-              <span data-testid="apply-count-skipped">{c.skipped}</span> left as they are (already flagged or rated)
+              <span data-testid="apply-count-skipped">{c.skipped}</span> left as they are (already flagged, rated or matching the suggestion)
             </li>
             {c.unanalyzed > 0 && (
               <li>
