@@ -81,7 +81,7 @@ pub fn duplicate_reason(
 ) -> SuggestionReason {
     let gap = |k: Option<f32>, m: Option<f32>| k.zip(m).map(|(k, m)| k - m);
     let why = if pinned {
-        "you chose that one as the keeper"
+        "you chose that one as the best of the burst"
     } else if gap(keeper.face_sharpness, member.face_sharpness).is_some_and(|d| d >= SHARPER_BY)
         || (keeper.face_sharpness.is_none() && keeper.global_sharpness - member.global_sharpness >= SHARPER_BY)
     {
@@ -229,7 +229,7 @@ mod tests {
         assert!(r.text.ends_with("that one is sharper"), "{}", r.text);
         // User-chosen keeper (even if it is the softer frame).
         let r = duplicate_reason(&keeper, &quality(0.5, Some(0.4), 0.5, None), 3, "DSC0001", true);
-        assert_eq!(r.text, "Similar to DSC0001 in this burst \u{2014} you chose that one as the keeper");
+        assert_eq!(r.text, "Similar to DSC0001 in this burst \u{2014} you chose that one as the best of the burst");
         assert_eq!(r.related_image_id, Some(3));
     }
 

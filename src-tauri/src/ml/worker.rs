@@ -729,7 +729,7 @@ mod tests {
         let dup = reasons_of(&conn, 2);
         assert_eq!(dup.len(), 1, "{dup:?}");
         assert_eq!(dup[0].related_image_id, Some(1));
-        assert_eq!(dup[0].text, "Similar to 1 in this burst \u{2014} you chose that one as the keeper");
+        assert_eq!(dup[0].text, "Similar to 1 in this burst \u{2014} you chose that one as the best of the burst");
 
         // Narrower burst window (rescore) dissolves the group and its duplicate tag.
         repo::set_burst_window(&conn, 400).unwrap();
