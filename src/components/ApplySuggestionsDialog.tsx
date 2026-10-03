@@ -39,7 +39,7 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
   }, [ids]);
 
   const c = useMemo(() => {
-    const out = { picks: 0, rejects: 0, rated: 0, skipped: 0, unanalyzed: 0, apply: 0 };
+    const out = { picks: 0, rejects: 0, starsOnly: 0, ratedAll: 0, skipped: 0, unanalyzed: 0, apply: 0 };
     for (const r of rows ?? []) {
       const q = r.quality;
       if (!q) {
@@ -59,7 +59,8 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
       out.apply++;
       if (q.suggestedPick === "pick") out.picks++;
       else if (q.suggestedPick === "reject") out.rejects++;
-      if (q.suggestedRating > 0) out.rated++;
+      if (q.suggestedRating > 0) out.ratedAll++;
+      if (q.suggestedPick === "unflagged" && q.suggestedRating > 0) out.starsOnly++;
     }
     return out;
   }, [rows, skipManual]);
@@ -78,7 +79,7 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
         Apply suggestions <HelpLink id="apply-suggestions" title="What does this do?" />
       </h2>
       <p className="mb-3 text-xs text-neutral-400" data-testid="apply-explain">
-        Fills in flags and stars from Sieve&apos;s analysis, by default only on photos you have not touched. Review the result in the Rejected view (each rejected photo shows why); Undo reverts it all.
+        Fills in flags and stars from Sieve&apos;s analysis, by default only on photos you have not flagged or rated. Review the result in the Rejected view (each rejected photo shows why); Undo reverts it all.
       </p>
       <div className="mb-3 flex gap-4 text-sm" role="radiogroup" aria-label="Scope" data-testid="apply-scope">
         <label className={`flex items-center gap-1.5 ${selected.length === 0 ? "opacity-50" : ""}`}>
@@ -100,8 +101,13 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
         ) : (
           <ul className="space-y-0.5">
             <li>
-              <span data-testid="apply-count-apply">{c.apply}</span> will be updated: {c.picks} picked, {c.rejects} rejected, {c.rated} star-rated
+              <span data-testid="apply-count-apply">{c.apply}</span> will be updated: {c.picks} picked · {c.rejects} rejected · {c.starsOnly} stars only
             </li>
+            {c.ratedAll > 0 && (
+              <li className="text-neutral-400" data-testid="apply-count-stars-line">
+                Stars are set on {c.ratedAll} of them
+              </li>
+            )}
             <li>
               <span data-testid="apply-count-skipped">{c.skipped}</span> left as they are (already flagged, rated or matching the suggestion)
             </li>

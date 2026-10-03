@@ -50,12 +50,12 @@ const LEGEND_TAGS: LegendItem[] = ALL_TAGS.map((t) => ({
 
 const LEGEND_STRIPS: LegendItem[] = [
   {
-    icon: <span className="w-full truncate bg-red-950/85 px-1 text-[10px] leading-4 text-red-100"><b>Auto-rejected</b> · Reason</span>,
+    icon: <span className="block h-3 w-14 bg-red-950/85" />,
     label: "Rejected strip",
     text: "Rejected, and by whom (you or Auto), with Sieve's reason",
   },
   {
-    icon: <span className="w-full truncate border-t border-dashed border-red-400/60 bg-sky-950/85 px-1 text-[10px] leading-4 text-sky-100"><b>Sieve suggests reject</b></span>,
+    icon: <span className="block h-3 w-14 border-t border-dashed border-red-400/60 bg-sky-950/85" />,
     label: "Suggestion strip",
     text: "Sieve suggests rejecting this photo. Nothing has changed until you press X or Apply suggestions",
   },
@@ -171,7 +171,7 @@ export const HELP: HelpEntry[] = [
     title: "Apply suggestions (Auto)",
     keywords: "auto analyze suggested rejects review undo",
     blocks: [
-      { p: "Analyze scores every photo. Apply suggestions (the \"Sieve suggests … Apply…\" button in the Cull summary, or More > Apply suggestions…) copies Sieve's suggested flag and star rating onto the photos, so you start from a first pass instead of a blank slate." },
+      { p: "Analyze scores every photo. Apply suggestions (the \"Suggestions: … — Apply…\" button at the right of the Cull summary, or More > Apply suggestions…) copies Sieve's suggested flag and star rating onto the photos, so you start from a first pass instead of a blank slate." },
       {
         ul: [
           "Scope: the selected photos or everything in view.",
@@ -181,7 +181,7 @@ export const HELP: HelpEntry[] = [
           "Undo brings the old flags and ratings back (the Undo button in the message, or Cmd+Z).",
         ],
       },
-      { p: "To review its rejects: click Rejected in the Cull summary or the filter bar. Each rejected thumbnail says who rejected it (you or Auto) and why (for example Eyes closed); hover any badge for its meaning. Press U on any photo you want to keep, or Z to pick it." },
+      { p: "To review its rejects: click Rejected in the Cull summary or the filter bar. Each rejected thumbnail says who rejected it (you or Auto) and why (for example Eyes closed); hover any badge for its meaning. Or click N auto in the Cull summary to see only Auto's rejects. Press U on any photo you want to keep, or Z to pick it." },
     ],
   },
   {

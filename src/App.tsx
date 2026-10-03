@@ -41,12 +41,12 @@ import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
 import { ActivityWidget } from "./components/ActivityWidget";
 import { HelpPanel } from "./components/HelpPanel";
-import { openHelp } from "./lib/helpStore";
+import { openHelp, useHelpState } from "./lib/helpStore";
 import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
-import { modalCount } from "./lib/modal";
+import { modalCount, useModalCount } from "./lib/modal";
 import { getClipboard } from "./lib/clipboard";
 import { clearFileHealth, describeReason, noteFailure } from "./lib/errors";
 import { HealthBanner, RestoreBackupDialog } from "./components/CatalogHealth";
@@ -67,6 +67,8 @@ interface AppProps {
 }
 
 export default function App({ project: projectProp, onHome, onOpenProject }: AppProps) {
+  const modalOpenCount = useModalCount();
+  const helpState = useHelpState();
   const [project, setProject] = useState(projectProp);
   const projectId = project?.id ?? null;
   const [queryState, setQuery] = useState<Query>(BASE_QUERY);
@@ -1697,7 +1699,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
       <HelpPanel onShortcuts={() => setCheatOpen(true)} />
-      <ActivityWidget behindDialogs={exportOpen != null} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
+      <ActivityWidget behindDialogs={exportOpen != null || modalOpenCount > 0 || helpState.open} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
         <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
       </ActivityWidget>
     </main>
