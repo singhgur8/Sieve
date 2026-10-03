@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use ort::ep;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
@@ -138,8 +139,9 @@ fn build(path: &Path, dim: (&str, i64)) -> Result<(Session, Provider), String> {
     if !path.is_file() {
         return Err(format!("model not found: {} (run scripts/fetch-models.sh)", path.display()));
     }
-    let force_cpu = std::env::var("SIEVE_ML_CPU").is_ok_and(|v| v == "1");
-    if !force_cpu {
+    // CoreML only on macOS (Linux builds have no CoreML EP; CPU is used).
+    #[cfg(target_os = "macos")]
+    if !std::env::var("SIEVE_ML_CPU").is_ok_and(|v| v == "1") {
         let coreml = ep::CoreML::default()
             .with_model_format(ep::coreml::ModelFormat::MLProgram)
             .with_static_input_shapes(true)

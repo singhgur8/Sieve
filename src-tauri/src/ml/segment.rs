@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+#[cfg(target_os = "macos")]
 use ort::ep;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
@@ -446,8 +447,9 @@ fn coreml_session(cfg: &SegmentConfig, name: &str, dims: &[(&str, i64)]) -> Resu
         }
         Ok(b)
     };
-    let force_cpu = std::env::var("SIEVE_ML_CPU").is_ok_and(|v| v == "1");
-    if cfg.coreml && !force_cpu {
+    // CoreML only on macOS (Linux builds have no CoreML EP; CPU is used).
+    #[cfg(target_os = "macos")]
+    if cfg.coreml && !std::env::var("SIEVE_ML_CPU").is_ok_and(|v| v == "1") {
         let mut coreml =
             ep::CoreML::default().with_model_format(ep::coreml::ModelFormat::MLProgram).with_static_input_shapes(true);
         if let Some(dir) = &cfg.coreml_cache {

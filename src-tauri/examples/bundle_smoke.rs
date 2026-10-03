@@ -79,6 +79,7 @@ impl ExportSink for Sink {
 }
 
 /// Non-system Mach-O images loaded into this process (dyld's list).
+#[cfg(target_os = "macos")]
 fn loaded_images() -> Vec<String> {
     extern "C" {
         fn _dyld_image_count() -> u32;
@@ -92,6 +93,12 @@ fn loaded_images() -> Vec<String> {
         })
         .filter(|n| !n.starts_with("/System/") && !n.starts_with("/usr/lib/"))
         .collect()
+}
+
+/// macOS-only check (dyld); other platforms report nothing.
+#[cfg(not(target_os = "macos"))]
+fn loaded_images() -> Vec<String> {
+    Vec::new()
 }
 
 fn step(name: &str, t: Instant) {

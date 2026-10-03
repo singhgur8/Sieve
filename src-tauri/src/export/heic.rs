@@ -5,6 +5,7 @@
 //!
 //! Minimal hand-written FFI; every CF object is released through [`Cf`].
 
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
 use std::path::Path;
 
@@ -133,6 +134,7 @@ impl Drop for Cf {
     }
 }
 
+#[cfg(target_os = "macos")]
 const HEIC_UTI: &str = "public.heic";
 
 /// `Ok` if this system's ImageIO can encode HEIC, else why not.

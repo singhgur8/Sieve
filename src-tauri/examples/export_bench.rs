@@ -118,6 +118,7 @@ impl ExportSink for Sink {
 }
 
 /// (current physical footprint, current resident size, lifetime max footprint), MiB.
+#[cfg(target_os = "macos")]
 fn memory_mb() -> (f64, f64, f64) {
     // SAFETY: proc_pid_rusage fills a zeroed rusage_info_v4 we own.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
@@ -133,6 +134,12 @@ fn memory_mb() -> (f64, f64, f64) {
     }
     let mb = |v: u64| v as f64 / (1024.0 * 1024.0);
     (mb(info.ri_phys_footprint), mb(info.ri_resident_size), mb(info.ri_lifetime_max_phys_footprint))
+}
+
+/// macOS-only (`proc_pid_rusage`); NaN elsewhere.
+#[cfg(not(target_os = "macos"))]
+fn memory_mb() -> (f64, f64, f64) {
+    (f64::NAN, f64::NAN, f64::NAN)
 }
 
 fn film_cube() -> String {

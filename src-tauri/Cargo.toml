@@ -50,8 +50,12 @@ libc = "0.2"
 sha2 = "0.10"
 # Culling engine (vision-ml-dev): ONNX Runtime 1.28 (prebuilt, statically linked by ort-sys)
 # with the CoreML execution provider; CPU EP is the fallback.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-27", "coreml"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-27"] }
 
+
+# CoreML EP on macOS only (no prebuilt ONNX Runtime with CoreML exists for Linux; used by CI / cloud builds).
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["coreml"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
