@@ -1,0 +1,43 @@
+{
+    "permissions": {
+        "defaultMode": "acceptEdits",
+        "allow": [
+            "Bash(cargo:*)",
+            "Bash(rustup:*)",
+            "Bash(pnpm:*)",
+            "Bash(npx playwright:*)",
+            "Bash(git add:*)",
+            "Bash(git commit:*)",
+            "Bash(git checkout:*)",
+            "Bash(git switch:*)",
+            "Bash(git merge:*)",
+            "Bash(git branch:*)",
+            "Bash(git worktree:*)",
+            "Bash(git status:*)",
+            "Bash(git diff:*)",
+            "Bash(git log:*)",
+            "Bash(brew install:*)",
+            "Bash(curl:*)",
+            "Bash(sqlite3:*)",
+            "Bash(exiftool:*)"
+        ],
+        "deny": [
+            "Bash(git push:*)",
+            "Bash(git reset --hard:*)",
+            "Edit(//Users/gurjotsingh/Pictures/**)",
+            "Write(//Users/gurjotsingh/Pictures/**)"
+        ]
+    },
+    "hooks": {
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/continue-roadmap.sh"
+                    }
+                ]
+            }
+        ]
+    }
+}
