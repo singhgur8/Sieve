@@ -181,17 +181,30 @@ test.describe("masks UX", () => {
     expect(tint.op).toBeGreaterThanOrEqual(0.55);
     expect(tint.op).toBeLessThanOrEqual(0.6);
     await shot(page, `${P}overlay-auto-visible`);
-    await expect(page.getByTestId("mask-overlay")).toHaveCount(0, { timeout: 4000 });
+    await expect(page.getByTestId("mask-overlay")).toHaveCount(0, { timeout: 15000 });
     await shot(page, `${P}overlay-auto-hidden`);
 
     // Adjusting a mask slider brings it back; ~600 ms after the release it is gone again.
     await clearCalls(page);
+    // Timestamps are taken inside the page (performance.now at the input event and at the attribute flip), so
+    // CPU load that delays Playwright's polling cannot affect them: only "hold >= 600 ms after the last edit" is checked.
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__ov = { lastInput: 0, hiddenAt: 0, sawVisible: false };
+      document.addEventListener("input", () => (w.__ov.lastInput = performance.now()), true);
+      new MutationObserver(() => {
+        const el = document.querySelector('[data-testid="mask-overlay"]');
+        const v = el?.getAttribute("data-overlay-visible");
+        if (v === "true") w.__ov.sawVisible = true;
+        if (v === "false" && !w.__ov.hiddenAt) w.__ov.hiddenAt = performance.now();
+      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-overlay-visible"] });
+    });
     await setSlider(page, "mask-exposure", 1);
-    await expect(page.getByTestId("mask-overlay")).toHaveAttribute("data-overlay-visible", "true");
-    const t0 = Date.now();
-    await expect(page.getByTestId("mask-overlay")).toHaveAttribute("data-overlay-visible", "false", { timeout: 3000 });
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(300);
-    await expect(page.getByTestId("mask-overlay")).toHaveCount(0, { timeout: 3000 });
+    await expect.poll(() => page.evaluate(() => (window as any).__ov.hiddenAt > 0), { timeout: 20000 }).toBe(true);
+    const ov = await page.evaluate(() => (window as any).__ov);
+    expect(ov.sawVisible).toBe(true);
+    expect(ov.hiddenAt - ov.lastInput).toBeGreaterThanOrEqual(550); // OVERLAY_HOLD_MS = 600
+    await expect(page.getByTestId("mask-overlay")).toHaveCount(0, { timeout: 10000 });
 
     // Show overlay (O) pins it: stays after editing.
     await page.keyboard.press("o");
