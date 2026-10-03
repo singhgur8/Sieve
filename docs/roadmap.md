@@ -188,6 +188,71 @@ the user asked for "auto edit based on what the model thinks I like".
 
 ---
 
+## Phase 8c — User feedback round 2: culling clarity + Lightroom interop (user request 2026-10-03)
+Runs in a Linux cloud container (no user RAWs, no CoreML, no macOS bundle): acceptance uses tests,
+synthetic / downloaded sample files and Playwright on the mock backend; anything that needs the user's Mac is listed
+under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origin` (user permission 2026-10-03).
+- [ ] **Contract v18** (architect): (a) `KeeperRule` gains a mode "everything not rejected" and it becomes the default
+  (user: "I would want to keep everything that's not rejected"); the old pick/stars/suggestion rule stays as an option.
+  (b) `get_cull_summary(projectId)`: picked / unflagged / rejected (by you vs. auto-applied) / keepers, with the keeper
+  formula broken down. (c) Human-readable suggestion reasons per image (`QualityScore.reasons`: kind + text, e.g.
+  "Eyes closed", "Missed focus on the face", "Duplicate in burst (keeper DSC0123)") and the user-vs-auto origin of a
+  reject flag. (d) Lightroom-style metadata filters on `ImageQuery` (file type / extension, camera, lens, ISO,
+  focal length, aperture, shutter, capture date range, edited / unedited, has sidecar) + a command returning the
+  distinct values with counts for the current scope. (e) A generic background-activity event (kind, label,
+  done / total, finished/error) for import, analysis, XMP save, paste/sync, apply to scene, export, model download.
+  Migration if needed; bindings regenerated; ipc-changelog entry.
+- [ ] **Culling shortcuts, Lightroom one-hand** (frontend-dev): Z = Pick, X = Reject (Shift = and advance), P stays
+  as an alias, U unflags. Space: Grid → Loupe; in Loupe / Compare / Develop Space toggles Fit ↔ 1:1 zoom and never
+  leaves the view (Esc / G / E / Enter go back to Grid). Z no longer zooms anywhere (crop tool keeps X = swap). Cheat
+  sheet, tooltips and hints follow the keymap. Acceptance: Playwright covers every changed chord in each mode.
+- [ ] **Arrow-key navigation glitch** (frontend-dev): with two filters on, holding / tapping Left/Right shows a
+  transition-like flash. Find the cause (CSS transitions, image swap without decode, re-mount, stale preview,
+  filter re-query on each move) and fix it. Acceptance: Playwright at 25 key presses/s with two filters: each
+  displayed frame belongs to the current photo (no previous-photo flash, no opacity animation), main-thread work per
+  keypress measured before/after and recorded.
+- [ ] **XMP that Lightroom reads, both ways** (rust-engine-dev): Lightroom Classic (13.2+) stores flags in
+  `xmpDM:pick` (1 / 0 / -1) and `xmpDM:good` (True / False / absent); `xmp:Label "Pick"` shows up as a bogus colour
+  label and `xmp:Rating -1` is Bridge-only. Write flags as `xmpDM:pick` / `xmpDM:good`, stars as `xmp:Rating 0–5`
+  (kept when rejected), real colour labels in `xmp:Label`, tags as keywords; remove a `Label "Pick"` written by older
+  Sieve versions. Read all conventions (xmpDM first, then Rating -1 / Label "Pick"). Re-read sidecars changed by
+  another app when a project opens and when the window regains focus (newer wins). Acceptance: fixture of a
+  Lightroom Classic sidecar with pick / reject / stars / label round-trips; exiftool shows `XMP-xmpDM:Pick/Good`;
+  unrelated fields byte-identical; externally edited sidecar picked up.
+- [ ] **"database is locked" on Save** (rust-engine-dev): Cmd+S over 2,389 photos while auto-sync ran gave "Saved
+  metadata for 685 photos; 1704 sidecars could not be written. database is locked". Cause: catalog connections have
+  no `busy_timeout`, so the auto-sync connection and the explicit save collide. Fix: busy timeout on every catalog
+  connection, short write transactions, explicit save waits for / merges with a running auto-sync pass.
+  Acceptance: test with ≥ 2,400 images running an explicit save while auto-sync and UI writes run → 0 failures;
+  catalog errors reported separately from per-file errors.
+- [ ] **Suggestion reasons** (vision-ml-dev): fill `QualityScore.reasons` for every non-pick suggestion and every
+  tag from the existing metrics (blink, missed focus, motion blur, under/over exposure, burst duplicate naming the
+  keeper). Acceptance: unit tests per reason; every reject suggestion in the test catalogs has ≥ 1 reason.
+- [ ] **Culling clarity: counts, keepers, rejected pile, icons** (frontend-dev): always-visible grid readout
+  "Showing N of M photos" that follows every filter (and the selection count); a cull summary (picked / unflagged /
+  rejected / keepers = formula, each clickable as a filter) in the Cull step and where the app says how many photos
+  go on to Edit; Edit / Export say what the keepers are made of and link to the keeper rule; a "Rejected" view whose
+  cells show why (you rejected / auto, with the reasons); Apply suggestions ("Auto") explained in place (what it
+  changes, that you review after, undoable). Every icon / badge on cells, loupe, filmstrip and toolbars has a
+  hover description. Acceptance: Playwright on mock data: counts match the grid for 3 filter combos, summary
+  formula adds up, reasons shown on rejected cells, every icon has a non-empty accessible title.
+- [ ] **Lightroom-style metadata filters** (frontend-dev, after the contract): Library Filter-style row (file type,
+  camera, lens, ISO, focal length, aperture, shutter, date, edited, sidecar) with counts per value, combined with the
+  existing tag / flag / star filters. Acceptance: Rust tests per filter; Playwright: filter by extension changes the
+  grid and the count readout.
+- [ ] **Background activity indicator** (frontend-dev): a small corner indicator (spinner / progress bar + label +
+  count) while long work runs (import, analysis, XMP save, paste / sync to many, apply to scene, export, model
+  download); conflicting buttons disabled meanwhile; finished / error states. Acceptance: Playwright with a slow mock.
+- [ ] **Help & FAQ** (frontend-dev, content reviewed by ux-designer): in-app guide (Help button + F1) covering the
+  culling workflow, what Auto / Apply suggestions does, keepers, auto-advance, what each icon means, where auto-save
+  writes (XMP sidecars next to the RAWs, shown with the path) and how to see Sieve's culling in Lightroom (on import;
+  for photos already in a catalog: Metadata → Read Metadata from Files; Lightroom writes back with Cmd+S or "Automatically
+  write changes into XMP"); controls such as Auto-advance link to their FAQ entry.
+- [ ] **UX review** (ux-designer): re-check the cull → edit flow with the above; no open P0/P1.
+- [ ] **QA gate**.
+
+---
+
 ## Future phases (notes to revisit — not part of the autonomous run)
 
 ### Phase 9 — Reference-match grading ("make photo A look like photo B")
