@@ -27,7 +27,7 @@ function Blocks({ blocks, onShortcuts }: { blocks: Block[]; onShortcuts: () => v
                   <li key={l.label} className="flex items-center gap-3" data-testid={`help-legend-${l.label}`}>
                     <span className="flex w-20 shrink-0 items-center justify-center rounded bg-neutral-800 py-1">{l.icon}</span>
                     <span className="text-neutral-300">
-                      <span className="font-medium capitalize text-neutral-100">{l.label}</span>. {l.text}
+                      <span className="font-medium text-neutral-100">{l.label}</span>. <span data-testid="help-legend-text">{l.text}</span>
                     </span>
                   </li>
                 ))}

@@ -1,4 +1,4 @@
-// Non-blocking export progress cards (bottom-right). A finished job collapses to a 28 px pill after 8 s.
+// Non-blocking export progress cards, rendered as the first children of the bottom-right ActivityWidget stack. A finished job collapses to a 28 px pill after 8 s.
 import { AlertTriangle, CheckCircle2, FolderSearch, X } from "lucide-react";
 import { describeReason, type ErrorCategory } from "../../lib/errors";
 import type { JobView } from "../../hooks/useExportJobs";
@@ -56,7 +56,7 @@ function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: 
   const title = job.presetName ?? "Export";
   return (
     <div
-      className="w-96 rounded-lg border border-neutral-700 bg-neutral-900/95 p-3 text-sm shadow-xl"
+      className="w-full rounded-lg border border-neutral-700 bg-neutral-900/95 p-3 text-sm shadow-xl"
       data-testid={`export-job-${job.id}`}
       data-state={f ? (f.cancelled ? "cancelled" : "finished") : "running"}
     >
@@ -142,9 +142,9 @@ function Card({ job, onCancel, onDismiss, onReveal }: { job: JobView; onCancel: 
 export function ExportJobsPanel({ jobs, onCancel, onDismiss, onReveal }: Props) {
   if (jobs.length === 0) return null;
   return (
-    <div className="pointer-events-none fixed bottom-24 right-3 z-40 flex flex-col items-end gap-2" data-testid="export-jobs">
+    <div className="contents" data-testid="export-jobs">
       {jobs.map((j) => (
-        <div key={j.id} className="pointer-events-auto">
+        <div key={j.id} className="pointer-events-auto w-full">
           {j.finished && j.collapsed ? <Pill job={j} onDismiss={onDismiss} onReveal={onReveal} /> : <Card job={j} onCancel={onCancel} onDismiss={onDismiss} onReveal={onReveal} />}
         </div>
       ))}

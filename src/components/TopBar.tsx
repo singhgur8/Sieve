@@ -162,7 +162,7 @@ export function TopBar(p: Props) {
         {p.exportPct != null ? <Ring pct={p.exportPct} /> : <Share className="size-4" />}
         Export
       </button>}
-      <button onClick={() => openHelp()} className={btn} data-testid="help-button" title={`Help and FAQ${hint("help")}`} aria-label="Help">
+      <button onClick={() => openHelp()} className={btn} data-testid="help-button" title="Help and FAQ (F1 / Cmd+?)" aria-label="Help">
         <CircleHelp className="size-4" />
         <span className={p.steps ? labelHide : ""}>Help</span>
       </button>
@@ -173,7 +173,7 @@ export function TopBar(p: Props) {
               className={menuItem}
               disabled={!p.hasImages}
               data-testid="apply-suggestions"
-              title="Copy suggested rating and pick to the selection (or all photos when nothing is selected)"
+              title="Fill in flags and stars from Sieve's suggestions for the selection or everything in view. Opens a preview first"
               onClick={() => {
                 close();
                 p.onApplySuggestions();
@@ -182,7 +182,7 @@ export function TopBar(p: Props) {
               <Check className="size-4" /> Apply suggestions…
             </button>
             <p className="px-3 pb-1.5 pr-4 text-[11px] leading-snug text-neutral-400" data-testid="apply-info">
-              Auto mode: fills in flags and stars from Sieve&apos;s analysis, only on photos you have not touched. You review the result (Rejected view) and can undo it.
+              Auto mode: fills in flags and stars from Sieve&apos;s analysis, by default only on photos you have not flagged or rated. You review the result (Rejected view) and can undo it.
             </p>
             <button
               className={menuItem}

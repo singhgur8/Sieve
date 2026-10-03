@@ -186,6 +186,7 @@ export function XmpExplainer({ autoSync, onClose }: { autoSync: boolean; onClose
         <li>Your changes are written back into the same sidecar: ratings, pick/reject flags, color labels, Sieve tags and develop settings.</li>
         <li>Every other field in the sidecar is kept as it is. Your RAW files are never modified.</li>
         <li>{autoSync ? "Saving happens automatically a moment after each change. " : "Auto-save is off; use Save to write sidecars. "}The status pill in the top bar shows Saved, Saving or Error and lets you turn auto-save on or off.</li>
+        <li>Using Lightroom Classic too? <HelpLink id="lightroom" label="See how it reads these sidecars" /></li>
       </ul>
       <div className="mt-4 flex justify-end">
         <button className="rounded-md bg-amber-600 px-3 py-1.5 font-medium text-black hover:bg-amber-500" data-testid="xmp-explainer-dismiss" onClick={onClose} autoFocus>

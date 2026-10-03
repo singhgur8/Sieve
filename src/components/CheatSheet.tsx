@@ -82,7 +82,7 @@ export function CheatSheet({ onClose, mode = "grid", editStep = false }: { onClo
           data-testid="cheat-open-help"
           className="shrink-0 text-xs text-sky-300 hover:underline"
         >
-          Help &amp; FAQ (F1)
+          Help &amp; FAQ (F1 / Cmd+?)
         </button>
         <input
           ref={input}

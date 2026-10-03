@@ -10,8 +10,8 @@ import { MetaChips } from "./MetadataFilterRow";
 const LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
 const PICKS: { key: PickFlag; label: string }[] = [
   { key: "pick", label: "Picked" },
-  { key: "reject", label: "Rejected" },
   { key: "unflagged", label: "Unflagged" },
+  { key: "reject", label: "Rejected" },
 ];
 
 interface Props {
@@ -107,7 +107,7 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
 
   return (
     <div className={`${rowClass} min-w-0`} data-testid="filter-bar">
-      <Filter className="size-3.5 shrink-0 text-neutral-400" />
+      <Filter className="size-3.5 shrink-0 text-neutral-400" aria-hidden />
       <div className="flex shrink-0 items-center gap-1" data-testid="filter-tags">
         {ALL_TAGS.map((t) => {
           const inc = query.includeTags.includes(t);
@@ -242,7 +242,7 @@ export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { q
         ))}
       </div>
 
-      <label className="flex items-center gap-1.5 text-neutral-300" title={counts && counts.burstNonKeepers > 0 ? `${counts.burstNonKeepers} burst frames hidden when collapsed` : "Show only the keeper of each burst"}>
+      <label className="flex items-center gap-1.5 text-neutral-300" title={counts && counts.burstNonKeepers > 0 ? `${counts.burstNonKeepers} burst frames hidden when collapsed` : "Show only the best frame of each burst"}>
         <input
           type="checkbox"
           data-testid="collapse-bursts"
@@ -306,7 +306,7 @@ export function FilterSummary({ query, shown, total, sceneNumber, onEdit, unit =
   const filtered = isFiltered(query);
   return (
     <div className="flex h-7 shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 text-xs text-neutral-300" data-testid="filter-summary">
-      <Filter className="size-3.5 shrink-0 text-neutral-400" />
+      <Filter className="size-3.5 shrink-0 text-neutral-400" aria-hidden />
       <span className="truncate" data-testid="filter-summary-text">
         {filtered ? `Filtered: ${describeFilters(query, sceneNumber)}` : "No filters"} · {shown}
         {total != null ? ` of ${total}` : ""}

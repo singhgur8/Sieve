@@ -244,7 +244,7 @@ test.describe("P0-2 apply suggestions", () => {
       if ((await line.count()) > 0) found = await line.textContent();
       else await page.keyboard.press("ArrowRight");
     }
-    expect(found).toMatch(/^Suggested: (Pick|Reject|Unflagged) · \d★$/);
+    expect(found).toMatch(/^(Suggested: (Pick|Unflagged) · \d★|Sieve suggests reject( · \d★)?(: .+)?)$/);
   });
 });
 

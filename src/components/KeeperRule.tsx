@@ -15,7 +15,8 @@ export const KEEPER_RULES: { rule: KeeperRule; label: string; long: string }[] =
   { rule: { mode: "picks_and_ratings", minRating: 5, useSuggestions: false }, label: "Picks, 5★", long: "Picks and 5★ photos" },
   { rule: { mode: "not_rejected", minRating: 1, useSuggestions: true }, label: "Everything not rejected", long: "Everything you have not rejected (default)" },
 ];
-const DISPLAY_ORDER = [4, 0, 1, 2, 3];
+/** Menu order of `KEEPER_RULES` indexes (default first). */
+export const DISPLAY_ORDER = [4, 0, 1, 2, 3];
 
 /** Same rule as far as keepers go (`not_rejected` ignores the thresholds). */
 export const sameRule = (a: KeeperRule, b: KeeperRule) => a.mode === b.mode && (a.mode === "not_rejected" || (a.minRating === b.minRating && a.useSuggestions === b.useSuggestions));

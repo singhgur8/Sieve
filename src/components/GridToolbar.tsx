@@ -75,7 +75,7 @@ export function GridToolbar(p: Props) {
           {p.query.sortDescending ? <ArrowUpAZ className="size-3.5" /> : <ArrowDownAZ className="size-3.5" />}
           {p.query.sortDescending ? "Descending" : "Ascending"}
         </button>
-      <label className="flex items-center gap-1.5" title="Advance to the next photo after flagging/rating (Shift+P / Shift+X always advance)">
+      <label className="flex items-center gap-1.5" title="Advance to the next photo after flagging/rating (Shift+Z / Shift+X always advance)">
         <input type="checkbox" checked={p.autoAdvance || !!p.capsLock} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />
         <SkipForward className="size-3.5" /> Auto-advance{p.capsLock ? " (Caps Lock)" : ""}
       </label>
