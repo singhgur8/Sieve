@@ -101,7 +101,7 @@ export function PlanView(p: Props) {
     );
   } else if (wf.plan && wf.plan.keeperIds.length === 0) {
     body = (
-      <Empty testid="plan-empty" title="No keepers yet." detail="Pick photos in Cull (P), or choose which photos count as keepers.">
+      <Empty testid="plan-empty" title="No keepers yet." detail="Pick photos in Cull (Z), or choose which photos count as keepers.">
         <button className="rounded-md bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700" data-testid="plan-back-cull" onClick={p.onBackToCull}>
           Back to Cull
         </button>

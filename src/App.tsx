@@ -562,7 +562,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       if (projectId != null && (keepers || step === "edit" || step === "export")) {
         try {
           const plan = await unwrap(commands.getEditPlan(projectId));
-          if (plan.keeperIds.length === 0) return setNotice("No keepers yet. Pick photos in Cull (P) first.");
+          if (plan.keeperIds.length === 0) return setNotice("No keepers yet. Pick photos in Cull (Z) first.");
           setExportOpen({ sel: targets(), keepers: plan.keeperIds });
         } catch (e) {
           reportError(e);
@@ -973,7 +973,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     }
     const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
-    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste"];
+    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste"];
     if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
     const k = e.key;
@@ -1102,10 +1102,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           setFiltersOpen(true);
         }
         return;
+      case "gridLoupe":
+        return openLoupe();
       case "zoomLoupe":
-        if (mode === "grid") openLoupe();
-        setTimeout(() => loupe.current?.toggleZoom(), mode === "grid" ? 120 : 0);
-        return;
+        return loupe.current?.toggleZoom();
       case "zoomDevelop":
         return develop.current?.toggleZoom();
       case "face":
@@ -1185,6 +1185,26 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const catalogEmpty = project ? project.photoCount === 0 : catalog != null && catalog.imageCount === 0;
   const filtered = isFiltered(query);
   const clearFilters = () => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }));
+
+  // While Loupe / Compare / Develop cover the grid, it receives the exact props it had when it was last visible
+  // (memoised, so it does not re-render): arrow-key navigation would otherwise re-render every visible cell per key.
+  const liveGridProps = {
+    lib,
+    targetSize: size,
+    selected: sel.selected,
+    active: sel.active,
+    onColsChange: (cols: number, page: number) => (colsRef.current = { cols, page }),
+    onCellClick: (id: number, e: React.MouseEvent) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey }),
+    onCellDoubleClick: openLoupe,
+    onRate: ratePhoto,
+    catalogEmpty,
+    filtered,
+    onImport: importFolder,
+    onClearFilters: clearFilters,
+  };
+  const frozenGrid = useRef(liveGridProps);
+  if (mode === "grid") frozenGrid.current = liveGridProps;
+  const gridProps = frozenGrid.current;
 
   return (
     <main className="flex h-screen flex-col">
@@ -1408,20 +1428,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
-        <PhotoGrid
-          lib={lib}
-          targetSize={size}
-          selected={sel.selected}
-          active={sel.active}
-          onColsChange={(cols, page) => (colsRef.current = { cols, page })}
-          onCellClick={(id, e) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
-          onCellDoubleClick={openLoupe}
-          onRate={ratePhoto}
-          catalogEmpty={catalogEmpty}
-          filtered={filtered}
-          onImport={importFolder}
-          onClearFilters={clearFilters}
-        />
+        <PhotoGrid {...gridProps} />
         </ErrorBoundary>
         {planOpen && project && step === "edit" && (
           <ErrorBoundary view="Plan" overlay onExit={() => setPlanOpen(false)}>

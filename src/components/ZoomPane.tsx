@@ -34,7 +34,9 @@ interface Props {
 export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 16 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
-  const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
+  // The preview is decoded off-screen first; it is only mounted once it can paint in full. Until then the
+  // (already decoded, tiny) thumbnail of the SAME photo shows, so a swap never paints the previous photo or a blank.
+  const [decoded, setDecoded] = useState<{ url: string; w: number; h: number } | null>(null);
   const [broken, setBroken] = useState<string | null>(null);
   const t = entry?.thumbnail;
   const previewPath = t?.status === "ready" ? (t.previewPath ?? t.path) : null;
@@ -50,9 +52,23 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
     return () => ro.disconnect();
   }, []);
 
+  const previewUrl = previewPath ? `${convertFileSrc(previewPath)}?v=${version}` : null;
+  const thumbUrl = thumbPath ? `${convertFileSrc(thumbPath)}?v=${version}` : null;
   useEffect(() => {
-    setNat(null);
-  }, [previewPath]);
+    if (!previewUrl) return;
+    let stale = false;
+    const im = new Image();
+    im.src = previewUrl;
+    im.decode().then(
+      () => !stale && setDecoded({ url: previewUrl, w: im.naturalWidth, h: im.naturalHeight }),
+      () => !stale && setBroken(previewPath),
+    );
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewUrl]);
+  const nat = decoded && decoded.url === previewUrl ? decoded : null;
 
   const nw = nat?.w ?? (t?.status === "ready" ? t.width : 3) ?? 3;
   const nh = nat?.h ?? (t?.status === "ready" ? t.height : 2) ?? 2;
@@ -122,24 +138,14 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
       onPointerUp={onPointerUp}
       onDoubleClick={() => onView(view.scale > 1 ? FIT : { scale: Math.max(1, (metricsRef.current?.natW ?? fitW) / fitW), cx: 0.5, cy: 0.5 })}
     >
-      {thumbPath && <img src={`${convertFileSrc(thumbPath)}?v=${version}`} alt="" draggable={false} className={imgClass} style={style} />}
+      {thumbUrl && <img key={thumbUrl} src={thumbUrl} alt="" draggable={false} className={imgClass} style={style} data-testid="zoom-thumb" />}
       {t?.status === "failed" && (
         <Unavailable title="No preview for this photo" detail={t.reason} />
       )}
       {previewPath && broken === previewPath && (
         <Unavailable title="Preview unavailable" detail="The cached preview could not be loaded (cache folder cleaned or drive offline). Use More > Regenerate previews, or re-import the folder." />
       )}
-      {previewPath && (
-        <img
-          src={`${convertFileSrc(previewPath)}?v=${version}`}
-          alt={entry?.fileName}
-          draggable={false}
-          className={imgClass}
-          style={style}
-          onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
-          onError={() => setBroken(previewPath)}
-        />
-      )}
+      {previewUrl && nat && <img key={previewUrl} src={previewUrl} alt={entry?.fileName} draggable={false} className={imgClass} style={style} onError={() => setBroken(previewPath)} />}
     </div>
   );
 }

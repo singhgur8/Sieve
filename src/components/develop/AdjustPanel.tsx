@@ -1,6 +1,6 @@
 // Develop right panel, Lightroom order (docs/ux-spec-8b.md 5.4): Histogram, tool strip (Crop, Masking), Basic (Treatment,
 // Profile, WB, Tone with Auto, Presence), Tone Curve, HSL / Color, Color Grading, Detail, Effects, Calibration, bottom bar.
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History } from "lucide-react";
 import type { AdjustmentField } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
@@ -95,7 +95,13 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
   const catalog = useProfileCatalog(imageId, onError, styleVersion);
   const resetFields = (fields: AdjustmentField[], label: string) => change((a) => copyFields(a, editor.defaults, fields), label);
   /** Some field of the section differs from its default (section dot). */
-  const dirty = (fields: AdjustmentField[]) => !sameAdjustments(copyFields(adj, editor.defaults, fields), adj);
+  const dirtyCache = useMemo(() => new Map<string, boolean>(), [adj, editor.defaults]);
+  const dirty = (fields: AdjustmentField[]) => {
+    const k = fields.join(",");
+    let v = dirtyCache.get(k);
+    if (v === undefined) dirtyCache.set(k, (v = !sameAdjustments(copyFields(adj, editor.defaults, fields), adj)));
+    return v;
+  };
 
   const simple = (d: SliderDef) => (
     <Slider

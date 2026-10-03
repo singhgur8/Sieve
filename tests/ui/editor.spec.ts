@@ -334,7 +334,7 @@ test.describe("develop", () => {
   test("zoom to 100% renders the detail slot for the visible region, again after panning", async ({ page }) => {
     await openDevelop(page);
     await clearCalls(page);
-    await page.keyboard.press("z");
+    await page.keyboard.press("Space");
     await expect(page.getByTestId("viewer")).toHaveAttribute("data-zoomed", "true");
     await expect(page.getByTestId("view-detail")).toBeVisible();
     const first = (await calls(page, "render_preview")).filter((c) => c.args.options.slot === "detail");
@@ -355,7 +355,7 @@ test.describe("develop", () => {
     expect(r2.x).toBeGreaterThan(r1.x);
     expect(r2.y).toBeGreaterThan(r1.y);
     await shot(page, "2x-editor-10-zoom");
-    await page.keyboard.press("z");
+    await page.keyboard.press("Space");
     await expect(page.getByTestId("viewer")).toHaveAttribute("data-zoomed", "false");
   });
 

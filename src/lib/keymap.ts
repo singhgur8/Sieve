@@ -15,6 +15,7 @@ export type ActionId =
   | "navV"
   | "gridJump"
   | "toggleLoupe"
+  | "gridLoupe"
   | "devToLoupe"
   | "toGrid"
   | "escape"
@@ -137,7 +138,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "cropLock", group: "Develop", label: "Lock / unlock the crop aspect ratio", chords: [c("a")], modes: ["develop"], display: ["A"], where: "While cropping", needs: "crop" },
 
   // ---- culling ----
-  { id: "pick", group: "Culling", label: "Pick (Shift = and advance)", chords: [c("p", { shift: "any" })], modes: ALL, display: ["P"], where: "Everywhere" },
+  { id: "pick", group: "Culling", label: "Pick (Shift = and advance; P is an alias)", chords: [c("z", { shift: "any" }), c("p", { shift: "any" })], modes: ALL, display: ["Z", "P"], where: "Everywhere" },
   { id: "reject", group: "Culling", label: "Reject (Shift = and advance)", chords: [c("x", { shift: "any" })], modes: ALL, display: ["X"], where: "Everywhere" },
   { id: "unflag", group: "Culling", label: "Unflag", chords: [c("u")], modes: ALL, display: ["U"], where: "Everywhere" },
   { id: "rate", group: "Culling", label: "Star rating", chords: digits(0, 5), modes: ALL, display: ["0-5"], where: "Everywhere" },
@@ -164,7 +165,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "navH", group: "Navigate", label: "Previous / next photo (Compare: the candidate; Grid: Shift extends)", chords: [c("ArrowLeft", { shift: "any" }), c("ArrowRight", { shift: "any" })], modes: ALL, display: ["Left / Right"], where: "Everywhere" },
   { id: "navV", group: "Navigate", label: "Row up / down", chords: [c("ArrowUp", { shift: "any" }), c("ArrowDown", { shift: "any" })], modes: ["grid"], display: ["Up / Down"], where: "Grid" },
   { id: "gridJump", group: "Navigate", label: "First / last / page up / page down (Shift extends)", chords: [c("Home", { shift: "any" }), c("End", { shift: "any" }), c("PageUp", { shift: "any" }), c("PageDown", { shift: "any" })], modes: ["grid"], display: ["Home / End / PgUp / PgDn"], where: "Grid" },
-  { id: "toggleLoupe", group: "Navigate", label: "Grid to Loupe and back", chords: [c(" "), c("Enter"), c("e")], modes: LIB, display: ["Space", "Enter", "E"], where: "Grid, Loupe, Compare" },
+  { id: "toggleLoupe", group: "Navigate", label: "Grid to Loupe and back", chords: [c("Enter"), c("e")], modes: LIB, display: ["Enter", "E"], where: "Grid, Loupe, Compare" },
+  { id: "gridLoupe", group: "Navigate", label: "Open the photo in Loupe", chords: [c(" ")], modes: ["grid"], display: ["Space"], where: "Grid" },
   { id: "devToLoupe", group: "Navigate", label: "Open in Loupe", chords: [c("e")], modes: ["develop"], display: ["E"], where: "Develop" },
   { id: "toGrid", group: "Navigate", label: "Back to Grid", chords: [c("g")], modes: ["loupe", "compare", "develop"], display: ["G"], where: "Outside Grid" },
   { id: "escape", group: "Navigate", label: "Back to Grid (Grid: clear selection)", chords: [c("Escape")], modes: LIB, display: ["Esc"], where: "Grid, Loupe, Compare (never with a dialog open)" },
@@ -183,8 +185,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "filterBar", group: "Navigate", label: "Show / hide the filter bar", chords: [c("f", { mod: true })], modes: ALL, display: ["Cmd+F"], where: "Library" },
 
   // ---- view ----
-  { id: "zoomLoupe", group: "View", label: "Zoom to 1:1", chords: [c("z")], modes: LIB, display: ["Z"], where: "Grid, Loupe, Compare" },
-  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100%", chords: [c("z"), c(" ")], modes: ["develop"], display: ["Z", "Space"], where: "Develop" },
+  { id: "zoomLoupe", group: "View", label: "Zoom Fit / 1:1 (never leaves the view)", chords: [c(" ")], modes: ["loupe", "compare"], display: ["Space"], where: "Loupe, Compare" },
+  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100%", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
   { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },

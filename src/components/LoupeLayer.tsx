@@ -7,6 +7,7 @@ import { CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
 import { Filmstrip } from "./Filmstrip";
 import { CompareBar, CompareTag } from "./CompareBar";
 import { usePanels } from "../lib/panels";
+import { usePrefetchNeighbours } from "../hooks/usePrefetch";
 import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
 
 /** Compare pair: `a` is the Select (the keeper so far), `b` the Candidate. `focus` is the active pane. */
@@ -53,11 +54,18 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
   const viewRef = useRef(view);
   viewRef.current = view;
 
-  // Single loupe: navigating resets to fit (compare keeps the shared zoom while stepping).
-  useEffect(() => {
+  // Single loupe: navigating resets to fit (compare keeps the shared zoom while stepping). Done during render
+  // (not in an effect) so the new photo never paints one frame at the previous photo's zoom.
+  const navKey = `${mode}:${activeId}`;
+  const [seenNav, setSeenNav] = useState(navKey);
+  if (seenNav !== navKey) {
+    setSeenNav(navKey);
     if (mode === "loupe") setView(FIT);
+  }
+  useEffect(() => {
     faceIdx.current = -1;
-  }, [activeId, mode]);
+  }, [navKey]);
+  usePrefetchNeighbours(lib, activeId);
 
   useEffect(() => {
     setFaces([]);
