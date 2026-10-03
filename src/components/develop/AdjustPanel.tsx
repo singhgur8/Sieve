@@ -3,6 +3,7 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History } from "lucide-react";
 import type { AdjustmentField } from "../../ipc";
+import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import type { Editor } from "../../hooks/useEditor";
 import {
   BANDS,
@@ -90,6 +91,7 @@ const stripBtn = (on: boolean) => `relative flex size-7 items-center justify-cen
 const AUTO_KEYS: SimpleKey[] = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "vibrance", "saturation"];
 
 export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
+  const syncing = useActivityRunning("paste_sync");
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
   const catalog = useProfileCatalog(imageId, onError, styleVersion);
@@ -340,9 +342,10 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
       <div className="flex h-9 shrink-0 gap-2 border-t border-neutral-800 px-3 py-1" data-testid="right-bar">
         {bar.count > 1 ? (
           <button
-            className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700"
+            className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
+            disabled={syncing}
             onClick={(e) => bar.onSync(e.altKey)}
-            title={`Synchronize settings with the ${bar.count - 1} other selected photos (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
+            title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
             data-testid="sync-settings"
           >
             <RefreshCw className="size-3.5" /> Sync…

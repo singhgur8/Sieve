@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { Filter, FolderSearch, Layers, RotateCcw, Unplug } from "lucide-react";
-import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type PickFlag } from "../ipc";
+import { Filter, FolderSearch, Layers, ListFilter, RotateCcw, Unplug } from "lucide-react";
+import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type MetadataFilter, type PickFlag } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
 import { BASE_QUERY } from "../hooks/useLibrary";
+import { describeMeta, metaActive, metaChips, setMetaRowOpen, useMetaRowOpen } from "../lib/metaFilter";
+import { MetaChips } from "./MetadataFilterRow";
 
 const LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
 const PICKS: { key: PickFlag; label: string }[] = [
@@ -35,26 +37,49 @@ export function isFiltered(q: Query): boolean {
     q.collapseBursts ||
     q.folderId != null ||
     q.missingOnly === true ||
-    q.sceneId != null
+    q.sceneId != null ||
+    metaActive(q.metadata)
   );
 }
 
 /** Filter counts for the current folder; refreshed whenever the library changes (`epoch`). */
-export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number, keepersOnly = false): FilterCounts | null {
+export function useFilterCounts(folderId: number | null, projectId: number | null, epoch: number, keepersOnly = false, metadata?: MetadataFilter): FilterCounts | null {
+  const metaKey = JSON.stringify(metadata ?? null);
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   useEffect(() => {
     let stale = false;
-    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null, null))
+    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null, metadata ?? null))
       .then((c) => !stale && setCounts(c))
       .catch(() => {});
     return () => {
       stale = true;
     };
-  }, [folderId, projectId, epoch, keepersOnly]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [folderId, projectId, epoch, keepersOnly, metaKey]);
   return counts;
 }
 
 const toggle = <T,>(list: T[], v: T) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
+
+/** "Metadata" button (opens the Lightroom-style column row, remembered for the session) plus chips of the active values. */
+function MetaToggle({ query, setQuery }: Pick<Props, "query" | "setQuery">) {
+  const open = useMetaRowOpen();
+  const n = metaChips(query.metadata, null).length;
+  return (
+    <div className="flex shrink-0 items-center gap-1" data-testid="filter-meta-group">
+      <button
+        data-testid="meta-toggle"
+        aria-pressed={open}
+        onClick={() => setMetaRowOpen(!open)}
+        title="Filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar"
+        className={`${chip} flex items-center gap-1 ${open ? "bg-sky-800 text-sky-100" : off}`}
+      >
+        <ListFilter className="size-3" /> Metadata{n > 0 && <span className="opacity-80" data-testid="meta-active-count">{n}</span>}
+      </button>
+      <MetaChips query={query} setQuery={setQuery} />
+    </div>
+  );
+}
 
 /** Row 1 of the Library chrome: culling tags, flags and the result count. */
 export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
@@ -112,6 +137,8 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
           </button>
         ))}
       </div>
+
+      <MetaToggle query={query} setQuery={setQuery} />
 
       {((counts?.missing ?? 0) > 0 || query.missingOnly) && (
         <div className="flex shrink-0 items-center gap-1" data-testid="filter-missing-group">
@@ -240,6 +267,7 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   if (q.collapseBursts) parts.push("bursts collapsed");
   if (q.folderId != null) parts.push("one folder");
   if (q.missingOnly) parts.push("missing");
+  describeMeta(q.metadata).forEach((t) => parts.push(t));
   if (q.sceneId != null) parts.push(`Scene ${sceneNumber?.(q.sceneId) || q.sceneId}`);
   return parts.join(", ");
 }

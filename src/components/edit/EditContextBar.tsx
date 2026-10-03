@@ -2,6 +2,7 @@
 import { ChevronDown, ChevronLeft, ChevronRight, ListChecks, X } from "lucide-react";
 import type { SceneRow, Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
+import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import { Menu, menuItem } from "../Menu";
 import { AutoEditButton, StatusIcon } from "./bits";
 
@@ -33,7 +34,8 @@ export function EditContextBar(p: Props) {
   const row = p.activeId != null ? rows.find((r) => r.entry.imageIds.includes(p.activeId!)) : undefined;
   const idx = row ? rows.indexOf(row) : -1;
   const isRep = !!row && row.entry.representativeId === p.activeId;
-  const busy = wf.busy != null;
+  const applying = useActivityRunning("apply_scene");
+  const busy = wf.busy != null || applying;
   const undo = row ? wf.sceneUndo(row.entry.sceneId) : null;
   const canApply = !!row && row.ui !== "todo" && row.ui !== "reset" && row.targets > 0 && !row.skipped;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
@@ -158,7 +160,7 @@ export function EditContextBar(p: Props) {
             className="flex h-6 items-center whitespace-nowrap rounded-l-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid="edit-apply"
             disabled={!canApply || busy}
-            title={row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
+            title={applying ? BUSY_WHY.apply_scene : row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
             onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview)}
           >
             {newKeepers > 0 ? `Apply to ${newKeepers} new` : `Apply to scene${row ? ` (${row.targets})` : ""}`}
