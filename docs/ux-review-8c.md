@@ -214,3 +214,54 @@ Z = Pick differs from Lightroom, where Z is zoom. The user asked for it explicit
 
 **Needs no changes**: Space / Z / X key handling and the keymap structure; the readout; the keeper rule menu and formula in Cull, Plan and Export;
 the Apply suggestions dialog layout and its counts; the Rejected view filter itself; Help panel structure, search and Esc behaviour; the activity widget's look and error state.
+
+---
+
+## Re-check 1 (2026-10-03)
+
+Branch `phase-8c-feedback` @ 1edf506, read-only. Mock backend (`vite --port 1462`): `/?mock=201&keepers=not_rejected&meta=1`, `/?mock=2000&keepers=not_rejected`,
+`/?mock=200&scope=all` with `__mockExportManual` and `window.__mockActivity`; 1280×800 and 1440×900. Scratchpad drivers `r1..r4.cjs`, screenshots `shots/1280-NN-*.png` / `shots/1440-NN-*.png`
+(not in the repo).
+
+**Summary: open P0 0 · P1 5 (3 leftover one-string fixes from P1-1 / P1-5 / P1-8, 2 new layout problems) · new P2 4.**
+The fixes work: one stack with no overlap, readable reject strips, a clear "Sieve suggests reject" strip, real by-you / auto filters, a Status column that fits, and the
+summary bar on one row (29 px at 1280 and 1440, also with 3- and 4-digit counts).
+
+### Per-item verdict
+
+| Item | Verdict | Evidence / exact remaining fix |
+|---|---|---|
+| P1-1 Suggestions dead end | **Behaviour resolved; one copy fix left (open)** | Bar `Suggestions: 20 picks · 8 rejects · 43 star-rated — Apply…`. The dialog applies 71 (= 20 + 8 + 43), and after Apply the button is gone (`1280-01`, `-02`, `-03`). But the dialog line reads `71 will be updated: 20 picked, 8 rejected, 67 star-rated`: "star-rated" means 43 on the bar and 67 one click later, because the dialog counts every photo that gets stars, flagged ones included. **Fix** (`ApplySuggestionsDialog.tsx`): count `starsOnly` (`suggestedPick === "unflagged" && suggestedRating > 0`) and render `71 will be updated: 20 picked · 8 rejected · 43 stars only`. Use the same words on the bar: `Suggestions: 20 picks · 8 rejects · 43 stars only — Apply…` (`suggestionParts`). Optional second line in the dialog: `Stars are set on 67 of them`. Acceptance: the bar's three numbers appear verbatim in `apply-counts`. |
+| P1-2 One activity stack | **Resolved** | Export card + xmp_save + paste_sync + failed apply_scene: no two boxes intersect, and the export count appears once (`1280-11-stack.png`). Analysis row hidden while `analysis-bar` is shown, and shown when it is not (`1280-20`, `1280-12`). Stack drops behind the Export dialog (`1280-13`). See new N1 for other dialogs. |
+| P1-3 Undimmed reject strip | **Resolved** | Only the picture is dimmed. `Rejected by you` / `Auto-rejected · …` read at full contrast (`1280-07-rejected.png`, `1280-08-meta.png`). Long reasons wrap to 2 lines at ≥ 200 px (P2-7 also done). |
+| P1-4 Suggestion strip copy | **Resolved** | Cell `Sieve suggests reject · Low overall quality` with a bold lead and a dashed top border (`1280-01-cull.png`). Loupe `Sieve suggests reject: Low overall quality` (`1280-18-loupe-suggest.png`). |
+| P1-5 "Keeper" means two things | **UI resolved; one engine string left (open)** | No user-facing "keeper" for bursts in `src/` (badges, Loupe `Best of burst` / `· best`, Help, keymap, notices, Collapse-bursts title). **Remaining**: `src-tauri/src/ml/bursts.rs:94` fallback `"that one is the keeper"` → `"Sieve chose that one as the best of the burst"` (owner rust-engine-dev; update the test that covers the fallback, if any). Note: reasons already stored in a catalog keep the old text until the next rescore/analysis. That is acceptable, so no migration is needed. |
+| P1-6 by you / auto filters | **Resolved** | `8 auto` → `Showing 8 of 101`, active pill, filter-bar chip `Auto-rejected ×`. `7 by you` → `Showing 7 of 101`, chip `Rejected by you ×`. × clears back to `Showing 15` (`1280-04/05/06`). See N2 for the chip's width. |
+| P1-7 Metadata columns off-screen | **Resolved** | 9 columns, last right edge = 1280 / 1440. Status column has `Edited / Unedited` and a divider before `Has sidecar / No sidecar`. Row height is 112 px (`1280-08-meta.png`). |
+| P1-8 Help copy | **Mostly resolved; one string left (open)** | Keepers entry, rule order, More-menu note, `apply-suggestions` title and the XMP sentence all match the spec. **Remaining** (`helpContent.tsx`, Apply suggestions first paragraph): it names the button `"Sieve suggests … Apply…"`, but the button now reads `Suggestions: … — Apply…`, and "Sieve suggests" is now the wording of the reject strip, so the old name sends people to the wrong control. Replace with `(the "Suggestions: … — Apply…" button at the right of the Cull summary, or More > Apply suggestions…)`. Same sentence in the dialog's `apply-explain`: "only on photos you have not touched" → "only on photos you have not flagged or rated". |
+| P1-9 One tag dictionary, legend | **Resolved** | Legend uses `TAG_MEANING`, sentence case, new "Strips on thumbnails" group, `Unreadable` and `Saved check` rows (`1280-14/15-help-*.png`). Strip icons are truncated (new P2-N3). |
+| Summary bar one row (P2-10) | **Resolved** | 29 px at 1280 and 1440, also with `/?mock=2000`. The formula truncates, and its title has the full text. |
+| Cheap P2s seen | Done | F1 and Cmd+? both open Help. Help tooltip `F1 / Cmd+?`. Auto-advance title says Shift+Z. Caps Lock row in the cheat sheet. Filter-bar flag order matches the summary. Explainer has a Lightroom link. |
+
+### New findings
+
+**N1 (P1) The bottom-right stack now draws over Help and every other dialog.**
+- Where: `ActivityWidget.tsx` (`z-[65]` unless `behindDialogs`), `App.tsx` passes `behindDialogs={exportOpen != null}` only. `Dialog` overlays are `z-50`.
+- Evidence: `1280-15-help-strips.png`. During an export, the export card and rows cover the lower-right of the Help panel and hide the legend text ("…with Sieve's reason", "Nothing has changed until you…"). The rows have `pointer-events-auto`, so they also catch clicks meant for the dialog. Before the fix the export card sat at `z-40`, under dialogs. Moving it into the `z-[65]` widget lifted it above them.
+- Fix: put the whole stack behind any modal. Add a subscription to `lib/modal.ts` (`useModalCount()`: listeners notified on push/splice), and in App pass `behindDialogs={exportOpen != null || modalCount > 0 || helpOpen}`. Use `helpOpen` if HelpPanel does not register through `useModalLayer`. Behind a dialog the stack uses `z-40`, so the dialog's `bg-black/60` overlay dims it. Error rows stay visible once the dialog closes. Acceptance: with Help open and an export running, `document.elementFromPoint` at the centre of the last legend row returns an element inside `help-panel`.
+
+**N2 (P1) At 1280 px the origin chip pushes Metadata and Clear off the filter bar.**
+- Where: `FilterBar.tsx` (`filter-origin` chip, trailing `Metadata` / `Clear`).
+- Evidence: `/?mock=2000`, 1280×800, `8 auto` on: `filter-bar` scrollWidth 1369 > 1280. `Metadata` is cut at the edge and **Clear is entirely off-screen** (`1280-22-2000-auto.png`). With 3-digit counts the bar is already exactly 1280 px before the chip (`1280-04-auto.png` at 201 photos shows `Clea`).
+- Why: Clear is the way out of a filter, and it disappears exactly while the user is reviewing Auto's rejects.
+- Fix: (1) the chip reads `Auto ×` / `By you ×` (full wording stays in its title and in `describeFilters`). It sits directly after the active `Rejected` chip, as now. (2) Wrap `Metadata` and `Clear` in a trailing group `ml-auto flex shrink-0 gap-1` so they are never clipped. (3) Below 1440 px they render icon-only (`ListFilter` / `RotateCcw`, label in `title` and `aria-label`; use `min-[1440px]:inline` on the text). (4) The tag group becomes `min-w-0` with the same right-edge fade as the Metadata row in case it still overflows. Acceptance: at 1280×800 on `/?mock=2000` with `8 auto` on, `filter-bar` scrollWidth ≤ clientWidth and `Clear`'s right edge ≤ 1280.
+
+**New P2s**
+- N3. Help legend strip icons are truncated to `Auto-rejecte…` / `Sieve sugge…` in the 80 px icon box (`1280-15`). Show bars without text in the box (red bar / sky bar with a dashed top border, 56×12 px). The row label already names them.
+- N4. `(7 by you, 0 auto)`: a zero part is still a button that shows an empty grid. Render a zero part as plain text (no hover). Also drop the stray spaces inside the parentheses: the `px-1` buttons make `( 7 by you ,  0 auto )`. Use `gap-0` and put the comma inside the first button's trailing text node.
+- N5. While the origin filter is on, the filter-bar flag chips count only that origin (`Picked 20 · Unflagged 0 · Rejected 8`), while the summary shows the totals. Clear enough with the chip there, but add the origin to their title: `Rejected 8 (auto only — clear "Auto ×" to see all)`.
+- N6. Help ▸ Apply suggestions, "To review its rejects" paragraph: add "or click **N auto** in the Cull summary to see only Auto's rejects", since that is now the direct path.
+
+### Open P0 / P1 after Re-check 1
+P0: none. P1 (5): P1-1 remainder (dialog `stars only` count/copy), P1-5 remainder (`bursts.rs:94` fallback string, rust-engine-dev), P1-8 remainder (Help / dialog button name and "not touched"),
+N1 (stack above dialogs), N2 (filter bar overflow at 1280 with the origin chip). All five are frontend-only except P1-5's engine string. No contract changes needed.

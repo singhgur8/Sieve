@@ -91,7 +91,7 @@ pub fn duplicate_reason(
     } else if keeper.overall > member.overall {
         "that one scored higher"
     } else {
-        "that one is the keeper"
+        "Sieve chose that one as the best of the burst"
     };
     SuggestionReason {
         kind: SuggestionReasonKind::DuplicateBurst,
