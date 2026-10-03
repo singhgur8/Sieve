@@ -23,9 +23,9 @@ use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
-    AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress, ImportProgress,
-    ModelDownloadFinished, ModelDownloadProgress, SceneProgress, StyleModelFinished, StyleModelProgress,
-    ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress,
+    ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress, StyleModelFinished,
+    StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -179,6 +179,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::list_xmp_failures,
             // IPC v16
             commands::get_edit_batches,
+            // IPC v18
+            commands::get_cull_summary,
+            commands::get_metadata_filter_options,
         ])
         .events(collect_events![
             ImportProgress,
@@ -196,7 +199,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             ModelDownloadProgress,
             ModelDownloadFinished,
             StyleModelProgress,
-            StyleModelFinished
+            StyleModelFinished,
+            ActivityEvent
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -252,6 +256,8 @@ pub fn run() {
         })
         .setup(move |app| {
             builder.mount_events(app);
+            // Background-activity events (IPC v18); managed first so every worker finds it.
+            app.manage(ipc::activity::Activities::for_app(app.handle()));
             let path = match std::env::var_os(CATALOG_ENV) {
                 Some(p) => PathBuf::from(p),
                 None => app.path().app_data_dir()?.join("catalog.sqlite"),

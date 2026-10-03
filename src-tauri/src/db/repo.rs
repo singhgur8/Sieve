@@ -351,7 +351,8 @@ const ENTRY_SELECT: &str = "
            i.xmp_dirty, i.xmp_synced_at, i.xmp_error,
            i.scene_id, i.scene_anchor,
            i.companion_path, i.develop_warnings,
-           i.missing_since_ms
+           i.missing_since_ms,
+           i.pick_origin, i.xmp_mtime_ms IS NOT NULL, q.reasons_json
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -371,6 +372,12 @@ fn enum_col<T>(row: &Row, idx: usize, parse: fn(&str) -> Option<T>) -> rusqlite:
 
 fn opt_enum_col<T>(row: &Row, idx: usize, parse: fn(&str) -> Option<T>) -> rusqlite::Result<Option<T>> {
     row.get::<_, Option<String>>(idx)?.map(|s| parse(&s).ok_or_else(|| bad_enum(idx, &s))).transpose()
+}
+
+/// `quality_scores.reasons_json` (v16); missing or unreadable JSON reads as no reasons (never
+/// blocks listing).
+pub fn parse_reasons(json: Option<&str>) -> Vec<SuggestionReason> {
+    json.and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default()
 }
 
 /// Maps an `ENTRY_SELECT` row; `tags` are filled in afterwards.
@@ -398,8 +405,14 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
             model_version: r.get(37)?,
             suggested_rating: r.get(40)?,
             suggested_pick: enum_col(r, 41, PickFlag::parse)?,
+            reasons: parse_reasons(r.get::<_, Option<String>>(53)?.as_deref()),
         }),
         None => None,
+    };
+    let pick = enum_col(r, 25, PickFlag::parse)?;
+    let pick_origin = match pick {
+        PickFlag::Unflagged => None,
+        _ => Some(PickOrigin::parse(&r.get::<_, String>(51)?).unwrap_or(PickOrigin::User)),
     };
     Ok(RawImageEntry {
         id: r.get(0)?,
@@ -427,14 +440,15 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         file_mtime_ms: r.get(18)?,
         thumbnail,
         rating: r.get(24)?,
-        pick: enum_col(r, 25, PickFlag::parse)?,
+        pick,
+        pick_origin,
         color_label: opt_enum_col(r, 26, ColorLabel::parse)?,
         burst_group_id: r.get(27)?,
         is_burst_keeper: r.get(42)?,
         tags: Vec::new(),
         quality,
         has_edits: r.get(38)?,
-        xmp: XmpSyncState { dirty: r.get(43)?, synced_at_ms: r.get(44)?, error: r.get(45)? },
+        xmp: XmpSyncState { dirty: r.get(43)?, synced_at_ms: r.get(44)?, error: r.get(45)?, has_sidecar: r.get(52)? },
         scene_id: r.get(46)?,
         is_scene_anchor: r.get(47)?,
         companion_path: r.get(48)?,
@@ -530,6 +544,9 @@ fn text_list<T: Copy>(items: &[T], args: &mut Vec<Value>, as_str: fn(T) -> &'sta
 /// (`""` or `"i."`); mirror of `KeeperRule::is_keeper_values` (unknown pick values count as
 /// unflagged). Values are integers, so inlining them is injection-safe.
 pub fn keeper_predicate(rule: &KeeperRule, prefix: &str) -> String {
+    if rule.mode == KeeperMode::NotRejected {
+        return format!("({prefix}pick <> 'reject')");
+    }
     format!(
         "({prefix}pick = 'pick' OR ({prefix}pick <> 'reject' AND ({prefix}rating >= {min} OR \
          ({sugg} AND {prefix}rating = 0 AND {prefix}id IN \
@@ -539,9 +556,159 @@ pub fn keeper_predicate(rule: &KeeperRule, prefix: &str) -> String {
     )
 }
 
+/// A facet of the Library Filter metadata row (`MetadataFilterOptions`, v18): counted with
+/// every constraint of the query except its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Facet {
+    Format,
+    Extension,
+    Camera,
+    Lens,
+    Iso,
+    FocalLength,
+    Aperture,
+    Shutter,
+    Captured,
+    Edited,
+    Sidecar,
+}
+
+/// Lower-case file extension of `{p}file_name` without the dot (`''` when none): the text
+/// after the last dot (`rtrim` strips every non-dot character from the right).
+fn ext_sql(p: &str) -> String {
+    format!(
+        "lower(CASE WHEN instr({p}file_name, '.') = 0 THEN '' \
+         ELSE substr({p}file_name, length(rtrim({p}file_name, replace({p}file_name, '.', ''))) + 1) END)"
+    )
+}
+
+/// Lens / camera model with blank values read as unknown (`NULL`).
+fn lens_sql(p: &str) -> String {
+    format!("NULLIF(TRIM({p}lens), '')")
+}
+
+fn model_sql(p: &str) -> String {
+    format!("NULLIF(TRIM({p}camera_model), '')")
+}
+
+/// `{p}`-prefixed "has develop edits" (same as `RawImageEntry.hasEdits`).
+fn edited_sql(p: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM adjustments a WHERE a.image_id = {p}id AND a.neutral = 0)")
+}
+
+/// Day start (naive ms, floor) of `{p}captured_at_ms`; `NULL` without a capture time.
+fn day_sql(p: &str) -> String {
+    format!("({p}captured_at_ms - ((({p}captured_at_ms % 86400000) + 86400000) % 86400000))")
+}
+
+/// Appends `{expr} >= lo AND {expr} <= hi` for `range` (bounds widened by 1e-6 relative so a
+/// facet value used as both bounds matches itself). Non-finite bounds -> `invalid_argument`.
+fn range_clause(
+    expr: &str,
+    name: &str,
+    range: &NumberRange,
+    clauses: &mut Vec<String>,
+    args: &mut Vec<Value>,
+) -> AppResult<()> {
+    for (bound, op, sign) in [(range.min, ">=", -1.0), (range.max, "<=", 1.0)] {
+        if let Some(v) = bound {
+            if !v.is_finite() {
+                return Err(AppError::invalid(format!("{name} bound {v} is not a finite number")));
+            }
+            clauses.push(format!("{expr} {op} ?"));
+            args.push(Value::Real(v + sign * v.abs() * 1e-6));
+        }
+    }
+    Ok(())
+}
+
+/// `ImageQuery.metadata` constraints over columns prefixed with `p` (`"i."`, or `"images."`
+/// for statements over the bare table), skipping `skip`'s own (facet counts).
+fn metadata_clauses(
+    m: &MetadataFilter,
+    p: &str,
+    skip: Option<Facet>,
+    clauses: &mut Vec<String>,
+    args: &mut Vec<Value>,
+) -> AppResult<()> {
+    let on = |f: Facet| skip != Some(f);
+    if on(Facet::Format) && !m.formats.is_empty() {
+        let ph = text_list(&m.formats, args, ImageFormat::as_str);
+        clauses.push(format!("{p}format IN ({ph})"));
+    }
+    if on(Facet::Extension) && !m.extensions.is_empty() {
+        for e in &m.extensions {
+            if e.is_empty() || e.len() > 10 || !e.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(AppError::invalid(format!("file extension {e:?} must be 1..=10 letters or digits")));
+            }
+            args.push(Value::Text(e.to_ascii_lowercase()));
+        }
+        clauses.push(format!("{} IN ({})", ext_sql(p), vec!["?"; m.extensions.len()].join(",")));
+    }
+    if on(Facet::Camera) && !m.cameras.is_empty() {
+        let mut ors = Vec::with_capacity(m.cameras.len());
+        for c in &m.cameras {
+            ors.push(format!("({p}camera_make = ? AND {} IS ?)", model_sql(p)));
+            args.push(Value::Text(c.make.as_str().to_owned()));
+            args.push(c.model.as_ref().map_or(Value::Null, |s| Value::Text(s.trim().to_owned())));
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+    if on(Facet::Lens) && !m.lenses.is_empty() {
+        let known: Vec<&String> = m.lenses.iter().flatten().collect();
+        let mut ors = Vec::new();
+        if !known.is_empty() {
+            args.extend(known.iter().map(|s| Value::Text(s.trim().to_owned())));
+            ors.push(format!("{} IN ({})", lens_sql(p), vec!["?"; known.len()].join(",")));
+        }
+        if m.lenses.iter().any(Option::is_none) {
+            ors.push(format!("{} IS NULL", lens_sql(p)));
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+    if let (true, Some(r)) = (on(Facet::Iso), &m.iso) {
+        range_clause(&format!("{p}iso"), "iso", r, clauses, args)?;
+    }
+    if let (true, Some(r)) = (on(Facet::FocalLength), &m.focal_length_mm) {
+        range_clause(&format!("ROUND({p}focal_length_mm, 1)"), "focalLengthMm", r, clauses, args)?;
+    }
+    if let (true, Some(r)) = (on(Facet::Aperture), &m.aperture) {
+        range_clause(&format!("ROUND({p}aperture, 1)"), "aperture", r, clauses, args)?;
+    }
+    if let (true, Some(r)) = (on(Facet::Shutter), &m.shutter_seconds) {
+        range_clause(&format!("{p}shutter_s"), "shutterSeconds", r, clauses, args)?;
+    }
+    if let (true, Some(r)) = (on(Facet::Captured), &m.captured) {
+        if let Some(from) = r.from_ms {
+            clauses.push(format!("{p}captured_at_ms >= ?"));
+            args.push(Value::Integer(from));
+        }
+        if let Some(to) = r.to_ms {
+            clauses.push(format!("{p}captured_at_ms < ?"));
+            args.push(Value::Integer(to));
+        }
+    }
+    if let (true, Some(edited)) = (on(Facet::Edited), m.edited) {
+        clauses.push(if edited { edited_sql(p) } else { format!("NOT {}", edited_sql(p)) });
+    }
+    if let (true, Some(sidecar)) = (on(Facet::Sidecar), m.has_sidecar) {
+        clauses.push(format!("{p}xmp_mtime_ms IS {}NULL", if sidecar { "NOT " } else { "" }));
+    }
+    Ok(())
+}
+
 /// `WHERE` clause (with leading space, or empty) and its bound values for `q`'s filters.
 /// `keepers` = the catalog's keeper rule, required when `q.keepersOnly`.
 fn query_filter(q: &ImageQuery, keepers: Option<&KeeperRule>) -> AppResult<(String, Vec<Value>)> {
+    query_filter_skip(q, keepers, None)
+}
+
+/// [`query_filter`] without the metadata constraint of facet `skip`.
+fn query_filter_skip(
+    q: &ImageQuery,
+    keepers: Option<&KeeperRule>,
+    skip: Option<Facet>,
+) -> AppResult<(String, Vec<Value>)> {
     let mut clauses: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
 
@@ -612,6 +779,7 @@ fn query_filter(q: &ImageQuery, keepers: Option<&KeeperRule>) -> AppResult<(Stri
         let rule = keepers.ok_or_else(|| AppError::internal("keepersOnly without a keeper rule"))?;
         clauses.push(keeper_predicate(rule, "i."));
     }
+    metadata_clauses(&q.metadata, "i.", skip, &mut clauses, &mut args)?;
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
         args.push(Value::Integer(folder));
@@ -728,20 +896,48 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
 /// statements per case so SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1`
 /// predicate cannot).
 pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
-    filter_counts_impl(conn, scope.into(), None)
+    filter_counts_impl(conn, scope.into(), None, &MetadataFilter::default())
 }
 
 /// [`filter_counts`] over the keepers of `scope` only (`get_filter_counts(.., keepersOnly)`,
 /// IPC v15; keeper rule = the catalog's).
 pub fn filter_counts_keepers(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
-    let rule = keeper_rule(conn)?;
-    filter_counts_impl(conn, scope.into(), Some(&rule))
+    filter_counts_with(conn, scope, true, &MetadataFilter::default())
 }
 
-fn filter_counts_impl(conn: &Connection, scope: FolderScope, keepers: Option<&KeeperRule>) -> AppResult<FilterCounts> {
+/// `get_filter_counts(folderId, projectId, keepersOnly, metadata)` (v18): [`filter_counts`]
+/// over the images of `scope` that pass `metadata` (and are keepers with `keepers_only`).
+pub fn filter_counts_with(
+    conn: &Connection,
+    scope: impl Into<FolderScope>,
+    keepers_only: bool,
+    metadata: &MetadataFilter,
+) -> AppResult<FilterCounts> {
+    let rule = if keepers_only { Some(keeper_rule(conn)?) } else { None };
+    filter_counts_impl(conn, scope.into(), rule.as_ref(), metadata)
+}
+
+fn filter_counts_impl(
+    conn: &Connection,
+    scope: FolderScope,
+    keepers: Option<&KeeperRule>,
+    metadata: &MetadataFilter,
+) -> AppResult<FilterCounts> {
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
     let scoped;
-    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() && keepers.is_none() {
+    // Metadata constraints, once over the bare table and once over `i.` (same bound values,
+    // each statement below contains the clause exactly once).
+    let mut meta_args: Vec<Value> = Vec::new();
+    let (meta_f, meta_fi) = if metadata.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let mut bare = Vec::new();
+        metadata_clauses(metadata, "images.", None, &mut bare, &mut meta_args)?;
+        let mut prefixed = Vec::new();
+        metadata_clauses(metadata, "i.", None, &mut prefixed, &mut Vec::new())?;
+        (format!(" AND {}", bare.join(" AND ")), format!(" AND {}", prefixed.join(" AND ")))
+    };
+    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() && keepers.is_none() && metadata.is_empty() {
         true => (
             // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
             // without a temp B-tree; the per-folder rows are summed below.
@@ -762,6 +958,7 @@ fn filter_counts_impl(conn: &Connection, scope: FolderScope, keepers: Option<&Ke
                     format!("{} AND {}", scope.predicate("i.folder_id"), keeper_predicate(rule, "i.")),
                 ),
             };
+            let (f, fi) = (format!("{f}{meta_f}"), format!("{fi}{meta_fi}"));
             scoped = [
                 format!("SELECT pick, rating, COUNT(*) FROM images WHERE {f} GROUP BY pick, rating"),
                 format!(
@@ -779,7 +976,7 @@ fn filter_counts_impl(conn: &Connection, scope: FolderScope, keepers: Option<&Ke
             (scoped[0].as_str(), scoped[1].as_str(), scoped[2].as_str(), scoped[3].as_str())
         }
     };
-    let args: [FolderId; 0] = [];
+    let args = meta_args;
     {
         let mut stmt = conn.prepare_cached(pick_sql)?;
         let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
@@ -823,6 +1020,164 @@ pub fn xmp_failures(conn: &Connection, scope: &FolderScope) -> AppResult<Vec<Xmp
     ))?;
     let rows = stmt.query_map([], |r| Ok(XmpFailure { image_id: r.get(0)?, reason: r.get(1)? }))?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+// ---------------------------------------------------------------------------
+// Cull summary + metadata facets (IPC v18)
+// ---------------------------------------------------------------------------
+
+/// `get_cull_summary(projectId)`: flag counts, keepers under the catalog's rule and their
+/// breakdown, over `scope`. `keepers` uses [`keeper_predicate`], so it equals a `keepersOnly`
+/// query over the same scope.
+pub fn cull_summary(conn: &Connection, scope: &FolderScope) -> AppResult<CullSummary> {
+    let rule = keeper_rule(conn)?;
+    let sql = format!(
+        "SELECT COUNT(*),
+                COALESCE(SUM(i.pick = 'pick'), 0),
+                COALESCE(SUM(i.pick = 'pick' AND i.pick_origin = 'auto'), 0),
+                COALESCE(SUM(i.pick = 'reject'), 0),
+                COALESCE(SUM(i.pick = 'reject' AND i.pick_origin = 'auto'), 0),
+                COALESCE(SUM(i.rating > 0), 0),
+                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND i.rating >= ?1), 0),
+                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND i.rating = 0 AND q.suggested_pick = 'pick'), 0),
+                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND q.suggested_pick = 'reject'), 0),
+                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND q.suggested_pick = 'pick'), 0),
+                COALESCE(SUM(q.image_id IS NULL), 0),
+                COALESCE(SUM({keeper}), 0)
+           FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id
+          WHERE {scope}",
+        keeper = keeper_predicate(&rule, "i."),
+        scope = scope.predicate("i.folder_id"),
+    );
+    let row: [u32; 12] = conn.query_row(&sql, [rule.min_rating], |r| {
+        let mut out = [0u32; 12];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = r.get(i)?;
+        }
+        Ok(out)
+    })?;
+    let [total, picked, picked_auto, rejected, rejected_auto, starred, starred_unflagged, suggested_unflagged, sugg_reject, sugg_pick, unanalyzed, keepers] =
+        row;
+    let unflagged = total - picked - rejected;
+    let keeper_breakdown = match rule.mode {
+        KeeperMode::NotRejected => KeeperBreakdown { picked, unflagged, ..Default::default() },
+        KeeperMode::PicksAndRatings => KeeperBreakdown {
+            picked,
+            starred: starred_unflagged,
+            suggested: if rule.use_suggestions { suggested_unflagged } else { 0 },
+            ..Default::default()
+        },
+    };
+    Ok(CullSummary {
+        total,
+        picked,
+        picked_auto,
+        unflagged,
+        rejected,
+        rejected_by_user: rejected - rejected_auto,
+        rejected_auto,
+        starred,
+        keepers,
+        keeper_breakdown,
+        keeper_rule: rule,
+        suggested_reject_pending: sugg_reject,
+        suggested_pick_pending: sugg_pick,
+        unanalyzed,
+    })
+}
+
+/// `get_metadata_filter_options(query)`: distinct values with counts per metadata facet over
+/// `q`'s images, each facet ignoring its own constraint (see `MetadataFilterOptions`).
+/// `offset` / `limit` / sort are ignored.
+pub fn metadata_filter_options(conn: &Connection, q: &ImageQuery) -> AppResult<MetadataFilterOptions> {
+    let rule = if q.keepers_only { Some(keeper_rule(conn)?) } else { None };
+    // `SELECT {cols}, COUNT(*) FROM images i WHERE <q without facet's constraint> GROUP BY ..`.
+    let grouped = |facet: Facet, cols: &str, n_keys: usize, f: &mut dyn FnMut(&Row, u32) -> rusqlite::Result<()>| {
+        let (where_sql, args) = query_filter_skip(q, rule.as_ref(), Some(facet))?;
+        let group: Vec<String> = (1..=n_keys).map(|i| i.to_string()).collect();
+        let sql = format!("SELECT {cols}, COUNT(*) FROM images i{where_sql} GROUP BY {}", group.join(", "));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args.iter()))?;
+        while let Some(r) = rows.next()? {
+            let count: u32 = r.get(n_keys)?;
+            f(r, count)?;
+        }
+        Ok::<(), AppError>(())
+    };
+    let mut o = MetadataFilterOptions::default();
+    {
+        let (where_sql, args) = query_filter(q, rule.as_ref())?;
+        o.total =
+            conn.query_row(&format!("SELECT COUNT(*) FROM images i{where_sql}"), params_from_iter(args.iter()), |r| {
+                r.get(0)
+            })?;
+    }
+    grouped(Facet::Format, "i.format", 1, &mut |r, count| {
+        if let Some(format) = ImageFormat::parse(&r.get::<_, String>(0)?) {
+            o.formats.push(FormatCount { format, count });
+        }
+        Ok(())
+    })?;
+    o.formats.sort_by_key(|c| ImageFormat::ALL.iter().position(|&f| f == c.format));
+    grouped(Facet::Extension, &ext_sql("i."), 1, &mut |r, count| {
+        o.extensions.push(ExtensionCount { extension: r.get(0)?, count });
+        Ok(())
+    })?;
+    o.extensions.sort_by(|a, b| a.extension.cmp(&b.extension));
+    grouped(Facet::Camera, &format!("i.camera_make, {}", model_sql("i.")), 2, &mut |r, count| {
+        let make = CameraMake::parse(&r.get::<_, String>(0)?).unwrap_or(CameraMake::Other);
+        o.cameras.push(CameraCount { camera: CameraFilter { make, model: r.get(1)? }, count });
+        Ok(())
+    })?;
+    o.cameras.sort_by(|a, b| {
+        (a.camera.model.is_none(), a.camera.make.as_str(), &a.camera.model).cmp(&(
+            b.camera.model.is_none(),
+            b.camera.make.as_str(),
+            &b.camera.model,
+        ))
+    });
+    grouped(Facet::Lens, &lens_sql("i."), 1, &mut |r, count| {
+        o.lenses.push(LensCount { lens: r.get(0)?, count });
+        Ok(())
+    })?;
+    o.lenses.sort_by(|a, b| (a.lens.is_none(), &a.lens).cmp(&(b.lens.is_none(), &b.lens)));
+    let numbers = |facet: Facet, expr: String, out: &mut Vec<NumberCount>| -> AppResult<()> {
+        grouped(facet, &expr, 1, &mut |r, count| {
+            out.push(NumberCount { value: r.get(0)?, count });
+            Ok(())
+        })?;
+        out.sort_by(|a, b| match (a.value, b.value) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (x, y) => x.is_none().cmp(&y.is_none()),
+        });
+        Ok(())
+    };
+    numbers(Facet::Iso, "i.iso".into(), &mut o.isos)?;
+    numbers(Facet::FocalLength, "ROUND(i.focal_length_mm, 1)".into(), &mut o.focal_lengths)?;
+    numbers(Facet::Aperture, "ROUND(i.aperture, 1)".into(), &mut o.apertures)?;
+    numbers(Facet::Shutter, "i.shutter_s".into(), &mut o.shutter_speeds)?;
+    grouped(Facet::Captured, &day_sql("i."), 1, &mut |r, count| {
+        o.capture_days.push(DayCount { day_start_ms: r.get(0)?, count });
+        Ok(())
+    })?;
+    o.capture_days.sort_by_key(|c| (c.day_start_ms.is_none(), c.day_start_ms));
+    grouped(Facet::Edited, &edited_sql("i."), 1, &mut |r, count| {
+        if r.get::<_, bool>(0)? {
+            o.edited.yes += count;
+        } else {
+            o.edited.no += count;
+        }
+        Ok(())
+    })?;
+    grouped(Facet::Sidecar, "i.xmp_mtime_ms IS NOT NULL", 1, &mut |r, count| {
+        if r.get::<_, bool>(0)? {
+            o.has_sidecar.yes += count;
+        } else {
+            o.has_sidecar.no += count;
+        }
+        Ok(())
+    })?;
+    Ok(o)
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1365,13 @@ pub fn set_rating(conn: &mut Connection, ids: &[ImageId], rating: u8) -> AppResu
 }
 
 pub fn set_pick(conn: &mut Connection, ids: &[ImageId], pick: PickFlag) -> AppResult<()> {
-    update_each(conn, ids, "UPDATE images SET pick = ?1 WHERE id = ?2", Value::Text(pick.as_str().into()))
+    // A user flag (v16 `pick_origin`), also when re-setting the value "Auto" chose.
+    update_each(
+        conn,
+        ids,
+        "UPDATE images SET pick = ?1, pick_origin = 'user' WHERE id = ?2",
+        Value::Text(pick.as_str().into()),
+    )
 }
 
 pub fn set_color_label(conn: &mut Connection, ids: &[ImageId], label: Option<ColorLabel>) -> AppResult<()> {
@@ -1321,6 +1682,7 @@ pub fn list_burst_groups(conn: &Connection, scope: impl Into<FolderScope>) -> Ap
 /// Copies `suggested_rating` / `suggested_pick` into the user's rating/pick for `ids`.
 /// Unanalyzed images are skipped; with `only_unset`, so are images already flagged
 /// (`pick != unflagged`) or rated (`rating != 0`). Atomic; unknown ids fail with `not_found`.
+/// A flag it changes gets `pick_origin = 'auto'` (v16); an unchanged flag keeps its origin.
 pub fn apply_suggestions(
     conn: &mut Connection,
     ids: &[ImageId],
@@ -1332,7 +1694,9 @@ pub fn apply_suggestions(
         let mut stmt = tx.prepare(
             "UPDATE images SET
                  rating = (SELECT suggested_rating FROM quality_scores WHERE image_id = ?1),
-                 pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
+                 pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1),
+                 pick_origin = CASE WHEN pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
+                                    THEN pick_origin ELSE 'auto' END
              WHERE id = ?1 AND EXISTS (SELECT 1 FROM quality_scores WHERE image_id = ?1)
                AND (?2 = 0 OR (pick = 'unflagged' AND rating = 0))",
         )?;
@@ -1351,16 +1715,21 @@ pub fn apply_suggestions(
 
 /// Current rating/pick/label of `ids`, in the given order. Unknown ids -> `not_found`.
 pub fn cull_snapshot(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<CullSnapshot>> {
-    let mut stmt = conn.prepare_cached("SELECT rating, pick, color_label FROM images WHERE id = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT rating, pick, color_label, pick_origin FROM images WHERE id = ?1")?;
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
         let snap = stmt
             .query_row([id], |r| {
+                let pick = enum_col(r, 1, PickFlag::parse)?;
                 Ok(CullSnapshot {
                     image_id: id,
                     rating: r.get(0)?,
-                    pick: enum_col(r, 1, PickFlag::parse)?,
+                    pick,
                     color_label: opt_enum_col(r, 2, ColorLabel::parse)?,
+                    pick_origin: match pick {
+                        PickFlag::Unflagged => None,
+                        _ => Some(PickOrigin::parse(&r.get::<_, String>(3)?).unwrap_or(PickOrigin::User)),
+                    },
                 })
             })
             .optional()?
@@ -1380,14 +1749,17 @@ pub fn restore_cull_snapshot(conn: &mut Connection, snapshots: &[CullSnapshot]) 
     let tx = conn.savepoint()?;
     let mut changed = Vec::new();
     {
+        // `pick_origin` is restored with the flag (v16); it only matters for flagged images.
         let mut stmt = tx.prepare(
-            "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4
-             WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4)",
+            "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4, pick_origin = ?5
+             WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4
+                                OR (?3 <> 'unflagged' AND pick_origin IS NOT ?5))",
         )?;
         for s in snapshots {
             ensure_image(&tx, s.image_id)?;
             let label = s.color_label.map(|l| l.as_str());
-            if stmt.execute(params![s.image_id, s.rating, s.pick.as_str(), label])? > 0
+            let origin = s.pick_origin.unwrap_or(PickOrigin::User).as_str();
+            if stmt.execute(params![s.image_id, s.rating, s.pick.as_str(), label, origin])? > 0
                 && !changed.contains(&s.image_id)
             {
                 changed.push(s.image_id);
@@ -2160,7 +2532,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids_for(&conn, keepers.clone()), [1, 2, 4]);
-        set_keeper_rule(&conn, &KeeperRule { min_rating: 3, use_suggestions: false }).unwrap();
+        set_keeper_rule(&conn, &KeeperRule::picks_and_ratings(3, false)).unwrap();
         assert_eq!(ids_for(&conn, keepers.clone()), [2]);
         assert_eq!(filter_counts_keepers(&conn, FolderScope::all()).unwrap().total, 1);
         for id in 1..=4 {
@@ -2288,7 +2660,7 @@ mod tests {
         assert!(dirty(&conn).is_empty());
         assert_eq!(
             get_image(&conn, 2).unwrap().xmp,
-            XmpSyncState { dirty: false, synced_at_ms: Some(5), error: Some("x".into()) }
+            XmpSyncState { dirty: false, synced_at_ms: Some(5), error: Some("x".into()), has_sidecar: false }
         );
 
         // On by default since v12 (IPC v14).
@@ -2308,8 +2680,20 @@ mod tests {
         assert_eq!(
             before,
             vec![
-                CullSnapshot { image_id: 2, rating: 5, pick: PickFlag::Pick, color_label: None },
-                CullSnapshot { image_id: 1, rating: 2, pick: PickFlag::Unflagged, color_label: Some(ColorLabel::Red) },
+                CullSnapshot {
+                    image_id: 2,
+                    rating: 5,
+                    pick: PickFlag::Pick,
+                    color_label: None,
+                    pick_origin: Some(PickOrigin::User)
+                },
+                CullSnapshot {
+                    image_id: 1,
+                    rating: 2,
+                    pick: PickFlag::Unflagged,
+                    color_label: Some(ColorLabel::Red),
+                    pick_origin: None
+                },
             ]
         );
         assert_eq!(cull_snapshot(&conn, &[1, 99]).unwrap_err().kind, ErrorKind::NotFound);
@@ -2320,7 +2704,13 @@ mod tests {
 
         // Unknown id: nothing restored.
         let mut bad = before.clone();
-        bad.push(CullSnapshot { image_id: 99, rating: 0, pick: PickFlag::Unflagged, color_label: None });
+        bad.push(CullSnapshot {
+            image_id: 99,
+            rating: 0,
+            pick: PickFlag::Unflagged,
+            color_label: None,
+            pick_origin: None,
+        });
         assert_eq!(restore_cull_snapshot(&mut conn, &bad).unwrap_err().kind, ErrorKind::NotFound);
         assert_eq!(get_image(&conn, 1).unwrap().pick, PickFlag::Reject);
         let mut bad = before.clone();
@@ -2353,5 +2743,318 @@ mod tests {
         assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
         set_meta(&conn, UI_PREFS_KEY, "not json").unwrap();
         assert_eq!(ui_prefs(&conn).unwrap(), UiPrefs::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // IPC v18: keeper modes, pick origin, cull summary, metadata filters
+    // -----------------------------------------------------------------------
+
+    /// Every (pick, rating, suggestion) combination, one image each, in folder 1.
+    /// (id, pick, rating, suggested pick) of a [`keeper_grid`] image.
+    type GridRow = (ImageId, PickFlag, u8, Option<PickFlag>);
+
+    fn keeper_grid() -> (Connection, Vec<GridRow>) {
+        let conn = open_in_memory();
+        conn.execute("INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0)", []).unwrap();
+        let mut rows = Vec::new();
+        let mut id = 0;
+        for pick in PickFlag::ALL {
+            for rating in 0..=5u8 {
+                for sugg in [None, Some(PickFlag::Pick), Some(PickFlag::Unflagged), Some(PickFlag::Reject)] {
+                    id += 1;
+                    conn.execute(
+                        "INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size,
+                                             file_mtime_ms, imported_at, rating, pick)
+                         VALUES (?1, 1, ?2, ?2, 'arw', 'sony', 1, 0, 0, ?3, ?4)",
+                        params![id, format!("/f/{id}.arw"), rating, pick.as_str()],
+                    )
+                    .unwrap();
+                    if let Some(s) = sugg {
+                        conn.execute(
+                            "INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                                     clipped_shadows_pct, mean_luma, model_version, analyzed_at, suggested_pick)
+                             VALUES (?1, 0.5, 0.5, 0, 0, 0.5, 'v', 1, ?2)",
+                            params![id, s.as_str()],
+                        )
+                        .unwrap();
+                    }
+                    rows.push((id, *pick, rating, sugg));
+                }
+            }
+        }
+        (conn, rows)
+    }
+
+    #[test]
+    fn keeper_modes_rust_and_sql_agree_and_summary_matches_keepers_only() {
+        let (conn, rows) = keeper_grid();
+        let rules = [
+            KeeperRule::default(),
+            KeeperRule::picks_and_ratings(1, true),
+            KeeperRule::picks_and_ratings(1, false),
+            KeeperRule::picks_and_ratings(3, true),
+            KeeperRule::picks_and_ratings(5, false),
+        ];
+        for rule in rules {
+            set_keeper_rule(&conn, &rule).unwrap();
+            let sql: Vec<ImageId> =
+                ids_for(&conn, ImageQuery { keepers_only: true, limit: 1000, ..Default::default() });
+            let rust: Vec<ImageId> =
+                rows.iter().filter(|(_, p, r, s)| rule.is_keeper_values(*p, *r, *s)).map(|r| r.0).collect();
+            let mut sql_sorted = sql.clone();
+            sql_sorted.sort();
+            assert_eq!(sql_sorted, rust, "SQL mirrors {rule:?}");
+
+            let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+            assert_eq!(s.keepers as usize, sql.len(), "{rule:?}");
+            let b = &s.keeper_breakdown;
+            assert_eq!(b.picked + b.unflagged + b.starred + b.suggested, s.keepers, "breakdown adds up for {rule:?}");
+            assert_eq!(s.total, s.picked + s.unflagged + s.rejected);
+            assert_eq!(s.keeper_rule, rule);
+            assert_eq!(filter_counts_keepers(&conn, FolderScope::all()).unwrap().total, s.keepers);
+            let projects_keepers: u32 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM images WHERE {}", keeper_predicate(&rule, "")), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(projects_keepers, s.keepers);
+        }
+        // The default keeps everything not rejected.
+        set_keeper_rule(&conn, &KeeperRule::default()).unwrap();
+        let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+        assert_eq!(s.keepers, s.picked + s.unflagged);
+        assert_eq!((s.keeper_breakdown.starred, s.keeper_breakdown.suggested), (0, 0));
+        // 24 combinations per flag; suggestions pending = unflagged with that suggestion.
+        assert_eq!((s.picked, s.unflagged, s.rejected), (24, 24, 24));
+        assert_eq!((s.suggested_reject_pending, s.suggested_pick_pending, s.unanalyzed), (6, 6, 18));
+        assert_eq!(s.starred, 60);
+        // Validation is mode-independent.
+        let bad = KeeperRule { mode: KeeperMode::NotRejected, min_rating: 0, use_suggestions: true };
+        assert_eq!(set_keeper_rule(&conn, &bad).unwrap_err().kind, ErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn pick_origin_follows_writers_and_feeds_the_summary() {
+        let mut conn = phase4_fixture();
+        conn.execute_batch(
+            "INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                     clipped_shadows_pct, mean_luma, model_version, analyzed_at, suggested_rating, suggested_pick,
+                     reasons_json)
+             VALUES (1, 0.1, 0.1, 0, 0, 0.5, 'v', 1, 0, 'reject',
+                     '[{\"kind\":\"blink\",\"text\":\"Eyes closed\"},{\"kind\":\"duplicate_burst\",\"text\":\"Duplicate in burst (keeper b.arw)\",\"relatedImageId\":2}]'),
+                    (2, 0.9, 0.9, 0, 0, 0.5, 'v', 1, 5, 'pick', 'not json');",
+        )
+        .unwrap();
+        let reasons = get_image(&conn, 1).unwrap().quality.unwrap().reasons;
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons[1].kind, SuggestionReasonKind::DuplicateBurst);
+        assert_eq!(reasons[1].related_image_id, Some(2));
+        assert!(get_image(&conn, 2).unwrap().quality.unwrap().reasons.is_empty(), "bad JSON reads as none");
+        assert_eq!(get_image(&conn, 1).unwrap().pick_origin, None, "unflagged has no origin");
+
+        let before = cull_snapshot(&conn, &[1, 2]).unwrap();
+        apply_suggestions(&mut conn, &[1, 2], false).unwrap();
+        let e1 = get_image(&conn, 1).unwrap();
+        assert_eq!((e1.pick, e1.pick_origin), (PickFlag::Reject, Some(PickOrigin::Auto)));
+        assert_eq!(get_image(&conn, 2).unwrap().pick_origin, Some(PickOrigin::User), "unchanged flag keeps origin");
+        let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+        assert_eq!((s.rejected, s.rejected_auto, s.rejected_by_user), (2, 1, 1));
+        assert_eq!(s.picked_auto, 0);
+
+        // Undo restores the user state; redo (snapshot of the auto state) restores `auto`.
+        let after = cull_snapshot(&conn, &[1]).unwrap();
+        assert_eq!(after[0].pick_origin, Some(PickOrigin::Auto));
+        restore_cull_snapshot(&mut conn, &before).unwrap();
+        assert_eq!(get_image(&conn, 1).unwrap().pick, PickFlag::Unflagged);
+        restore_cull_snapshot(&mut conn, &after).unwrap();
+        assert_eq!(get_image(&conn, 1).unwrap().pick_origin, Some(PickOrigin::Auto));
+        // Only the origin differs: still restored (and reported changed).
+        let as_user = vec![CullSnapshot { pick_origin: None, ..after[0].clone() }];
+        assert_eq!(restore_cull_snapshot(&mut conn, &as_user).unwrap(), vec![1]);
+        assert_eq!(get_image(&conn, 1).unwrap().pick_origin, Some(PickOrigin::User));
+
+        // A user flag over an auto flag becomes `user`.
+        apply_suggestions(&mut conn, &[1], false).unwrap();
+        set_pick(&mut conn, &[1], PickFlag::Reject).unwrap();
+        assert_eq!(get_image(&conn, 1).unwrap().pick_origin, Some(PickOrigin::User));
+    }
+
+    /// Six images with varied metadata (folder 1: 1-5, folder 2: 6).
+    fn metadata_fixture() -> Connection {
+        let conn = open_in_memory();
+        conn.execute_batch(
+            "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0), (2, '/g', 0);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, camera_model, lens, iso,
+                                 shutter_s, aperture, focal_length_mm, captured_at_ms, xmp_mtime_ms,
+                                 file_size, file_mtime_ms, imported_at, pick)
+             VALUES
+               (1, 1, '/f/A.ARW',  'A.ARW',  'arw',  'sony',     'ILCE-7M4', 'FE 35mm F1.4 GM', 100,  0.004,   1.4, 35.0,
+                86400000 + 1000, 5, 1, 0, 0, 'pick'),
+               (2, 1, '/f/b.arw',  'b.arw',  'arw',  'sony',     'ILCE-7M4', 'FE 85mm F1.4 GM', 800,  0.008,   1.4, 85.0,
+                86400000 + 5000, NULL, 1, 0, 0, 'unflagged'),
+               (3, 1, '/f/c.RAF',  'c.RAF',  'raf',  'fujifilm', 'X-T5',     NULL,              3200, 0.000125, 2.8, 23.04,
+                2 * 86400000, NULL, 1, 0, 0, 'reject'),
+               (4, 1, '/f/d.JPG',  'd.JPG',  'jpeg', 'canon',    'EOS R5',   '  ',              6400, 0.5,     2.8, 50.0,
+                NULL, 7, 1, 0, 0, 'unflagged'),
+               (5, 1, '/f/e.jpeg', 'e.jpeg', 'jpeg', 'other',    NULL,       NULL,              NULL, NULL,    NULL, NULL,
+                3 * 86400000, NULL, 1, 0, 0, 'unflagged'),
+               (6, 2, '/g/f.arw',  'f.arw',  'arw',  'sony',     'ILCE-7M4', 'FE 35mm F1.4 GM', 100,  0.004,   1.4, 35.0,
+                86400000, NULL, 1, 0, 0, 'unflagged');
+             INSERT INTO adjustments (image_id, params_json, process_version, updated_at, neutral)
+             VALUES (1, '{}', 1, 0, 0), (3, '{}', 1, 0, 1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn meta(m: MetadataFilter) -> ImageQuery {
+        ImageQuery { metadata: m, ..Default::default() }
+    }
+
+    fn sorted(mut v: Vec<ImageId>) -> Vec<ImageId> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn metadata_filters_one_by_one() {
+        let conn = metadata_fixture();
+        let ids = |m: MetadataFilter| sorted(ids_for(&conn, meta(m)));
+        let d = MetadataFilter::default;
+        assert_eq!(ids(d()), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(ids(MetadataFilter { formats: vec![ImageFormat::Jpeg], ..d() }), [4, 5]);
+        assert_eq!(ids(MetadataFilter { formats: vec![ImageFormat::Raf, ImageFormat::Arw], ..d() }), [1, 2, 3, 6]);
+        assert_eq!(ids(MetadataFilter { extensions: vec!["JPG".into()], ..d() }), [4], "case-insensitive");
+        assert_eq!(ids(MetadataFilter { extensions: vec!["jpeg".into(), "raf".into()], ..d() }), [3, 5]);
+        assert_eq!(ids(MetadataFilter { extensions: vec!["arw".into()], ..d() }), [1, 2, 6]);
+        let cam = |make, model: Option<&str>| CameraFilter { make, model: model.map(str::to_owned) };
+        assert_eq!(ids(MetadataFilter { cameras: vec![cam(CameraMake::Sony, Some("ILCE-7M4"))], ..d() }), [1, 2, 6]);
+        assert_eq!(
+            ids(MetadataFilter {
+                cameras: vec![cam(CameraMake::Fujifilm, Some("X-T5")), cam(CameraMake::Other, None)],
+                ..d()
+            }),
+            [3, 5]
+        );
+        assert_eq!(ids(MetadataFilter { lenses: vec![Some("FE 35mm F1.4 GM".into())], ..d() }), [1, 6]);
+        assert_eq!(ids(MetadataFilter { lenses: vec![None], ..d() }), [3, 4, 5], "blank lens is unknown");
+        let range = |min: Option<f64>, max: Option<f64>| Some(NumberRange { min, max });
+        assert_eq!(ids(MetadataFilter { iso: range(Some(800.0), Some(3200.0)), ..d() }), [2, 3]);
+        assert_eq!(ids(MetadataFilter { iso: range(None, Some(100.0)), ..d() }), [1, 6]);
+        assert_eq!(ids(MetadataFilter { focal_length_mm: range(Some(23.0), Some(23.0)), ..d() }), [3], "0.1 mm");
+        assert_eq!(ids(MetadataFilter { focal_length_mm: range(Some(50.0), None), ..d() }), [2, 4]);
+        assert_eq!(ids(MetadataFilter { aperture: range(Some(2.8), Some(2.8)), ..d() }), [3, 4]);
+        assert_eq!(ids(MetadataFilter { shutter_seconds: range(Some(0.000125), Some(0.000125)), ..d() }), [3]);
+        assert_eq!(ids(MetadataFilter { shutter_seconds: range(Some(0.004), Some(0.008)), ..d() }), [1, 2, 6]);
+        let day = 86_400_000;
+        let dates = |from, to| Some(DateRange { from_ms: from, to_ms: to });
+        assert_eq!(ids(MetadataFilter { captured: dates(Some(day), Some(2 * day)), ..d() }), [1, 2, 6], "to exclusive");
+        assert_eq!(ids(MetadataFilter { captured: dates(Some(2 * day), None), ..d() }), [3, 5]);
+        assert_eq!(ids(MetadataFilter { edited: Some(true), ..d() }), [1], "neutral adjustments are unedited");
+        assert_eq!(ids(MetadataFilter { edited: Some(false), ..d() }), [2, 3, 4, 5, 6]);
+        assert_eq!(ids(MetadataFilter { has_sidecar: Some(true), ..d() }), [1, 4]);
+        assert_eq!(ids(MetadataFilter { has_sidecar: Some(false), ..d() }), [2, 3, 5, 6]);
+        assert!(get_image(&conn, 1).unwrap().xmp.has_sidecar && !get_image(&conn, 2).unwrap().xmp.has_sidecar);
+        // Combined (AND across fields) and with the other filters.
+        let m = MetadataFilter { formats: vec![ImageFormat::Arw], iso: range(Some(100.0), Some(100.0)), ..d() };
+        assert_eq!(ids(m.clone()), [1, 6]);
+        assert_eq!(sorted(ids_for(&conn, ImageQuery { folder_id: Some(1), ..meta(m) })), [1]);
+        // Invalid constraints.
+        for bad in [
+            MetadataFilter { extensions: vec!["a.b".into()], ..d() },
+            MetadataFilter { extensions: vec![String::new()], ..d() },
+            MetadataFilter { iso: range(Some(f64::NAN), None), ..d() },
+        ] {
+            assert_eq!(list_image_ids(&conn, &meta(bad)).unwrap_err().kind, ErrorKind::InvalidArgument);
+        }
+        // Wire shape: every field optional.
+        let q: ImageQuery = serde_json::from_value(serde_json::json!({
+            "includeTags": [], "excludeTags": [], "tagMatch": "any", "picks": [], "minRating": null,
+            "maxRating": null, "colorLabels": [], "burstGroupId": null, "collapseBursts": false, "folderId": null,
+            "sort": "capture_time", "sortDescending": false, "offset": 0, "limit": 10,
+            "metadata": {"extensions": ["raf"]}
+        }))
+        .unwrap();
+        assert_eq!(sorted(ids_for(&conn, q)), [3]);
+    }
+
+    #[test]
+    fn filter_counts_honour_metadata() {
+        let conn = metadata_fixture();
+        let m = MetadataFilter { formats: vec![ImageFormat::Arw, ImageFormat::Raf], ..Default::default() };
+        let c = filter_counts_with(&conn, FolderScope::all(), false, &m).unwrap();
+        assert_eq!((c.total, c.picked, c.rejected, c.unflagged), (4, 1, 1, 2));
+        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), false, &m).unwrap();
+        assert_eq!(c.total, 3);
+        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), true, &m).unwrap();
+        assert_eq!(c.total, 2, "keepers (not rejected) among folder 1's RAWs");
+        let edited = MetadataFilter { edited: Some(true), ..Default::default() };
+        assert_eq!(filter_counts_with(&conn, FolderScope::all(), false, &edited).unwrap().total, 1);
+        assert_eq!(
+            filter_counts_with(&conn, FolderScope::all(), false, &MetadataFilter::default()).unwrap(),
+            filter_counts(&conn, FolderScope::all()).unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_facets_cascade_and_count() {
+        let conn = metadata_fixture();
+        let o = metadata_filter_options(&conn, &ImageQuery::default()).unwrap();
+        assert_eq!(o.total, 6);
+        assert_eq!(
+            o.formats.iter().map(|c| (c.format, c.count)).collect::<Vec<_>>(),
+            [(ImageFormat::Arw, 3), (ImageFormat::Raf, 1), (ImageFormat::Jpeg, 2)]
+        );
+        assert_eq!(
+            o.extensions.iter().map(|c| (c.extension.as_str(), c.count)).collect::<Vec<_>>(),
+            [("arw", 3), ("jpeg", 1), ("jpg", 1), ("raf", 1)]
+        );
+        assert_eq!(o.cameras.len(), 4);
+        assert_eq!(o.cameras.last().unwrap().camera, CameraFilter { make: CameraMake::Other, model: None });
+        assert_eq!(o.cameras.iter().find(|c| c.camera.make == CameraMake::Sony).unwrap().count, 3);
+        assert_eq!(
+            o.lenses.iter().map(|c| (c.lens.as_deref(), c.count)).collect::<Vec<_>>(),
+            [(Some("FE 35mm F1.4 GM"), 2), (Some("FE 85mm F1.4 GM"), 1), (None, 3)]
+        );
+        assert_eq!(
+            o.isos.iter().map(|c| (c.value, c.count)).collect::<Vec<_>>(),
+            [(Some(100.0), 2), (Some(800.0), 1), (Some(3200.0), 1), (Some(6400.0), 1), (None, 1)]
+        );
+        assert_eq!(o.focal_lengths.first().unwrap().value, Some(23.0), "rounded to 0.1 mm");
+        assert_eq!(o.apertures.iter().map(|c| c.count).collect::<Vec<_>>(), [3, 2, 1]);
+        assert_eq!(o.shutter_speeds.first().unwrap().value, Some(0.000125));
+        assert_eq!(
+            o.capture_days.iter().map(|c| (c.day_start_ms, c.count)).collect::<Vec<_>>(),
+            [(Some(86_400_000), 3), (Some(2 * 86_400_000), 1), (Some(3 * 86_400_000), 1), (None, 1)]
+        );
+        assert_eq!(o.edited, YesNoCount { yes: 1, no: 5 });
+        assert_eq!(o.has_sidecar, YesNoCount { yes: 2, no: 4 });
+
+        // A facet ignores its own constraint but follows the others.
+        let q = meta(MetadataFilter { formats: vec![ImageFormat::Jpeg], ..Default::default() });
+        let o = metadata_filter_options(&conn, &q).unwrap();
+        assert_eq!(o.total, 2);
+        assert_eq!(o.formats.len(), 3, "own facet: every format still offered");
+        assert_eq!(o.extensions.iter().map(|c| c.extension.as_str()).collect::<Vec<_>>(), ["jpeg", "jpg"]);
+        assert_eq!(o.edited, YesNoCount { yes: 0, no: 2 });
+        // Every facet value's count equals the total of selecting it.
+        let o = metadata_filter_options(&conn, &ImageQuery { folder_id: Some(1), ..Default::default() }).unwrap();
+        for c in &o.isos {
+            let m = MetadataFilter { iso: Some(NumberRange { min: c.value, max: c.value }), ..Default::default() };
+            if c.value.is_some() {
+                let n = list_image_ids(&conn, &ImageQuery { folder_id: Some(1), ..meta(m) }).unwrap().len();
+                assert_eq!(n as u32, c.count, "iso {:?}", c.value);
+            }
+        }
+        for c in &o.apertures {
+            let m = MetadataFilter { aperture: Some(NumberRange { min: c.value, max: c.value }), ..Default::default() };
+            if c.value.is_some() {
+                let n = list_image_ids(&conn, &ImageQuery { folder_id: Some(1), ..meta(m) }).unwrap().len();
+                assert_eq!(n as u32, c.count, "aperture {:?}", c.value);
+            }
+        }
+        // Keepers only: the rejected RAF disappears.
+        let o = metadata_filter_options(&conn, &ImageQuery { keepers_only: true, ..Default::default() }).unwrap();
+        assert!(o.formats.iter().all(|c| c.format != ImageFormat::Raf));
     }
 }

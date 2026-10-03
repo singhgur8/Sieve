@@ -2,7 +2,7 @@
 // the personal style model, and the batch actions (auto edit, apply to scene, apply all, undo). Every call goes through the typed wrappers;
 // Markers ("needs a look", "auto edited", "applied", skipped) come from the persisted plan (IPC v15), never from session state.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditBatchInfo, type EditPlan, type ImageEditState, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
+import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditBatchInfo, type EditPlan, type ImageEditState, type KeeperRule, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
 import { describeError } from "../lib/errors";
 import type { ToastApi } from "../components/Toasts";
 
@@ -597,7 +597,7 @@ export function useWorkflow(d: Deps) {
   );
 
   const setKeeperRule = useCallback(
-    async (rule: { minRating: number; useSuggestions: boolean }) => {
+    async (rule: KeeperRule) => {
       try {
         await unwrap(commands.setKeeperRule(rule));
         await dref.current.onChanged([]);

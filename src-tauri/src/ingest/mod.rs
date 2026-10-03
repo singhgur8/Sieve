@@ -91,6 +91,21 @@ impl<R: Runtime> IngestSink for AppHandle<R> {
         let _ = event.emit(self);
     }
     fn progress(&self, event: ImportProgress) {
+        // Background-activity indicator (IPC v18): one activity per pipeline run.
+        if let Some(a) = crate::ipc::activity::activities(self) {
+            use crate::ipc::activity::photos;
+            use crate::ipc::events::{ActivityKind, ActivityState};
+            if event.done < event.total {
+                a.progress("import", ActivityKind::Import, "Importing photos", event.done, Some(event.total));
+            } else if a.is_running("import") {
+                a.progress("import", ActivityKind::Import, "Importing photos", event.done, Some(event.total));
+                let message = match event.failed {
+                    0 => format!("Imported {}", photos(event.done)),
+                    f => format!("Imported {}; {f} could not be read", photos(event.done - f)),
+                };
+                a.finish("import", ActivityState::Finished, Some(message));
+            }
+        }
         let _ = event.emit(self);
     }
 }

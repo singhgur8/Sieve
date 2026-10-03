@@ -19,12 +19,17 @@ const TABS: { id: PlanTab; label: string }[] = [
 ];
 
 export const KEEPER_RULES: { rule: KeeperRule; label: string; long: string }[] = [
-  { rule: { minRating: 1, useSuggestions: true }, label: "Picks, 1★+, suggested", long: "Picks, anything rated 1★ and up, and photos Sieve suggests" },
-  { rule: { minRating: 1, useSuggestions: false }, label: "Picks, 1★+", long: "Picks and anything rated 1★ and up" },
-  { rule: { minRating: 3, useSuggestions: false }, label: "Picks, 3★+", long: "Picks and photos rated 3★ and up" },
-  { rule: { minRating: 5, useSuggestions: false }, label: "Picks, 5★", long: "Picks and 5★ photos" },
+  { rule: { mode: "picks_and_ratings", minRating: 1, useSuggestions: true }, label: "Picks, 1★+, suggested", long: "Picks, anything rated 1★ and up, and photos Sieve suggests" },
+  { rule: { mode: "picks_and_ratings", minRating: 1, useSuggestions: false }, label: "Picks, 1★+", long: "Picks and anything rated 1★ and up" },
+  { rule: { mode: "picks_and_ratings", minRating: 3, useSuggestions: false }, label: "Picks, 3★+", long: "Picks and photos rated 3★ and up" },
+  { rule: { mode: "picks_and_ratings", minRating: 5, useSuggestions: false }, label: "Picks, 5★", long: "Picks and 5★ photos" },
+  // IPC v18 default. Appended so the existing menu indices (keeper-rule-0..3) stay stable.
+  { rule: { mode: "not_rejected", minRating: 1, useSuggestions: true }, label: "Everything not rejected", long: "Everything you have not rejected" },
 ];
-const ruleLabel = (r: KeeperRule) => KEEPER_RULES.find((x) => x.rule.minRating === r.minRating && x.rule.useSuggestions === r.useSuggestions)?.label ?? `${r.minRating}★+`;
+/** Same rule as far as keepers go (`not_rejected` ignores the thresholds). */
+const sameRule = (a: KeeperRule, b: KeeperRule) =>
+  a.mode === b.mode && (a.mode === "not_rejected" || (a.minRating === b.minRating && a.useSuggestions === b.useSuggestions));
+const ruleLabel = (r: KeeperRule) => KEEPER_RULES.find((x) => sameRule(x.rule, r))?.label ?? `${r.minRating}★+`;
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const timeRange = (a: number | null | undefined, b: number | null | undefined) => {
@@ -330,7 +335,7 @@ function RuleItems({ current, onPick }: { current: KeeperRule; onPick: (r: Keepe
   return (
     <div className="w-80 py-1" data-testid="keeper-rule-menu">
       {KEEPER_RULES.map((k, i) => {
-        const on = k.rule.minRating === current.minRating && k.rule.useSuggestions === current.useSuggestions;
+        const on = sameRule(k.rule, current);
         return (
           <button key={i} className={menuItem} data-testid={`keeper-rule-${i}`} aria-checked={on} role="menuitemradio" onClick={() => onPick(k.rule)}>
             <span className="w-4">{on ? "✓" : ""}</span>

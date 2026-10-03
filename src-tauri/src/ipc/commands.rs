@@ -247,7 +247,10 @@ pub async fn list_image_ids(catalog: State<'_, Catalog>, query: ImageQuery) -> A
 
 /// Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
 /// inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
-/// (`ImageQuery.keepersOnly`, the Edit / Export steps). Unknown project -> `not_found`.
+/// (`ImageQuery.keepersOnly`, the Edit / Export steps). `metadata` (v18; `null` = none) counts
+/// only images passing the Library Filter metadata constraints (`ImageQuery.metadata`), so
+/// the facet counts follow the metadata row. Unknown project -> `not_found`; an invalid
+/// constraint -> `invalid_argument`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_filter_counts(
@@ -255,17 +258,43 @@ pub async fn get_filter_counts(
     folder_id: Option<FolderId>,
     project_id: Option<ProjectId>,
     keepers_only: Option<bool>,
+    metadata: Option<MetadataFilter>,
 ) -> AppResult<FilterCounts> {
     catalog
         .run(move |c| {
             let scope = FolderScope::resolve(c, folder_id, project_id)?;
-            if keepers_only.unwrap_or(false) {
-                repo::filter_counts_keepers(c, scope)
-            } else {
-                repo::filter_counts(c, scope)
-            }
+            repo::filter_counts_with(c, scope, keepers_only.unwrap_or(false), &metadata.unwrap_or_default())
         })
         .await
+}
+
+/// Cull step summary for `projectId` (`null` = whole catalog) (v18): picked / unflagged /
+/// rejected (by you vs. "Auto") / keepers with the breakdown under the catalog's keeper rule /
+/// suggestions not acted on. `keepers` equals a `keepersOnly` query's total over the same
+/// scope. Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_cull_summary(catalog: State<'_, Catalog>, project_id: Option<ProjectId>) -> AppResult<CullSummary> {
+    catalog
+        .run(move |c| {
+            let scope = FolderScope::resolve(c, None, project_id)?;
+            repo::cull_summary(c, &scope)
+        })
+        .await
+}
+
+/// Distinct values with image counts for each Library Filter metadata facet (v18) over
+/// `query`'s images (pass the grid's query: scope, flags, tags and metadata; sort / offset /
+/// limit are ignored). Each facet ignores its own constraint (Lightroom's cascading columns).
+/// Like `list_images`, an unknown project matches nothing; an invalid constraint ->
+/// `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_metadata_filter_options(
+    catalog: State<'_, Catalog>,
+    query: ImageQuery,
+) -> AppResult<MetadataFilterOptions> {
+    catalog.run(move |c| repo::metadata_filter_options(c, &query)).await
 }
 
 // Culling writes. Each marks changed images `xmp.dirty` (DB triggers) and notifies the
@@ -564,11 +593,39 @@ pub async fn paste_settings(
 ) -> AppResult<()> {
     require_fields(&fields)?;
     adjustments.validate().map_err(AppError::invalid)?;
-    catalog
+    let n = ids.len() as u32;
+    let activity = start_multi_activity(&app, n, "Pasting settings to");
+    let result = catalog
         .run(move |c| develop::history::apply_fields(c, &ids, &adjustments, &fields, develop::history::LABEL_PASTE))
-        .await?;
+        .await;
+    end_activity(activity, &result, |_| format!("Pasted settings to {}", super::activity::photos(n)));
+    result?;
     xmp.notify(&app);
     Ok(())
+}
+
+/// A `paste_sync` activity (IPC v18) for writes to more than one photo ("Pasting settings to
+/// 12 photos"); `None` for a single photo or without a reporter.
+fn start_multi_activity(app: &AppHandle, n: u32, verb: &str) -> Option<super::activity::ActivityHandle> {
+    if n < 2 {
+        return None;
+    }
+    let label = format!("{verb} {}", super::activity::photos(n));
+    super::activity::activities(app).map(|a| a.start(super::events::ActivityKind::PasteSync, label, None))
+}
+
+/// Ends `activity` from a command result.
+fn end_activity<T>(
+    activity: Option<super::activity::ActivityHandle>,
+    result: &AppResult<T>,
+    ok: impl FnOnce(&T) -> String,
+) {
+    if let Some(a) = activity {
+        match result {
+            Ok(v) => a.finish(Some(ok(v))),
+            Err(e) => a.fail(e.message.clone()),
+        }
+    }
 }
 
 /// Copies the `fields` groups of `sourceId`'s stored adjustments onto `targetIds`
@@ -584,12 +641,16 @@ pub async fn sync_settings(
     fields: Vec<AdjustmentField>,
 ) -> AppResult<()> {
     require_fields(&fields)?;
-    catalog
+    let n = target_ids.len() as u32;
+    let activity = start_multi_activity(&app, n, "Syncing settings to");
+    let result = catalog
         .run(move |c| {
             let src = repo::get_adjustments(c, source_id)?;
             develop::history::apply_fields(c, &target_ids, &src, &fields, develop::history::LABEL_SYNC)
         })
-        .await?;
+        .await;
+    end_activity(activity, &result, |_| format!("Synced settings to {}", super::activity::photos(n)));
+    result?;
     xmp.notify(&app);
     Ok(())
 }
@@ -1094,18 +1155,45 @@ where
 /// preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
 #[tauri::command]
 #[specta::specta]
-pub async fn write_xmp(xmp: State<'_, XmpSync>, ids: Vec<ImageId>) -> AppResult<XmpSyncReport> {
+pub async fn write_xmp(app: AppHandle, xmp: State<'_, XmpSync>, ids: Vec<ImageId>) -> AppResult<XmpSyncReport> {
     let sync = xmp.inner().clone();
-    blocking(move || sync.write_images(&ids)).await
+    blocking(move || write_xmp_reporting(&app, &sync, &ids)).await
+}
+
+/// Explicit XMP save with an `xmp_save` activity (IPC v18).
+fn write_xmp_reporting(app: &AppHandle, sync: &XmpSync, ids: &[ImageId]) -> AppResult<XmpSyncReport> {
+    use super::activity::{activities, xmp_message};
+    use super::events::ActivityKind;
+    let Some(a) = activities(app).filter(|_| !ids.is_empty()) else { return sync.write_images(ids) };
+    let handle = a.start(ActivityKind::XmpSave, "Saving metadata to XMP", Some(ids.len() as u32));
+    let result = sync.write_images_with(ids, &|done| handle.progress(done));
+    match result {
+        Ok(report) => {
+            handle.finish(Some(xmp_message(report.succeeded as usize, report.failed.len())));
+            Ok(report)
+        }
+        Err(e) => {
+            handle.fail(e.message.clone());
+            Err(e)
+        }
+    }
 }
 
 /// "Save all": writes sidecars for every XMP-dirty image of `folderId` (all folders for
 /// `null`) now, whether or not auto-sync is on (catalog wins, like `write_xmp`).
 #[tauri::command]
 #[specta::specta]
-pub async fn write_xmp_all_dirty(xmp: State<'_, XmpSync>, folder_id: Option<FolderId>) -> AppResult<XmpSyncReport> {
+pub async fn write_xmp_all_dirty(
+    app: AppHandle,
+    xmp: State<'_, XmpSync>,
+    folder_id: Option<FolderId>,
+) -> AppResult<XmpSyncReport> {
     let sync = xmp.inner().clone();
-    blocking(move || sync.write_dirty(folder_id)).await
+    blocking(move || {
+        let ids = sync.dirty_ids(folder_id)?;
+        write_xmp_reporting(&app, &sync, &ids)
+    })
+    .await
 }
 
 /// Reads rating/pick/label (and crs: develop settings, see `xmp::crs`) from existing sidecars
@@ -1583,14 +1671,32 @@ pub async fn model_downloads_status(downloads: State<'_, ModelDownloads>) -> App
 #[specta::specta]
 pub async fn download_models(app: AppHandle, downloads: State<'_, ModelDownloads>, group: String) -> AppResult<()> {
     let progress_app = app.clone();
+    // Background-activity indicator (IPC v18), in KiB so large files fit a u32.
+    let activity = super::activity::activities(&app);
+    let finish_activity = activity.clone();
     downloads.start(
         &group,
         move |p| {
+            if let Some(a) = &activity {
+                let total = u32::try_from(p.bytes_total / 1024).unwrap_or(u32::MAX);
+                let done = u32::try_from(p.bytes_done / 1024).unwrap_or(u32::MAX).min(total);
+                let kind = super::events::ActivityKind::ModelDownload;
+                a.progress("model_download", kind, "Downloading AI models", done, Some(total));
+            }
             let _ = p.emit(&progress_app);
         },
         move |f| {
             if let Some(e) = &f.error {
                 eprintln!("model download ({}): {e}", f.group);
+            }
+            if let Some(a) = &finish_activity {
+                use super::events::ActivityState;
+                let (state, message) = match (f.ok, f.cancelled) {
+                    (true, _) => (ActivityState::Finished, Some("AI models installed".to_owned())),
+                    (false, true) => (ActivityState::Cancelled, None),
+                    (false, false) => (ActivityState::Error, f.error.clone()),
+                };
+                a.finish("model_download", state, message);
             }
             let _ = f.emit(&app);
         },
@@ -1910,6 +2016,37 @@ async fn apply_scenes(
     options.match_options.validate().map_err(AppError::invalid)?;
     let opts = options.clone();
     let all = matches!(scene_ids, SceneIds::EditedIn(_));
+    // Background-activity indicator (IPC v18); indeterminate (`sceneProgress` has the counts).
+    let activity = super::activity::activities(&app).map(|a| {
+        let label = if all { "Applying edits to scenes" } else { "Applying edit to scene" };
+        a.start(super::events::ActivityKind::ApplyScene, label, None)
+    });
+    let result = apply_scenes_inner(app, catalog, develop, luts, xmp, control, scene_ids, options, opts, all).await;
+    if let Some(a) = activity {
+        match &result {
+            Ok(r) if r.cancelled => a.cancel(Some(format!("Stopped after {} scene(s)", r.scenes.len()))),
+            Ok(r) => {
+                a.finish(Some(format!("Applied to {}", super::activity::photos(r.batch.changed_ids.len() as u32))))
+            }
+            Err(e) => a.fail(e.message.clone()),
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_scenes_inner(
+    app: AppHandle,
+    catalog: &Catalog,
+    develop: &DevelopCache,
+    luts: &LutLibrary,
+    xmp: &XmpSync,
+    control: &SceneApplyControl,
+    scene_ids: SceneIds,
+    options: SceneApplyOptions,
+    opts: SceneApplyOptions,
+    all: bool,
+) -> AppResult<ApplyScenesResult> {
     let (jobs, mut skipped) = catalog
         .run(move |c| match scene_ids {
             SceneIds::One(id) => Ok((scene::workflow::apply_inputs(c, &[id], &opts)?, Vec::new())),

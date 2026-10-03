@@ -135,6 +135,10 @@ pub fn resolve_sidecar(image_path: &Path) -> PathBuf {
 pub trait XmpSink: Send + Sync {
     fn synced(&self, event: XmpSynced);
     fn failed(&self, event: XmpWriteFailed);
+    /// Background-activity reporter for auto-sync passes (IPC v18); none by default.
+    fn activities(&self) -> Option<crate::ipc::activity::Activities> {
+        None
+    }
 }
 
 impl<R: Runtime> XmpSink for AppHandle<R> {
@@ -143,6 +147,9 @@ impl<R: Runtime> XmpSink for AppHandle<R> {
     }
     fn failed(&self, event: XmpWriteFailed) {
         let _ = event.emit(self);
+    }
+    fn activities(&self) -> Option<crate::ipc::activity::Activities> {
+        crate::ipc::activity::activities(self)
     }
 }
 
@@ -276,8 +283,17 @@ impl XmpSync {
         if ids.is_empty() {
             return Ok(());
         }
+        // Background-activity indicator (IPC v18); dropped on an early return = error.
+        let total = ids.len() as u32;
+        let activity = sink
+            .activities()
+            .map(|a| a.start(crate::ipc::events::ActivityKind::XmpSave, "Saving metadata to XMP", Some(total)));
         let mut event = XmpSynced { written: Vec::new(), read: Vec::new() };
-        for id in ids {
+        let mut failures = 0u32;
+        for (done, id) in ids.into_iter().enumerate() {
+            if let Some(a) = &activity {
+                a.progress(done as u32);
+            }
             let Some(row) = store::load(&conn, id)? else { continue };
             match atomically(&mut conn, |c| self.sync_one(c, &row, SyncPolicy::NewerWins)) {
                 Ok(Outcome::Written) => event.written.push(id),
@@ -285,9 +301,17 @@ impl XmpSync {
                 Ok(Outcome::Skipped) => {}
                 Err(reason) => {
                     store::mark_failed(&conn, id, &reason)?;
+                    failures += 1;
                     sink.failed(XmpWriteFailed { image_id: id, reason });
                 }
             }
+        }
+        if let Some(a) = activity {
+            a.progress(total);
+            a.finish(Some(crate::ipc::activity::xmp_message(
+                event.written.len() + event.read.len(),
+                failures as usize,
+            )));
         }
         sink.synced(event);
         Ok(())
@@ -317,11 +341,31 @@ impl XmpSync {
         self.run_explicit(ids, SyncPolicy::SidecarWins)
     }
 
+    /// [`Self::write_images`] calling `progress(done)` after each image (IPC v18 activity).
+    pub fn write_images_with(&self, ids: &[ImageId], progress: &dyn Fn(u32)) -> AppResult<XmpSyncReport> {
+        self.run_explicit_with(ids, SyncPolicy::CatalogWins, progress)
+    }
+
+    /// The ids [`Self::write_dirty`] writes (every `xmp_dirty` image of `folder`).
+    pub fn dirty_ids(&self, folder: Option<FolderId>) -> AppResult<Vec<ImageId>> {
+        store::dirty_ids_in(&db::open(&self.config.catalog_path)?, folder)
+    }
+
     fn run_explicit(&self, ids: &[ImageId], policy: SyncPolicy) -> AppResult<XmpSyncReport> {
+        self.run_explicit_with(ids, policy, &|_| {})
+    }
+
+    fn run_explicit_with(
+        &self,
+        ids: &[ImageId],
+        policy: SyncPolicy,
+        progress: &dyn Fn(u32),
+    ) -> AppResult<XmpSyncReport> {
         let mut conn = db::open(&self.config.catalog_path)?;
         store::ensure_exist(&conn, ids)?;
         let mut report = XmpSyncReport::default();
-        for &id in ids {
+        for (done, &id) in ids.iter().enumerate() {
+            progress(done as u32);
             let row = store::load(&conn, id)?.ok_or_else(|| AppError::not_found(format!("image {id}")))?;
             match atomically(&mut conn, |c| self.sync_one(c, &row, policy)) {
                 Ok(Outcome::Written) => report.succeeded += 1,
@@ -338,6 +382,7 @@ impl XmpSync {
                 }
             }
         }
+        progress(ids.len() as u32);
         Ok(report)
     }
 

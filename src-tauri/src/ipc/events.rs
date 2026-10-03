@@ -4,7 +4,62 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
 
-use super::types::{ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase};
+use super::types::{string_enum, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase};
+
+string_enum! {
+    /// What a background activity is doing (v18, [`ActivityEvent`]).
+    pub enum ActivityKind {
+        /// Import: thumbnail + EXIF extraction of new photos.
+        Import => "import",
+        /// Culling analysis (faces, sharpness, scores, bursts).
+        Analysis => "analysis",
+        /// Writing XMP sidecars (explicit save or auto-sync).
+        XmpSave => "xmp_save",
+        /// Paste / sync settings to many photos.
+        PasteSync => "paste_sync",
+        /// Apply a scene edit to its members.
+        ApplyScene => "apply_scene",
+        Export => "export",
+        ModelDownload => "model_download",
+        Other => "other",
+    }
+}
+
+string_enum! {
+    /// Lifecycle of a background activity (v18).
+    pub enum ActivityState {
+        Running => "running",
+        /// Ended normally (possibly with per-item failures: see `message`).
+        Finished => "finished",
+        /// Ended by an error; `message` says why.
+        Error => "error",
+        /// Stopped by the user.
+        Cancelled => "cancelled",
+    }
+}
+
+/// Generic background-activity report for the corner indicator (v18). One activity = one
+/// `id`: a `running` event when it starts, throttled `running` progress events (at most 10 per
+/// second per activity), then exactly one terminal event (`finished` / `error` / `cancelled`).
+/// Several activities may run at once (e.g. import + analysis). Emitted in addition to the
+/// specific progress events (`ImportProgress`, `ExportProgress`, ...), which stay the source
+/// of truth for their screens. Emitted via `ipc::activity::Activities`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEvent {
+    /// Unique per activity within an app session.
+    pub id: u32,
+    pub kind: ActivityKind,
+    /// User-facing, e.g. "Saving metadata to XMP", "Exporting 120 photos".
+    pub label: String,
+    pub done: u32,
+    /// `null` = indeterminate (spinner without a count).
+    pub total: Option<u32>,
+    pub state: ActivityState,
+    /// Terminal events: a short user-facing summary or the error ("Saved 685 photos; 3
+    /// failed"); `null` while running unless there is something to say.
+    pub message: Option<String>,
+}
 
 /// Progress of the ingest pipeline (thumbnail + EXIF extraction).
 /// Counts cover the current pipeline run: images queued since the pipeline was last

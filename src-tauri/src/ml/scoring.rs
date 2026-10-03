@@ -398,6 +398,8 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
             model_version: MODEL_VERSION.to_string(),
             suggested_rating,
             suggested_pick,
+            // v18: filled by vision-ml-dev (Phase 8c "Suggestion reasons").
+            reasons: Vec::new(),
         },
         faces,
         tags,

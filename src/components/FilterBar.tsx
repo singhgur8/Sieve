@@ -44,7 +44,7 @@ export function useFilterCounts(folderId: number | null, projectId: number | nul
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   useEffect(() => {
     let stale = false;
-    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null))
+    unwrap(commands.getFilterCounts(folderId, projectId, keepersOnly || null, null))
       .then((c) => !stale && setCounts(c))
       .catch(() => {});
     return () => {

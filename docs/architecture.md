@@ -26,6 +26,8 @@ src-tauri/
   migrations/0014_linear_undo.sql v14: clears the applied state of scenes whose apply batch was undone (IPC v16)
   migrations/0015_apply_bases.sql v15: edit_batch_bases (the batch a scene apply's representative settings came
                                from; linear undo across Auto edit -> Apply, IPC v17)
+  migrations/0016_cull_clarity.sql v16: images.pick_origin (user/auto), quality_scores.reasons_json, keeper rule
+                               mode (old default -> not_rejected), camera/lens facet indexes (IPC v18)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -226,6 +228,14 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `mark_reviewed` / `markReviewed` (v15) | `imageIds: number[]` | `number[]` (ids whose needs-a-look was cleared) |
 | `cancel_scene_apply` / `cancelSceneApply` (v15) | – | `null` (running apply resolves with `cancelled: true`) |
 | `list_xmp_failures` / `listXmpFailures` (v15) | `projectId: number \| null` | `XmpFailure[]` (capture order) |
+| `get_cull_summary` / `getCullSummary` (v18) | `projectId: number \| null` | `CullSummary` (picked / unflagged / rejected by you vs auto / keepers + `keeperBreakdown` / suggestions pending; `keepers` = `keepersOnly` total) |
+| `get_metadata_filter_options` / `getMetadataFilterOptions` (v18) | `query: ImageQuery` | `MetadataFilterOptions` (distinct values + counts per metadata facet; each facet ignores its own constraint) |
+
+v18: `get_filter_counts(folderId, projectId, keepersOnly, metadata: MetadataFilter | null)`;
+`ImageQuery.metadata?: MetadataFilter` (file type, extension, camera, lens, ISO / focal length / aperture / shutter
+ranges, capture date range, edited, has sidecar; SQL in `repo::metadata_clauses`); `KeeperRule.mode`
+(`not_rejected` default | `picks_and_ratings`); `QualityScore.reasons: SuggestionReason[]`;
+`RawImageEntry.pickOrigin` (`user` | `auto` | null) and `CullSnapshot.pickOrigin?`; `XmpSyncState.hasSidecar`.
 
 v15: `get_filter_counts(folderId, projectId, keepersOnly)` and `ImageQuery.keepersOnly` (keepers only);
 `SceneApplyOptions.excludeIds`.
@@ -250,6 +260,14 @@ Events (`events.x.listen(cb)`): `importProgress {done,total,failed}`,
 `modelDownloadFinished {group,ok,cancelled,error}` (v12).
 `styleModelProgress {phase,done,total}`, `styleModelFinished {ok,cancelled,error,status}` (v14);
 `sceneProgress` task `"apply"` (v14).
+`activityEvent {id,kind,label,done,total,state,message}` (v18): generic background activity for the corner
+indicator. Kinds `import | analysis | xmp_save | paste_sync | apply_scene | export | model_download | other`;
+states `running` (start + progress, at most 10/s per activity) then exactly one of `finished | error | cancelled`.
+Emitted through `ipc::activity::Activities` (managed state): workers report on named channels from their
+`AppHandle` sinks (ingest `"import"`, analysis `"analysis"`, export `"export-<jobId>"`, auto-sync passes,
+model downloads); commands use `Activities::start` -> `ActivityHandle` (`write_xmp`, `write_xmp_all_dirty`,
+`paste_settings` / `sync_settings` on 2+ photos, `apply_scene_edit` / `apply_all_edited_scenes`). A handle dropped
+without ending reports `error`. New long-running work should report through the same helper.
 
 Batch writes (`ids: number[]`) are atomic: an unknown id fails the whole batch with `not_found`.
 
@@ -716,13 +734,13 @@ migrations tracked by `PRAGMA user_version`.
 
 | Table | Purpose |
 |---|---|
-| `catalog_meta` | `shoot_type` (default for new projects), `burst_window_ms`, `auto_analyze`, `xmp_auto_sync` (+ `xmp_auto_sync_user_set`, v12), `keeper_rule` (JSON `KeeperRule`, v12), `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
+| `catalog_meta` | `shoot_type` (default for new projects), `burst_window_ms`, `auto_analyze`, `xmp_auto_sync` (+ `xmp_auto_sync_user_set`, v12), `keeper_rule` (JSON `KeeperRule`, v12; `mode` since v16), `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `projects` | one shoot (v12): name, `cover_image_id` (NULL = automatic), `shoot_type`, `workflow_step`, `created_at`, `last_opened_at` |
 | `folders` | imported roots; `project_id` (v12, every folder in exactly one project; cascade on project delete) |
-| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below) |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
-| `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) |
+| `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) + `reasons_json` (v16, JSON `SuggestionReason[]`) |
 | `image_analysis` | per-image analysis status (queued/done/failed), model version, error, `phash` (u64 as i64), `faces_json` (`FaceInfo[]`), `metrics_json` (`ml::ImageMetrics`) |
 | `burst_groups` | time/similarity clusters, optional keeper |
 | `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
@@ -802,6 +820,32 @@ source none / auto_style. `outdated` = unassigned keepers or unapplied keepers i
 `replace_scenes` carries `skipped` and the coverage with the rest of the plan state. Applies run per scene in steps
 of 32 targets and check `SceneApplyControl` (managed state, `cancel_scene_apply`) between steps; finished scenes
 are committed as one batch.
+
+### Culling clarity (v16, IPC v18)
+Keepers: `KeeperRule.mode` = `not_rejected` (default: every photo not rejected) or `picks_and_ratings` (pre-v18:
+picks, unflagged >= `minRating`, untouched + pick suggestion). Three mirrors that must agree:
+`KeeperRule::is_keeper_values` (Rust), `repo::keeper_predicate` (SQL: `keepersOnly`, keeper filter counts, cull
+summary, scene numbering) + `PROJECT_SQL` (project counts, `?4` = not_rejected) and `isKeeperValues` (TS,
+`src/ipc/index.ts`). `repo::cull_summary` counts with the same predicate, so its `keepers` equals a `keepersOnly`
+query; `keeperBreakdown` parts are disjoint and add up to it.
+
+Pick origin: `images.pick_origin` is written explicitly by every writer of `pick` (no trigger can tell whether an
+UPDATE set the column): `repo::set_pick` -> `user`; `repo::apply_suggestions` -> `auto` when it changes the flag
+(unchanged keeps its origin); `repo::restore_cull_snapshot` -> the snapshot's `pickOrigin` (missing = `user`);
+`xmp::store::apply_read` -> `user` when a sidecar changes the flag. Pre-v16 flags read as `user`. Reported as
+`null` while unflagged.
+
+Suggestion reasons: `QualityScore.reasons` (`quality_scores.reasons_json`) are produced by the culling engine with
+the score (`ml::scoring`, burst capping in `ml::bursts`) and stored by `ml::store::write_scored`; unreadable JSON
+reads as none.
+
+Metadata filters: `repo::metadata_clauses(filter, prefix, skip)` builds the SQL for `ImageQuery.metadata`
+(`query_filter`) and `get_filter_counts(.., metadata)` (`filter_counts_with`); `get_metadata_filter_options` runs
+one grouped query per facet with that facet's own constraint skipped (Lightroom's cascading columns). Extension =
+text after the last dot of `file_name`, lower-cased (pure SQL); blank lens / model = unknown (`NULL`); focal length
+and aperture compare at 0.1 (the facet's rounding); range bounds get 1e-6 relative slack; capture days are the
+floor of the naive capture ms; has sidecar = `xmp_mtime_ms IS NOT NULL` (a sidecar existed at the last write /
+read; import reads existing sidecars); edited = a non-neutral `adjustments` row (`hasEdits`).
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

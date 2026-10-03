@@ -201,12 +201,14 @@ fn insert_project(conn: &Connection, name: &str, shoot_type: ShootType) -> AppRe
 }
 
 /// SQL of `Project` rows (without folders / cover path); `?1` = project id or NULL for all,
-/// `?2` / `?3` = keeper rule (`KeeperRule::is_keeper_values` mirror).
+/// `?2` / `?3` / `?4` = keeper rule `minRating` / `useSuggestions` / mode is `not_rejected`
+/// (`KeeperRule::is_keeper_values` mirror).
 const PROJECT_SQL: &str = "
     SELECT p.id, p.name, p.cover_image_id, p.shoot_type, p.workflow_step, p.created_at, p.last_opened_at,
            COUNT(i.id),
            COALESCE(SUM(CASE WHEN i.pick = 'reject' THEN 0
                              WHEN i.pick = 'pick' THEN 1
+                             WHEN ?4 THEN 1
                              WHEN i.rating >= ?2 THEN 1
                              WHEN i.rating = 0 AND ?3 AND q.suggested_pick = 'pick' THEN 1
                              ELSE 0 END), 0),
@@ -227,7 +229,7 @@ fn query_projects(conn: &Connection, id: Option<ProjectId>) -> AppResult<Vec<Pro
     let rule = repo::keeper_rule(conn)?;
     let mut projects = conn
         .prepare_cached(PROJECT_SQL)?
-        .query_map(params![id, rule.min_rating, rule.use_suggestions], |r| {
+        .query_map(params![id, rule.min_rating, rule.use_suggestions, rule.mode == KeeperMode::NotRejected], |r| {
             let cover: Option<ImageId> = r.get(2)?;
             Ok(Project {
                 id: r.get(0)?,

@@ -224,6 +224,7 @@ mod tests {
             thumbnail: ThumbnailState::Pending,
             rating: 4,
             pick: PickFlag::Unflagged,
+            pick_origin: None,
             color_label: None,
             burst_group_id: None,
             is_burst_keeper: false,

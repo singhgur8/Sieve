@@ -116,6 +116,7 @@ mod tests {
             model_version: String::new(),
             suggested_rating: stars,
             suggested_pick: pick,
+            reasons: Vec::new(),
         };
         let mut a = q(PickFlag::Pick, 5);
         demote(&mut a, 4);

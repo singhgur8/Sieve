@@ -987,11 +987,11 @@ mod tests {
         assert_eq!(e.representative_id, ids[3]); // best overall
         assert_eq!(e.representative_source, RepresentativeSource::Auto);
 
-        repo::set_keeper_rule(&conn, &KeeperRule { min_rating: 3, use_suggestions: false }).unwrap();
+        repo::set_keeper_rule(&conn, &KeeperRule::picks_and_ratings(3, false)).unwrap();
         assert_eq!(edit_plan(&conn, folder).unwrap().keeper_ids, vec![ids[0]]);
         repo::set_keeper_rule(&conn, &KeeperRule::default()).unwrap();
         assert_eq!(
-            repo::set_keeper_rule(&conn, &KeeperRule { min_rating: 0, use_suggestions: true }).unwrap_err().kind,
+            repo::set_keeper_rule(&conn, &KeeperRule::picks_and_ratings(0, true)).unwrap_err().kind,
             ErrorKind::InvalidArgument
         );
 
@@ -1197,7 +1197,7 @@ mod tests {
     fn keepers_added_after_apply_exclusions_and_outdated_plan() {
         let (mut conn, project, scene, ids) = fixture();
         // Keeper rule without suggestions: keepers 0 (pick) and 1 (2 stars).
-        repo::set_keeper_rule(&conn, &KeeperRule { min_rating: 1, use_suggestions: false }).unwrap();
+        repo::set_keeper_rule(&conn, &KeeperRule::picks_and_ratings(1, false)).unwrap();
         set_representative(&conn, scene, Some(ids[1])).unwrap();
         let graded = ParametricAdjustments { exposure: 0.7, ..ParametricAdjustments::default() };
         history::commit(&mut conn, ids[1], &graded, "Exposure").unwrap();
@@ -1273,7 +1273,7 @@ mod tests {
         assert_eq!(set_skipped(&conn, 999, true).unwrap_err().kind, ErrorKind::NotFound);
 
         // Minor: at most MINOR_SCENE_MAX_KEEPERS keepers.
-        repo::set_keeper_rule(&conn, &KeeperRule { min_rating: 3, use_suggestions: false }).unwrap();
+        repo::set_keeper_rule(&conn, &KeeperRule::picks_and_ratings(3, false)).unwrap();
         let plan = edit_plan(&conn, project).unwrap();
         assert!(plan.scenes[0].minor);
         assert_eq!(plan.counts.minor, 1);

@@ -350,6 +350,8 @@ export function isKeeperValues(
     case "pick":
       return true;
     default:
+      // v18: the default mode keeps everything that is not rejected.
+      if (rule.mode === "not_rejected") return true;
       if (rating >= rule.minRating) return true;
       return rating === 0 && rule.useSuggestions && suggestedPick === "pick";
   }

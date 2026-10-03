@@ -130,9 +130,28 @@ pub trait ExportSink: Send + Sync {
 
 impl<R: Runtime> ExportSink for AppHandle<R> {
     fn progress(&self, event: ExportProgress) {
+        // Background-activity indicator (IPC v18): one activity per job.
+        if let Some(a) = crate::ipc::activity::activities(self) {
+            let label = format!("Exporting {}", crate::ipc::activity::photos(event.total));
+            let kind = crate::ipc::events::ActivityKind::Export;
+            a.progress(&format!("export-{}", event.job_id), kind, &label, event.done, Some(event.total));
+        }
         let _ = event.emit(self);
     }
     fn finished(&self, event: ExportFinished) {
+        if let Some(a) = crate::ipc::activity::activities(self) {
+            use crate::ipc::activity::photos;
+            use crate::ipc::events::ActivityState;
+            let mut message = format!("Exported {}", photos(event.succeeded));
+            if event.skipped > 0 {
+                message += &format!("; {} skipped", event.skipped);
+            }
+            if !event.failed.is_empty() {
+                message += &format!("; {} failed", event.failed.len());
+            }
+            let state = if event.cancelled { ActivityState::Cancelled } else { ActivityState::Finished };
+            a.finish(&format!("export-{}", event.job_id), state, Some(message));
+        }
         let _ = event.emit(self);
     }
 }

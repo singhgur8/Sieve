@@ -117,9 +117,36 @@ export const commands = {
 	/**
 	 *  Filter-bar facet counts for `folderId` AND `projectId` (both `null` = whole catalog; v14:
 	 *  inside a project pass its id). `keepersOnly` (v15; `null` = false) counts keepers only
-	 *  (`ImageQuery.keepersOnly`, the Edit / Export steps). Unknown project -> `not_found`.
+	 *  (`ImageQuery.keepersOnly`, the Edit / Export steps). `metadata` (v18; `null` = none) counts
+	 *  only images passing the Library Filter metadata constraints (`ImageQuery.metadata`), so
+	 *  the facet counts follow the metadata row. Unknown project -> `not_found`; an invalid
+	 *  constraint -> `invalid_argument`.
 	 */
-	getFilterCounts: (folderId: number | null, projectId: number | null, keepersOnly: boolean | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId, keepersOnly })),
+	getFilterCounts: (folderId: number | null, projectId: number | null, keepersOnly: boolean | null, metadata: {
+	/**  File type (Lightroom "File Type"): image's `format` is one of these. */
+	formats?: ImageFormat[],
+	/**
+	 *  File extension without the dot, case-insensitive (`"arw"`, `"jpg"`): `[A-Za-z0-9]{1,10}`
+	 *  each, else `invalid_argument`.
+	 */
+	extensions?: string[],
+	/**  Camera body (make + model) is one of these. */
+	cameras?: CameraFilter[],
+	/**  Lens is one of these; `null` = lens unknown. */
+	lenses?: (string | null)[],
+	iso?: NumberRange | null,
+	/**  Focal length in mm, compared at 0.1 mm (the facet's rounding). */
+	focalLengthMm?: NumberRange | null,
+	/**  f-number, compared at 0.1 (the facet's rounding). */
+	aperture?: NumberRange | null,
+	/**  Exposure time in seconds (1/250 s = 0.004). */
+	shutterSeconds?: NumberRange | null,
+	captured?: DateRange | null,
+	/**  `true` = has develop edits (`RawImageEntry.hasEdits`), `false` = unedited. */
+	edited?: boolean | null,
+	/**  `true` = has an XMP sidecar (`XmpSyncState.hasSidecar`), `false` = none known. */
+	hasSidecar?: boolean | null,
+} | null) => typedError<FilterCounts, AppError>(__TAURI_INVOKE("get_filter_counts", { folderId, projectId, keepersOnly, metadata })),
 	/**
 	 *  Writes `<basename>.xmp` sidecars for `ids` now (catalog wins; unrelated XMP fields are
 	 *  preserved). Unknown ids -> `not_found`; per-file errors are listed in the report.
@@ -802,10 +829,26 @@ export const commands = {
 	 *  `not_found`.
 	 */
 	getEditBatches: (batchIds: number[]) => typedError<EditBatchInfo[], AppError>(__TAURI_INVOKE("get_edit_batches", { batchIds })),
+	/**
+	 *  Cull step summary for `projectId` (`null` = whole catalog) (v18): picked / unflagged /
+	 *  rejected (by you vs. "Auto") / keepers with the breakdown under the catalog's keeper rule /
+	 *  suggestions not acted on. `keepers` equals a `keepersOnly` query's total over the same
+	 *  scope. Unknown project -> `not_found`.
+	 */
+	getCullSummary: (projectId: number | null) => typedError<CullSummary, AppError>(__TAURI_INVOKE("get_cull_summary", { projectId })),
+	/**
+	 *  Distinct values with image counts for each Library Filter metadata facet (v18) over
+	 *  `query`'s images (pass the grid's query: scope, flags, tags and metadata; sort / offset /
+	 *  limit are ignored). Each facet ignores its own constraint (Lightroom's cascading columns).
+	 *  Like `list_images`, an unknown project matches nothing; an invalid constraint ->
+	 *  `invalid_argument`.
+	 */
+	getMetadataFilterOptions: (query: ImageQuery) => typedError<MetadataFilterOptions, AppError>(__TAURI_INVOKE("get_metadata_filter_options", { query })),
 };
 
 /** Events */
 export const events = {
+	activityEvent: makeEvent<ActivityEvent>("activity-event"),
 	analysisFailed: makeEvent<AnalysisFailed>("analysis-failed"),
 	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
@@ -833,7 +876,7 @@ export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"a
 
 export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
-export const DEFAULT_KEEPER_RULE = {"minRating":1,"useSuggestions":true} as const;
+export const DEFAULT_KEEPER_RULE = {"minRating":1,"mode":"not_rejected","useSuggestions":true} as const;
 
 export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"hue":0.0,"saturation":0.0},"contrast":0.0,"curveRefineSaturation":100.0,"defringe":0.0,"dehaze":0.0,"exposure":0.0,"highlights":0.0,"hue":0.0,"moire":0.0,"noise":0.0,"saturation":0.0,"shadows":0.0,"sharpness":0.0,"temperature":0.0,"texture":0.0,"tint":0.0,"toneCurve":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]},"whites":0.0} as const;
 
@@ -850,6 +893,53 @@ export const PASTE_PREVIOUS_FIELDS = ["white_balance","exposure","contrast","hig
 export const USER_PRESETS_GROUP_ID = 1 as const;
 
 /* Types */
+/**
+ *  Generic background-activity report for the corner indicator (v18). One activity = one
+ *  `id`: a `running` event when it starts, throttled `running` progress events (at most 10 per
+ *  second per activity), then exactly one terminal event (`finished` / `error` / `cancelled`).
+ *  Several activities may run at once (e.g. import + analysis). Emitted in addition to the
+ *  specific progress events (`ImportProgress`, `ExportProgress`, ...), which stay the source
+ *  of truth for their screens. Emitted via `ipc::activity::Activities`.
+ */
+export type ActivityEvent = {
+	/**  Unique per activity within an app session. */
+	id: number,
+	kind: ActivityKind,
+	/**  User-facing, e.g. "Saving metadata to XMP", "Exporting 120 photos". */
+	label: string,
+	done: number,
+	/**  `null` = indeterminate (spinner without a count). */
+	total: number | null,
+	state: ActivityState,
+	/**
+	 *  Terminal events: a short user-facing summary or the error ("Saved 685 photos; 3
+	 *  failed"); `null` while running unless there is something to say.
+	 */
+	message: string | null,
+};
+
+/**  What a background activity is doing (v18, [`ActivityEvent`]). */
+export type ActivityKind = 
+/**  Import: thumbnail + EXIF extraction of new photos. */
+"import" | 
+/**  Culling analysis (faces, sharpness, scores, bursts). */
+"analysis" | 
+/**  Writing XMP sidecars (explicit save or auto-sync). */
+"xmp_save" | 
+/**  Paste / sync settings to many photos. */
+"paste_sync" | 
+/**  Apply a scene edit to its members. */
+"apply_scene" | "export" | "model_download" | "other";
+
+/**  Lifecycle of a background activity (v18). */
+export type ActivityState = "running" | 
+/**  Ended normally (possibly with per-item failures: see `message`). */
+"finished" | 
+/**  Ended by an error; `message` says why. */
+"error" | 
+/**  Stopped by the user. */
+"cancelled";
+
 /**
  *  Groups of `ParametricAdjustments` selectable in a fields mask (Lightroom's
  *  "Copy Settings" / preset checkboxes). `ALL` selects everything.
@@ -1235,6 +1325,17 @@ export type CameraCalibration = {
 	shadowTint: number,
 };
 
+export type CameraCount = {
+	camera: CameraFilter,
+	count: number,
+};
+
+/**  One camera body of the camera facet (v18): `model = null` = model unknown. */
+export type CameraFilter = {
+	make: CameraMake,
+	model: string | null,
+};
+
 export type CameraInfo = {
 	make: CameraMake,
 	model: string | null,
@@ -1458,6 +1559,45 @@ export type CullSnapshot = {
 	rating: number,
 	pick: PickFlag,
 	colorLabel: ColorLabel | null,
+	/**
+	 *  Who set `pick` (v18; `RawImageEntry.pickOrigin`). Restored with the flag, so undoing a
+	 *  user flag over an "Auto" reject brings back an `auto` reject. Missing / `null` restores
+	 *  as `user`.
+	 */
+	pickOrigin?: PickOrigin | null,
+};
+
+/**
+ *  `get_cull_summary(projectId)` (v18): the Cull step readout "picked / unflagged / rejected /
+ *  keepers = formula". `total = picked + unflagged + rejected`; `keepers` equals the number of
+ *  images a `keepersOnly` query over the same scope returns.
+ */
+export type CullSummary = {
+	total: number,
+	picked: number,
+	/**
+	 *  Of `picked`, flagged by `apply_suggestions` ("Auto") and not changed by the user since
+	 *  (`RawImageEntry.pickOrigin = auto`).
+	 */
+	pickedAuto: number,
+	unflagged: number,
+	rejected: number,
+	/**  Of `rejected`, rejected by the user (flag keys, sidecar reads, undo of a user flag). */
+	rejectedByUser: number,
+	/**  Of `rejected`, rejected by `apply_suggestions` and not changed by the user since. */
+	rejectedAuto: number,
+	/**  Photos rated 1..=5 stars (any flag). */
+	starred: number,
+	keepers: number,
+	keeperBreakdown: KeeperBreakdown,
+	/**  The rule `keepers` was counted with (= `CatalogState.keeperRule`). */
+	keeperRule: KeeperRule,
+	/**  Analysed photos the engine suggests rejecting that are still unflagged (not acted on). */
+	suggestedRejectPending: number,
+	/**  Analysed photos the engine suggests picking that are still unflagged. */
+	suggestedPickPending: number,
+	/**  Photos without a `QualityScore` yet (not analysed, or analysis failed). */
+	unanalyzed: number,
 };
 
 /**  Granular reason a frame may be culled (or deliberately kept). */
@@ -1509,6 +1649,25 @@ export type CullThresholds = {
 	/**  `overall` below this suggests `reject`. 0..=1, `<= pickMinOverall`. */
 	rejectMaxOverall: number,
 	weights: ScoreWeights,
+};
+
+/**
+ *  Capture-time range (v18) in the naive ms of `CaptureMeta.capturedAtMs`: `fromMs` inclusive,
+ *  `toMs` exclusive (one day = `[dayStartMs, dayStartMs + 86_400_000)`); `null` = open.
+ *  Images without a capture time never match.
+ */
+export type DateRange = {
+	fromMs: number | null,
+	toMs: number | null,
+};
+
+/**
+ *  Images captured on one (naive, camera-local) day; `dayStartMs = null` counts images
+ *  without a capture time.
+ */
+export type DayCount = {
+	dayStartMs: number | null,
+	count: number,
 };
 
 export type DetailAdjustments = {
@@ -1947,6 +2106,12 @@ export type ExposureStats = {
 	meanLuma: number,
 };
 
+export type ExtensionCount = {
+	/**  Lower case, without the dot. */
+	extension: string,
+	count: number,
+};
+
 /**
  *  One detected face, for the loupe's face-crop zoom and per-face diagnostics.
  *  Raw measurements (`ear`, `sharpness`) are threshold-independent; the derived flags
@@ -2013,6 +2178,11 @@ export type FolderEntry = {
 	imageCount: number,
 	/**  Project this folder belongs to (v14; every folder belongs to exactly one). */
 	projectId: number,
+};
+
+export type FormatCount = {
+	format: ImageFormat,
+	count: number,
 };
 
 /**
@@ -2157,6 +2327,8 @@ export type ImageQuery = {
 	projectId?: number | null,
 	/**  Only keepers under the catalog's `KeeperRule` (v15; the Edit / Export steps' grid). */
 	keepersOnly?: boolean,
+	/**  Lightroom-style Library Filter "Metadata" constraints (v18; default: none). */
+	metadata?: MetadataFilter,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -2299,27 +2471,70 @@ export type ImportSummary = {
 };
 
 /**
- *  Which images are keepers (Edit step scenes, Export step selection). One definition for
- *  the whole app ([`KeeperRule::is_keeper`], TS mirror `isKeeper`):
- *  1. rejected by the user -> never;
- *  2. picked by the user -> keeper;
- *  3. rated `>= minRating` stars by the user -> keeper;
- *  4. untouched by the user (unflagged and 0 stars) and `useSuggestions` -> keeper iff the
- *     culling engine suggests `pick` (`QualityScore.suggestedPick`; burst non-keepers are never
- *     suggested `pick`).
+ *  How the keepers of a [`CullSummary`] are made up under its `keeperRule` (v18). The parts
+ *  are disjoint and add up to `CullSummary.keepers`:
+ *  - `not_rejected`: `picked + unflagged` (`starred = suggested = 0`);
+ *  - `picks_and_ratings`: `picked + starred + suggested` (`unflagged = 0`).
+ */
+export type KeeperBreakdown = {
+	/**  Picked photos (always keepers). */
+	picked: number,
+	/**  `not_rejected`: unflagged photos (any stars). */
+	unflagged: number,
+	/**  `picks_and_ratings`: unflagged photos rated `>= minRating`. */
+	starred: number,
+	/**
+	 *  `picks_and_ratings` with `useSuggestions`: unflagged 0-star photos the engine suggests
+	 *  `pick`.
+	 */
+	suggested: number,
+};
+
+/**  How [`KeeperRule`] decides (v18). */
+export type KeeperMode = 
+/**
+ *  Every photo that is not rejected is a keeper (picked or unflagged; stars and
+ *  suggestions do not matter). The default since v18 (user decision 2026-10-03).
+ */
+"not_rejected" | 
+/**
+ *  The pre-v18 rule: picks, unflagged photos rated `>= minRating`, and (with
+ *  `useSuggestions`) untouched photos the engine suggests `pick`.
+ */
+"picks_and_ratings";
+
+/**
+ *  Which images are keepers (Edit step scenes, Export step selection, cull summary). One
+ *  definition for the whole app ([`KeeperRule::is_keeper`], SQL mirror
+ *  `repo::keeper_predicate`, TS mirror `isKeeper`):
+ *  1. rejected (by the user or by `apply_suggestions`) -> never;
+ *  2. picked -> keeper;
+ *  3. mode `not_rejected` (default): every other (unflagged) photo -> keeper;
+ *  4. mode `picks_and_ratings`: unflagged and rated `>= minRating` -> keeper; unflagged with
+ *     0 stars and `useSuggestions` -> keeper iff the culling engine suggests `pick`
+ *     (`QualityScore.suggestedPick`; burst non-keepers are never suggested `pick`); otherwise
+ *     not a keeper.
  * 
- *  Otherwise (unflagged with 1..minRating-1 stars, or untouched without a pick suggestion)
- *  not a keeper.
+ *  `minRating` / `useSuggestions` are kept (and validated) in both modes, so switching back
+ *  to `picks_and_ratings` restores the user's thresholds.
  */
 export type KeeperRule = {
-	/**  1..=5. Default 1 (any star keeps, Lightroom convention). */
+	/**  v18. Default `not_rejected`. */
+	mode: KeeperMode,
+	/**  `picks_and_ratings` only. 1..=5. Default 1 (any star keeps, Lightroom convention). */
 	minRating: number,
-	/**  Default `true`. */
+	/**  `picks_and_ratings` only. Default `true`. */
 	useSuggestions: boolean,
 };
 
 /**  Landscape categories of an AI "Landscape" selection (Lightroom 13; sky is `AiTarget::Sky`). */
 export type LandscapeCategory = "water" | "vegetation" | "mountains" | "architecture" | "natural_ground" | "artificial_ground";
+
+export type LensCount = {
+	/**  `null` = unknown lens. */
+	lens: string | null,
+	count: number,
+};
 
 /**
  *  Linear gradient: 0 % effect at `zero`, 100 % at `full`, linear ramp between, constant
@@ -2748,6 +2963,64 @@ export type MatchPreview = {
 };
 
 /**
+ *  Library Filter "Metadata" constraints (v18, `ImageQuery.metadata`, also accepted by
+ *  `get_filter_counts`). All fields optional on the wire; each set field narrows the result
+ *  (AND across fields, OR within a list). Values come from `get_metadata_filter_options`.
+ */
+export type MetadataFilter = {
+	/**  File type (Lightroom "File Type"): image's `format` is one of these. */
+	formats?: ImageFormat[],
+	/**
+	 *  File extension without the dot, case-insensitive (`"arw"`, `"jpg"`): `[A-Za-z0-9]{1,10}`
+	 *  each, else `invalid_argument`.
+	 */
+	extensions?: string[],
+	/**  Camera body (make + model) is one of these. */
+	cameras?: CameraFilter[],
+	/**  Lens is one of these; `null` = lens unknown. */
+	lenses?: (string | null)[],
+	iso?: NumberRange | null,
+	/**  Focal length in mm, compared at 0.1 mm (the facet's rounding). */
+	focalLengthMm?: NumberRange | null,
+	/**  f-number, compared at 0.1 (the facet's rounding). */
+	aperture?: NumberRange | null,
+	/**  Exposure time in seconds (1/250 s = 0.004). */
+	shutterSeconds?: NumberRange | null,
+	captured?: DateRange | null,
+	/**  `true` = has develop edits (`RawImageEntry.hasEdits`), `false` = unedited. */
+	edited?: boolean | null,
+	/**  `true` = has an XMP sidecar (`XmpSyncState.hasSidecar`), `false` = none known. */
+	hasSidecar?: boolean | null,
+};
+
+/**
+ *  `get_metadata_filter_options(query)` (v18): distinct values with image counts per facet.
+ *  Each facet is counted over the query's images with every constraint applied **except that
+ *  facet's own** (Lightroom's cascading columns), so a value's count is what selecting it
+ *  (alone) would show. Values with 0 images are omitted. Order: formats in `ImageFormat`
+ *  order; extensions, cameras, lenses by name (unknown last); numbers ascending (unknown
+ *  last); days ascending (unknown last).
+ */
+export type MetadataFilterOptions = {
+	/**  Images matching the query (all constraints). */
+	total: number,
+	formats: FormatCount[],
+	extensions: ExtensionCount[],
+	cameras: CameraCount[],
+	lenses: LensCount[],
+	isos: NumberCount[],
+	/**  Rounded to 0.1 mm. */
+	focalLengths: NumberCount[],
+	/**  Rounded to 0.1. */
+	apertures: NumberCount[],
+	/**  Exact stored seconds. */
+	shutterSpeeds: NumberCount[],
+	captureDays: DayCount[],
+	edited: YesNoCount,
+	hasSidecar: YesNoCount,
+};
+
+/**
  *  Which metadata is copied into exported files. Develop settings (`crs:`) and Sieve's
  *  culling tags (`Sieve|*`) are never exported. Orientation is always written as 1
  *  (pixels are rotated); the ICC profile and resolution are always present.
@@ -2888,6 +3161,22 @@ export type NormRect = {
 	height: number,
 };
 
+/**  A distinct numeric value and its image count; `value = null` counts images without it. */
+export type NumberCount = {
+	value: number | null,
+	count: number,
+};
+
+/**
+ *  Inclusive numeric range (v18); a `null` bound is open. Images without the value never
+ *  match a range. Bounds are compared with a tiny tolerance (1e-6 relative), so a facet
+ *  value (`MetadataFilterOptions`) used as both bounds selects exactly that value.
+ */
+export type NumberRange = {
+	min: number | null,
+	max: number | null,
+};
+
 /**  A colour in Oklab (L 0..=1; a/b ~ -0.4..=0.4, 0 = neutral). */
 export type OklabColor = {
 	l: number,
@@ -2960,6 +3249,17 @@ export type ParametricCurve = {
 export type PersonPart = "face_skin" | "body_skin" | "eyebrows" | "eye_sclera" | "iris_pupil" | "lips" | "teeth" | "hair" | "clothes";
 
 export type PickFlag = "pick" | "reject" | "unflagged";
+
+/**  Who set an image's pick / reject flag (v18; `images.pick_origin`). */
+export type PickOrigin = 
+/**
+ *  The user: flag commands, undo/redo of the user's flags, sidecar reads (a flag
+ *  found in an XMP file counts as a person's decision). Flags set before v18 count as
+ *  `user`.
+ */
+"user" | 
+/**  `apply_suggestions` ("Auto"), not changed by the user since. */
+"auto";
 
 /**  One file an export would write (`plan_export`). */
 export type PlannedFile = {
@@ -3154,6 +3454,13 @@ export type QualityScore = {
 	 *  Never written to `RawImageEntry.pick` except through `apply_suggestions`.
 	 */
 	suggestedPick: PickFlag,
+	/**
+	 *  Why the engine suggests what it does, most important first (v18; filled by the culling
+	 *  engine for every non-`pick` suggestion and every auto tag; may be empty, e.g. for
+	 *  scores written before v18 until the next analysis / rescore). Stored as JSON with the
+	 *  score (`quality_scores.reasons_json`).
+	 */
+	reasons: SuggestionReason[],
 };
 
 /**
@@ -3197,6 +3504,8 @@ export type RawImageEntry = {
 	/**  Star rating 0..=5. */
 	rating: number,
 	pick: PickFlag,
+	/**  Who set `pick` (v18); `null` when `pick = unflagged`. */
+	pickOrigin: PickOrigin | null,
 	colorLabel: ColorLabel | null,
 	burstGroupId: number | null,
 	/**  This image is its burst group's keeper. */
@@ -3843,6 +4152,37 @@ export type StyleValidation = {
 	noEditDeltaE: number,
 };
 
+/**
+ *  One human-readable reason behind a suggestion (v18), e.g.
+ *  `{kind: "blink", text: "Eyes closed"}` or
+ *  `{kind: "duplicate_burst", text: "Duplicate in burst (keeper DSC0123)", relatedImageId: 42}`.
+ */
+export type SuggestionReason = {
+	kind: SuggestionReasonKind,
+	/**  Short, user-facing, sentence case, no trailing period. */
+	text: string,
+	/**  Another image the reason refers to (the burst keeper for `duplicate_burst`). */
+	relatedImageId?: number | null,
+};
+
+/**
+ *  Category of a [`SuggestionReason`] (v18). Tag-like kinds match the `CullTag` of the
+ *  same name.
+ */
+export type SuggestionReasonKind = 
+/**  Eyes closed (`blink`). */
+"blink" | 
+/**  The face (or, without a usable face, the frame) is not sharp (`missed_focus`). */
+"missed_focus" | "motion_blur" | 
+/**  Intentional blur, not a defect (`creative_blur`). */
+"creative_blur" | "underexposed" | "overexposed" | 
+/**  A better frame of the same burst exists (`relatedImageId` = the burst keeper). */
+"duplicate_burst" | 
+/**  Low overall score without a single dominant defect. */
+"low_score" | 
+/**  Anything else (the text says what). */
+"other";
+
 export type TagCount = {
 	tag: CullTag,
 	count: number,
@@ -4016,6 +4356,12 @@ export type XmpSyncState = {
 	syncedAtMs: number | null,
 	/**  Reason of the last failed write/read; `None` after a success. */
 	error: string | null,
+	/**
+	 *  A sidecar existed at the last successful write or read (import reads existing
+	 *  sidecars) (v18; `ImageQuery.metadata.hasSidecar`). `false` = never synced, or no
+	 *  sidecar was found then.
+	 */
+	hasSidecar: boolean,
 };
 
 /**
@@ -4035,6 +4381,11 @@ export type XmpSynced = {
 export type XmpWriteFailed = {
 	imageId: number,
 	reason: string,
+};
+
+export type YesNoCount = {
+	yes: number,
+	no: number,
 };
 
 /* Tauri Specta runtime */

@@ -70,6 +70,15 @@ import type {
   StylePreset,
   StyleProfile,
   WorkflowStep,
+  ActivityEvent,
+  ActivityKind,
+  ActivityState,
+  CullSummary,
+  ImageFormat,
+  MetadataFilter,
+  MetadataFilterOptions,
+  NumberRange,
+  SuggestionReason,
 } from "../ipc";
 import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS } from "../ipc";
 
@@ -223,6 +232,8 @@ declare global {
     __mockExportManual?: boolean;
     /** Advances the running mock export job by n files (default 1); finishes it when done. */
     __mockExportStep?: (n?: number) => void;
+    /** v18: emits an arbitrary `activityEvent` (corner indicator tests). */
+    __mockActivity?: (e: ActivityEvent) => void;
     /** Test hook: the mock auto-sync writer reports `running` in `get_xmp_status`. */
     __mockXmpRunning?: boolean;
     /** Test hook: emulates an auto-sync pass (writes every dirty photo it can, emits `xmp-synced` / `xmp-write-failed`). */
@@ -315,6 +326,27 @@ const DEFAULT_PASTE_PREVIOUS: AdjustmentField[] = [
   "calibration", "sharpening", "noise_reduction", "vignette", "grain", "black_and_white", "crop", "profile", "process_version",
 ];
 
+/** v18 `QualityScore.reasons` like the engine fills them: one per auto tag, plus a low score for
+ *  reject suggestions without a tag. `keeperId` = the burst keeper (for `duplicate_burst`). */
+function mockReasons(e: RawImageEntry, keeperId: number | null): SuggestionReason[] {
+  const text: Record<CullTag, string> = {
+    blink: "Eyes closed",
+    missed_focus: "Missed focus on the face",
+    motion_blur: "Motion blur",
+    creative_blur: "Intentional blur (kept)",
+    underexposed: "Too dark",
+    overexposed: "Blown highlights on skin",
+    duplicate_burst: "Duplicate in burst",
+  };
+  const out: SuggestionReason[] = e.tags.map((t) =>
+    t.tag === "duplicate_burst" && keeperId != null && keeperId !== e.id
+      ? { kind: "duplicate_burst", text: `Duplicate in burst (keeper DSC${String(keeperId).padStart(5, "0")})`, relatedImageId: keeperId }
+      : { kind: t.tag, text: text[t.tag], relatedImageId: null },
+  );
+  if (e.quality?.suggestedPick === "reject" && out.length === 0) out.push({ kind: "low_score", text: "Low overall quality", relatedImageId: null });
+  return out;
+}
+
 export function installMockBackend(count: number) {
   window.__ipcLog = [];
   const rand = rng(42);
@@ -373,10 +405,14 @@ export function installMockBackend(count: number) {
         modelVersion: "mock",
         suggestedRating: Math.round(overall * 5),
         suggestedPick: overall > 0.8 ? "pick" : overall < 0.15 ? "reject" : "unflagged",
+        reasons: [],
       },
       hasEdits: false,
-      xmp: { dirty: false, syncedAtMs: null, error: null },
+      // v18: every 4th frame came with a sidecar.
+      xmp: { dirty: false, syncedAtMs: null, error: null, hasSidecar: id % 4 === 0 },
+      pickOrigin: null,
     };
+    entry.quality!.reasons = mockReasons(entry, inBurst ? (group - 1) * 25 + 2 : null);
     rows.push(entry);
     if (inBurst) {
       const g = bursts.get(group) ?? { id: group, startedAtMs: entry.capture.capturedAtMs ?? 0, endedAtMs: 0, keeperImageId: null, imageIds: [] };
@@ -395,15 +431,33 @@ export function installMockBackend(count: number) {
   if (errorsOn) {
     for (const r of rows) {
       if (r.id % 10 === 7) r.thumbnail = { status: "failed", reason: `Could not decode ${r.path}: unsupported RAW variant. The file may be damaged, still copying, or from an unsupported camera.` };
-      if (mockReadOnly(r.id)) r.xmp = { dirty: true, syncedAtMs: null, error: READ_ONLY(r.id) };
+      if (mockReadOnly(r.id)) r.xmp = { ...r.xmp, dirty: true, syncedAtMs: null, error: READ_ONLY(r.id) };
       if (r.id % 10 === 3) r.missingSinceMs = base + 3_600_000;
     }
   }
-  // A few pre-set flags so screenshots show something.
-  for (let i = 0; i < count; i += 7) rows[i].pick = i % 14 === 0 ? "pick" : "reject";
+  // A few pre-set flags so screenshots show something (v18: set by the user).
+  for (let i = 0; i < count; i += 7) {
+    rows[i].pick = i % 14 === 0 ? "pick" : "reject";
+    rows[i].pickOrigin = "user";
+  }
+  // v18 `?meta=1`: varied file types / cameras / lenses for the metadata filter row (default data
+  // stays all Sony ARW so existing suites are unaffected).
+  if (new URLSearchParams(location.search).get("meta") === "1") {
+    for (const r of rows) {
+      const stem = r.fileName.replace(/\.[^.]+$/, "");
+      if (r.id % 4 === 0) {
+        Object.assign(r, { fileName: `${stem}.JPG`, path: r.path.replace(/\.[^.]+$/, ".JPG"), format: "jpeg" });
+      } else if (r.id % 4 === 1) {
+        Object.assign(r, { fileName: `${stem}.RAF`, path: r.path.replace(/\.[^.]+$/, ".RAF"), format: "raf" });
+        r.camera = { make: "fujifilm", model: "X-T5", sensorLayout: "x_trans" };
+        r.capture = { ...r.capture, lens: "XF33mmF1.4 R LM WR", focalLengthMm: 33, aperture: 1.4 };
+      }
+      if (r.id % 6 === 0) r.capture = { ...r.capture, lens: null };
+    }
+  }
   for (let i = 0; i < count; i += 5) rows[i].rating = (i / 5) % 6;
   for (let i = 0; i < count; i += 11) rows[i].colorLabel = LABELS[i % LABELS.length];
-  for (let i = 3; i < count; i += 40) rows[i].xmp = { dirty: true, syncedAtMs: null, error: null };
+  for (let i = 3; i < count; i += 40) rows[i].xmp = { ...rows[i].xmp, dirty: true, syncedAtMs: null, error: null };
   void rand;
 
   // ---- Phase 8 hardening (v13): `?missing=N` flags images 1..N missing; `?health=read_only|replaced` ----
@@ -462,7 +516,11 @@ export function installMockBackend(count: number) {
     // Existing Playwright suites expect auto-sync off; `?autosync=1` gives the v14 default (on).
     xmpAutoSync: params.get("autosync") === "1",
     health,
-    keeperRule: { minRating: 1, useSuggestions: true },
+    // Existing suites were written for the pre-v18 rule; `?keepers=not_rejected` gives the v18 default.
+    keeperRule:
+      params.get("keepers") === "not_rejected"
+        ? { mode: "not_rejected", minRating: 1, useSuggestions: true }
+        : { mode: "picks_and_ratings", minRating: 1, useSuggestions: true },
   };
 
   // ---- projects (v14): one project per mock folder; `?projects=0` starts with none ----
@@ -575,6 +633,7 @@ export function installMockBackend(count: number) {
       if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
       if (q.missingOnly && r.missingSinceMs == null) return false;
       if (q.keepersOnly && !keeper(r)) return false;
+      if (!metaOk(r, q.metadata)) return false;
       return true;
     });
     const key: Record<string, (r: RawImageEntry) => number | string> = {
@@ -589,9 +648,144 @@ export function installMockBackend(count: number) {
     return out.map((r) => r.id);
   }
 
-  function counts(folderId: number | null, projectId: number | null = null, keepersOnly = false): FilterCounts {
+  // ---- v18 metadata filters (mirror of Rust `repo::metadata_clauses`) ----
+  type Facet = keyof MetadataFilter;
+  const extOf = (r: RawImageEntry) => (r.fileName.includes(".") ? r.fileName.slice(r.fileName.lastIndexOf(".") + 1).toLowerCase() : "");
+  const blank = (s: string | null | undefined) => (s && s.trim() ? s.trim() : null);
+  const round1 = (v: number | null | undefined) => (v == null ? null : Math.round(v * 10) / 10);
+  const inRange = (v: number | null | undefined, range: NumberRange | null | undefined) => {
+    if (!range) return true;
+    if (v == null) return false;
+    if (range.min != null && v < range.min - Math.abs(range.min) * 1e-6) return false;
+    if (range.max != null && v > range.max + Math.abs(range.max) * 1e-6) return false;
+    return true;
+  };
+  const DAY = 86_400_000;
+  const dayOf = (ms: number | null | undefined) => (ms == null ? null : ms - (((ms % DAY) + DAY) % DAY));
+  function metaOk(r: RawImageEntry, m: MetadataFilter | null | undefined, skip?: Facet): boolean {
+    if (!m) return true;
+    const on = (f: Facet) => skip !== f;
+    if (on("formats") && m.formats?.length && !m.formats.includes(r.format)) return false;
+    if (on("extensions") && m.extensions?.length) {
+      for (const e of m.extensions) if (!/^[A-Za-z0-9]{1,10}$/.test(e)) throw { kind: "invalid_argument", message: `file extension "${e}" must be 1..=10 letters or digits` };
+      if (!m.extensions.map((e) => e.toLowerCase()).includes(extOf(r))) return false;
+    }
+    if (on("cameras") && m.cameras?.length && !m.cameras.some((c) => c.make === r.camera.make && (blank(c.model) ?? null) === blank(r.camera.model))) return false;
+    if (on("lenses") && m.lenses?.length && !m.lenses.some((l) => (l == null ? null : l.trim()) === blank(r.capture.lens))) return false;
+    if (on("iso") && !inRange(r.capture.iso, m.iso)) return false;
+    if (on("focalLengthMm") && !inRange(round1(r.capture.focalLengthMm), m.focalLengthMm)) return false;
+    if (on("aperture") && !inRange(round1(r.capture.aperture), m.aperture)) return false;
+    if (on("shutterSeconds") && !inRange(r.capture.shutterSeconds, m.shutterSeconds)) return false;
+    if (on("captured") && m.captured) {
+      const t = r.capture.capturedAtMs;
+      if (t == null) return false;
+      if (m.captured.fromMs != null && t < m.captured.fromMs) return false;
+      if (m.captured.toMs != null && t >= m.captured.toMs) return false;
+    }
+    if (on("edited") && m.edited != null && r.hasEdits !== m.edited) return false;
+    if (on("hasSidecar") && m.hasSidecar != null && r.xmp.hasSidecar !== m.hasSidecar) return false;
+    return true;
+  }
+  function metadataOptions(q: ImageQuery): MetadataFilterOptions {
+    // Each facet: the query without metadata, then every metadata constraint but the facet's own.
+    const unfiltered = new Set(query({ ...q, metadata: {} }));
+    const base = (skip: Facet) => rows.filter((r) => unfiltered.has(r.id) && metaOk(r, q.metadata, skip));
+    const tally = <K,>(skip: Facet, key: (r: RawImageEntry) => K) => {
+      const m = new Map<string, { key: K; count: number }>();
+      for (const r of base(skip)) {
+        const k = key(r);
+        const s = JSON.stringify(k);
+        const e = m.get(s);
+        if (e) e.count++;
+        else m.set(s, { key: k, count: 1 });
+      }
+      return [...m.values()];
+    };
+    const nullsLast = <T,>(a: T | null, b: T | null, cmp: (x: T, y: T) => number) => (a == null ? (b == null ? 0 : 1) : b == null ? -1 : cmp(a, b));
+    const nums = (skip: Facet, key: (r: RawImageEntry) => number | null | undefined) =>
+      tally(skip, (r) => key(r) ?? null)
+        .map(({ key, count }) => ({ value: key, count }))
+        .sort((a, b) => nullsLast(a.value, b.value, (x, y) => x - y));
+    const yesNo = (skip: Facet, key: (r: RawImageEntry) => boolean) => {
+      const t = tally(skip, key);
+      return { yes: t.find((x) => x.key)?.count ?? 0, no: t.find((x) => !x.key)?.count ?? 0 };
+    };
+    const FORMATS: ImageFormat[] = ["arw", "raf", "cr3", "jpeg", "heic", "tiff", "png"];
+    return {
+      total: query(q).length,
+      formats: tally("formats", (r) => r.format)
+        .map(({ key, count }) => ({ format: key, count }))
+        .sort((a, b) => FORMATS.indexOf(a.format) - FORMATS.indexOf(b.format)),
+      extensions: tally("extensions", extOf)
+        .map(({ key, count }) => ({ extension: key, count }))
+        .sort((a, b) => (a.extension < b.extension ? -1 : 1)),
+      cameras: tally("cameras", (r) => ({ make: r.camera.make, model: blank(r.camera.model) }))
+        .map(({ key, count }) => ({ camera: key, count }))
+        .sort((a, b) => Number(a.camera.model == null) - Number(b.camera.model == null) || a.camera.make.localeCompare(b.camera.make) || (a.camera.model ?? "").localeCompare(b.camera.model ?? "")),
+      lenses: tally("lenses", (r) => blank(r.capture.lens))
+        .map(({ key, count }) => ({ lens: key, count }))
+        .sort((a, b) => nullsLast(a.lens, b.lens, (x, y) => x.localeCompare(y))),
+      isos: nums("iso", (r) => r.capture.iso),
+      focalLengths: nums("focalLengthMm", (r) => round1(r.capture.focalLengthMm)),
+      apertures: nums("aperture", (r) => round1(r.capture.aperture)),
+      shutterSpeeds: nums("shutterSeconds", (r) => r.capture.shutterSeconds),
+      captureDays: tally("captured", (r) => dayOf(r.capture.capturedAtMs))
+        .map(({ key, count }) => ({ dayStartMs: key, count }))
+        .sort((a, b) => nullsLast(a.dayStartMs, b.dayStartMs, (x, y) => x - y)),
+      edited: yesNo("edited", (r) => r.hasEdits),
+      hasSidecar: yesNo("hasSidecar", (r) => r.xmp.hasSidecar),
+    };
+  }
+  /** v18 `get_cull_summary` (mirror of Rust `repo::cull_summary`). */
+  function cullSummary(projectId: number | null): CullSummary {
     if (projectId != null) requireProject(projectId);
-    const scope = rows.filter((r) => inScope(r, folderId, projectId) && (!keepersOnly || keeper(r)));
+    const scope = rows.filter((r) => inScope(r, null, projectId));
+    const rule = catalog.keeperRule;
+    const n = (f: (r: RawImageEntry) => boolean) => scope.filter(f).length;
+    const unflaggedR = (r: RawImageEntry) => r.pick !== "pick" && r.pick !== "reject";
+    const picked = n((r) => r.pick === "pick");
+    const rejected = n((r) => r.pick === "reject");
+    const rejectedAuto = n((r) => r.pick === "reject" && r.pickOrigin === "auto");
+    const unflagged = scope.length - picked - rejected;
+    const starredU = n((r) => unflaggedR(r) && r.rating >= rule.minRating);
+    const suggestedU = n((r) => unflaggedR(r) && r.rating === 0 && r.quality?.suggestedPick === "pick");
+    const notRejected = rule.mode === "not_rejected";
+    return {
+      total: scope.length,
+      picked,
+      pickedAuto: n((r) => r.pick === "pick" && r.pickOrigin === "auto"),
+      unflagged,
+      rejected,
+      rejectedByUser: rejected - rejectedAuto,
+      rejectedAuto,
+      starred: n((r) => r.rating > 0),
+      keepers: n(keeper),
+      keeperBreakdown: notRejected
+        ? { picked, unflagged, starred: 0, suggested: 0 }
+        : { picked, unflagged: 0, starred: starredU, suggested: rule.useSuggestions ? suggestedU : 0 },
+      keeperRule: rule,
+      suggestedRejectPending: n((r) => unflaggedR(r) && r.quality?.suggestedPick === "reject"),
+      suggestedPickPending: n((r) => unflaggedR(r) && r.quality?.suggestedPick === "pick"),
+      unanalyzed: n((r) => !r.quality),
+    };
+  }
+  /** v18 activity events: `window.__mockActivity(event)` emits any; the mock's own long work emits through `activity`. */
+  let activitySeq = 0;
+  const activity = (kind: ActivityKind, label: string, total: number | null) => {
+    const id = ++activitySeq;
+    const send = (done: number, state: ActivityState, message: string | null = null) => void emit("activity-event", { id, kind, label, done, total, state, message } satisfies ActivityEvent);
+    send(0, "running");
+    return { progress: (done: number) => send(done, "running"), end: (done: number, state: ActivityState, message: string | null) => send(done, state, message) };
+  };
+  window.__mockActivity = (e: ActivityEvent) => void emit("activity-event", e);
+  const photos = (n: number) => `${n} photo${n === 1 ? "" : "s"}`;
+  /** Rust `ipc::activity::xmp_message`. */
+  const xmpMessage = (saved: number, failed: number) =>
+    `Saved metadata for ${photos(saved)}` + (failed ? `; ${failed} sidecar${failed === 1 ? "" : "s"} could not be written` : "");
+
+  function counts(folderId: number | null, projectId: number | null = null, keepersOnly = false, metadata: MetadataFilter | null = null): FilterCounts {
+    if (projectId != null) requireProject(projectId);
+    const scope = rows.filter((r) => inScope(r, folderId, projectId) && (!keepersOnly || keeper(r)) && metaOk(r, metadata));
     const tags = TAGS.map((tag) => ({ tag, count: scope.filter((r) => visibleTags(r).includes(tag)).length })).filter((t) => t.count > 0);
     const ratings = [0, 0, 0, 0, 0, 0];
     scope.forEach((r) => ratings[r.rating]++);
@@ -752,6 +946,8 @@ export function installMockBackend(count: number) {
     ids: number[];
     timer: ReturnType<typeof setInterval> | null;
     cancelled: boolean;
+    /** v18 activity of the job (started with its first progress). */
+    act?: ReturnType<typeof activity>;
   }
   let activeRun: Run | null = null;
   const allExportPresets = () => [...BUILTIN_EXPORT_PRESETS, ...exportPresets];
@@ -764,6 +960,8 @@ export function installMockBackend(count: number) {
         run.job.failed++;
         run.job.failures.push({ imageId: id, fileName: r?.fileName ?? String(id), reason: window.__mockExportFail ?? "Decode error (mock)" });
       } else run.job.succeeded++;
+      run.act ??= activity("export", `Exporting ${photos(run.job.total)}`, run.job.total);
+      run.act.progress(run.job.done);
       void emit("export-progress", {
         jobId: run.job.id,
         done: run.job.done,
@@ -781,6 +979,11 @@ export function installMockBackend(count: number) {
     run.job.finishedAtMs = Date.now();
     if (activeRun === run) activeRun = null;
     const failed: ExportFailure[] = run.job.failures;
+    run.act?.end(
+      run.job.done,
+      run.cancelled ? "cancelled" : "finished",
+      `Exported ${photos(run.job.succeeded)}` + (failed.length ? `; ${failed.length} failed` : ""),
+    );
     void emit("export-finished", {
       jobId: run.job.id,
       succeeded: run.job.succeeded,
@@ -796,17 +999,19 @@ export function installMockBackend(count: number) {
   };
   window.__mockXmpFlush = () => {
     const written: number[] = [];
-    for (const r of rows) {
-      if (!r.xmp.dirty) continue;
+    const dirty = rows.filter((r) => r.xmp.dirty);
+    const a = dirty.length ? activity("xmp_save", "Saving metadata to XMP", dirty.length) : null;
+    for (const r of dirty) {
       if (mockReadOnly(r.id) || mockMissing(r.id)) {
         const reason = mockMissing(r.id) ? missingMessage(r) : READ_ONLY(r.id);
-        r.xmp = { dirty: true, syncedAtMs: null, error: reason };
+        r.xmp = { ...r.xmp, dirty: true, syncedAtMs: null, error: reason };
         void emit("xmp-write-failed", { imageId: r.id, reason });
       } else {
-        r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
+        r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null, hasSidecar: true };
         written.push(r.id);
       }
     }
+    a?.end(dirty.length, "finished", xmpMessage(written.length, dirty.length - written.length));
     void emit("xmp-synced", { written, read: [] });
   };
 
@@ -1271,7 +1476,17 @@ export function installMockBackend(count: number) {
         case "get_image":
           return byId.get(args.id as number);
         case "get_filter_counts":
-          return counts(args.folderId as number | null, (args.projectId as number | null) ?? null, (args.keepersOnly as boolean | null) ?? false);
+          return counts(
+            args.folderId as number | null,
+            (args.projectId as number | null) ?? null,
+            (args.keepersOnly as boolean | null) ?? false,
+            (args.metadata as MetadataFilter | null) ?? null,
+          );
+        // ---- IPC v18 ----
+        case "get_cull_summary":
+          return cullSummary((args.projectId as number | null) ?? null);
+        case "get_metadata_filter_options":
+          return metadataOptions(args.query as ImageQuery);
         case "get_import_status":
           return { total: count, pending: 0, ready: count, failed: 0, running: false };
         case "get_analysis_status":
@@ -1282,7 +1497,10 @@ export function installMockBackend(count: number) {
           guardWrite();
           ids.forEach((i) => {
             const r = byId.get(i);
-            if (r) r.pick = args.pick as PickFlag;
+            if (r) {
+              r.pick = args.pick as PickFlag;
+              r.pickOrigin = r.pick === "unflagged" ? null : "user";
+            }
           });
           return null;
         case "set_rating":
@@ -1310,8 +1528,12 @@ export function installMockBackend(count: number) {
           const bad = ids.filter((i) => mockReadOnly(i) || mockMissing(i));
           ids.forEach((i) => {
             const r = byId.get(i);
-            if (r && !bad.includes(i)) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null };
+            if (r && !bad.includes(i)) r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null, hasSidecar: true };
           });
+          if (ids.length) {
+            const a = activity("xmp_save", "Saving metadata to XMP", ids.length);
+            a.end(ids.length, "finished", xmpMessage(ids.length - bad.length, bad.length));
+          }
           return { ...ok, succeeded: ids.length - bad.length, failed: bad.map((i) => ({ imageId: i, reason: mockMissing(i) ? missingMessage(byId.get(i)!) : READ_ONLY(i) })), changed: [] };
         }
         case "read_xmp":
@@ -1323,6 +1545,8 @@ export function installMockBackend(count: number) {
             if (!r?.quality) return;
             if (args.onlyUnset && (r.pick !== "unflagged" || r.rating !== 0)) return;
             r.rating = r.quality.suggestedRating;
+            // v18: a flag "Auto" changes is `auto`; an unchanged flag keeps its origin.
+            if (r.pick !== r.quality.suggestedPick) r.pickOrigin = r.quality.suggestedPick === "unflagged" ? null : "auto";
             r.pick = r.quality.suggestedPick;
             r.xmp = { ...r.xmp, dirty: true };
             applied++;
@@ -1332,15 +1556,17 @@ export function installMockBackend(count: number) {
         case "get_cull_snapshot":
           return ids.map((i) => {
             const r = byId.get(i)!;
-            return { imageId: i, rating: r.rating, pick: r.pick, colorLabel: r.colorLabel };
+            return { imageId: i, rating: r.rating, pick: r.pick, colorLabel: r.colorLabel, pickOrigin: r.pickOrigin };
           });
         case "restore_cull_snapshot": {
           const changed: number[] = [];
           for (const s of args.snapshots as CullSnapshot[]) {
             const r = byId.get(s.imageId);
-            if (!r || (r.rating === s.rating && r.pick === s.pick && r.colorLabel === s.colorLabel)) continue;
+            const origin = s.pick === "unflagged" ? null : (s.pickOrigin ?? "user");
+            if (!r || (r.rating === s.rating && r.pick === s.pick && r.colorLabel === s.colorLabel && r.pickOrigin === origin)) continue;
             r.rating = s.rating;
             r.pick = s.pick;
+            r.pickOrigin = origin;
             r.colorLabel = s.colorLabel;
             r.xmp = { ...r.xmp, dirty: true };
             changed.push(s.imageId);
@@ -1371,7 +1597,8 @@ export function installMockBackend(count: number) {
           const folderId = args.folderId as number | null;
           const dirty = rows.filter((r) => r.xmp.dirty && (folderId == null || r.folderId === folderId));
           const bad = dirty.filter((r) => mockReadOnly(r.id) || mockMissing(r.id));
-          dirty.filter((r) => !bad.includes(r)).forEach((r) => (r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null }));
+          dirty.filter((r) => !bad.includes(r)).forEach((r) => (r.xmp = { dirty: false, syncedAtMs: Date.now(), error: null, hasSidecar: true }));
+          if (dirty.length) activity("xmp_save", "Saving metadata to XMP", dirty.length).end(dirty.length, "finished", xmpMessage(dirty.length - bad.length, bad.length));
           return {
             ...ok,
             succeeded: dirty.length - bad.length,

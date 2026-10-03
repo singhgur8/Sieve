@@ -1047,4 +1047,49 @@ mod tests {
             conn.query_row("SELECT reviewed_at FROM edit_batch_items", [], |r| r.get(0)).unwrap();
         assert_eq!(reviewed, None);
     }
+
+    /// Schema v16 (IPC v18): the old default keeper rule becomes `not_rejected`, a customised
+    /// rule keeps its behaviour as `picks_and_ratings`; existing flags count as `user`,
+    /// existing scores have no reasons.
+    #[test]
+    fn migration_0016_keeper_mode_pick_origin_reasons() {
+        use crate::ipc::types::{KeeperMode, KeeperRule, PickOrigin};
+        let at_v15 = |rule: &str| {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, sql) in schema::MIGRATIONS[..15].iter().enumerate() {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", (i + 1) as i64).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute("UPDATE catalog_meta SET value = ?1 WHERE key = 'keeper_rule'", [rule]).unwrap();
+            conn.execute_batch(
+                "INSERT INTO folders (id, path, added_at) VALUES (1, '/f', 0);
+                 INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms,
+                                     imported_at, pick)
+                 VALUES (1, 1, '/f/a.arw', 'a.arw', 'arw', 'sony', 1, 0, 0, 'reject');
+                 INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                                             clipped_shadows_pct, mean_luma, model_version, analyzed_at)
+                 VALUES (1, 0.1, 0.1, 0, 0, 0.5, 'v', 1);",
+            )
+            .unwrap();
+            migrate(&mut conn).unwrap();
+            conn
+        };
+        let conn = at_v15(r#"{"minRating":1,"useSuggestions":true}"#);
+        assert_eq!(repo::keeper_rule(&conn).unwrap(), KeeperRule::default());
+        assert_eq!(repo::keeper_rule(&conn).unwrap().mode, KeeperMode::NotRejected);
+        let e = repo::get_image(&conn, 1).unwrap();
+        assert_eq!(e.pick_origin, Some(PickOrigin::User));
+        assert!(e.quality.unwrap().reasons.is_empty());
+
+        let conn = at_v15(r#"{"minRating":3,"useSuggestions":false}"#);
+        assert_eq!(repo::keeper_rule(&conn).unwrap(), KeeperRule::picks_and_ratings(3, false));
+        let conn = at_v15(r#"{"minRating":1,"useSuggestions":false}"#);
+        assert_eq!(repo::keeper_rule(&conn).unwrap(), KeeperRule::picks_and_ratings(1, false));
+        // Unreadable values fall back to the default (unchanged by the migration).
+        let conn = at_v15("not json");
+        assert_eq!(repo::keeper_rule(&conn).unwrap(), KeeperRule::default());
+    }
 }

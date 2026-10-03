@@ -59,9 +59,27 @@ impl<R: Runtime> AnalysisSink for AppHandle<R> {
         let _ = e.emit(self);
     }
     fn progress(&self, e: AnalysisProgress) {
+        // Background-activity indicator (IPC v18): one activity per worker run, from the first
+        // image counted until `AnalysisFinished` (burst grouping included).
+        if let Some(a) = crate::ipc::activity::activities(self) {
+            if e.total > 0 {
+                let kind = crate::ipc::events::ActivityKind::Analysis;
+                a.progress("analysis", kind, "Analysing photos", e.done, Some(e.total));
+            }
+        }
         let _ = e.emit(self);
     }
     fn finished(&self, e: AnalysisFinished) {
+        if let Some(a) = crate::ipc::activity::activities(self) {
+            use crate::ipc::activity::photos;
+            use crate::ipc::events::ActivityState;
+            let (state, message) = match (e.cancelled, e.failed) {
+                (true, _) => (ActivityState::Cancelled, format!("Stopped after {}", photos(e.analyzed))),
+                (false, 0) => (ActivityState::Finished, format!("Analysed {}", photos(e.analyzed))),
+                (false, f) => (ActivityState::Finished, format!("Analysed {}; {f} failed", photos(e.analyzed))),
+            };
+            a.finish("analysis", state, Some(message));
+        }
         let _ = e.emit(self);
     }
     fn ingest_running(&self) -> bool {

@@ -277,6 +277,47 @@ pub struct QualityScore {
     /// capped below the keeper (never `pick`) but not rejected.
     /// Never written to `RawImageEntry.pick` except through `apply_suggestions`.
     pub suggested_pick: PickFlag,
+    /// Why the engine suggests what it does, most important first (v18; filled by the culling
+    /// engine for every non-`pick` suggestion and every auto tag; may be empty, e.g. for
+    /// scores written before v18 until the next analysis / rescore). Stored as JSON with the
+    /// score (`quality_scores.reasons_json`).
+    pub reasons: Vec<SuggestionReason>,
+}
+
+string_enum! {
+    /// Category of a [`SuggestionReason`] (v18). Tag-like kinds match the `CullTag` of the
+    /// same name.
+    pub enum SuggestionReasonKind {
+        /// Eyes closed (`blink`).
+        Blink => "blink",
+        /// The face (or, without a usable face, the frame) is not sharp (`missed_focus`).
+        MissedFocus => "missed_focus",
+        MotionBlur => "motion_blur",
+        /// Intentional blur, not a defect (`creative_blur`).
+        CreativeBlur => "creative_blur",
+        Underexposed => "underexposed",
+        Overexposed => "overexposed",
+        /// A better frame of the same burst exists (`relatedImageId` = the burst keeper).
+        DuplicateBurst => "duplicate_burst",
+        /// Low overall score without a single dominant defect.
+        LowScore => "low_score",
+        /// Anything else (the text says what).
+        Other => "other",
+    }
+}
+
+/// One human-readable reason behind a suggestion (v18), e.g.
+/// `{kind: "blink", text: "Eyes closed"}` or
+/// `{kind: "duplicate_burst", text: "Duplicate in burst (keeper DSC0123)", relatedImageId: 42}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionReason {
+    pub kind: SuggestionReasonKind,
+    /// Short, user-facing, sentence case, no trailing period.
+    pub text: String,
+    /// Another image the reason refers to (the burst keeper for `duplicate_burst`).
+    #[serde(default)]
+    pub related_image_id: Option<ImageId>,
 }
 
 /// Axis-aligned rectangle in normalized preview coordinates: 0..=1 of the preview's
@@ -508,6 +549,18 @@ string_enum! {
 }
 
 string_enum! {
+    /// Who set an image's pick / reject flag (v18; `images.pick_origin`).
+    pub enum PickOrigin {
+        /// The user: flag commands, undo/redo of the user's flags, sidecar reads (a flag
+        /// found in an XMP file counts as a person's decision). Flags set before v18 count as
+        /// `user`.
+        User => "user",
+        /// `apply_suggestions` ("Auto"), not changed by the user since.
+        Auto => "auto",
+    }
+}
+
+string_enum! {
     /// Lightroom-compatible colour labels (`xmp:Label`).
     pub enum ColorLabel {
         Red => "red",
@@ -539,6 +592,8 @@ pub struct RawImageEntry {
     /// Star rating 0..=5.
     pub rating: u8,
     pub pick: PickFlag,
+    /// Who set `pick` (v18); `null` when `pick = unflagged`.
+    pub pick_origin: Option<PickOrigin>,
     pub color_label: Option<ColorLabel>,
     pub burst_group_id: Option<BurstGroupId>,
     /// This image is its burst group's keeper.
@@ -584,6 +639,10 @@ pub struct XmpSyncState {
     pub synced_at_ms: Option<i64>,
     /// Reason of the last failed write/read; `None` after a success.
     pub error: Option<String>,
+    /// A sidecar existed at the last successful write or read (import reads existing
+    /// sidecars) (v18; `ImageQuery.metadata.hasSidecar`). `false` = never synced, or no
+    /// sidecar was found then.
+    pub has_sidecar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -2221,6 +2280,9 @@ pub struct ImageQuery {
     /// Only keepers under the catalog's `KeeperRule` (v15; the Edit / Export steps' grid).
     #[serde(default)]
     pub keepers_only: bool,
+    /// Lightroom-style Library Filter "Metadata" constraints (v18; default: none).
+    #[serde(default)]
+    pub metadata: MetadataFilter,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2250,12 +2312,161 @@ impl Default for ImageQuery {
             folder_id: None,
             project_id: None,
             keepers_only: false,
+            metadata: MetadataFilter::default(),
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
             limit: 200,
         }
     }
+}
+
+/// Inclusive numeric range (v18); a `null` bound is open. Images without the value never
+/// match a range. Bounds are compared with a tiny tolerance (1e-6 relative), so a facet
+/// value (`MetadataFilterOptions`) used as both bounds selects exactly that value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberRange {
+    #[specta(type = Option<Number>)]
+    pub min: Option<f64>,
+    #[specta(type = Option<Number>)]
+    pub max: Option<f64>,
+}
+
+/// Capture-time range (v18) in the naive ms of `CaptureMeta.capturedAtMs`: `fromMs` inclusive,
+/// `toMs` exclusive (one day = `[dayStartMs, dayStartMs + 86_400_000)`); `null` = open.
+/// Images without a capture time never match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DateRange {
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+}
+
+/// One camera body of the camera facet (v18): `model = null` = model unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraFilter {
+    pub make: CameraMake,
+    pub model: Option<String>,
+}
+
+/// Library Filter "Metadata" constraints (v18, `ImageQuery.metadata`, also accepted by
+/// `get_filter_counts`). All fields optional on the wire; each set field narrows the result
+/// (AND across fields, OR within a list). Values come from `get_metadata_filter_options`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MetadataFilter {
+    /// File type (Lightroom "File Type"): image's `format` is one of these.
+    pub formats: Vec<ImageFormat>,
+    /// File extension without the dot, case-insensitive (`"arw"`, `"jpg"`): `[A-Za-z0-9]{1,10}`
+    /// each, else `invalid_argument`.
+    pub extensions: Vec<String>,
+    /// Camera body (make + model) is one of these.
+    pub cameras: Vec<CameraFilter>,
+    /// Lens is one of these; `null` = lens unknown.
+    pub lenses: Vec<Option<String>>,
+    pub iso: Option<NumberRange>,
+    /// Focal length in mm, compared at 0.1 mm (the facet's rounding).
+    pub focal_length_mm: Option<NumberRange>,
+    /// f-number, compared at 0.1 (the facet's rounding).
+    pub aperture: Option<NumberRange>,
+    /// Exposure time in seconds (1/250 s = 0.004).
+    pub shutter_seconds: Option<NumberRange>,
+    pub captured: Option<DateRange>,
+    /// `true` = has develop edits (`RawImageEntry.hasEdits`), `false` = unedited.
+    pub edited: Option<bool>,
+    /// `true` = has an XMP sidecar (`XmpSyncState.hasSidecar`), `false` = none known.
+    pub has_sidecar: Option<bool>,
+}
+
+impl MetadataFilter {
+    /// No constraint set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatCount {
+    pub format: ImageFormat,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCount {
+    /// Lower case, without the dot.
+    pub extension: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraCount {
+    pub camera: CameraFilter,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LensCount {
+    /// `null` = unknown lens.
+    pub lens: Option<String>,
+    pub count: u32,
+}
+
+/// A distinct numeric value and its image count; `value = null` counts images without it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberCount {
+    #[specta(type = Option<Number>)]
+    pub value: Option<f64>,
+    pub count: u32,
+}
+
+/// Images captured on one (naive, camera-local) day; `dayStartMs = null` counts images
+/// without a capture time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DayCount {
+    pub day_start_ms: Option<i64>,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct YesNoCount {
+    pub yes: u32,
+    pub no: u32,
+}
+
+/// `get_metadata_filter_options(query)` (v18): distinct values with image counts per facet.
+/// Each facet is counted over the query's images with every constraint applied **except that
+/// facet's own** (Lightroom's cascading columns), so a value's count is what selecting it
+/// (alone) would show. Values with 0 images are omitted. Order: formats in `ImageFormat`
+/// order; extensions, cameras, lenses by name (unknown last); numbers ascending (unknown
+/// last); days ascending (unknown last).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataFilterOptions {
+    /// Images matching the query (all constraints).
+    pub total: u32,
+    pub formats: Vec<FormatCount>,
+    pub extensions: Vec<ExtensionCount>,
+    pub cameras: Vec<CameraCount>,
+    pub lenses: Vec<LensCount>,
+    pub isos: Vec<NumberCount>,
+    /// Rounded to 0.1 mm.
+    pub focal_lengths: Vec<NumberCount>,
+    /// Rounded to 0.1.
+    pub apertures: Vec<NumberCount>,
+    /// Exact stored seconds.
+    pub shutter_speeds: Vec<NumberCount>,
+    pub capture_days: Vec<DayCount>,
+    pub edited: YesNoCount,
+    pub has_sidecar: YesNoCount,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -3404,6 +3615,11 @@ pub struct CullSnapshot {
     pub rating: u8,
     pub pick: PickFlag,
     pub color_label: Option<ColorLabel>,
+    /// Who set `pick` (v18; `RawImageEntry.pickOrigin`). Restored with the flag, so undoing a
+    /// user flag over an "Auto" reject brings back an `auto` reject. Missing / `null` restores
+    /// as `user`.
+    #[serde(default)]
+    pub pick_origin: Option<PickOrigin>,
 }
 
 /// Small per-catalog UI preferences. Every field is optional so the struct can grow;
@@ -3729,33 +3945,54 @@ string_enum! {
     }
 }
 
-/// Which images are keepers (Edit step scenes, Export step selection). One definition for
-/// the whole app ([`KeeperRule::is_keeper`], TS mirror `isKeeper`):
-/// 1. rejected by the user -> never;
-/// 2. picked by the user -> keeper;
-/// 3. rated `>= minRating` stars by the user -> keeper;
-/// 4. untouched by the user (unflagged and 0 stars) and `useSuggestions` -> keeper iff the
-///    culling engine suggests `pick` (`QualityScore.suggestedPick`; burst non-keepers are never
-///    suggested `pick`).
+string_enum! {
+    /// How [`KeeperRule`] decides (v18).
+    pub enum KeeperMode {
+        /// Every photo that is not rejected is a keeper (picked or unflagged; stars and
+        /// suggestions do not matter). The default since v18 (user decision 2026-10-03).
+        NotRejected => "not_rejected",
+        /// The pre-v18 rule: picks, unflagged photos rated `>= minRating`, and (with
+        /// `useSuggestions`) untouched photos the engine suggests `pick`.
+        PicksAndRatings => "picks_and_ratings",
+    }
+}
+
+/// Which images are keepers (Edit step scenes, Export step selection, cull summary). One
+/// definition for the whole app ([`KeeperRule::is_keeper`], SQL mirror
+/// `repo::keeper_predicate`, TS mirror `isKeeper`):
+/// 1. rejected (by the user or by `apply_suggestions`) -> never;
+/// 2. picked -> keeper;
+/// 3. mode `not_rejected` (default): every other (unflagged) photo -> keeper;
+/// 4. mode `picks_and_ratings`: unflagged and rated `>= minRating` -> keeper; unflagged with
+///    0 stars and `useSuggestions` -> keeper iff the culling engine suggests `pick`
+///    (`QualityScore.suggestedPick`; burst non-keepers are never suggested `pick`); otherwise
+///    not a keeper.
 ///
-/// Otherwise (unflagged with 1..minRating-1 stars, or untouched without a pick suggestion)
-/// not a keeper.
+/// `minRating` / `useSuggestions` are kept (and validated) in both modes, so switching back
+/// to `picks_and_ratings` restores the user's thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KeeperRule {
-    /// 1..=5. Default 1 (any star keeps, Lightroom convention).
+    /// v18. Default `not_rejected`.
+    pub mode: KeeperMode,
+    /// `picks_and_ratings` only. 1..=5. Default 1 (any star keeps, Lightroom convention).
     pub min_rating: u8,
-    /// Default `true`.
+    /// `picks_and_ratings` only. Default `true`.
     pub use_suggestions: bool,
 }
 
 impl Default for KeeperRule {
     fn default() -> Self {
-        Self { min_rating: 1, use_suggestions: true }
+        Self { mode: KeeperMode::NotRejected, min_rating: 1, use_suggestions: true }
     }
 }
 
 impl KeeperRule {
+    /// A `picks_and_ratings` rule (the pre-v18 behaviour) with these thresholds.
+    pub fn picks_and_ratings(min_rating: u8, use_suggestions: bool) -> Self {
+        Self { mode: KeeperMode::PicksAndRatings, min_rating, use_suggestions }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=5).contains(&self.min_rating) {
             return Err(format!("minRating = {} is outside 1..=5", self.min_rating));
@@ -3763,19 +4000,71 @@ impl KeeperRule {
         Ok(())
     }
 
-    /// The rule on the culling values (SQL mirror in `scene::workflow`).
+    /// The rule on the culling values (SQL mirror `repo::keeper_predicate`).
     pub fn is_keeper_values(&self, pick: PickFlag, rating: u8, suggested_pick: Option<PickFlag>) -> bool {
-        match pick {
-            PickFlag::Reject => false,
-            PickFlag::Pick => true,
-            PickFlag::Unflagged if rating >= self.min_rating => true,
-            PickFlag::Unflagged => rating == 0 && self.use_suggestions && suggested_pick == Some(PickFlag::Pick),
+        match (pick, self.mode) {
+            (PickFlag::Reject, _) => false,
+            (PickFlag::Pick, _) => true,
+            (PickFlag::Unflagged, KeeperMode::NotRejected) => true,
+            (PickFlag::Unflagged, KeeperMode::PicksAndRatings) if rating >= self.min_rating => true,
+            (PickFlag::Unflagged, KeeperMode::PicksAndRatings) => {
+                rating == 0 && self.use_suggestions && suggested_pick == Some(PickFlag::Pick)
+            }
         }
     }
 
     pub fn is_keeper(&self, e: &RawImageEntry) -> bool {
         self.is_keeper_values(e.pick, e.rating, e.quality.as_ref().map(|q| q.suggested_pick))
     }
+}
+
+/// How the keepers of a [`CullSummary`] are made up under its `keeperRule` (v18). The parts
+/// are disjoint and add up to `CullSummary.keepers`:
+/// - `not_rejected`: `picked + unflagged` (`starred = suggested = 0`);
+/// - `picks_and_ratings`: `picked + starred + suggested` (`unflagged = 0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KeeperBreakdown {
+    /// Picked photos (always keepers).
+    pub picked: u32,
+    /// `not_rejected`: unflagged photos (any stars).
+    pub unflagged: u32,
+    /// `picks_and_ratings`: unflagged photos rated `>= minRating`.
+    pub starred: u32,
+    /// `picks_and_ratings` with `useSuggestions`: unflagged 0-star photos the engine suggests
+    /// `pick`.
+    pub suggested: u32,
+}
+
+/// `get_cull_summary(projectId)` (v18): the Cull step readout "picked / unflagged / rejected /
+/// keepers = formula". `total = picked + unflagged + rejected`; `keepers` equals the number of
+/// images a `keepersOnly` query over the same scope returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CullSummary {
+    pub total: u32,
+    pub picked: u32,
+    /// Of `picked`, flagged by `apply_suggestions` ("Auto") and not changed by the user since
+    /// (`RawImageEntry.pickOrigin = auto`).
+    pub picked_auto: u32,
+    pub unflagged: u32,
+    pub rejected: u32,
+    /// Of `rejected`, rejected by the user (flag keys, sidecar reads, undo of a user flag).
+    pub rejected_by_user: u32,
+    /// Of `rejected`, rejected by `apply_suggestions` and not changed by the user since.
+    pub rejected_auto: u32,
+    /// Photos rated 1..=5 stars (any flag).
+    pub starred: u32,
+    pub keepers: u32,
+    pub keeper_breakdown: KeeperBreakdown,
+    /// The rule `keepers` was counted with (= `CatalogState.keeperRule`).
+    pub keeper_rule: KeeperRule,
+    /// Analysed photos the engine suggests rejecting that are still unflagged (not acted on).
+    pub suggested_reject_pending: u32,
+    /// Analysed photos the engine suggests picking that are still unflagged.
+    pub suggested_pick_pending: u32,
+    /// Photos without a `QualityScore` yet (not analysed, or analysis failed).
+    pub unanalyzed: u32,
 }
 
 string_enum! {

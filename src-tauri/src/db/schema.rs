@@ -17,4 +17,5 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0013_workflow_state.sql"),
     include_str!("../../migrations/0014_linear_undo.sql"),
     include_str!("../../migrations/0015_apply_bases.sql"),
+    include_str!("../../migrations/0016_cull_clarity.sql"),
 ];

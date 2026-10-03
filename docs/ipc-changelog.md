@@ -839,6 +839,82 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v18 — 2026-10-03 (Phase 8c: culling clarity, metadata filters, background activity)
+
+Keeper rule (a)
+- `KeeperRule.mode: KeeperMode` (`"not_rejected"` | `"picks_and_ratings"`), **required** on the wire.
+  `DEFAULT_KEEPER_RULE` = `{mode: "not_rejected", minRating: 1, useSuggestions: true}` (user decision 2026-10-03:
+  keep everything not rejected). `picks_and_ratings` = the pre-v18 rule; `minRating` / `useSuggestions` only apply
+  there but are kept (and validated 1..=5) in both modes.
+- Mirrors updated: `KeeperRule::is_keeper_values`, `repo::keeper_predicate`, `PROJECT_SQL` (project counts),
+  `isKeeperValues` / `isKeeper` in `src/ipc/index.ts`.
+- Schema v16 migrates the stored rule: the old default `{minRating:1,useSuggestions:true}` (written into every
+  catalog by migration 0012) -> `not_rejected`; any other stored rule -> `picks_and_ratings` with its thresholds.
+
+Cull summary (b)
+- `get_cull_summary(projectId | null) -> CullSummary {total, picked, pickedAuto, unflagged, rejected,
+  rejectedByUser, rejectedAuto, starred, keepers, keeperBreakdown: {picked, unflagged, starred, suggested},
+  keeperRule, suggestedRejectPending, suggestedPickPending, unanalyzed}`. `keepers` equals a `keepersOnly` query
+  over the same scope; the breakdown adds up to it (`not_rejected`: picked + unflagged; `picks_and_ratings`:
+  picked + starred + suggested). Unknown project -> `not_found`.
+
+Pick origin + suggestion reasons (c)
+- `PickOrigin` (`"user"` | `"auto"`); `RawImageEntry.pickOrigin: PickOrigin | null` (null while unflagged);
+  `CullSnapshot.pickOrigin?: PickOrigin | null` (optional; missing restores as `user`). Schema v16
+  `images.pick_origin`: `apply_suggestions` -> `auto` (only when it changes the flag), `set_pick` / sidecar reads
+  / restore without origin -> `user`. Flags from before v18 read as `user`.
+- `QualityScore.reasons: SuggestionReason[]` (`{kind: SuggestionReasonKind, text, relatedImageId?}`; kinds
+  `blink | missed_focus | motion_blur | creative_blur | underexposed | overexposed | duplicate_burst | low_score |
+  other`). Schema v16 `quality_scores.reasons_json` (default `[]`), written by `ml::store::write_scored`. Empty until
+  vision-ml-dev fills them.
+- `XmpSyncState.hasSidecar: boolean` (a sidecar existed at the last write / read).
+
+Metadata filters (d)
+- `ImageQuery.metadata?: MetadataFilter` (every field optional): `formats: ImageFormat[]`, `extensions: string[]`
+  (no dot, case-insensitive, `[A-Za-z0-9]{1,10}`), `cameras: CameraFilter[]` (`{make, model | null}`),
+  `lenses: (string | null)[]` (null = unknown), `iso / focalLengthMm / aperture / shutterSeconds: NumberRange`
+  (`{min?, max?}` inclusive, 1e-6 relative slack; focal length / aperture compared at 0.1), `captured: DateRange`
+  (`{fromMs?, toMs?}`, naive ms, to exclusive), `edited: boolean`, `hasSidecar: boolean`. Invalid values ->
+  `invalid_argument`.
+- `get_filter_counts(folderId, projectId, keepersOnly, metadata)` — **new fourth argument** (`null` = none).
+- `get_metadata_filter_options(query: ImageQuery) -> MetadataFilterOptions {total, formats, extensions, cameras,
+  lenses, isos, focalLengths, apertures, shutterSpeeds, captureDays, edited, hasSidecar}`: distinct values with
+  counts; each facet ignores its own constraint (Lightroom cascading columns); unknown values counted as `null`
+  entries (last).
+- Schema v16 indexes `idx_images_folder_camera`, `idx_images_folder_lens`.
+
+Background activity (e)
+- Event `activityEvent {id, kind: ActivityKind, label, done, total | null, state: ActivityState, message | null}`;
+  kinds `import | analysis | xmp_save | paste_sync | apply_scene | export | model_download | other`; states
+  `running | finished | error | cancelled`. Per activity: running events (start always, then <= 10/s), then one
+  terminal event. Helper `ipc::activity::Activities` (managed state; `activities(&app)`): channel API
+  `progress(channel, kind, label, done, total)` / `finish(channel, state, message)`, handle API
+  `start(kind, label, total) -> ActivityHandle` (`progress`, `finish`, `fail`, `cancel`; dropped = `error`).
+- Wired: ingest (`"import"`), analysis (`"analysis"`, until `analysisFinished`), export (per job), auto-sync passes
+  and explicit `write_xmp` / `write_xmp_all_dirty` (`xmp_save`, message "Saved metadata for N photos; M sidecars
+  could not be written"), `paste_settings` / `sync_settings` on 2+ photos (`paste_sync`, indeterminate),
+  `apply_scene_edit` / `apply_all_edited_scenes` (`apply_scene`, indeterminate), `download_models`
+  (`model_download`, KiB).
+
+Who updates what
+- architect (done): types, schema v16, commands + registration, `Activities` managed state + wiring above, SQL
+  (filters, facets, summary, keeper predicate), pick-origin writers (`repo`, `xmp::store::apply_read`), Rust tests,
+  bindings, TS `isKeeperValues`, compile fixes (`FilterBar.tsx` 4th arg, `PlanView.tsx` rules carry `mode` and a
+  fifth entry "Everything not rejected" appended so menu indices 0..3 are unchanged, `useWorkflow.setKeeperRule`
+  takes `KeeperRule`), mock backend (summary, facets, metadata filtering + counts, pick origin, reasons per tag,
+  `hasSidecar`, activity events for write_xmp / save all / `__mockXmpFlush` / export, `window.__mockActivity(e)`;
+  `?meta=1` varied file types / cameras / lenses; `?keepers=not_rejected` = v18 default rule — the mock keeps the
+  pre-v18 rule by default so existing suites are unchanged).
+- frontend-dev: cull summary readout (`getCullSummary`, refetch after culling writes / `analysisFinished`); keeper
+  rule menu (new default, `mode`); Rejected view (`pickOrigin`, `quality.reasons`); metadata filter row
+  (`getMetadataFilterOptions(query)` + `ImageQuery.metadata` + `getFilterCounts(.., metadata)`); corner indicator
+  from `events.activityEvent`; `useCullUndo.snapOf` should include `pickOrigin: e.pickOrigin` so undo restores
+  auto flags exactly.
+- vision-ml-dev: fill `QualityScore.reasons` in `ml::scoring` (tags / low score) and `ml::bursts` capping
+  (`duplicate_burst` with `relatedImageId` = keeper); persisted automatically by `write_scored`.
+- rust-engine-dev: XMP flag rewrite (xmpDM) must keep `pick_origin = 'user'` when a sidecar read changes the flag
+  (`xmp::store::apply_read`); report new long-running work through `ipc::activity`.
+
 ## v17 (no contract change) — 2026-09-30 (Auto tone: on-demand faces on unanalysed photos)
 No type, command signature, event or schema change; `src/ipc/bindings.ts` unchanged (`cargo test bindings` passes).
 - Behaviour: `auto_tone` on a photo without analysis results now detects faces itself (`ml::auto_faces`, SCRFD on the neutral render, cached per image) instead of relying only on the skin-colour estimate, so skin is protected as on analysed photos; results for such photos change (usually Whites / Highlights a little lower on portraits). First call after launch loads the detector (~0.2 s); then about +30 ms per photo, 0 ms once cached. Without the model file the previous bounded estimate is used.
