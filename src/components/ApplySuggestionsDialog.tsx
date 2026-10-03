@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { commands, unwrap, type RawImageEntry } from "../ipc";
 import { Dialog } from "./Dialog";
+import { HelpLink } from "./HelpLink";
 
 interface Props {
   /** The current multi-selection (0 or 1 photos count as "nothing selected", like Export). */
@@ -67,8 +68,8 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
       onConfirm={() => onConfirm(ids, skipManual)}
       canConfirm={() => rows != null && c.apply > 0}
     >
-      <h2 className="mb-1 text-sm font-semibold" data-testid="apply-title">
-        Apply suggestions
+      <h2 className="mb-1 flex items-center gap-2 text-sm font-semibold" data-testid="apply-title">
+        Apply suggestions <HelpLink id="apply-suggestions" title="What does this do?" />
       </h2>
       <p className="mb-3 text-xs text-neutral-400">Replaces flags and star ratings with Sieve&apos;s suggestions. You can undo it afterwards.</p>
       <div className="mb-3 flex gap-4 text-sm" role="radiogroup" aria-label="Scope" data-testid="apply-scope">

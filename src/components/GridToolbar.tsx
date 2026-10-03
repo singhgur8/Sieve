@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { ArrowDownAZ, ArrowUpAZ, ChevronDown, SkipForward, SlidersHorizontal } from "lucide-react";
 import { Menu } from "./Menu";
+import { HelpLink } from "./HelpLink";
 import { useWide } from "./edit/bits";
 import type { ImageSort } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
@@ -78,6 +79,7 @@ export function GridToolbar(p: Props) {
         <input type="checkbox" checked={p.autoAdvance || !!p.capsLock} onChange={(e) => p.onAutoAdvance(e.target.checked)} data-testid="auto-advance" />
         <SkipForward className="size-3.5" /> Auto-advance{p.capsLock ? " (Caps Lock)" : ""}
       </label>
+      <HelpLink id="auto-advance" title="What does Auto-advance do?" />
     </>
   );
   return (

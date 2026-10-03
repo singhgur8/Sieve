@@ -1,6 +1,6 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
-import { Aperture, Check, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, LayoutList, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
+import { Aperture, Check, CircleHelp, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, LayoutList, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
 import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
@@ -9,6 +9,8 @@ import { XmpStatusPill, type XmpFailureRow } from "./XmpStatus";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { AnalyzeSplit, ShootSelect } from "./AnalyzeControls";
 import type { ReactNode } from "react";
+import { openHelp } from "../lib/helpStore";
+import { BUSY_WHY, useActivityRunning } from "../lib/activity";
 
 const btn = "flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 text-sm hover:bg-neutral-700 disabled:opacity-50";
 const labelHide = "max-[1439px]:hidden";
@@ -80,6 +82,7 @@ function Ring({ pct }: { pct: number }) {
 export function TopBar(p: Props) {
   const c = p.catalog;
   const xmp = p.xmp;
+  const saving = useActivityRunning("xmp_save");
   const modes: { m: Mode; label: string; icon: typeof Grid3x3; title: string; testid: string }[] = [
     { m: "grid", label: "Grid", icon: Grid3x3, title: `Grid${hint("toGrid")}`, testid: "mode-grid" },
     { m: "loupe", label: "Loupe", icon: Maximize, title: `Loupe${hint("toggleLoupe")}`, testid: "mode-loupe" },
@@ -151,7 +154,7 @@ export function TopBar(p: Props) {
       )}
 
       <XmpStatusPill xmp={xmp} failures={p.xmpFailures} onOpenErrors={p.onOpenXmpErrors} onShow={p.onShowXmpFailure} onRetry={p.onSaveAllDirty} onSaveAll={p.onSaveAllDirty} onAutoSync={p.onAutoXmp} onExplain={p.onXmpExplain} />
-      <button onClick={p.onWriteXmp} disabled={!p.hasSelection} className={btn} data-testid="save-metadata" title={`Write XMP sidecars for the selection${hint("saveXmp")}`}>
+      <button onClick={p.onWriteXmp} disabled={!p.hasSelection || saving} className={btn} data-testid="save-metadata" title={saving ? BUSY_WHY.xmp_save : `Write XMP sidecars for the selection${hint("saveXmp")}`}>
         <CloudUpload className="size-4" />
         Save
       </button>
@@ -159,6 +162,10 @@ export function TopBar(p: Props) {
         {p.exportPct != null ? <Ring pct={p.exportPct} /> : <Share className="size-4" />}
         Export
       </button>}
+      <button onClick={() => openHelp()} className={btn} data-testid="help-button" title={`Help and FAQ${hint("help")}`} aria-label="Help">
+        <CircleHelp className="size-4" />
+        <span className={p.steps ? labelHide : ""}>Help</span>
+      </button>
       <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass={btn} triggerTestId="more-menu" title="More actions" align="right">
         {(close) => (
           <>

@@ -6,6 +6,7 @@ import type { XmpStatus } from "../ipc";
 import { describeReason } from "../lib/errors";
 import { Dialog } from "./Dialog";
 import { Menu, menuItem } from "./Menu";
+import { HelpLink } from "./HelpLink";
 
 export interface XmpFailureRow {
   imageId: number;
@@ -171,6 +172,7 @@ function PopoverBody(p: {
       <button className={`${menuItem} -mx-3 mt-1 w-[calc(100%+1.5rem)] text-xs text-neutral-300`} data-testid="xmp-explain" onClick={p.onExplain}>
         <HelpCircle className="size-3.5" /> How XMP sync works
       </button>
+      <HelpLink id="saved" label="Where is my work saved?" className="mt-1" />
     </>
   );
 }

@@ -9,6 +9,8 @@ import { useKeyboard } from "./hooks/useKeyboard";
 import { useCullUndo } from "./hooks/useCullUndo";
 import { TopBar } from "./components/TopBar";
 import { XmpExplainer } from "./components/XmpStatus";
+import { MetadataRow } from "./components/MetadataFilterRow";
+import { useMetaRowOpen } from "./lib/metaFilter";
 import { FilterBar, FilterExtras, filterSummaryText, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
@@ -33,6 +35,10 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ModelsDialog } from "./components/ModelsCard";
 import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
+import { ActivityWidget } from "./components/ActivityWidget";
+import { HelpPanel } from "./components/HelpPanel";
+import { openHelp } from "./lib/helpStore";
+import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
@@ -70,6 +76,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const importOptsRef = useRef(importOpts);
   importOptsRef.current = importOpts;
   const [filtersOpen, setFiltersOpen] = useState(true);
+  const metaOpen = useMetaRowOpen();
   const [exportOpen, setExportOpen] = useState<{ sel: number[]; keepers?: number[] } | null>(null);
   const [exportedCount, setExportedCount] = useState<number | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
@@ -123,12 +130,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
-  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
+  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating";
+    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -471,7 +478,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const writeXmp = useCallback(async () => {
     const t = targets();
-    if (t.length === 0) return;
+    if (t.length === 0 || isActivityRunning("xmp_save")) return;
     try {
       const r = await unwrap(commands.writeXmp(t));
       status.noteXmpFailures([], t.filter((i) => !r.failed.some((f) => f.imageId === i)));
@@ -1176,6 +1183,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return importFolder();
       case "cheatSheet":
         return setCheatOpen(true);
+      case "help":
+        return openHelp();
     }
   });
 
@@ -1349,7 +1358,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
-            <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
+            <>
+              <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
+              {metaOpen && <MetadataRow query={query} setQuery={setQuery} epoch={lib.epoch} />}
+            </>
           ) : (
             <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
           )}
@@ -1603,6 +1615,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         />
       )}
       <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <HelpPanel onShortcuts={() => setCheatOpen(true)} />
+      <ActivityWidget />
     </main>
   );
 }
