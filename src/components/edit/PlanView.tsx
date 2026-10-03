@@ -2,11 +2,13 @@
 // (to do / edited / applied) with Auto edit (my style), Apply to scene and Apply all.
 import { useEffect, useRef, useState } from "react";
 import { ArrowRight, ChevronDown, ChevronRight, MoreHorizontal, X } from "lucide-react";
-import type { KeeperRule } from "../../ipc";
+import type { CullSummary } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import { rowInTab, type PlanTab, type SceneRow, type Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
 import { Menu, menuItem } from "../Menu";
+import { KeeperRuleMenu, RuleItems, ruleLabel } from "../KeeperRule";
+import { keeperEquation } from "../../lib/cull";
 import { Dialog } from "../Dialog";
 import { AutoEditButton, StatusIcon, statusLine, Thumb, useWide } from "./bits";
 
@@ -17,19 +19,6 @@ const TABS: { id: PlanTab; label: string }[] = [
   { id: "applied", label: "Applied" },
   { id: "skipped", label: "Skipped" },
 ];
-
-export const KEEPER_RULES: { rule: KeeperRule; label: string; long: string }[] = [
-  { rule: { mode: "picks_and_ratings", minRating: 1, useSuggestions: true }, label: "Picks, 1★+, suggested", long: "Picks, anything rated 1★ and up, and photos Sieve suggests" },
-  { rule: { mode: "picks_and_ratings", minRating: 1, useSuggestions: false }, label: "Picks, 1★+", long: "Picks and anything rated 1★ and up" },
-  { rule: { mode: "picks_and_ratings", minRating: 3, useSuggestions: false }, label: "Picks, 3★+", long: "Picks and photos rated 3★ and up" },
-  { rule: { mode: "picks_and_ratings", minRating: 5, useSuggestions: false }, label: "Picks, 5★", long: "Picks and 5★ photos" },
-  // IPC v18 default. Appended so the existing menu indices (keeper-rule-0..3) stay stable.
-  { rule: { mode: "not_rejected", minRating: 1, useSuggestions: true }, label: "Everything not rejected", long: "Everything you have not rejected" },
-];
-/** Same rule as far as keepers go (`not_rejected` ignores the thresholds). */
-const sameRule = (a: KeeperRule, b: KeeperRule) =>
-  a.mode === b.mode && (a.mode === "not_rejected" || (a.minRating === b.minRating && a.useSuggestions === b.useSuggestions));
-const ruleLabel = (r: KeeperRule) => KEEPER_RULES.find((x) => sameRule(x.rule, r))?.label ?? `${r.minRating}★+`;
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const timeRange = (a: number | null | undefined, b: number | null | undefined) => {
@@ -53,6 +42,8 @@ interface Props {
   onBackToCull: () => void;
   onContinueExport: () => void;
   onRegroup: () => void;
+  /** Cull summary of the project: the keeper formula under the header. */
+  summary?: CullSummary | null;
 }
 
 export function PlanView(p: Props) {
@@ -268,6 +259,18 @@ export function PlanView(p: Props) {
         </div>
       </header>
 
+      {p.summary && !wf.grouping && (
+        <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-2 border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="plan-keeper-formula">
+          <span title="Only keepers are grouped into scenes, edited and exported">
+            Keepers <b>{p.summary.keepers}</b> {keeperEquation(p.summary)}
+          </span>
+          <KeeperRuleMenu current={p.summary.keeperRule} onPick={(r) => void wf.setKeeperRule(r)} testid="plan-keeper-rule-link" />
+          <button className="text-sky-300 hover:underline" data-testid="plan-review-rejected" onClick={p.onBackToCull} title="Go back to Cull to look at what was left out">
+            Back to Cull
+          </button>
+        </div>
+      )}
+
       {unassigned > 0 && !wf.grouping && (
         <div className="flex h-8 shrink-0 items-center gap-3 border-b border-amber-900 bg-amber-950 px-3 text-xs text-amber-100" data-testid="plan-unassigned">
           <span>
@@ -328,22 +331,6 @@ export function PlanView(p: Props) {
         </Dialog>
       )}
     </section>
-  );
-}
-
-function RuleItems({ current, onPick }: { current: KeeperRule; onPick: (r: KeeperRule) => void }) {
-  return (
-    <div className="w-80 py-1" data-testid="keeper-rule-menu">
-      {KEEPER_RULES.map((k, i) => {
-        const on = sameRule(k.rule, current);
-        return (
-          <button key={i} className={menuItem} data-testid={`keeper-rule-${i}`} aria-checked={on} role="menuitemradio" onClick={() => onPick(k.rule)}>
-            <span className="w-4">{on ? "✓" : ""}</span>
-            {k.long}
-          </button>
-        );
-      })}
-    </div>
   );
 }
 

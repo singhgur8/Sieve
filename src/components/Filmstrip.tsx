@@ -6,6 +6,7 @@ import { convertFileSrc, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { LABEL_COLOR } from "../lib/format";
 import { SceneBadge, Stars } from "./Cell";
+import { flagTitle } from "../lib/cull";
 
 interface Props {
   lib: Library;
@@ -108,7 +109,7 @@ const FilmCell = memo(FilmCellImpl, cellPropsEqual);
 function entrySig(e: RawImageEntry | undefined): string {
   if (!e) return "";
   const t = e.thumbnail;
-  return `${e.id}|${e.pick}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}`;
+  return `${e.id}|${e.pick}|${e.pickOrigin}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}`;
 }
 function cellPropsEqual(a: CellProps, b: CellProps): boolean {
   for (const k of Object.keys(a) as (keyof CellProps)[]) if (k !== "e" && a[k] !== b[k]) return false;
@@ -131,14 +132,22 @@ function FilmCellImpl({ fid, e, v, active, isSel, isMarked, left, top, cellW, ce
   >
     {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${v}`} alt="" draggable={false} className="size-full object-cover" />}
     {e && (e.pick !== "unflagged" || e.colorLabel) && (
-      <span className="pointer-events-none absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
-        {e.pick === "pick" && <Flag className="size-3 fill-green-500 text-green-500" />}
-        {e.pick === "reject" && <X className="size-3.5 text-red-500" strokeWidth={3} />}
-        {e.colorLabel && <span className={`size-2 rounded-full ${LABEL_COLOR[e.colorLabel]}`} />}
+      <span className="absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
+        {e.pick === "pick" && (
+          <span title={flagTitle(e)} aria-label={flagTitle(e)}>
+            <Flag className="size-3 fill-green-500 text-green-500" />
+          </span>
+        )}
+        {e.pick === "reject" && (
+          <span title={flagTitle(e)} aria-label={flagTitle(e)}>
+            <X className="size-3.5 text-red-500" strokeWidth={3} />
+          </span>
+        )}
+        {e.colorLabel && <span className={`size-2 rounded-full ${LABEL_COLOR[e.colorLabel]}`} title={`Color label: ${e.colorLabel}`} aria-label={`Color label ${e.colorLabel}`} />}
       </span>
     )}
     {e && e.rating > 0 && (
-      <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5" data-testid={`film-rating-${fid}`} data-rating={e.rating}>
+      <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5" title={`Rated ${e.rating} star${e.rating === 1 ? "" : "s"}`} data-testid={`film-rating-${fid}`} data-rating={e.rating}>
         <Stars n={e.rating} className="size-2.5" onRate={onRate && ((r) => onRate(fid, r))} testId={`film-stars-${fid}`} />
       </span>
     )}
@@ -148,7 +157,7 @@ function FilmCellImpl({ fid, e, v, active, isSel, isMarked, left, top, cellW, ce
         <SceneBadge entry={e} testPrefix={scenePrefix} />
       </span>
     )}
-    {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited" data-testid={`film-edited-${fid}`} />}
+    {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited: this photo has develop adjustments" aria-label="Edited" data-testid={`film-edited-${fid}`} />}
   </div>
   );
 }

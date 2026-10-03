@@ -1,12 +1,16 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ColorLabel, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, unwrap, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useCullUndo } from "./hooks/useCullUndo";
+import { useCullSummary } from "./hooks/useCullSummary";
+import { useBurstSizes } from "./hooks/useBurstSizes";
+import { CullSummaryBar } from "./components/CullSummaryBar";
+import { keeperFormula } from "./lib/cull";
 import { TopBar } from "./components/TopBar";
 import { XmpExplainer } from "./components/XmpStatus";
 import { FilterBar, FilterExtras, filterSummaryText, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
@@ -46,6 +50,9 @@ const LABEL_KEYS: Record<string, ColorLabel> = { "6": "red", "7": "yellow", "8":
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
+/** Optimistic flag change: a flag you set is yours (`pickOrigin: user`), clearing it leaves no origin. */
+const withPick = (e: RawImageEntry, pick: PickFlag): RawImageEntry => ({ ...e, pick, pickOrigin: pick === "unflagged" ? null : "user" });
+
 interface AppProps {
   /** The open project; every query, count, scene list, import, analysis and export job is scoped to it (null = no scope, dev mock only). */
   project: Project | null;
@@ -60,7 +67,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // The project scope is applied here, so resetting filters (BASE_QUERY) can never leave the project.
   // The Edit and Export steps list the project's keepers only (server-side, so counts and ids agree).
   const keepersStep = projectId != null && (project?.workflowStep === "edit" || project?.workflowStep === "export");
-  const query = useMemo<Query>(() => ({ ...queryState, projectId, keepersOnly: keepersStep }), [queryState, projectId, keepersStep]);
+  const query = useMemo<Query>(() => ({ ...queryState, projectId, keepersOnly: keepersStep || !!queryState.keepersOnly }), [queryState, projectId, keepersStep, queryState.keepersOnly]);
+  // What the filter bars show: the Edit / Export steps' built-in keepers scope is not a filter the user set.
+  const uiQuery = useMemo<Query>(() => ({ ...query, keepersOnly: !!queryState.keepersOnly }), [query, queryState.keepersOnly]);
   const [mode, setMode] = useState<Mode>("grid");
   const [cmp, setCmp] = useState<CompareState | null>(null);
   const [size, setSize] = useState(200);
@@ -124,6 +133,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const { ids } = lib;
   const sel = useSelection(ids);
   const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
+  // Cull summary (picked / unflagged / rejected / keepers): follows culling changes, analysis and the keeper rule.
+  const analysisRunning = status.analysis?.running ?? false;
+  const cullSum = useCullSummary(projectId, [rawLib.epoch, analysisRunning, status.catalog?.keeperRule]);
+  const burstSizes = useBurstSizes(query.folderId, projectId, analysisRunning);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
@@ -381,7 +394,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       const t = targets();
       if (t.length === 0) return;
       const label = `${{ pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick]} ${what(t)}`;
-      void mutate(label, t, (e) => ({ ...e, pick }), () => unwrap(commands.setPick(t, pick)));
+      void mutate(label, t, (e) => withPick(e, pick), () => unwrap(commands.setPick(t, pick)));
       advanceIf(t, advance);
     },
     [targets, mutate, advanceIf, what],
@@ -410,7 +423,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     (id: number, flag: "pick" | "reject") => {
       const pick: PickFlag = lib.getEntry(id)?.pick === flag ? "unflagged" : flag;
       const name = { pick: "Pick", reject: "Reject", unflagged: "Unflag" }[pick];
-      void mutate(`${name} ${what([id])}`, [id], (e) => ({ ...e, pick }), () => unwrap(commands.setPick([id], pick)));
+      void mutate(`${name} ${what([id])}`, [id], (e) => withPick(e, pick), () => unwrap(commands.setPick([id], pick)));
     },
     [lib, mutate, what],
   );
@@ -444,7 +457,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       try {
         const g = await unwrap(commands.setBurstKeeper(entry.burstGroupId, id));
         if (alsoPick) {
-          void mutate(`Pick ${entry.fileName}`, [id], (e) => ({ ...e, pick: "pick" }), () => unwrap(commands.setPick([id], "pick")));
+          void mutate(`Pick ${entry.fileName}`, [id], (e) => withPick(e, "pick"), () => unwrap(commands.setPick([id], "pick")));
         }
         await lib.refresh(g.imageIds.filter((x) => lib.getEntry(x)));
         setNotice(`${entry.fileName} is now the burst keeper`);
@@ -899,10 +912,61 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return;
       }
       const entry = cull.record(`Apply suggestions to ${plural(applied, "photo")}`, before);
-      push(`Applied suggestions to ${applied} of ${t.length} photos${skipped ? ` (${skipped} skipped)` : ""}`, {
+      push(`Applied suggestions to ${applied} of ${t.length} photos${skipped ? ` (${skipped} skipped)` : ""}. Review the result in the Rejected view`, {
         action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) },
       });
     });
+
+  /** Keeper rule changed from the Cull summary / Export dialog (the Edit plan has its own path through `wf`). */
+  const changeKeeperRule = useCallback(
+    async (rule: KeeperRule) => {
+      try {
+        await unwrap(commands.setKeeperRule(rule));
+        status.setCatalog((c) => (c ? { ...c, keeperRule: rule } : c));
+        cullSum.refresh();
+        wf.refreshPlan();
+        await refreshProject();
+        void rawLib.reload();
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [status.setCatalog, cullSum.refresh, wf.refreshPlan, refreshProject, rawLib, reportError],
+  );
+
+  // Lightroom (or anything else) may have edited sidecars: re-read the changed ones when the project opens and whenever
+  // the window regains focus (at most every 2 s), then refetch the photos that changed.
+  const lastSidecarRefresh = useRef(0);
+  const sidecarProject = useRef<number | null>(null);
+  useEffect(() => {
+    if (projectId == null) return;
+    if (sidecarProject.current !== projectId) {
+      sidecarProject.current = projectId;
+      lastSidecarRefresh.current = 0;
+    }
+    const run = async () => {
+      const now = Date.now();
+      if (now - lastSidecarRefresh.current < 2000) return;
+      lastSidecarRefresh.current = now;
+      try {
+        const changed = await unwrap(commands.refreshSidecars(projectId));
+        if (changed.length === 0) return;
+        await rawLib.refresh(changed.filter((id) => rawLib.getEntry(id)).slice(0, 2000));
+        void rawLib.reload();
+        cullSum.refresh();
+        status.refreshXmp();
+        setNotice(`${plural(changed.length, "photo")} changed in sidecars by another app (Lightroom?) and were reloaded`);
+      } catch (e) {
+        reportError(e);
+      }
+    };
+    void run();
+    const onFocus = () => void run();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
 
   const revealInFinder = (path: string) => void run(() => unwrap(commands.revealInFinder(path)));
 
@@ -1183,7 +1247,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const running = exportJobs.jobs.filter((j) => j.running);
   const exportPct = running.length ? Math.round((running.reduce((a, j) => a + j.done, 0) / Math.max(1, running.reduce((a, j) => a + j.total, 0))) * 100) : null;
   const catalogEmpty = project ? project.photoCount === 0 : catalog != null && catalog.imageCount === 0;
-  const filtered = isFiltered(query);
+  const filtered = isFiltered(uiQuery);
   const clearFilters = () => setQuery((q) => ({ ...BASE_QUERY, sort: q.sort, sortDescending: q.sortDescending }));
 
   // While Loupe / Compare / Develop cover the grid, it receives the exact props it had when it was last visible
@@ -1197,6 +1261,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     onCellClick: (id: number, e: React.MouseEvent) => sel.click(id, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey }),
     onCellDoubleClick: openLoupe,
     onRate: ratePhoto,
+    burstSizes,
     catalogEmpty,
     filtered,
     onImport: importFolder,
@@ -1260,6 +1325,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               exportSub={exportPct != null ? `Exporting ${exportPct}%` : exportedCount != null ? `Exported ${exportedCount}` : `${project.keeperCount} photos`}
               exportPct={exportPct}
               editDone={wf.done}
+              keeperNote={cullSum.summary ? keeperFormula(cullSum.summary) : undefined}
               onStep={goStep}
             />
           ) : undefined
@@ -1307,6 +1373,11 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             selectionIds={exportOpen.sel}
             filteredIds={ids}
             keeperIds={exportOpen.keepers}
+            summary={cullSum.summary}
+            onKeeperRule={async (r) => {
+              await changeKeeperRule(r);
+              void openExport(true);
+            }}
             sampleEntry={(id) => lib.getEntry(id)}
             onClose={() => setExportOpen(null)}
             onStarted={(job) => {
@@ -1349,9 +1420,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
-            <FilterBar query={query} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
+            <FilterBar query={uiQuery} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
           ) : (
-            <FilterSummary query={query} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
+            <FilterSummary query={uiQuery} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
           )}
           <GridToolbar
             query={query}
@@ -1390,19 +1461,22 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600"
                   data-testid="continue-edit"
                   onClick={() => goStep("edit")}
-                  title="Group the keepers into scenes and edit one photo per scene"
+                  title={`Group the keepers into scenes and edit one photo per scene.${cullSum.summary ? ` ${keeperFormula(cullSum.summary)}. Change the keeper rule in the summary bar above.` : ""}`}
                 >
                   Continue to Edit{project.keeperCount > 0 ? ` · ${project.keeperCount} keepers` : ""} <ChevronRight className="size-3.5" />
                 </button>
               ) : undefined
             }
-            filters={filtersOpen ? <FilterExtras query={query} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
+            filters={filtersOpen ? <FilterExtras query={uiQuery} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
+          {project && step === "cull" && cullSum.summary && (
+            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} />
+          )}
         </>
         )
       ) : mode === "develop" || (mode === "loupe" && loupePanels.chrome) ? null : (
         <FilterSummary
-          query={query}
+          query={uiQuery}
           shown={ids.length}
           total={counts?.total ?? null}
           unit={keepersStep ? "keepers" : ""}
@@ -1455,6 +1529,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               onBackToCull={() => goStep("cull")}
               onContinueExport={() => goStep("export")}
               onRegroup={() => void wf.regroup()}
+              summary={cullSum.summary}
             />
           </ErrorBoundary>
         )}
@@ -1480,7 +1555,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onRate={ratePhoto}
             onFlag={flagPhoto}
             filterSummary={{
-              text: filterSummaryText(query, ids.length, counts?.total ?? null, scenes.number, keepersStep ? "keepers" : ""),
+              text: filterSummaryText(uiQuery, ids.length, counts?.total ?? null, scenes.number, keepersStep ? "keepers" : ""),
               onEdit: () => {
                 changeMode("grid");
                 setFiltersOpen(true);
@@ -1525,12 +1600,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                       <>
                         {isRep && (
                           <>
-                            <span className="pointer-events-none absolute inset-0 rounded ring-2 ring-inset ring-amber-400" data-testid={`film-rep-${fid}`} />
-                            <span className="pointer-events-none absolute left-0.5 top-4 rounded bg-black/70 px-0.5 text-[9px] font-bold text-amber-400">R</span>
+                            <span className="pointer-events-none absolute inset-0 rounded ring-2 ring-inset ring-amber-400" data-testid={`film-rep-${fid}`} aria-hidden />
+                            <span className="absolute left-0.5 top-4 rounded bg-black/70 px-0.5 text-[9px] font-bold text-amber-400" title="Representative: the photo you edit for this scene; Apply to scene copies its look to the others" aria-label="Representative of the scene">R</span>
                           </>
                         )}
-                        {!isRep && wf.needsReviewSet.has(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-amber-400" data-testid={`film-review-${fid}`}>!</span>}
-                        {!isRep && !wf.needsReviewSet.has(fid) && row.entry.appliedIds.includes(fid) && <span className="pointer-events-none absolute right-3.5 top-0 text-[11px] font-bold text-emerald-400" data-testid={`film-applied-${fid}`}>✓</span>}
+                        {!isRep && wf.needsReviewSet.has(fid) && <span className="absolute right-3.5 top-0 text-[11px] font-bold text-amber-400" title="Needs a look: the applied edit did not match this frame well" aria-label="Needs a look" data-testid={`film-review-${fid}`}>!</span>}
+                        {!isRep && !wf.needsReviewSet.has(fid) && row.entry.appliedIds.includes(fid) && <span className="absolute right-3.5 top-0 text-[11px] font-bold text-emerald-400" title="The scene edit has been applied to this photo" aria-label="Edit applied" data-testid={`film-applied-${fid}`}>✓</span>}
                       </>
                     );
                   }
@@ -1556,6 +1631,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onExitCompare={() => openLoupe(cmp ? cmp[cmp.focus] : undefined)}
             onRate={ratePhoto}
             onLocate={locateFolder}
+            burstSizes={burstSizes}
           />
           </ErrorBoundary>
         )}

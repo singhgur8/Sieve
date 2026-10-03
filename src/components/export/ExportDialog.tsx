@@ -6,7 +6,9 @@ import {
   commands,
   EXPORT_FILENAME_TOKENS,
   unwrap,
+  type CullSummary,
   type ExportCapabilities,
+  type KeeperRule,
   type ExportFormatKind,
   type ExportJob,
   type ExportPlan,
@@ -18,6 +20,8 @@ import {
 } from "../../ipc";
 import { formatError } from "../../lib/format";
 import { Dialog } from "../Dialog";
+import { KeeperRuleMenu } from "../KeeperRule";
+import { keeperEquation } from "../../lib/cull";
 import { defaultFormat, defaultResize, DEFAULT_SETTINGS, normalizeSettings, previewTemplate, validateSubfolder } from "../../lib/exportSettings";
 
 interface Props {
@@ -27,6 +31,10 @@ interface Props {
   filteredIds: number[];
   /** Export step: the project's keepers. Adds a first scope "Keepers (N)", selected by default. */
   keeperIds?: number[];
+  /** Cull summary: the keeper formula shown under the scope. */
+  summary?: CullSummary | null;
+  /** Keeper rule picked in the dialog (the caller changes it and reopens the dialog with the new keepers). */
+  onKeeperRule?: (r: KeeperRule) => void;
   sampleEntry: (id: number) => RawImageEntry | undefined;
   onClose: () => void;
   onStarted: (job: ExportJob) => void;
@@ -91,7 +99,7 @@ function NumInput({ id, value, min, max, step, onChange, width = "w-24" }: { id:
   );
 }
 
-export function ExportDialog({ selectionIds, filteredIds, keeperIds, sampleEntry, onClose, onStarted }: Props) {
+export function ExportDialog({ selectionIds, filteredIds, keeperIds, summary, onKeeperRule, sampleEntry, onClose, onStarted }: Props) {
   const [presets, setPresets] = useState<ExportPreset[]>([]);
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -674,6 +682,14 @@ export function ExportDialog({ selectionIds, filteredIds, keeperIds, sampleEntry
           </div>
         </div>
 
+        {keeperIds && summary && (
+          <div className="flex flex-wrap items-center gap-x-2 border-t border-neutral-800 px-4 py-1.5 text-xs text-neutral-300" data-testid="export-keeper-formula">
+            <span title="Export works on the keepers; nothing is deleted from the catalog">
+              Keepers <b>{summary.keepers}</b> {keeperEquation(summary)}
+            </span>
+            {onKeeperRule && <KeeperRuleMenu current={summary.keeperRule} onPick={onKeeperRule} testid="export-keeper-rule" />}
+          </div>
+        )}
         <footer className="flex flex-wrap items-center gap-3 border-t border-neutral-800 px-4 py-2.5">
           <div className="flex items-center gap-3 text-sm" data-testid="export-scope">
             {keeperIds && (

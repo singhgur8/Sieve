@@ -1,8 +1,9 @@
 import { memo, useState } from "react";
-import { AlertTriangle, Anchor, CloudUpload, Flag, ImageOff, Layers, Loader2, Star, Unplug, X } from "lucide-react";
+import { AlertTriangle, Anchor, CloudUpload, FileCheck, Flag, ImageOff, Layers, Loader2, Star, Unplug, X } from "lucide-react";
 import { convertFileSrc, type RawImageEntry } from "../ipc";
 import { useEntryHealth } from "../lib/errors";
-import { LABEL_COLOR, TAG_SHORT, TAG_STYLE, tagName } from "../lib/format";
+import { LABEL_COLOR, TAG_SHORT, TAG_STYLE } from "../lib/format";
+import { flagTitle, rejectInfo, sidecarName, suggestedReject, tagTitle } from "../lib/cull";
 
 interface Props {
   id: number;
@@ -15,6 +16,8 @@ interface Props {
   onDoubleClick: (id: number) => void;
   /** Click on a star: rate this photo only (0 clears). */
   onRate?: (id: number, rating: number) => void;
+  /** Size of the photo's burst (for the badge text). */
+  burstSize?: number;
 }
 
 const stopAll = (e: React.SyntheticEvent) => e.stopPropagation();
@@ -89,17 +92,28 @@ export function HealthBadge({ entry, testPrefix = "health" }: { entry: RawImageE
   );
 }
 
-export function XmpBadge({ entry }: { entry: RawImageEntry }) {
+/**
+ * Sidecar state of one photo. Errors and unsaved changes always show; with `showSaved` a photo whose sidecar is
+ * up to date gets a quiet check mark too ("Saved to DSC0001.xmp next to the original").
+ */
+export function XmpBadge({ entry, showSaved = false }: { entry: RawImageEntry; showSaved?: boolean }) {
+  const sidecar = sidecarName(entry.fileName);
   if (entry.xmp.error)
     return (
-      <span title={`Sidecar not written: ${entry.xmp.error}`} data-xmp="error" data-testid={`xmp-error-${entry.id}`} className="text-red-400">
+      <span title={`${sidecar} could not be written: ${entry.xmp.error}`} aria-label={`${sidecar} could not be written`} data-xmp="error" data-testid={`xmp-error-${entry.id}`} className="text-red-400">
         <AlertTriangle className="size-3.5" />
       </span>
     );
   if (entry.xmp.dirty)
     return (
-      <span title="Metadata not saved to sidecar" data-xmp="dirty" className="text-amber-400">
+      <span title={`Changes not saved to ${sidecar} yet (Save, or wait for auto-sync)`} aria-label={`Changes not saved to ${sidecar} yet`} data-xmp="dirty" className="text-amber-400">
         <CloudUpload className="size-3.5" />
+      </span>
+    );
+  if (showSaved && entry.xmp.syncedAtMs != null)
+    return (
+      <span title={`Saved to ${sidecar} next to the original`} aria-label={`Saved to ${sidecar}`} data-xmp="saved" data-testid={`xmp-saved-${entry.id}`} className="text-emerald-500">
+        <FileCheck className="size-3.5" />
       </span>
     );
   return null;
@@ -109,7 +123,8 @@ export function SceneBadge({ entry, testPrefix = "scene-badge" }: { entry: RawIm
   if (entry.sceneId == null) return null;
   return (
     <span
-      title={entry.isSceneAnchor ? `Scene ${entry.sceneId} anchor` : `Scene ${entry.sceneId}`}
+      title={entry.isSceneAnchor ? `Scene ${entry.sceneId}: the anchor photo (graded by you; the other frames of the scene are matched to it)` : `Scene ${entry.sceneId}: photos shot in the same lighting`}
+      aria-label={entry.isSceneAnchor ? `Scene ${entry.sceneId} anchor` : `Scene ${entry.sceneId}`}
       data-testid={`${testPrefix}-${entry.id}`}
       data-anchor={entry.isSceneAnchor}
       className={`flex items-center gap-0.5 rounded px-1 text-[10px] ${entry.isSceneAnchor ? "bg-amber-800 text-amber-100" : "bg-emerald-950/90 text-emerald-200"}`}
@@ -124,8 +139,27 @@ export function CompanionBadge({ entry, testPrefix = "companion" }: { entry: Raw
   if (!entry.companionPath) return null;
   const name = entry.companionPath.split("/").pop();
   return (
-    <span title={`Paired with ${name}`} data-testid={`${testPrefix}-${entry.id}`} className="rounded bg-neutral-800/90 px-1 text-[10px] font-semibold text-neutral-200">
+    <span title={`Camera JPEG ${name} is paired with this RAW (shown as one photo)`} aria-label={`Paired with ${name}`} data-testid={`${testPrefix}-${entry.id}`} className="rounded bg-neutral-800/90 px-1 text-[10px] font-semibold text-neutral-200">
       +JPG
+    </span>
+  );
+}
+
+/** "Burst of 5: this is the keeper" / "Burst of 5: not the keeper". */
+export function BurstBadge({ entry, size, testPrefix = "burst-badge" }: { entry: RawImageEntry; size?: number; testPrefix?: string }) {
+  if (entry.burstGroupId == null) return null;
+  const of = size ? `Burst of ${size}` : `Burst #${entry.burstGroupId}`;
+  const dup = entry.quality?.reasons?.find((r) => r.kind === "duplicate_burst")?.text;
+  const title = entry.isBurstKeeper ? `${of} — this is the keeper, the best frame of the burst` : `${of} — not the keeper${dup ? `. ${dup}` : ""}`;
+  return (
+    <span
+      title={title}
+      aria-label={title}
+      data-testid={`${testPrefix}-${entry.id}`}
+      className={`flex items-center gap-0.5 rounded px-1 text-[10px] ${entry.isBurstKeeper ? "bg-green-900 text-green-200" : "bg-neutral-800/90 text-neutral-300"}`}
+    >
+      <Layers className="size-3" />
+      {entry.isBurstKeeper ? "★" : ""}
     </span>
   );
 }
@@ -143,10 +177,12 @@ function Thumb({ src, name }: { src: string; name: string | undefined }) {
   return <img src={src} decoding="async" draggable={false} alt={name} className="size-full object-contain" onError={() => setBroken(src)} />;
 }
 
-export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick, onRate }: Props) {
+export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick, onRate, burstSize }: Props) {
   const t = entry?.thumbnail;
   const compact = size < 150;
   const tags = entry?.tags.filter((x) => !x.suppressed) ?? [];
+  const reject = entry && !compact ? rejectInfo(entry) : null;
+  const suggested = entry && !compact && !reject ? suggestedReject(entry) : null;
   return (
     <div
       data-testid={`cell-${id}`}
@@ -175,32 +211,45 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
       )}
       {entry && (
         <>
-          <div className="pointer-events-none absolute left-1 top-1 flex items-center gap-1">
-            {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" />}
-            {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} />}
-            {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={entry.colorLabel} />}
+          <div className="absolute left-1 top-1 flex items-center gap-1">
+            {entry.pick === "pick" && (
+              <span title={flagTitle(entry)} aria-label={flagTitle(entry)} data-testid={`flag-${id}`}>
+                <Flag className="size-3.5 fill-green-500 text-green-500" />
+              </span>
+            )}
+            {entry.pick === "reject" && (
+              <span title={flagTitle(entry)} aria-label={flagTitle(entry)} data-testid={`flag-${id}`}>
+                <X className="size-4 text-red-500" strokeWidth={3} />
+              </span>
+            )}
+            {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={`Color label: ${entry.colorLabel}`} aria-label={`Color label ${entry.colorLabel}`} />}
           </div>
-          <div className="pointer-events-none absolute right-1 top-1 flex items-center gap-1">
+          <div className="absolute right-1 top-1 flex items-center gap-1">
             <HealthBadge entry={entry} />
             <XmpBadge entry={entry} />
             <CompanionBadge entry={entry} />
             <SceneBadge entry={entry} />
-            {entry.burstGroupId != null && (
-              <span
-                title={`Burst #${entry.burstGroupId}${entry.isBurstKeeper ? " (keeper)" : ""}`}
-                className={`flex items-center gap-0.5 rounded px-1 text-[10px] ${
-                  entry.isBurstKeeper ? "bg-green-900 text-green-200" : "bg-neutral-800/90 text-neutral-300"
-                }`}
-              >
-                <Layers className="size-3" />
-                {entry.isBurstKeeper ? "★" : ""}
-              </span>
-            )}
+            <BurstBadge entry={entry} size={burstSize} />
           </div>
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-between gap-1 bg-gradient-to-t from-black/80 to-transparent px-1 pb-0.5 pt-3">
+          {reject ? (
+            <div
+              className="absolute inset-x-0 bottom-5 truncate bg-red-950/85 px-1 text-[10px] leading-4 text-red-100"
+              data-testid={`reject-reason-${id}`}
+              data-origin={reject.who}
+              title={`${reject.origin}${reject.reasons.length ? `: ${reject.reasons.join("; ")}` : ""}`}
+            >
+              <b>{reject.origin}</b>
+              {reject.reasons[0] ? ` · ${reject.reasons[0]}` : ""}
+            </div>
+          ) : suggested ? (
+            <div className="absolute inset-x-0 bottom-5 truncate bg-sky-950/85 px-1 text-[10px] leading-4 text-sky-100" data-testid={`suggested-reason-${id}`} title={`${suggested}. Sieve suggests rejecting this photo; nothing was changed. Press X to reject it, or use Apply suggestions`}>
+              {suggested}
+            </div>
+          ) : null}
+          <div className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-1 bg-gradient-to-t from-black/80 to-transparent px-1 pb-0.5 pt-3">
             <div className="flex flex-wrap gap-0.5">
               {tags.map((x) => (
-                <span key={x.tag} title={tagName(x.tag)} className={`rounded px-1 text-[9px] font-semibold leading-4 ${TAG_STYLE[x.tag]}`}>
+                <span key={x.tag} title={tagTitle(entry, x.tag)} aria-label={tagTitle(entry, x.tag)} className={`rounded px-1 text-[9px] font-semibold leading-4 ${TAG_STYLE[x.tag]}`}>
                   {TAG_SHORT[x.tag]}
                 </span>
               ))}

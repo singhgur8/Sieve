@@ -17,6 +17,8 @@ interface Props {
   onCellClick: (id: number, e: React.MouseEvent) => void;
   onCellDoubleClick: (id: number) => void;
   onRate?: (id: number, rating: number) => void;
+  /** Burst sizes by group id (burst badge text). */
+  burstSizes?: Map<number, number>;
   /** True when the catalog holds no photos at all (first run). */
   catalogEmpty: boolean;
   filtered: boolean;
@@ -26,7 +28,7 @@ interface Props {
 
 export const PhotoGrid = memo(PhotoGridImpl);
 
-function PhotoGridImpl({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, onRate, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
+function PhotoGridImpl({ lib, targetSize, selected, active, onColsChange, onCellClick, onCellDoubleClick, onRate, burstSizes, catalogEmpty, filtered, onImport, onClearFilters }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const { ids } = lib;
@@ -140,6 +142,10 @@ function PhotoGridImpl({ lib, targetSize, selected, active, onColsChange, onCell
                   onClick={onCellClick}
                   onDoubleClick={onCellDoubleClick}
                   onRate={onRate}
+                  burstSize={(() => {
+                    const g = lib.getEntry(id)?.burstGroupId;
+                    return g != null ? burstSizes?.get(g) : undefined;
+                  })()}
                 />
               ))}
             </div>

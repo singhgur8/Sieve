@@ -70,7 +70,13 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm }: P
       <h2 className="mb-1 text-sm font-semibold" data-testid="apply-title">
         Apply suggestions
       </h2>
-      <p className="mb-3 text-xs text-neutral-400">Replaces flags and star ratings with Sieve&apos;s suggestions. You can undo it afterwards.</p>
+      <div className="mb-3 space-y-1.5 text-xs text-neutral-400" data-testid="apply-explain">
+        <p>
+          Sieve analysed your photos (blinks, focus, blur, exposure, duplicates in a burst) and suggests a flag and stars for each. <b className="text-neutral-200">Applying copies those suggestions in place</b>: it only changes flags and stars, never your files or edits, and
+          by default only photos you have not flagged or rated yourself.
+        </p>
+        <p>Nothing is final. Afterwards, open the Rejected view: every auto-rejected photo shows why it was rejected, and you can flag it back (Z / U). Undo (Cmd+Z, or the Undo button that follows) reverts the whole apply.</p>
+      </div>
       <div className="mb-3 flex gap-4 text-sm" role="radiogroup" aria-label="Scope" data-testid="apply-scope">
         <label className={`flex items-center gap-1.5 ${selected.length === 0 ? "opacity-50" : ""}`}>
           <input type="radio" name="apply-scope" checked={scope === "selected"} disabled={selected.length === 0} onChange={() => setScope("selected")} data-testid="apply-scope-selected" />

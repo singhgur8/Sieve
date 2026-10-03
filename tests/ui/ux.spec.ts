@@ -332,7 +332,7 @@ test.describe("P1-3 culling undo", () => {
     await expect.poll(() => rating(page, 3)).toBe("0");
     await expect(page.getByTestId("notice")).toContainText("Undid");
     const [r] = await calls(page, "restore_cull_snapshot");
-    expect(r.args.snapshots).toEqual([{ imageId: 3, rating: 0, pick: "reject", colorLabel: null }]);
+    expect(r.args.snapshots).toEqual([{ imageId: 3, rating: 0, pick: "reject", colorLabel: null, pickOrigin: "user" }]);
     await page.keyboard.press("Meta+z");
     await expect.poll(() => pick(page, 3)).toBe("unflagged");
     await page.keyboard.press("Meta+Shift+z");

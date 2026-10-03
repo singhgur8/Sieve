@@ -110,10 +110,17 @@ export function GridToolbar(p: Props) {
           )}
         </Menu>
       )}
-      <span className="ml-auto min-w-[120px] shrink-0 truncate pl-2 text-right" data-testid="selection-count">
-        {p.catalogTotal != null && p.catalogTotal !== p.total ? `${p.total} of ${p.catalogTotal}${p.unit && p.unit !== "photos" ? ` ${p.unit}` : ""}` : `${p.total} ${p.unit ?? "photos"}`} · {p.selectedCount} selected
-      </span>
     </div>
+    <span
+      className="shrink-0 whitespace-nowrap px-3 text-right text-xs text-neutral-200"
+      data-testid="selection-count"
+      title="How many photos the grid shows right now (all filters, scene and burst collapse applied) out of all photos in this view, and how many are selected"
+    >
+      Showing <b data-testid="readout-shown">{p.total}</b>
+      {p.catalogTotal != null ? <> of <span data-testid="readout-total">{p.catalogTotal}</span></> : null} {p.unit ?? "photos"}
+      {" · "}
+      {p.selectedCount} selected
+    </span>
     {p.trailing && <div className="flex shrink-0 items-center px-3">{p.trailing}</div>}
     </div>
   );

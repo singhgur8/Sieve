@@ -174,6 +174,9 @@ export function TopBar(p: Props) {
             >
               <Check className="size-4" /> Apply suggestions…
             </button>
+            <p className="px-3 pb-1.5 pr-4 text-[11px] leading-snug text-neutral-400" data-testid="apply-info">
+              Auto mode: fills in flags and stars from Sieve&apos;s analysis, only on photos you have not touched. You review the result (Rejected view) and can undo it.
+            </p>
             <button
               className={menuItem}
               disabled={!p.hasSelection}

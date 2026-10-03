@@ -102,7 +102,7 @@ test.describe("projects home page", () => {
     await clearCalls(page);
     await openProject(page, 1);
     await expect(page.getByTestId("project-name")).toHaveText("ceremony");
-    await expect(page.getByTestId("grid-toolbar")).toContainText("101 photos");
+    await expect(page.getByTestId("selection-count")).toContainText("101 photos");
     await expect(page.getByTestId("cell-1")).toBeVisible();
     await expectThumb(page, 1);
     await expect(page.getByTestId("cell-102")).toHaveCount(0);
@@ -121,7 +121,7 @@ test.describe("projects home page", () => {
     await shot(page, `${P}switcher`);
     await page.getByTestId("switcher-project-2").click();
     await expect(page.getByTestId("project-name")).toHaveText("reception");
-    await expect(page.getByTestId("grid-toolbar")).toContainText("100 photos");
+    await expect(page.getByTestId("selection-count")).toContainText("100 photos");
     await expect(page.getByTestId("cell-102")).toBeVisible();
     await expectThumb(page, 102);
     await expect(page.getByTestId("cell-1")).toHaveCount(0);
@@ -217,7 +217,7 @@ test.describe("projects home page", () => {
 
     // The surviving project still opens with its own photos and the switcher lists only it.
     await openProject(page, 1);
-    await expect(page.getByTestId("grid-toolbar")).toContainText("101 photos");
+    await expect(page.getByTestId("selection-count")).toContainText("101 photos");
     await page.getByTestId("project-switcher").click();
     await expect(page.getByTestId("switcher-project-2")).toHaveCount(0);
     await expect(page.getByTestId("error")).toHaveCount(0);

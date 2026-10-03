@@ -418,13 +418,13 @@ test.describe("P1-7 filter bar and count", () => {
       expect(b.x, id).toBeGreaterThanOrEqual(bar.x);
       expect(b.x + b.width, id).toBeLessThanOrEqual(bar.x + bar.width + 0.5);
     }
-    await expect(page.getByTestId("selection-count")).toHaveText("2000 photos · 0 selected");
+    await expect(page.getByTestId("selection-count")).toHaveText("Showing 2000 of 2000 photos · 0 selected");
     await page.getByTestId("tag-blink").click();
-    await expect(page.getByTestId("selection-count")).toHaveText(/^\d+ of 2000 · 0 selected$/);
+    await expect(page.getByTestId("selection-count")).toHaveText(/^Showing \d+ of 2000 photos · 0 selected$/);
     await shot(page, `${P}filter-1280`);
     await page.getByTestId("clear-filters").click();
     await page.getByTestId("cell-1").click();
-    await expect(page.getByTestId("selection-count")).toHaveText("2000 photos · 1 selected");
+    await expect(page.getByTestId("selection-count")).toHaveText("Showing 2000 of 2000 photos · 1 selected");
   });
 });
 

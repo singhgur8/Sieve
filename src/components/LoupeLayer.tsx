@@ -3,7 +3,8 @@ import { Flag, X } from "lucide-react";
 import { commands, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
-import { CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
+import { BurstBadge, CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
+import { flagTitle, rejectInfo, tagTitle } from "../lib/cull";
 import { Filmstrip } from "./Filmstrip";
 import { CompareBar, CompareTag } from "./CompareBar";
 import { usePanels } from "../lib/panels";
@@ -41,10 +42,12 @@ interface Props {
   onRate?: (id: number, rating: number) => void;
   /** "Locate folder…" for the folder of image `imageId`. */
   onLocate?: (imageId: number) => void;
+  /** Burst sizes by group id (burst badge text). */
+  burstSizes?: Map<number, number>;
 }
 
 /** Full-area loupe / 2-up compare. Owns zoom/pan state so pans do not re-render the grid. */
-export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen, onCandidate, onSwap, onMakeSelect, onEditCompare, onExitCompare, onRate, onLocate }, ref) {
+export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ mode, lib, activeId, compare, onFocusPane, onOpen, onCandidate, onSwap, onMakeSelect, onEditCompare, onExitCompare, onRate, onLocate, burstSizes }, ref) {
   const [view, setView] = useState<View>(FIT);
   const [faces, setFaces] = useState<FaceInfo[]>([]);
   const [info, setInfo] = useState<InfoLevel>("full");
@@ -108,6 +111,8 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
     [faces],
   );
 
+  const posId = mode === "compare" && compare ? compare[compare.focus] : activeId;
+  const posIdx = posId != null ? lib.ids.indexOf(posId) : -1;
   const zoomLabel = view.scale <= 1.001 ? "Fit" : `${Math.round((metrics.current ? (metrics.current.fitW / metrics.current.natW) * view.scale : view.scale) * 100)}%`;
 
   return (
@@ -137,7 +142,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-image-id={id}
                 >
                   <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} />
-                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} />
+                  <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
                 </div>
               );
             })}
@@ -145,11 +150,22 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
             <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} testId="zoom-a" />
-            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} onRate={onRate} />
+            <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
           </div>
         ) : null}
+        {posIdx >= 0 && (
+          <div
+            className="absolute bottom-2 left-3 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
+            data-testid="loupe-position"
+            title={`Photo ${posIdx + 1} of ${lib.ids.length} in the current view (filters apply)`}
+            aria-label={`Photo ${posIdx + 1} of ${lib.ids.length}`}
+          >
+            {posIdx + 1} of {lib.ids.length}
+          </div>
+        )}
         <div
-          className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
+          className="absolute bottom-2 right-3 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
+          title={`Zoom level${faces.length > 0 ? `, ${faces.length} face${faces.length > 1 ? "s" : ""} found (F steps through them)` : ""}. Space toggles Fit and 100%`}
           data-testid="zoom-label"
         >
           {zoomLabel}
@@ -191,7 +207,21 @@ function suggestion(entry: RawImageEntry): string | null {
   return `Suggested: ${PICK_LABEL[q.suggestedPick]} · ${q.suggestedRating}★`;
 }
 
-function InfoOverlay({ entry, level, showKeeper, onLocate, onRate }: { entry: RawImageEntry | undefined; level: InfoLevel; showKeeper: boolean; onLocate?: (id: number) => void; onRate?: (id: number, rating: number) => void }) {
+function InfoOverlay({
+  entry,
+  level,
+  showKeeper,
+  onLocate,
+  onRate,
+  burstSizes,
+}: {
+  entry: RawImageEntry | undefined;
+  level: InfoLevel;
+  showKeeper: boolean;
+  onLocate?: (id: number) => void;
+  onRate?: (id: number, rating: number) => void;
+  burstSizes?: Map<number, number>;
+}) {
   if (!entry || level === "off") return null;
   if (level === "name")
     return (
@@ -208,34 +238,55 @@ function InfoOverlay({ entry, level, showKeeper, onLocate, onRate }: { entry: Ra
     c.focalLengthMm != null ? `${trimNum(c.focalLengthMm)}mm` : null,
   ].filter(Boolean);
   const tags = entry.tags.filter((t) => !t.suppressed);
+  const reject = rejectInfo(entry);
+  const reasons = entry.quality?.reasons ?? [];
+  const burstSize = entry.burstGroupId != null ? burstSizes?.get(entry.burstGroupId) : undefined;
   return (
     <div className="pointer-events-none absolute left-2 top-2 flex max-w-[90%] flex-col gap-1 rounded bg-black/60 px-2 py-1 text-xs" data-testid="info-overlay" data-level="full">
       <div className="flex items-center gap-2">
         <span className="font-medium text-neutral-100">{entry.fileName}</span>
-        {entry.pick === "pick" && <Flag className="size-3.5 fill-green-500 text-green-500" />}
-        {entry.pick === "reject" && <X className="size-4 text-red-500" strokeWidth={3} />}
-        {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} />}
+        {entry.pick === "pick" && (
+          <span className="pointer-events-auto" title={flagTitle(entry)} aria-label={flagTitle(entry)} data-testid="loupe-flag">
+            <Flag className="size-3.5 fill-green-500 text-green-500" />
+          </span>
+        )}
+        {entry.pick === "reject" && (
+          <span className="pointer-events-auto" title={flagTitle(entry)} aria-label={flagTitle(entry)} data-testid="loupe-flag">
+            <X className="size-4 text-red-500" strokeWidth={3} />
+          </span>
+        )}
+        {entry.colorLabel && <span className={`pointer-events-auto size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={`Color label: ${entry.colorLabel}`} aria-label={`Color label ${entry.colorLabel}`} />}
         <Stars n={entry.rating} className="size-3.5" onRate={onRate && ((r) => onRate(entry.id, r))} testId={`loupe-stars-${entry.id}`} />
-        <HealthBadge entry={entry} testPrefix="loupe-health" />
+        <span className="pointer-events-auto flex items-center gap-2">
+          <HealthBadge entry={entry} testPrefix="loupe-health" />
+          <XmpBadge entry={entry} showSaved />
+          <CompanionBadge entry={entry} testPrefix="loupe-companion" />
+          <BurstBadge entry={entry} size={burstSize} testPrefix="loupe-burst" />
+        </span>
         {onLocate && entry.missingSinceMs != null && (
-          <button onClick={() => onLocate(entry.id)} data-testid="loupe-locate" className="pointer-events-auto rounded bg-neutral-800 px-1.5 text-[10px] text-neutral-200 hover:bg-neutral-700">
+          <button onClick={() => onLocate(entry.id)} data-testid="loupe-locate" title="Point the folder of this photo at where it was moved" className="pointer-events-auto rounded bg-neutral-800 px-1.5 text-[10px] text-neutral-200 hover:bg-neutral-700">
             Locate folder…
           </button>
         )}
-        <XmpBadge entry={entry} />
-        <CompanionBadge entry={entry} testPrefix="loupe-companion" />
         {showKeeper && entry.isBurstKeeper && (
-          <span className="rounded bg-green-900 px-1.5 text-green-200" data-testid="keeper-badge">
+          <span className="pointer-events-auto rounded bg-green-900 px-1.5 text-green-200" title="Keeper of its burst: the best frame, the others are duplicates" data-testid="keeper-badge">
             Keeper
           </span>
         )}
       </div>
-      {suggested && (
-        <div className="text-sky-300" data-testid="suggested-line">
-          {suggested}
+      {reject && (
+        <div className="text-red-300" data-testid="loupe-reject-reason" data-origin={reject.who} title="Why this photo is rejected">
+          <b>{reject.origin}</b>
+          {reject.reasons.length > 0 ? `: ${reject.reasons.join("; ")}` : ""}
         </div>
       )}
-      <div className="text-neutral-400">
+      {suggested && (
+        <div className="text-sky-300" data-testid="suggested-line" title="What Apply suggestions would set. Nothing changes until you apply it">
+          {suggested}
+          {!reject && entry.quality?.suggestedPick === "reject" && reasons.length > 0 ? `: ${reasons.map((r) => r.text).join("; ")}` : ""}
+        </div>
+      )}
+      <div className="text-neutral-400" title="Capture settings, Sieve's quality score (0-100) and burst membership">
         {exif.join(" · ")}
         {entry.quality ? ` · Q ${Math.round(entry.quality.overall * 100)}` : ""}
         {entry.burstGroupId != null ? ` · burst #${entry.burstGroupId}${entry.isBurstKeeper ? " keeper" : ""}` : ""}
@@ -243,7 +294,7 @@ function InfoOverlay({ entry, level, showKeeper, onLocate, onRate }: { entry: Ra
       {tags.length > 0 && (
         <div className="flex gap-1">
           {tags.map((t) => (
-            <span key={t.tag} className={`rounded px-1 ${TAG_STYLE[t.tag]}`}>
+            <span key={t.tag} className={`pointer-events-auto rounded px-1 ${TAG_STYLE[t.tag]}`} title={tagTitle(entry, t.tag)} aria-label={tagTitle(entry, t.tag)}>
               {tagName(t.tag)}
             </span>
           ))}

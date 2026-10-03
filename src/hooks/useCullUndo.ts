@@ -14,7 +14,7 @@ export interface CullEntry {
   at: number;
 }
 
-export const snapOf = (e: RawImageEntry): CullSnapshot => ({ imageId: e.id, rating: e.rating, pick: e.pick, colorLabel: e.colorLabel });
+export const snapOf = (e: RawImageEntry): CullSnapshot => ({ imageId: e.id, rating: e.rating, pick: e.pick, colorLabel: e.colorLabel, pickOrigin: e.pickOrigin });
 
 interface Deps {
   getEntry: (id: number) => RawImageEntry | undefined;

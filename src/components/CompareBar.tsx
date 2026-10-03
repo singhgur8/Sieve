@@ -60,7 +60,9 @@ export function CompareTag({ id, a, b }: { id: number; a: number; b: number }) {
   if (id !== a && id !== b) return null;
   return (
     <span
-      className={`pointer-events-none absolute inset-x-0 top-0 text-center text-[9px] font-semibold leading-3 ${id === a ? "bg-sky-700 text-white" : "bg-amber-400 text-black"}`}
+      title={id === a ? "Select: the frame you are keeping so far (left pane)" : "Candidate: the frame being compared against the Select (right pane)"}
+      aria-label={id === a ? "Select" : "Candidate"}
+      className={`absolute inset-x-0 top-0 text-center text-[9px] font-semibold leading-3 ${id === a ? "bg-sky-700 text-white" : "bg-amber-400 text-black"}`}
       data-testid={`film-tag-${id}`}
     >
       {id === a ? "Select" : "Candidate"}
