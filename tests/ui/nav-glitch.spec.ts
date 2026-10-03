@@ -165,7 +165,7 @@ async function run(page: Page, mode: "loupe" | "develop") {
 }
 
 test.describe("arrow-key navigation (two filters on, 25 presses/s)", () => {
-  test("Loupe: every painted frame belongs to the current photo, no animation, no re-queries", async ({ page }) => {
+  test("Loupe: no previous-photo frame (painted and DOM level), no animation, no list/count re-queries", async ({ page }) => {
     await openApp(page, 400);
     await rasterRoutes(page); // registered last: wins over the SVG routes of openApp
     await twoFilters(page);
@@ -184,7 +184,7 @@ test.describe("arrow-key navigation (two filters on, 25 presses/s)", () => {
     expect(r.ipc.get_filter_counts).toBe(0);
   });
 
-  test("Develop: every painted frame belongs to the current photo, no blank frame", async ({ page }) => {
+  test("Develop: no previous-photo frame (painted and DOM level), no animation, no list/count re-queries", async ({ page }) => {
     await openApp(page, 400);
     await rasterRoutes(page); // registered last: wins over the SVG routes of openApp
     await twoFilters(page);
