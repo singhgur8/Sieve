@@ -1234,6 +1234,41 @@ pub async fn list_xmp_failures(
     catalog.run(move |c| repo::xmp_failures(c, &FolderScope::resolve(c, None, project_id)?)).await
 }
 
+/// Re-reads sidecars another app (Lightroom, Bridge) changed since Sieve last wrote / read them,
+/// for `projectId`'s folders (`null` = every catalog folder) (v18). Only sidecars whose mtime
+/// changed are read; images with unsaved catalog changes are left to auto-sync (newer wins).
+/// Returns the images whose rating / flag / label / develop settings changed (refetch them with
+/// `get_images`). Call on project open and on window focus (debounced). Unknown project ->
+/// `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_sidecars(
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    develop: State<'_, DevelopCache>,
+    project_id: Option<ProjectId>,
+) -> AppResult<Vec<ImageId>> {
+    let folders: Vec<FolderId> = catalog
+        .run(move |c| match project_id {
+            Some(p) => projects::project_folder_ids(c, p),
+            None => Ok(c
+                .prepare("SELECT id FROM folders ORDER BY id")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?),
+        })
+        .await?;
+    if folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sync = xmp.inner().clone();
+    let changed = blocking(move || sync.refresh_folders(&folders)).await?;
+    if !changed.is_empty() {
+        // Like import's sidecar read: cached develop state of these images is stale.
+        develop.forget_sources(Some(&changed));
+    }
+    Ok(changed)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn get_xmp_status(catalog: State<'_, Catalog>, xmp: State<'_, XmpSync>) -> AppResult<XmpStatus> {

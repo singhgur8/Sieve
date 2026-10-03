@@ -12,10 +12,18 @@ const CAPTURE_ONE: &str = include_str!("fixtures/captureone.xmp");
 const DARKTABLE: &str = include_str!("fixtures/darktable.xmp");
 const DATE: &str = "2026-09-29T12:00:00Z";
 
+/// Culling write. `rating -1` = rejected with 0 stars, `label "Pick"` = picked (the old
+/// Sieve encoding, kept as test shorthand).
 fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
+    let pick = match (rating, label) {
+        (r, _) if r < 0 => PickFlag::Reject,
+        (_, Some("Pick")) => PickFlag::Pick,
+        _ => PickFlag::Unflagged,
+    };
     Desired {
-        rating,
-        label,
+        rating: rating.max(0),
+        pick,
+        label: label.filter(|l| *l != "Pick"),
         tags: tags.iter().map(|t| t.to_string()).collect(),
         metadata_date: DATE.into(),
         develop: Vec::new(),
@@ -40,7 +48,8 @@ fn assert_unrelated_preserved(orig: &str, out: &str, owned: &[&str]) {
     }
 }
 
-const OWNED: &[&str] = &["Rating", "Label", "MetadataDate", "Sieve|", "<rdf:li>blink<", "<rdf:li>motion_blur<"];
+const OWNED: &[&str] =
+    &["Rating", "Label", "MetadataDate", "xmpDM", "Sieve|", "<rdf:li>blink<", "<rdf:li>motion_blur<"];
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -87,12 +96,15 @@ fn lightroom_merge_updates_owned_fields_only() {
     let out = merge(Some(LIGHTROOM), &want(5, Some("Pick"), &["blink", "missed_focus"])).unwrap();
     assert_unrelated_preserved(LIGHTROOM, &out, OWNED);
     // Attribute form kept in place.
-    assert!(out.contains("   xmp:Rating=\"5\"\n   xmp:Label=\"Pick\"\n   xmp:MetadataDate=\"2026-09-29T12:00:00Z\"\n"));
+    assert!(out.contains("   xmp:Rating=\"5\"\n   xmp:MetadataDate=\"2026-09-29T12:00:00Z\"\n"));
+    assert!(!out.contains("xmp:Label"), "Red is ours; a pick is no longer a label");
+    assert!(out.contains("xmpDM:pick=\"1\"") && out.contains("xmpDM:good=\"True\""));
+    assert!(out.contains("xmlns:xmpDM=\"http://ns.adobe.com/xmp/1.0/DynamicMedia/\""));
     assert!(out.contains("crs:Exposure2012=\"+0.35\""));
     assert!(out.contains("<rdf:li>Smith &amp; Jones</rdf:li>"));
     let v = parse(&out).unwrap();
     assert_eq!(v.rating, Some(5));
-    assert_eq!(v.label.as_deref(), Some("Pick"));
+    assert_eq!((v.label.as_deref(), v.dm_pick, v.dm_good), (None, Some(1), Some(true)));
     assert_eq!(
         v.hierarchical_subjects,
         ["Events|wedding", "Clients|Smith & Jones", "Sieve|blink", "Sieve|missed_focus"]
@@ -148,8 +160,9 @@ fn leaf_shared_with_foreign_hierarchy_is_kept() {
 #[test]
 fn element_style_sidecars_are_edited_in_place() {
     let out = merge(Some(CAPTURE_ONE), &want(-1, None, &["blink"])).unwrap();
-    assert_unrelated_preserved(CAPTURE_ONE, &out, &["Rating", "Label"]);
-    assert!(out.contains("<xmp:Rating>-1</xmp:Rating>"));
+    assert_unrelated_preserved(CAPTURE_ONE, &out, &["Rating", "Label", "xmpDM"]);
+    assert!(out.contains("<xmp:Rating>0</xmp:Rating>"), "stars, never -1");
+    assert!(out.contains("xmpDM:pick=\"-1\"") && out.contains("xmpDM:good=\"False\""));
     assert!(!out.contains("Purple"), "Purple is ours and was cleared");
     let v = parse(&out).unwrap();
     assert_eq!(v.subjects, ["travel", "portrait", "blink"]);
@@ -182,13 +195,14 @@ fn creates_minimal_packet() {
     assert!(out.starts_with("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\""));
     let v = parse(&out).unwrap();
     assert_eq!(v.rating, Some(4));
-    assert_eq!(v.label.as_deref(), Some("Pick"));
+    assert_eq!((v.label.as_deref(), v.dm_pick, v.dm_good), (None, Some(1), Some(true)));
     assert_eq!(v.hierarchical_subjects, ["Sieve|duplicate_burst"]);
     assert_eq!(v.subjects, ["duplicate_burst"]);
     // No tags: no keyword properties at all.
     let bare = merge(None, &want(0, None, &[])).unwrap();
     assert!(!bare.contains("subject") && !bare.contains("Subject"));
     assert!(bare.contains("xmp:Rating=\"0\""));
+    assert!(!bare.contains("xmpDM"), "unflagged adds no flag properties");
 }
 
 #[test]
@@ -241,11 +255,11 @@ fn row(rating: u8, pick: PickFlag, label: Option<ColorLabel>) -> ImageRow {
 #[test]
 fn catalog_to_sidecar_mapping() {
     let d = desired(&row(4, PickFlag::Reject, Some(ColorLabel::Blue)), &[], None);
-    assert_eq!((d.rating, d.label), (-1, Some("Blue")));
+    assert_eq!((d.rating, d.pick, d.label), (4, PickFlag::Reject, Some("Blue")));
     let d = desired(&row(2, PickFlag::Pick, Some(ColorLabel::Blue)), &[], None);
-    assert_eq!((d.rating, d.label), (2, Some("Pick")));
+    assert_eq!((d.rating, d.pick, d.label), (2, PickFlag::Pick, Some("Blue")));
     let d = desired(&row(0, PickFlag::Unflagged, None), &["blink".into()], None);
-    assert_eq!((d.rating, d.label, d.tags), (0, None, vec!["blink".to_string()]));
+    assert_eq!((d.rating, d.pick, d.label, d.tags), (0, PickFlag::Unflagged, None, vec!["blink".to_string()]));
 }
 
 #[test]
@@ -259,6 +273,21 @@ fn sidecar_to_catalog_mapping() {
     assert_eq!(catalog_values(&v(Some(4), Some("Pick")), 0), (4, PickFlag::Pick, None));
     assert_eq!(catalog_values(&v(Some(9), Some("purple")), 0), (5, PickFlag::Unflagged, Some(ColorLabel::Purple)));
     assert_eq!(catalog_values(&v(None, Some("Approved")), 2), (0, PickFlag::Unflagged, None));
+    // Lightroom Classic flags win over the legacy encodings.
+    let dm = |pick: Option<i32>, good: Option<bool>, rating: i32, label: Option<&str>| SidecarValues {
+        dm_pick: pick,
+        dm_good: good,
+        ..v(Some(rating), label)
+    };
+    assert_eq!(catalog_values(&dm(Some(1), Some(true), 3, None), 0), (3, PickFlag::Pick, None));
+    assert_eq!(
+        catalog_values(&dm(Some(-1), Some(false), 4, Some("Red")), 0),
+        (4, PickFlag::Reject, Some(ColorLabel::Red))
+    );
+    assert_eq!(catalog_values(&dm(Some(0), None, 2, Some("Pick")), 0), (2, PickFlag::Unflagged, None));
+    assert_eq!(catalog_values(&dm(None, Some(true), 1, None), 0), (1, PickFlag::Pick, None));
+    assert_eq!(catalog_values(&dm(None, Some(false), 5, None), 0), (5, PickFlag::Reject, None));
+    assert_eq!(catalog_values(&dm(Some(0), None, -1, None), 3), (3, PickFlag::Unflagged, None));
 }
 
 #[test]
@@ -353,6 +382,17 @@ impl Fixture {
     }
 }
 
+/// Running as root (CI containers): directory permissions are not enforced, so the
+/// read-only-folder parts of a test are skipped (with a note).
+fn permissions_not_enforced() -> bool {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
+        eprintln!("note: running as root; read-only folder checks skipped (permissions are not enforced)");
+    }
+    root
+}
+
 /// Sleeps long enough for file mtimes / trigger timestamps to move on.
 fn tick() {
     std::thread::sleep(Duration::from_millis(15));
@@ -373,7 +413,8 @@ fn write_images_creates_sidecars_and_clears_dirty() {
     let v0 = parse(&fs::read_to_string(f.sidecar(0)).unwrap()).unwrap();
     assert_eq!((v0.rating, v0.label.as_deref()), (Some(4), None));
     assert_eq!(v0.hierarchical_subjects, ["Sieve|blink"]);
-    assert_eq!(parse(&fs::read_to_string(f.sidecar(1)).unwrap()).unwrap().rating, Some(-1));
+    let v1 = parse(&fs::read_to_string(f.sidecar(1)).unwrap()).unwrap();
+    assert_eq!((v1.rating, v1.dm_pick, v1.dm_good), (Some(0), Some(-1), Some(false)));
     assert_eq!(parse(&fs::read_to_string(f.sidecar(2)).unwrap()).unwrap().label.as_deref(), Some("Green"));
     for (i, &id) in f.ids.iter().enumerate() {
         let (dirty, synced, mtime, err) = f.state(id);
@@ -449,6 +490,9 @@ fn read_only_folder_and_missing_raw_are_reported() {
     assert!(f.ids[..2].iter().filter(|&&id| id != gone).all(|&id| !missing(id)));
 
     // Read-only folder (e.g. a locked card or a share without write access).
+    if permissions_not_enforced() {
+        return;
+    }
     let shoot = f.dir.path().join("shoot");
     fs::set_permissions(&shoot, fs::Permissions::from_mode(0o555)).unwrap();
     let report = f.sync.write_images(&f.ids[2..]).unwrap();
@@ -610,7 +654,16 @@ fn auto_sync_reports_failures() {
 
 fn exiftool_json(files: &[PathBuf]) -> serde_json::Value {
     let out = std::process::Command::new("exiftool")
-        .args(["-j", "-XMP:Rating", "-XMP:Label", "-XMP-lr:HierarchicalSubject", "-XMP-dc:Subject", "-XMP-crs:all"])
+        .args([
+            "-j",
+            "-XMP:Rating",
+            "-XMP:Label",
+            "-XMP-xmpDM:Pick",
+            "-XMP-xmpDM:Good",
+            "-XMP-lr:HierarchicalSubject",
+            "-XMP-dc:Subject",
+            "-XMP-crs:all",
+        ])
         .args(files)
         .output()
         .expect("exiftool on PATH");
@@ -679,8 +732,10 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
     println!("exiftool after write_xmp:\n{}", serde_json::to_string_pretty(&json).unwrap());
     let j = json.as_array().unwrap();
     assert_eq!(j[0]["Rating"], 5);
-    assert_eq!(j[0]["Label"], "Pick");
-    assert_eq!(j[1]["Rating"], -1);
+    assert_eq!((j[0]["Pick"].clone(), j[0]["Good"].clone()), (serde_json::json!(1), serde_json::json!(true)));
+    assert!(j[0].get("Label").is_none(), "a pick is not a colour label");
+    assert_eq!(j[1]["Rating"], 0);
+    assert_eq!((j[1]["Pick"].clone(), j[1]["Good"].clone()), (serde_json::json!(-1), serde_json::json!(false)));
     assert_eq!(j[1]["HierarchicalSubject"], "Sieve|blink");
     assert_eq!(j[1]["Subject"], "blink");
     assert_eq!(j[2]["Rating"], 2);
@@ -707,7 +762,7 @@ fn xmp_exiftool_roundtrip_on_real_raws() {
     assert_eq!(sync.refresh_folder(summary.folder_id).unwrap(), 1);
     let r = store::load(&conn, ids[0]).unwrap().unwrap();
     println!("after exiftool edit + refresh_folder: rating={} pick={:?} label={:?}", r.rating, r.pick, r.color_label);
-    assert_eq!((r.rating, r.pick, r.color_label), (4, PickFlag::Unflagged, Some(ColorLabel::Blue)));
+    assert_eq!((r.rating, r.pick, r.color_label), (4, PickFlag::Pick, Some(ColorLabel::Blue)), "xmpDM:pick kept");
 
     std::thread::sleep(Duration::from_millis(20));
     let st = std::process::Command::new("exiftool")
@@ -1169,7 +1224,7 @@ fn fresh_catalog_auto_saves_edits_preserving_sidecar_fields() {
     let text = fs::read_to_string(f.sidecar(0)).unwrap();
     let v = parse(&text).unwrap();
     assert_eq!(v.rating, Some(4));
-    assert_eq!(v.label.as_deref(), Some("Pick"));
+    assert_eq!((v.label.as_deref(), v.dm_pick, v.dm_good), (None, Some(1), Some(true)));
     let dev = v.develop.expect("edits written");
     assert_eq!((dev.exposure, dev.contrast), (0.5, -20.0));
     let after: Vec<_> = packet::top_level_properties(&text)
@@ -1181,6 +1236,9 @@ fn fresh_catalog_auto_saves_edits_preserving_sidecar_fields() {
     assert!(!f.sidecar(1).exists(), "untouched images get no sidecar");
 
     // Error: the sidecar cannot be written -> failed count (the UI's error state).
+    if permissions_not_enforced() {
+        return;
+    }
     let shoot = f.dir.path().join("shoot");
     let mut perms = fs::metadata(&shoot).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
@@ -1197,3 +1255,6 @@ fn fresh_catalog_auto_saves_edits_preserving_sidecar_fields() {
     let st = repo::xmp_status(&conn, false).unwrap();
     assert_eq!((st.dirty, st.failed), (1, 1));
 }
+
+mod lock;
+mod lr_flags;

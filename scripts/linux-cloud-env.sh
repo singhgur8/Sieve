@@ -26,3 +26,8 @@ export ORT_LIB_PATH=/opt/ort/lib
 export ORT_PREFER_DYNAMIC_LINK=1
 export LD_LIBRARY_PATH=/opt/ljt3/lib:/opt/ort/lib:${LD_LIBRARY_PATH}
 export PATH=$HOME/.cargo/bin:$PATH
+# Disk: the per-session allowance is small; several worktrees share one CARGO_TARGET_DIR.
+export CARGO_INCREMENTAL=0
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/user/Sieve/src-tauri/target}
+# Playwright: the image ships Chromium 1194, @playwright/test wants a newer build.
+export PW_CHROMIUM=/opt/pw-browsers/chromium_headless_shell-1194/chrome-linux/headless_shell

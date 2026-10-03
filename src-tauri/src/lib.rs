@@ -182,6 +182,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             // IPC v18
             commands::get_cull_summary,
             commands::get_metadata_filter_options,
+            commands::refresh_sidecars,
         ])
         .events(collect_events![
             ImportProgress,

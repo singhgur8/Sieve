@@ -896,6 +896,13 @@ Background activity (e)
   `apply_scene_edit` / `apply_all_edited_scenes` (`apply_scene`, indeterminate), `download_models`
   (`model_download`, KiB).
 
+Sidecar refresh (added for rust-engine-dev's "XMP both ways")
+- `refresh_sidecars(projectId | null) -> number[]`: re-reads sidecars whose mtime changed since Sieve last wrote /
+  read them (another app edited them) for the project's folders (`null` = all folders), via
+  `XmpSync::refresh_folders`; images with unsaved catalog changes are skipped (auto-sync's newer-wins handles
+  them). Returns the changed image ids (refetch with `get_images`); forgets their develop sources. Unknown project
+  -> `not_found`. Frontend: call on project open and on window focus (debounced). Mock returns `[]`.
+
 Who updates what
 - architect (done): types, schema v16, commands + registration, `Activities` managed state + wiring above, SQL
   (filters, facets, summary, keeper predicate), pick-origin writers (`repo`, `xmp::store::apply_read`), Rust tests,
@@ -905,7 +912,7 @@ Who updates what
   `hasSidecar`, activity events for write_xmp / save all / `__mockXmpFlush` / export, `window.__mockActivity(e)`;
   `?meta=1` varied file types / cameras / lenses; `?keepers=not_rejected` = v18 default rule — the mock keeps the
   pre-v18 rule by default so existing suites are unchanged).
-- frontend-dev: cull summary readout (`getCullSummary`, refetch after culling writes / `analysisFinished`); keeper
+- frontend-dev: `refreshSidecars(projectId)` on project open + window focus (debounced; refetch the returned ids); cull summary readout (`getCullSummary`, refetch after culling writes / `analysisFinished`); keeper
   rule menu (new default, `mode`); Rejected view (`pickOrigin`, `quality.reasons`); metadata filter row
   (`getMetadataFilterOptions(query)` + `ImageQuery.metadata` + `getFilterCounts(.., metadata)`); corner indicator
   from `events.activityEvent`; `useCullUndo.snapOf` should include `pickOrigin: e.pickOrigin` so undo restores

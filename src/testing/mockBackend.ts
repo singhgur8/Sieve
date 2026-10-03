@@ -1487,6 +1487,10 @@ export function installMockBackend(count: number) {
           return cullSummary((args.projectId as number | null) ?? null);
         case "get_metadata_filter_options":
           return metadataOptions(args.query as ImageQuery);
+        case "refresh_sidecars":
+          // No other app edits mock sidecars.
+          if (args.projectId != null) requireProject(args.projectId as number);
+          return [];
         case "get_import_status":
           return { total: count, pending: 0, ready: count, failed: 0, running: false };
         case "get_analysis_status":

@@ -156,7 +156,7 @@ test.describe("guided workflow", () => {
     await page.getByTestId("plan-keepers-rule").click();
     await page.getByTestId("keeper-rule-3").click(); // Picks, 5 stars
     const [call] = await calls(page, "set_keeper_rule");
-    expect(call.args.rule).toEqual({ minRating: 5, useSuggestions: false });
+    expect(call.args.rule).toEqual({ mode: "picks_and_ratings", minRating: 5, useSuggestions: false });
     await expect(page.getByTestId("plan-keepers-rule")).toContainText("Picks, 5★");
     await expect(page.getByTestId("plan-summary")).not.toContainText("43 keepers");
   });

@@ -16,6 +16,11 @@
 //!   [`health`] / [`read_only_message`]) and is never backed up over the good backups. A
 //!   file that is not a database at all is moved aside (`<catalog>.corrupt-<ms>`) and a
 //!   new catalog is created. [`stage_restore`] + the next launch put a backup back.
+//! - Concurrency (Phase 8c): every connection waits up to [`BUSY_TIMEOUT`] for a lock
+//!   instead of failing with "database is locked" (the command connection, the XMP sync,
+//!   analysis and export workers all write the same file). Writers that read first and write
+//!   later use [`write_tx`] (`BEGIN IMMEDIATE`): in WAL mode a deferred transaction whose
+//!   snapshot went stale cannot wait for the lock and fails at once.
 
 pub mod projects;
 pub mod repo;
@@ -24,7 +29,7 @@ pub mod schema;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -109,6 +114,9 @@ pub fn explain_error(path: &Path, e: AppError) -> AppError {
     e
 }
 
+/// How long a catalog connection waits for another connection's lock before failing.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Opens (creating if needed) the catalog at `path` and brings it to the latest schema.
 /// The first call per catalog in this process also checks integrity and backs it up (see
 /// the module docs); a damaged catalog yields a read-only connection instead of an error.
@@ -128,6 +136,7 @@ pub fn open(path: &Path) -> AppResult<Connection> {
         return open_read_only(path);
     }
     let mut conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     configure(&mut conn)?;
     Ok(conn)
@@ -136,6 +145,7 @@ pub fn open(path: &Path) -> AppResult<Connection> {
 /// Read-only connection (no migrations, `query_only`).
 fn open_read_only(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "query_only", "ON")?;
     Ok(conn)
 }
@@ -216,6 +226,7 @@ fn is_not_a_database(e: &rusqlite::Error) -> bool {
 /// `Ok(None)` = `quick_check` passed; `Ok(Some(first problem))`; `Err` = could not check.
 pub fn integrity(path: &Path) -> rusqlite::Result<Option<String>> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     let problems: Vec<String> =
         conn.prepare("PRAGMA quick_check(5)")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     Ok(match problems.as_slice() {
@@ -227,12 +238,14 @@ pub fn integrity(path: &Path) -> rusqlite::Result<Option<String>> {
 
 fn schema_version(path: &Path) -> rusqlite::Result<i64> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_query_value(None, "user_version", |r| r.get(0))
 }
 
 /// The catalog holds at least one image (`false` if unreadable or pre-schema).
 fn has_images(path: &Path) -> bool {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .and_then(|c| c.busy_timeout(BUSY_TIMEOUT).map(|()| c))
         .and_then(|c| c.query_row("SELECT EXISTS (SELECT 1 FROM images)", [], |r| r.get(0)))
         .unwrap_or(false)
 }
@@ -282,6 +295,7 @@ pub fn backup(path: &Path) -> AppResult<PathBuf> {
     {
         let conn =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy()]).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             AppError::new(ErrorKind::Io, format!("catalog backup to {} failed: {e}", tmp.display()))
@@ -395,6 +409,30 @@ pub fn atomic<T>(conn: &mut Connection, f: impl FnOnce(&mut Connection) -> AppRe
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK TO sieve_atomic; RELEASE sieve_atomic");
+            Err(e)
+        }
+    }
+}
+
+/// Runs `f` in a write transaction taken up front (`BEGIN IMMEDIATE`, waiting up to
+/// [`BUSY_TIMEOUT`] for other writers), committed if `f` succeeds and rolled back otherwise.
+/// Inside an already open transaction it is [`atomic`] (a savepoint of the outer one). Keep
+/// `f` short and free of file I/O: other writers wait while it runs.
+pub fn write_tx<T>(conn: &mut Connection, f: impl FnOnce(&mut Connection) -> AppResult<T>) -> AppResult<T> {
+    if !conn.is_autocommit() {
+        return atomic(conn, f);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match f(conn) {
+        Ok(v) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(v),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e.into())
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
     }

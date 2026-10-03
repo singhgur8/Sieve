@@ -844,6 +844,15 @@ export const commands = {
 	 *  `invalid_argument`.
 	 */
 	getMetadataFilterOptions: (query: ImageQuery) => typedError<MetadataFilterOptions, AppError>(__TAURI_INVOKE("get_metadata_filter_options", { query })),
+	/**
+	 *  Re-reads sidecars another app (Lightroom, Bridge) changed since Sieve last wrote / read them,
+	 *  for `projectId`'s folders (`null` = every catalog folder) (v18). Only sidecars whose mtime
+	 *  changed are read; images with unsaved catalog changes are left to auto-sync (newer wins).
+	 *  Returns the images whose rating / flag / label / develop settings changed (refetch them with
+	 *  `get_images`). Call on project open and on window focus (debounced). Unknown project ->
+	 *  `not_found`.
+	 */
+	refreshSidecars: (projectId: number | null) => typedError<number[], AppError>(__TAURI_INVOKE("refresh_sidecars", { projectId })),
 };
 
 /** Events */
