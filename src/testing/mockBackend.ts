@@ -47,6 +47,7 @@ import type {
   Preset,
   RenderOptions,
   PickFlag,
+  PickOrigin,
   RawImageEntry,
   AutoToneValues,
   CreateProjectResult,
@@ -616,6 +617,10 @@ export function installMockBackend(count: number) {
   const byId = new Map(rows.map((r) => [r.id, r]));
   const visibleTags = (r: RawImageEntry) => r.tags.filter((t) => !t.suppressed).map((t) => t.tag);
 
+  /** v18.1 `ImageQuery.pickOrigin` (mirror of Rust `repo::pick_origin_sql`): only flagged images match; no origin = the user's. */
+  const originOk = (r: RawImageEntry, o: PickOrigin | null | undefined) =>
+    o == null || (r.pick !== "unflagged" && (o === "auto" ? r.pickOrigin === "auto" : r.pickOrigin !== "auto"));
+
   function query(q: ImageQuery): number[] {
     let out = rows.filter((r) => {
       if (!inScope(r, q.folderId, q.projectId)) return false;
@@ -626,6 +631,7 @@ export function installMockBackend(count: number) {
       }
       if (q.excludeTags.some((x) => t.includes(x))) return false;
       if (q.picks.length && !q.picks.includes(r.pick)) return false;
+      if (!originOk(r, q.pickOrigin)) return false;
       if (q.minRating != null && r.rating < q.minRating) return false;
       if (q.maxRating != null && r.rating > q.maxRating) return false;
       if (q.colorLabels.length && (!r.colorLabel || !q.colorLabels.includes(r.colorLabel))) return false;
@@ -743,6 +749,7 @@ export function installMockBackend(count: number) {
     const rule = catalog.keeperRule;
     const n = (f: (r: RawImageEntry) => boolean) => scope.filter(f).length;
     const unflaggedR = (r: RawImageEntry) => r.pick !== "pick" && r.pick !== "reject";
+    const untouched = (r: RawImageEntry) => !!r.quality && r.pick === "unflagged" && r.rating === 0;
     const picked = n((r) => r.pick === "pick");
     const rejected = n((r) => r.pick === "reject");
     const rejectedAuto = n((r) => r.pick === "reject" && r.pickOrigin === "auto");
@@ -764,8 +771,10 @@ export function installMockBackend(count: number) {
         ? { picked, unflagged, starred: 0, suggested: 0 }
         : { picked, unflagged: 0, starred: starredU, suggested: rule.useSuggestions ? suggestedU : 0 },
       keeperRule: rule,
-      suggestedRejectPending: n((r) => unflaggedR(r) && r.quality?.suggestedPick === "reject"),
-      suggestedPickPending: n((r) => unflaggedR(r) && r.quality?.suggestedPick === "pick"),
+      // v18.1: exactly what `apply_suggestions(onlyUnset)` changes (untouched = unflagged and 0 stars).
+      suggestedRejectPending: n((r) => untouched(r) && r.quality?.suggestedPick === "reject"),
+      suggestedPickPending: n((r) => untouched(r) && r.quality?.suggestedPick === "pick"),
+      suggestedRatingPending: n((r) => untouched(r) && r.quality?.suggestedPick === "unflagged" && r.quality.suggestedRating > 0),
       unanalyzed: n((r) => !r.quality),
     };
   }
@@ -783,9 +792,9 @@ export function installMockBackend(count: number) {
   const xmpMessage = (saved: number, failed: number) =>
     `Saved metadata for ${photos(saved)}` + (failed ? `; ${failed} sidecar${failed === 1 ? "" : "s"} could not be written` : "");
 
-  function counts(folderId: number | null, projectId: number | null = null, keepersOnly = false, metadata: MetadataFilter | null = null): FilterCounts {
+  function counts(folderId: number | null, projectId: number | null = null, keepersOnly = false, metadata: MetadataFilter | null = null, pickOrigin: PickOrigin | null = null): FilterCounts {
     if (projectId != null) requireProject(projectId);
-    const scope = rows.filter((r) => inScope(r, folderId, projectId) && (!keepersOnly || keeper(r)) && metaOk(r, metadata));
+    const scope = rows.filter((r) => inScope(r, folderId, projectId) && (!keepersOnly || keeper(r)) && metaOk(r, metadata) && originOk(r, pickOrigin));
     const tags = TAGS.map((tag) => ({ tag, count: scope.filter((r) => visibleTags(r).includes(tag)).length })).filter((t) => t.count > 0);
     const ratings = [0, 0, 0, 0, 0, 0];
     scope.forEach((r) => ratings[r.rating]++);
@@ -1481,6 +1490,7 @@ export function installMockBackend(count: number) {
             (args.projectId as number | null) ?? null,
             (args.keepersOnly as boolean | null) ?? false,
             (args.metadata as MetadataFilter | null) ?? null,
+            (args.pickOrigin as PickOrigin | null) ?? null,
           );
         // ---- IPC v18 ----
         case "get_cull_summary":
@@ -1548,6 +1558,8 @@ export function installMockBackend(count: number) {
             const r = byId.get(i);
             if (!r?.quality) return;
             if (args.onlyUnset && (r.pick !== "unflagged" || r.rating !== 0)) return;
+            // v18.1: only real changes count as applied.
+            if (r.pick === r.quality.suggestedPick && r.rating === r.quality.suggestedRating) return;
             r.rating = r.quality.suggestedRating;
             // v18: a flag "Auto" changes is `auto`; an unchanged flag keeps its origin.
             if (r.pick !== r.quality.suggestedPick) r.pickOrigin = r.quality.suggestedPick === "unflagged" ? null : "auto";

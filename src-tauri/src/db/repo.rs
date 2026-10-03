@@ -697,6 +697,16 @@ fn metadata_clauses(
     Ok(())
 }
 
+/// `ImageQuery.pickOrigin` as a predicate on the `images` row aliased `p` (v18.1). Only
+/// flagged images match; a flag without an origin (pre-v18) counts as the user's, like
+/// `CullSummary.rejectedByUser`.
+fn pick_origin_sql(origin: PickOrigin, p: &str) -> String {
+    match origin {
+        PickOrigin::Auto => format!("({p}pick IN ('pick', 'reject') AND {p}pick_origin = 'auto')"),
+        PickOrigin::User => format!("({p}pick IN ('pick', 'reject') AND {p}pick_origin IS NOT 'auto')"),
+    }
+}
+
 /// `WHERE` clause (with leading space, or empty) and its bound values for `q`'s filters.
 /// `keepers` = the catalog's keeper rule, required when `q.keepersOnly`.
 fn query_filter(q: &ImageQuery, keepers: Option<&KeeperRule>) -> AppResult<(String, Vec<Value>)> {
@@ -736,6 +746,9 @@ fn query_filter_skip(
     if !q.picks.is_empty() {
         let ph = text_list(&q.picks, &mut args, PickFlag::as_str);
         clauses.push(format!("i.pick IN ({ph})"));
+    }
+    if let Some(origin) = q.pick_origin {
+        clauses.push(pick_origin_sql(origin, "i."));
     }
     for (bound, op) in [(q.min_rating, ">="), (q.max_rating, "<=")] {
         if let Some(v) = bound {
@@ -896,25 +909,27 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
 /// statements per case so SQLite can use the folder index (an `?1 IS NULL OR folder_id = ?1`
 /// predicate cannot).
 pub fn filter_counts(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
-    filter_counts_impl(conn, scope.into(), None, &MetadataFilter::default())
+    filter_counts_impl(conn, scope.into(), None, &MetadataFilter::default(), None)
 }
 
 /// [`filter_counts`] over the keepers of `scope` only (`get_filter_counts(.., keepersOnly)`,
 /// IPC v15; keeper rule = the catalog's).
 pub fn filter_counts_keepers(conn: &Connection, scope: impl Into<FolderScope>) -> AppResult<FilterCounts> {
-    filter_counts_with(conn, scope, true, &MetadataFilter::default())
+    filter_counts_with(conn, scope, true, &MetadataFilter::default(), None)
 }
 
-/// `get_filter_counts(folderId, projectId, keepersOnly, metadata)` (v18): [`filter_counts`]
-/// over the images of `scope` that pass `metadata` (and are keepers with `keepers_only`).
+/// `get_filter_counts(folderId, projectId, keepersOnly, metadata, pickOrigin)` (v18, v18.1):
+/// [`filter_counts`] over the images of `scope` that pass `metadata` and `pick_origin` (and
+/// are keepers with `keepers_only`).
 pub fn filter_counts_with(
     conn: &Connection,
     scope: impl Into<FolderScope>,
     keepers_only: bool,
     metadata: &MetadataFilter,
+    pick_origin: Option<PickOrigin>,
 ) -> AppResult<FilterCounts> {
     let rule = if keepers_only { Some(keeper_rule(conn)?) } else { None };
-    filter_counts_impl(conn, scope.into(), rule.as_ref(), metadata)
+    filter_counts_impl(conn, scope.into(), rule.as_ref(), metadata, pick_origin)
 }
 
 fn filter_counts_impl(
@@ -922,6 +937,7 @@ fn filter_counts_impl(
     scope: FolderScope,
     keepers: Option<&KeeperRule>,
     metadata: &MetadataFilter,
+    pick_origin: Option<PickOrigin>,
 ) -> AppResult<FilterCounts> {
     let mut c = FilterCounts { ratings: vec![0; 6], ..Default::default() };
     let scoped;
@@ -937,7 +953,16 @@ fn filter_counts_impl(
         metadata_clauses(metadata, "i.", None, &mut prefixed, &mut Vec::new())?;
         (format!(" AND {}", bare.join(" AND ")), format!(" AND {}", prefixed.join(" AND ")))
     };
-    let (pick_sql, tag_sql, burst_sql, missing_sql) = match scope.is_all() && keepers.is_none() && metadata.is_empty() {
+    // Literal SQL (no bound values), so it can follow the metadata clause in both forms.
+    let (meta_f, meta_fi) = match pick_origin {
+        None => (meta_f, meta_fi),
+        Some(o) => (
+            format!("{meta_f} AND {}", pick_origin_sql(o, "images.")),
+            format!("{meta_fi} AND {}", pick_origin_sql(o, "i.")),
+        ),
+    };
+    let fast = scope.is_all() && keepers.is_none() && metadata.is_empty() && pick_origin.is_none();
+    let (pick_sql, tag_sql, burst_sql, missing_sql) = match fast {
         true => (
             // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
             // without a temp B-tree; the per-folder rows are summed below.
@@ -1040,23 +1065,26 @@ pub fn cull_summary(conn: &Connection, scope: &FolderScope) -> AppResult<CullSum
                 COALESCE(SUM(i.rating > 0), 0),
                 COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND i.rating >= ?1), 0),
                 COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND i.rating = 0 AND q.suggested_pick = 'pick'), 0),
-                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND q.suggested_pick = 'reject'), 0),
-                COALESCE(SUM(i.pick NOT IN ('pick', 'reject') AND q.suggested_pick = 'pick'), 0),
+                COALESCE(SUM({untouched} AND q.suggested_pick = 'reject'), 0),
+                COALESCE(SUM({untouched} AND q.suggested_pick = 'pick'), 0),
+                COALESCE(SUM({untouched} AND q.suggested_pick NOT IN ('pick', 'reject') AND q.suggested_rating > 0), 0),
                 COALESCE(SUM(q.image_id IS NULL), 0),
                 COALESCE(SUM({keeper}), 0)
            FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id
           WHERE {scope}",
         keeper = keeper_predicate(&rule, "i."),
         scope = scope.predicate("i.folder_id"),
+        // `apply_suggestions(onlyUnset = true)`'s own condition (analysed = `q` joined).
+        untouched = "(q.image_id IS NOT NULL AND i.pick = 'unflagged' AND i.rating = 0)",
     );
-    let row: [u32; 12] = conn.query_row(&sql, [rule.min_rating], |r| {
-        let mut out = [0u32; 12];
+    let row: [u32; 13] = conn.query_row(&sql, [rule.min_rating], |r| {
+        let mut out = [0u32; 13];
         for (i, slot) in out.iter_mut().enumerate() {
             *slot = r.get(i)?;
         }
         Ok(out)
     })?;
-    let [total, picked, picked_auto, rejected, rejected_auto, starred, starred_unflagged, suggested_unflagged, sugg_reject, sugg_pick, unanalyzed, keepers] =
+    let [total, picked, picked_auto, rejected, rejected_auto, starred, starred_unflagged, suggested_unflagged, sugg_reject, sugg_pick, sugg_rating, unanalyzed, keepers] =
         row;
     let unflagged = total - picked - rejected;
     let keeper_breakdown = match rule.mode {
@@ -1082,6 +1110,7 @@ pub fn cull_summary(conn: &Connection, scope: &FolderScope) -> AppResult<CullSum
         keeper_rule: rule,
         suggested_reject_pending: sugg_reject,
         suggested_pick_pending: sugg_pick,
+        suggested_rating_pending: sugg_rating,
         unanalyzed,
     })
 }
@@ -1680,8 +1709,10 @@ pub fn list_burst_groups(conn: &Connection, scope: impl Into<FolderScope>) -> Ap
 }
 
 /// Copies `suggested_rating` / `suggested_pick` into the user's rating/pick for `ids`.
-/// Unanalyzed images are skipped; with `only_unset`, so are images already flagged
-/// (`pick != unflagged`) or rated (`rating != 0`). Atomic; unknown ids fail with `not_found`.
+/// Unanalyzed images are skipped, and so are images already matching their suggestion (v18.1,
+/// so `applied` counts real changes); with `only_unset`, so are images already flagged
+/// (`pick != unflagged`) or rated (`rating != 0`). With `only_unset` over a scope it changes
+/// exactly the `CullSummary.suggested*Pending` images. Atomic; unknown ids fail with `not_found`.
 /// A flag it changes gets `pick_origin = 'auto'` (v16); an unchanged flag keeps its origin.
 pub fn apply_suggestions(
     conn: &mut Connection,
@@ -1697,7 +1728,9 @@ pub fn apply_suggestions(
                  pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1),
                  pick_origin = CASE WHEN pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
                                     THEN pick_origin ELSE 'auto' END
-             WHERE id = ?1 AND EXISTS (SELECT 1 FROM quality_scores WHERE image_id = ?1)
+             WHERE id = ?1
+               AND EXISTS (SELECT 1 FROM quality_scores q WHERE q.image_id = ?1
+                             AND (q.suggested_pick <> images.pick OR q.suggested_rating <> images.rating))
                AND (?2 = 0 OR (pick = 'unflagged' AND rating = 0))",
         )?;
         for &id in ids {
@@ -2479,8 +2512,9 @@ mod tests {
         assert_eq!(r, ApplySuggestionsResult { applied: 1, skipped: 2 });
         assert_eq!(get_image(&conn, 1).unwrap().rating, 2);
         assert_eq!(get_image(&conn, 2).unwrap().pick, PickFlag::Pick);
+        // 2 already matches its suggestion and 3 is unanalyzed (v18.1: only changes count).
         let r = apply_suggestions(&mut conn, &[1, 2, 3], false).unwrap();
-        assert_eq!(r, ApplySuggestionsResult { applied: 2, skipped: 1 });
+        assert_eq!(r, ApplySuggestionsResult { applied: 1, skipped: 2 });
         let (a, b, c) = (get_image(&conn, 1).unwrap(), get_image(&conn, 2).unwrap(), get_image(&conn, 3).unwrap());
         assert_eq!((a.rating, a.pick), (1, PickFlag::Reject));
         assert_eq!((b.rating, b.pick), (4, PickFlag::Pick));
@@ -2785,6 +2819,111 @@ mod tests {
         (conn, rows)
     }
 
+    /// v18.1 (UX P1-1): the summary's pending suggestions are exactly what one Apply
+    /// suggestions with its defaults (`onlyUnset`) over the scope changes, split by outcome;
+    /// afterwards nothing is pending and a second Apply changes nothing.
+    #[test]
+    fn suggestions_pending_equals_default_apply() {
+        let (mut conn, rows) = keeper_grid();
+        // Suggested stars everywhere, plus untouched images whose suggestion changes nothing
+        // (unflagged, 0 stars; 1000) or only the stars (1001, 1002).
+        conn.execute("UPDATE quality_scores SET suggested_rating = 3", []).unwrap();
+        for (id, stars) in [(1000, 0), (1001, 2), (1002, 5)] {
+            conn.execute(
+                "INSERT INTO images (id, folder_id, path, file_name, format, camera_make, file_size,
+                                     file_mtime_ms, imported_at, rating, pick)
+                 VALUES (?1, 1, ?2, ?2, 'arw', 'sony', 1, 0, 0, 0, 'unflagged')",
+                params![id, format!("/f/{id}.arw")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                         clipped_shadows_pct, mean_luma, model_version, analyzed_at, suggested_pick, suggested_rating)
+                 VALUES (?1, 0.5, 0.5, 0, 0, 0.5, 'v', 1, 'unflagged', ?2)",
+                params![id, stars],
+            )
+            .unwrap();
+        }
+        let ids: Vec<ImageId> = rows.iter().map(|r| r.0).chain([1000, 1001, 1002]).collect();
+        let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+        let pending = s.suggested_pick_pending + s.suggested_reject_pending + s.suggested_rating_pending;
+        // Grid: one untouched image per suggestion (the `unflagged` one now has 3 stars).
+        assert_eq!((s.suggested_pick_pending, s.suggested_reject_pending, s.suggested_rating_pending), (1, 1, 3));
+
+        let before: Vec<RawImageEntry> = ids.iter().map(|&id| get_image(&conn, id).unwrap()).collect();
+        let r = apply_suggestions(&mut conn, &ids, true).unwrap();
+        assert_eq!(r.applied, pending, "Apply changes exactly the pending images");
+        assert_eq!(r.applied + r.skipped, ids.len() as u32);
+        let (mut picks, mut rejects, mut stars) = (0, 0, 0);
+        for b in &before {
+            let a = get_image(&conn, b.id).unwrap();
+            if (a.pick, a.rating) == (b.pick, b.rating) {
+                continue;
+            }
+            assert_eq!((b.pick, b.rating), (PickFlag::Unflagged, 0), "only untouched images change");
+            match a.pick {
+                PickFlag::Pick => picks += 1,
+                PickFlag::Reject => rejects += 1,
+                PickFlag::Unflagged => stars += 1,
+            }
+        }
+        assert_eq!(
+            (picks, rejects, stars),
+            (s.suggested_pick_pending, s.suggested_reject_pending, s.suggested_rating_pending)
+        );
+        let after = cull_summary(&conn, &FolderScope::all()).unwrap();
+        assert_eq!(
+            (after.suggested_pick_pending, after.suggested_reject_pending, after.suggested_rating_pending),
+            (0, 0, 0)
+        );
+        assert_eq!(apply_suggestions(&mut conn, &ids, true).unwrap().applied, 0);
+        // Without onlyUnset, images already matching their suggestion are not counted either.
+        assert!(apply_suggestions(&mut conn, &ids, false).unwrap().applied > 0);
+        assert_eq!(apply_suggestions(&mut conn, &ids, false).unwrap().applied, 0);
+    }
+
+    /// v18.1 (UX P1-6): `ImageQuery.pickOrigin` in queries, facet counts and metadata options.
+    #[test]
+    fn pick_origin_filter() {
+        let (conn, rows) = keeper_grid();
+        // Every other flagged image was flagged by Auto.
+        conn.execute("UPDATE images SET pick_origin = 'auto' WHERE pick <> 'unflagged' AND id % 2 = 0", []).unwrap();
+        let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+        let q = |picks: Vec<PickFlag>, o: Option<PickOrigin>| ImageQuery {
+            picks,
+            pick_origin: o,
+            limit: 1000,
+            ..Default::default()
+        };
+        let rejects = |o| ids_for(&conn, q(vec![PickFlag::Reject], o)).len() as u32;
+        assert!(s.rejected_auto > 0 && s.rejected_by_user > 0);
+        assert_eq!(rejects(Some(PickOrigin::Auto)), s.rejected_auto);
+        assert_eq!(rejects(Some(PickOrigin::User)), s.rejected_by_user);
+        assert_eq!(rejects(None), s.rejected);
+        assert_eq!(ids_for(&conn, q(vec![PickFlag::Pick], Some(PickOrigin::Auto))).len() as u32, s.picked_auto);
+        // Unflagged images never match an origin; alone, an origin means "flagged by".
+        assert!(ids_for(&conn, q(vec![PickFlag::Unflagged], Some(PickOrigin::User))).is_empty());
+        let auto = sorted(ids_for(&conn, q(vec![], Some(PickOrigin::Auto))));
+        let expect: Vec<ImageId> =
+            rows.iter().filter(|r| r.1 != PickFlag::Unflagged && r.0 % 2 == 0).map(|r| r.0).collect();
+        assert_eq!(auto, expect);
+
+        for o in [PickOrigin::Auto, PickOrigin::User] {
+            let none = MetadataFilter::default();
+            let c = filter_counts_with(&conn, FolderScope::all(), false, &none, Some(o)).unwrap();
+            let (p, r) = match o {
+                PickOrigin::Auto => (s.picked_auto, s.rejected_auto),
+                PickOrigin::User => (s.picked - s.picked_auto, s.rejected_by_user),
+            };
+            assert_eq!((c.picked, c.rejected, c.unflagged, c.total), (p, r, 0, p + r), "{o:?}");
+            assert_eq!(c.ratings.iter().sum::<u32>(), c.total);
+            let scoped = filter_counts_with(&conn, FolderScope::from(Some(1)), false, &none, Some(o)).unwrap();
+            assert_eq!(scoped, c, "folder-scoped path agrees ({o:?})");
+            let opts = metadata_filter_options(&conn, &q(vec![PickFlag::Reject], Some(o))).unwrap();
+            assert_eq!(opts.total, r, "{o:?}");
+        }
+    }
+
     #[test]
     fn keeper_modes_rust_and_sql_agree_and_summary_matches_keepers_only() {
         let (conn, rows) = keeper_grid();
@@ -2824,9 +2963,11 @@ mod tests {
         let s = cull_summary(&conn, &FolderScope::all()).unwrap();
         assert_eq!(s.keepers, s.picked + s.unflagged);
         assert_eq!((s.keeper_breakdown.starred, s.keeper_breakdown.suggested), (0, 0));
-        // 24 combinations per flag; suggestions pending = unflagged with that suggestion.
+        // 24 combinations per flag; suggestions pending = unflagged, 0 stars, that suggestion
+        // (v18.1; suggested ratings are all 0 here).
         assert_eq!((s.picked, s.unflagged, s.rejected), (24, 24, 24));
-        assert_eq!((s.suggested_reject_pending, s.suggested_pick_pending, s.unanalyzed), (6, 6, 18));
+        assert_eq!((s.suggested_reject_pending, s.suggested_pick_pending, s.unanalyzed), (1, 1, 18));
+        assert_eq!(s.suggested_rating_pending, 0);
         assert_eq!(s.starred, 60);
         // Validation is mode-independent.
         let bad = KeeperRule { mode: KeeperMode::NotRejected, min_rating: 0, use_suggestions: true };
@@ -2982,16 +3123,16 @@ mod tests {
     fn filter_counts_honour_metadata() {
         let conn = metadata_fixture();
         let m = MetadataFilter { formats: vec![ImageFormat::Arw, ImageFormat::Raf], ..Default::default() };
-        let c = filter_counts_with(&conn, FolderScope::all(), false, &m).unwrap();
+        let c = filter_counts_with(&conn, FolderScope::all(), false, &m, None).unwrap();
         assert_eq!((c.total, c.picked, c.rejected, c.unflagged), (4, 1, 1, 2));
-        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), false, &m).unwrap();
+        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), false, &m, None).unwrap();
         assert_eq!(c.total, 3);
-        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), true, &m).unwrap();
+        let c = filter_counts_with(&conn, FolderScope::from(Some(1)), true, &m, None).unwrap();
         assert_eq!(c.total, 2, "keepers (not rejected) among folder 1's RAWs");
         let edited = MetadataFilter { edited: Some(true), ..Default::default() };
-        assert_eq!(filter_counts_with(&conn, FolderScope::all(), false, &edited).unwrap().total, 1);
+        assert_eq!(filter_counts_with(&conn, FolderScope::all(), false, &edited, None).unwrap().total, 1);
         assert_eq!(
-            filter_counts_with(&conn, FolderScope::all(), false, &MetadataFilter::default()).unwrap(),
+            filter_counts_with(&conn, FolderScope::all(), false, &MetadataFilter::default(), None).unwrap(),
             filter_counts(&conn, FolderScope::all()).unwrap()
         );
     }

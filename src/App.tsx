@@ -139,7 +139,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
-  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata);
+  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata, query.pickOrigin);
   // "of M" in the readouts is the unfiltered total (the metadata filter changes `counts`, not this).
   const totals = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
   // Cull summary (picked / unflagged / rejected / keepers): follows culling changes, analysis and the keeper rule.
@@ -150,7 +150,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
+    query.picks.length > 0 || query.pickOrigin != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
