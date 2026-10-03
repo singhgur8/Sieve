@@ -50,6 +50,7 @@ fn write(adj: &ParametricAdjustments, format: Option<ImageFormat>) -> Desired {
     Desired {
         develop: edits,
         rating: 2,
+        pick: crate::ipc::types::PickFlag::Unflagged,
         label: None,
         tags: Vec::new(),
         metadata_date: DATE.into(),
