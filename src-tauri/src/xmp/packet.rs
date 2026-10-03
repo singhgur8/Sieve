@@ -18,17 +18,21 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use super::crs::{self, LookChange, PropertyEdit, SeqEdit};
-use crate::ipc::types::{DevelopWarning, ImageFormat, LookSettings, ParametricAdjustments, ProfileSettings};
+use crate::ipc::types::{DevelopWarning, ImageFormat, LookSettings, ParametricAdjustments, PickFlag, ProfileSettings};
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
 pub const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
 pub const NS_LR: &str = "http://ns.adobe.com/lightroom/1.0/";
+/// Dynamic Media: Lightroom Classic 13.2+ keeps the pick/reject flag in `xmpDM:pick` and
+/// `xmpDM:good`.
+pub const NS_XMP_DM: &str = "http://ns.adobe.com/xmp/1.0/DynamicMedia/";
 const NS_XMLNS_PREFIX: &str = "xmlns";
 
 /// Hierarchical keyword root owned by Sieve.
 pub const KEYWORD_ROOT: &str = "Sieve";
-/// `xmp:Label` values Sieve writes (and may therefore remove). Lightroom's default label set.
+/// `xmp:Label` values Sieve owns (and may therefore remove): Lightroom's default colour
+/// label set, plus the `"Pick"` older Sieve versions wrote for a pick flag (removed on write).
 pub const OWNED_LABELS: [&str; 6] = ["Pick", "Red", "Yellow", "Green", "Blue", "Purple"];
 
 const BOM: &str = "\u{feff}";
@@ -62,6 +66,11 @@ pub struct SidecarValues {
     /// `xmp:Rating` rounded (`None` if absent or unparsable).
     pub rating: Option<i32>,
     pub label: Option<String>,
+    /// `xmpDM:pick` (Lightroom Classic 13.2+): 1 pick, 0 unflagged, -1 reject (`None` if
+    /// absent or unparsable).
+    pub dm_pick: Option<i32>,
+    /// `xmpDM:good`: `True` pick, `False` reject (`None` if absent or unparsable).
+    pub dm_good: Option<bool>,
     pub hierarchical_subjects: Vec<String>,
     pub subjects: Vec<String>,
     /// Importable develop settings (`crs:` PV2012+, see `crs::decode`).
@@ -78,9 +87,11 @@ pub struct SidecarValues {
 pub struct Desired {
     /// `crs:` / `sieve:` develop properties to set or remove (empty = leave untouched).
     pub develop: Vec<PropertyEdit>,
-    /// -1 (reject) ..= 5.
+    /// Stars, 0..=5 (`xmp:Rating`; kept when the photo is rejected).
     pub rating: i32,
-    /// One of [`OWNED_LABELS`], or `None` to remove an owned label.
+    /// Flag: `xmpDM:pick` + `xmpDM:good` (see [`merge`]).
+    pub pick: PickFlag,
+    /// A colour of [`OWNED_LABELS`], or `None` to remove an owned label (`"Pick"` included).
     pub label: Option<&'static str>,
     /// Visible tags (snake_case), written as `Sieve|<tag>` and `<tag>`.
     pub tags: Vec<String>,
@@ -110,10 +121,17 @@ pub struct ProfileWrite {
 
 impl Desired {
     /// Culling-only write (no develop settings).
-    pub fn culling(rating: i32, label: Option<&'static str>, tags: Vec<String>, metadata_date: String) -> Self {
+    pub fn culling(
+        rating: i32,
+        pick: PickFlag,
+        label: Option<&'static str>,
+        tags: Vec<String>,
+        metadata_date: String,
+    ) -> Self {
         Desired {
             develop: Vec::new(),
             rating,
+            pick,
             label,
             tags,
             metadata_date,
@@ -147,6 +165,15 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     let rating =
         scalar("Rating").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round() as i32);
     let label = scalar("Label").filter(|v| !v.is_empty());
+    let dm = |local: &str| -> Option<String> {
+        doc.scalars(NS_XMP_DM, local).into_iter().next().map(|s| s.value.trim().to_owned())
+    };
+    let dm_pick = dm("pick").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round() as i32);
+    let dm_good = dm("good").and_then(|v| match v.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    });
     let list = |ns: &str, local: &str| -> Vec<String> {
         doc.list(ns, local).map(|p| p.items.iter().map(|i| i.value.clone()).collect()).unwrap_or_default()
     };
@@ -159,6 +186,8 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
     Ok(SidecarValues {
         rating,
         label,
+        dm_pick,
+        dm_good,
         hierarchical_subjects: list(NS_LR, "hierarchicalSubject"),
         subjects: list(NS_DC, "subject"),
         develop,
@@ -565,6 +594,13 @@ fn render_look(look: &LookSettings, source: Option<&str>, qname: &str, rdf: &str
 
 /// Applies `want` to `existing` (or to a new minimal packet), touching only the fields
 /// Sieve owns.
+///
+/// Flag (Lightroom Classic 13.2+ convention): pick -> `xmpDM:pick="1"` + `xmpDM:good="True"`;
+/// reject -> `xmpDM:pick="-1"` + `xmpDM:good="False"`; unflagged -> `xmpDM:good` removed and
+/// `xmpDM:pick="0"` only where the packet already carries `xmpDM:pick` (absent reads as
+/// unflagged, so an untouched sidecar gains nothing). `xmp:Rating` is always the 0..=5 stars,
+/// which also replaces a legacy `-1`; an owned `xmp:Label` that is not the wanted colour
+/// (legacy `"Pick"` included) is removed.
 pub fn merge(existing: Option<&str>, want: &Desired) -> Result<String> {
     let src = existing.unwrap_or(NEW_PACKET);
     let (bom, body) = match src.strip_prefix(BOM) {
@@ -600,6 +636,22 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
     match want.label {
         Some(label) => ed.set_scalar(NS_XMP, "Label", label),
         None => ed.remove_scalar_if(NS_XMP, "Label", is_owned_label),
+    }
+    match want.pick {
+        PickFlag::Pick => {
+            ed.set_scalar(NS_XMP_DM, "pick", "1");
+            ed.set_scalar(NS_XMP_DM, "good", "True");
+        }
+        PickFlag::Reject => {
+            ed.set_scalar(NS_XMP_DM, "pick", "-1");
+            ed.set_scalar(NS_XMP_DM, "good", "False");
+        }
+        PickFlag::Unflagged => {
+            if !doc.scalars(NS_XMP_DM, "pick").is_empty() {
+                ed.set_scalar(NS_XMP_DM, "pick", "0");
+            }
+            ed.remove_scalar_if(NS_XMP_DM, "good", |_| true);
+        }
     }
     ed.set_scalar(NS_XMP, "MetadataDate", &want.metadata_date);
     let top = ScopeSource { doc, scope: Scope::Top };
@@ -1203,6 +1255,7 @@ fn preferred_prefix(uri: &str) -> &'static str {
         NS_XMP => "xmp",
         NS_DC => "dc",
         NS_LR => "lr",
+        NS_XMP_DM => "xmpDM",
         NS_RDF => "rdf",
         crs::CRS_NS => "crs",
         crs::SIEVE_NS => "sieve",

@@ -321,19 +321,32 @@ Error kinds (`AppError.kind`; the `message` is always user-facing): `not_found` 
 
 - Sidecar: `<basename>.xmp` next to the RAW (Lightroom convention; `DSC0001.ARW` -> `DSC0001.xmp`). Two RAWs
   with the same basename in one folder would share a sidecar (not supported; last writer wins).
-- Mapping, catalog -> sidecar:
+- Mapping, catalog -> sidecar (Lightroom Classic 13.2+ flags, Phase 8c; the catalog is authoritative on write):
   | Catalog | XMP |
   |---|---|
-  | `pick = reject` | `xmp:Rating = -1` (stars not representable) |
-  | `rating` 0..=5 (not rejected) | `xmp:Rating` |
-  | `pick = pick` | `xmp:Label = "Pick"` (wins over a colour label) |
-  | `colorLabel` (not picked) | `xmp:Label = "Red"/"Yellow"/"Green"/"Blue"/"Purple"` |
-  | neither | `xmp:Label` removed only if it held "Pick" or one of those names |
+  | `pick = pick` | `xmpDM:pick = "1"`, `xmpDM:good = "True"` |
+  | `pick = reject` | `xmpDM:pick = "-1"`, `xmpDM:good = "False"` |
+  | `pick = unflagged` | `xmpDM:good` removed; `xmpDM:pick = "0"` only if the sidecar already has `xmpDM:pick` |
+  | `rating` 0..=5 | `xmp:Rating` (always, also when rejected; replaces a legacy `-1`) |
+  | `colorLabel` | `xmp:Label = "Red"/"Yellow"/"Green"/"Blue"/"Purple"` |
+  | no `colorLabel` | `xmp:Label` removed only if it held one of those names or the legacy `"Pick"` |
   | visible tags | `lr:hierarchicalSubject` `Sieve\|<tag>` + `dc:subject` `<tag>` |
-  Writes replace only `Sieve|*` items (and their `dc:subject` leaves), bump `xmp:MetadataDate`, and preserve
-  every other field/namespace. Atomic (temp file + rename).
-- Sidecar -> catalog (read/import): `-1` -> reject; `0..=5` -> rating, `pick` iff Label "Pick" else unflagged;
-  label names -> `colorLabel`. `Sieve|*` keywords are not read back (analysis owns tags).
+  `xmpDM` = `http://ns.adobe.com/xmp/1.0/DynamicMedia/`. Lightroom Classic ignores `xmp:Rating -1` (Bridge's
+  reject) and shows `xmp:Label "Pick"` as an unknown colour label, which is what Sieve wrote before Phase 8c;
+  both are migrated by the next write. Writes replace only `Sieve|*` items (and their `dc:subject` leaves), bump
+  `xmp:MetadataDate`, and preserve every other field/namespace byte for byte (attribute or element form kept as
+  found). Atomic (temp file + rename).
+- Sidecar -> catalog (read/import), flag: `xmpDM:pick` (1 / -1 / 0) first, then `xmpDM:good` (True / False), then
+  legacy `xmp:Rating -1` -> reject, `xmp:Label "Pick"` -> pick, else unflagged. `xmp:Rating 0..=5` -> rating
+  (`-1` keeps the catalog's stars); label names -> `colorLabel`. `Sieve|*` keywords are not read back (analysis
+  owns tags).
+- Changes made by another app (Lightroom, Bridge) are picked up by `XmpSync::refresh_folders(folders)` (one
+  `stat` per clean image; reads sidecars whose mtime moved; returns the changed image ids). Import calls
+  `refresh_folder`; project open / window focus need a command wrapping `refresh_folders` (architect).
+- Catalog concurrency: every catalog connection has a 5 s busy timeout (`db::BUSY_TIMEOUT`); XMP sync never holds
+  a transaction across file I/O (file first, then one short `BEGIN IMMEDIATE` / autocommit update per image);
+  an explicit save and an auto-sync pass are serialised (`io_lock`; the pass yields between images); a catalog
+  error ends an explicit run with one error instead of N per-file failures.
 - Dirty tracking is in the schema: triggers set `images.xmp_dirty = 1` + `meta_updated_at` when rating / pick /
   color_label or visible tags change, whoever writes them (commands, `apply_suggestions`, analysis auto tags).
   A successful write/read sets `xmp_dirty = 0`, `xmp_synced_at`, `xmp_mtime_ms` (sidecar mtime), clears `xmp_error`.

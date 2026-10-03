@@ -20,6 +20,7 @@ fn develop_write(adj: &ParametricAdjustments, look_source: Option<&str>) -> Desi
     Desired {
         develop: edits,
         rating: 2,
+        pick: crate::ipc::types::PickFlag::Unflagged,
         label: None,
         tags: Vec::new(),
         metadata_date: DATE.into(),
