@@ -1,7 +1,8 @@
 // Corner widget (bottom-right) listing background work: spinner or progress ring with done / total, a brief check when it
 // finishes, a sticky message on errors. Fed by `events.activityEvent` through src/lib/activity.ts.
 import { AlertTriangle, Check, Loader2, X } from "lucide-react";
-import type { ActivityEvent } from "../ipc";
+import type { ReactNode } from "react";
+import type { ActivityEvent, ActivityKind } from "../ipc";
 import { dismissActivity, useActivities } from "../lib/activity";
 
 function Ring({ pct }: { pct: number }) {
@@ -61,11 +62,16 @@ function Row({ a }: { a: ActivityEvent }) {
   );
 }
 
-export function ActivityWidget() {
-  const list = useActivities();
-  if (list.length === 0) return null;
+/**
+ * The one bottom-right stack. `children` (export job cards) come first. Activities whose progress is already shown
+ * elsewhere (`hideKinds`: export while a job card is listed, analysis / import while their top bar is visible) are skipped.
+ */
+export function ActivityWidget({ children, hasChildren = false, hideKinds = [], behindDialogs = false }: { children?: ReactNode; hasChildren?: boolean; hideKinds?: ActivityKind[]; behindDialogs?: boolean }) {
+  const list = useActivities().filter((a) => !hideKinds.includes(a.kind));
+  if (list.length === 0 && !hasChildren) return null;
   return (
-    <div className="pointer-events-none fixed bottom-3 right-3 z-[65] flex w-[min(320px,92vw)] flex-col items-stretch gap-2" data-testid="activity-widget" aria-live="polite">
+    <div className={`pointer-events-none fixed bottom-3 right-3 ${behindDialogs ? "z-40" : "z-[65]"} flex w-[min(384px,92vw)] flex-col items-stretch gap-2`} data-testid="activity-widget" aria-live="polite">
+      {children}
       {list.map((a) => (
         <Row key={a.id} a={a} />
       ))}

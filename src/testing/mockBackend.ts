@@ -340,9 +340,10 @@ function mockReasons(e: RawImageEntry, keeperId: number | null): SuggestionReaso
   };
   const out: SuggestionReason[] = e.tags.map((t) =>
     t.tag === "duplicate_burst" && keeperId != null && keeperId !== e.id
-      ? { kind: "duplicate_burst", text: `Duplicate in burst (keeper DSC${String(keeperId).padStart(5, "0")})`, relatedImageId: keeperId }
+      ? { kind: "duplicate_burst", text: `Duplicate in burst (best DSC${String(keeperId).padStart(5, "0")})`, relatedImageId: keeperId }
       : { kind: t.tag, text: text[t.tag], relatedImageId: null },
   );
+  out.sort((a, b) => Number(a.kind === "creative_blur") - Number(b.kind === "creative_blur")); // notes last, like the engine
   if (e.quality?.suggestedPick === "reject" && out.length === 0) out.push({ kind: "low_score", text: "Low overall quality", relatedImageId: null });
   return out;
 }

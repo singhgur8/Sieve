@@ -7,7 +7,7 @@ export function AnalysisBar({ a, onCancel, onDismiss }: { a: AnalysisView; onCan
   return (
     <div className="border-b border-neutral-800 px-4 py-1.5" data-testid="analysis-bar">
       <div className="mb-1 flex items-center gap-2 text-xs text-neutral-400">
-        {a.running && <Loader2 className="size-3 animate-spin" />}
+        {a.running && <Loader2 className="size-3 animate-spin" aria-hidden />}
         <span>
           {a.running ? "Analyzing" : "Analysis paused"}: {a.done} / {a.total}
         </span>
@@ -39,7 +39,7 @@ export function ImportBar({ progress, active }: { progress: ImportProgress; acti
   return (
     <div className="border-b border-neutral-800 px-4 py-1.5" data-testid="import-bar">
       <div className="mb-1 flex items-center gap-2 text-xs text-neutral-400">
-        {active && <Loader2 className="size-3 animate-spin" />}
+        {active && <Loader2 className="size-3 animate-spin" aria-hidden />}
         <span>
           {active ? "Extracting thumbnails" : "Done"}: {progress.done} / {progress.total}
         </span>

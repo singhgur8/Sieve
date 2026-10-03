@@ -199,11 +199,12 @@ type InfoLevel = "full" | "name" | "off";
 
 const PICK_LABEL = { pick: "Pick", reject: "Reject", unflagged: "Unflagged" } as const;
 
-/** "Suggested: Reject · 2★" when the automatic suggestion differs from what is set. */
+/** "Sieve suggests reject" / "Suggested: Pick · 2★" when the automatic suggestion differs from what is set. */
 function suggestion(entry: RawImageEntry): string | null {
   const q = entry.quality;
   if (!q) return null;
   if (q.suggestedPick === entry.pick && q.suggestedRating === entry.rating) return null;
+  if (q.suggestedPick === "reject") return `Sieve suggests reject${q.suggestedRating > 0 ? ` · ${q.suggestedRating}★` : ""}`;
   return `Suggested: ${PICK_LABEL[q.suggestedPick]} · ${q.suggestedRating}★`;
 }
 
@@ -269,15 +270,15 @@ function InfoOverlay({
           </button>
         )}
         {showKeeper && entry.isBurstKeeper && (
-          <span className="pointer-events-auto rounded bg-green-900 px-1.5 text-green-200" title="Keeper of its burst: the best frame, the others are duplicates" data-testid="keeper-badge">
-            Keeper
+          <span className="pointer-events-auto rounded bg-green-900 px-1.5 text-green-200" title="Best of its burst: Sieve's choice, the others are duplicates" data-testid="keeper-badge">
+            Best of burst
           </span>
         )}
       </div>
       {reject && (
         <div className="text-red-300" data-testid="loupe-reject-reason" data-origin={reject.who} title="Why this photo is rejected">
           <b>{reject.origin}</b>
-          {reject.reasons.length > 0 ? `: ${reject.reasons.join("; ")}` : ""}
+          {reject.reasons.length > 0 ? `${reject.who === "auto" ? ": " : ". Sieve noted: "}${reject.reasons.join("; ")}` : ""}
         </div>
       )}
       {suggested && (
@@ -289,7 +290,7 @@ function InfoOverlay({
       <div className="text-neutral-400" title="Capture settings, Sieve's quality score (0-100) and burst membership">
         {exif.join(" · ")}
         {entry.quality ? ` · Q ${Math.round(entry.quality.overall * 100)}` : ""}
-        {entry.burstGroupId != null ? ` · burst #${entry.burstGroupId}${entry.isBurstKeeper ? " keeper" : ""}` : ""}
+        {entry.burstGroupId != null ? ` · burst #${entry.burstGroupId}${entry.isBurstKeeper ? " · best" : ""}` : ""}
       </div>
       {tags.length > 0 && (
         <div className="flex gap-1">

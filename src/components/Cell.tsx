@@ -145,12 +145,12 @@ export function CompanionBadge({ entry, testPrefix = "companion" }: { entry: Raw
   );
 }
 
-/** "Burst of 5: this is the keeper" / "Burst of 5: not the keeper". */
+/** "Burst of 5 — best frame" / "Burst of 5 — not the best frame". ("Keeper" is reserved for the Edit / Export set.) */
 export function BurstBadge({ entry, size, testPrefix = "burst-badge" }: { entry: RawImageEntry; size?: number; testPrefix?: string }) {
   if (entry.burstGroupId == null) return null;
   const of = size ? `Burst of ${size}` : `Burst #${entry.burstGroupId}`;
   const dup = entry.quality?.reasons?.find((r) => r.kind === "duplicate_burst")?.text;
-  const title = entry.isBurstKeeper ? `${of} — this is the keeper, the best frame of the burst` : `${of} — not the keeper${dup ? `. ${dup}` : ""}`;
+  const title = entry.isBurstKeeper ? `${of} — best frame (Sieve's choice)` : `${of} — not the best frame${dup ? `. ${dup}` : ""}`;
   return (
     <span
       title={title}
@@ -165,21 +165,22 @@ export function BurstBadge({ entry, size, testPrefix = "burst-badge" }: { entry:
 }
 
 /** Cached thumbnail; when the file cannot be loaded (cache folder cleaned, drive offline) a placeholder replaces the broken image. */
-function Thumb({ src, name }: { src: string; name: string | undefined }) {
+function Thumb({ src, name, dim }: { src: string; name: string | undefined; dim: boolean }) {
   const [broken, setBroken] = useState<string | null>(null);
   if (broken === src)
     return (
-      <div className="flex size-full flex-col items-center justify-center gap-1 text-center" data-testid="thumb-broken" title="The cached preview could not be loaded. Regenerate previews from the More menu, or re-import the folder.">
+      <div className={`flex size-full flex-col items-center justify-center gap-1 text-center ${dim ? "opacity-40" : ""}`} data-testid="thumb-broken" title="The cached preview could not be loaded. Regenerate previews from the More menu, or re-import the folder.">
         <ImageOff className="size-5 text-neutral-400" />
         <span className="text-[10px] text-neutral-400">Preview unavailable</span>
       </div>
     );
-  return <img src={src} decoding="async" draggable={false} alt={name} className="size-full object-contain" onError={() => setBroken(src)} />;
+  return <img src={src} decoding="async" draggable={false} alt={name} className={`size-full object-contain ${dim ? "opacity-40" : ""}`} onError={() => setBroken(src)} />;
 }
 
 export const Cell = memo(function Cell({ id, entry, version, size, selected, active, onClick, onDoubleClick, onRate, burstSize }: Props) {
   const t = entry?.thumbnail;
   const compact = size < 150;
+  const dim = entry?.pick === "reject";
   const tags = entry?.tags.filter((x) => !x.suppressed) ?? [];
   const reject = entry && !compact ? rejectInfo(entry) : null;
   const suggested = entry && !compact && !reject ? suggestedReject(entry) : null;
@@ -194,18 +195,18 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
       onDoubleClick={() => onDoubleClick(id)}
       className={`relative select-none overflow-hidden rounded bg-neutral-900 ${
         selected ? "ring-2 ring-sky-500" : ""
-      } ${active ? "outline outline-2 -outline-offset-2 outline-white" : ""} ${entry?.pick === "reject" ? "opacity-50" : ""}`}
+      } ${active ? "outline outline-2 -outline-offset-2 outline-white" : ""}`}
       style={{ contain: "strict" }}
     >
       {t?.status === "ready" ? (
-        <Thumb src={`${convertFileSrc(t.path)}?v=${version}`} name={entry?.fileName} />
+        <Thumb src={`${convertFileSrc(t.path)}?v=${version}`} name={entry?.fileName} dim={dim} />
       ) : t?.status === "failed" ? (
-        <div className="flex size-full flex-col items-center justify-center gap-1 px-1 text-center" title={t.reason} data-testid={`thumb-failed-${id}`}>
+        <div className={`flex size-full flex-col items-center justify-center gap-1 px-1 text-center ${dim ? "opacity-40" : ""}`} title={t.reason} data-testid={`thumb-failed-${id}`}>
           <ImageOff className="size-5 text-red-500" />
           {!compact && <span className="text-[10px] text-red-300">No preview</span>}
         </div>
       ) : (
-        <div className="flex size-full items-center justify-center">
+        <div className={`flex size-full items-center justify-center ${dim ? "opacity-40" : ""}`}>
           <Loader2 className={`size-5 text-neutral-700 ${entry ? "animate-spin" : ""}`} />
         </div>
       )}
@@ -222,6 +223,11 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
                 <X className="size-4 text-red-500" strokeWidth={3} />
               </span>
             )}
+            {entry.pick === "reject" && compact && entry.pickOrigin === "auto" && (
+              <span title="Auto-rejected by Sieve" aria-label="Auto-rejected" data-testid={`auto-chip-${id}`} className="rounded bg-red-950/85 px-0.5 text-[9px] font-bold leading-3 text-red-100">
+                A
+              </span>
+            )}
             {entry.colorLabel && <span className={`size-2.5 rounded-full ${LABEL_COLOR[entry.colorLabel]}`} title={`Color label: ${entry.colorLabel}`} aria-label={`Color label ${entry.colorLabel}`} />}
           </div>
           <div className="absolute right-1 top-1 flex items-center gap-1">
@@ -233,17 +239,17 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
           </div>
           {reject ? (
             <div
-              className="absolute inset-x-0 bottom-5 truncate bg-red-950/85 px-1 text-[10px] leading-4 text-red-100"
+              className={`absolute inset-x-0 bottom-5 bg-red-950/85 px-1 text-[10px] leading-4 text-red-100 ${size >= 200 ? "line-clamp-2" : "truncate"}`}
               data-testid={`reject-reason-${id}`}
               data-origin={reject.who}
               title={`${reject.origin}${reject.reasons.length ? `: ${reject.reasons.join("; ")}` : ""}`}
             >
               <b>{reject.origin}</b>
-              {reject.reasons[0] ? ` · ${reject.reasons[0]}` : ""}
+              {reject.headline ? `${reject.lead}${reject.headline}` : ""}
             </div>
           ) : suggested ? (
-            <div className="absolute inset-x-0 bottom-5 truncate bg-sky-950/85 px-1 text-[10px] leading-4 text-sky-100" data-testid={`suggested-reason-${id}`} title={`${suggested}. Sieve suggests rejecting this photo; nothing was changed. Press X to reject it, or use Apply suggestions`}>
-              {suggested}
+            <div className="absolute inset-x-0 bottom-5 truncate border-t border-dashed border-red-400/60 bg-sky-950/85 px-1 text-[10px] leading-4 text-sky-100" data-testid={`suggested-reason-${id}`} title={`${suggested.lead} · ${suggested.reason}. Nothing was changed. Press X to reject it, or use Apply suggestions`}>
+              <b>{suggested.lead}</b> · {suggested.reason}
             </div>
           ) : null}
           <div className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-1 bg-gradient-to-t from-black/80 to-transparent px-1 pb-0.5 pt-3">

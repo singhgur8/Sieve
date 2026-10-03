@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, unwrap, type ActivityKind, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -469,7 +469,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           void mutate(`Pick ${entry.fileName}`, [id], (e) => withPick(e, "pick"), () => unwrap(commands.setPick([id], "pick")));
         }
         await lib.refresh(g.imageIds.filter((x) => lib.getEntry(x)));
-        setNotice(`${entry.fileName} is now the burst keeper`);
+        setNotice(`${entry.fileName} is now the best of its burst`);
       } catch (e) {
         reportError(e);
       }
@@ -1255,6 +1255,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   });
 
   const importActive = status.progress !== null && status.progress.done < status.progress.total;
+  const analysisBarShown = !!status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total);
+  const importBarShown = !!status.progress && (importActive || status.progress.failed > 0);
+  // One progress display per job: the corner stack skips what the export cards / top bars already show.
+  const hiddenActivityKinds: ActivityKind[] = [...(exportJobs.jobs.length > 0 ? (["export"] as const) : []), ...(analysisBarShown ? (["analysis"] as const) : []), ...(importBarShown ? (["import"] as const) : [])];
   const running = exportJobs.jobs.filter((j) => j.running);
   const exportPct = running.length ? Math.round((running.reduce((a, j) => a + j.done, 0) / Math.max(1, running.reduce((a, j) => a + j.total, 0))) * 100) : null;
   const catalogEmpty = project ? project.photoCount === 0 : catalog != null && catalog.imageCount === 0;
@@ -1377,7 +1381,6 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         }
         exportPct={exportPct}
       />
-      <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
       {exportOpen && (
         <ErrorBoundary view="Export" overlay onExit={() => setExportOpen(null)}>
           <ExportDialog
@@ -1414,10 +1417,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       {project && <StyleDialogs wf={wf} fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`} />}
       {(explainOpen || explainerDue) && <XmpExplainer autoSync={status.catalog?.xmpAutoSync ?? false} onClose={closeExplainer} />}
       {cheatOpen && <CheatSheet mode={mode} editStep={projectId != null && step === "edit" && (planOpen || mode === "develop")} onClose={() => setCheatOpen(false)} />}
-      {status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total) && (
+      {analysisBarShown && status.analysis && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}
-      {status.progress && (importActive || status.progress.failed > 0) && <ImportBar progress={status.progress} active={importActive} />}
+      {importBarShown && status.progress && <ImportBar progress={status.progress} active={importActive} />}
 
       {idFilter && !planOpen && (
         <div className="flex h-7 shrink-0 items-center gap-3 border-b border-amber-900 bg-amber-950 px-3 text-xs text-amber-100" data-testid="id-filter-bar">
@@ -1475,7 +1478,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600"
                   data-testid="continue-edit"
                   onClick={() => goStep("edit")}
-                  title={`Group the keepers into scenes and edit one photo per scene.${cullSum.summary ? ` ${keeperFormula(cullSum.summary)}. Change the keeper rule in the summary bar above.` : ""}`}
+                  title={`Group the keepers into scenes and edit one photo per scene.${cullSum.summary ? ` ${keeperFormula(cullSum.summary)}. Change the keeper rule in the Cull summary bar.` : ""}`}
                 >
                   Continue to Edit{project.keeperCount > 0 ? ` · ${project.keeperCount} keepers` : ""} <ChevronRight className="size-3.5" />
                 </button>
@@ -1694,7 +1697,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
       <HelpPanel onShortcuts={() => setCheatOpen(true)} />
-      <ActivityWidget />
+      <ActivityWidget behindDialogs={exportOpen != null} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
+        <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />
+      </ActivityWidget>
     </main>
   );
 }

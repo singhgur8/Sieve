@@ -1,10 +1,11 @@
 // Help & FAQ entries. Every statement here was checked against the code (App.tsx culling actions, repo::apply_suggestions,
 // xmp::sidecar_path, KEEPER_RULES). Plain strings are what the search looks at; legends carry their own labels.
 import type { ReactNode } from "react";
-import { Anchor, CheckCircle2, CloudOff, CloudUpload, Flag, Layers, Loader2, Unplug, X, AlertTriangle } from "lucide-react";
+import { Anchor, CheckCircle2, CloudOff, CloudUpload, FileCheck, Flag, ImageOff, Layers, Loader2, Unplug, X, AlertTriangle } from "lucide-react";
 import { Stars } from "../components/Cell";
-import { KEEPER_RULES } from "../components/KeeperRule";
-import { ALL_TAGS, LABEL_COLOR, TAG_SHORT, TAG_STYLE } from "./format";
+import { DISPLAY_ORDER, KEEPER_RULES } from "../components/KeeperRule";
+import { ALL_TAGS, LABEL_COLOR, TAG_SHORT, TAG_STYLE, tagName } from "./format";
+import { TAG_MEANING } from "./cull";
 
 export interface LegendItem {
   icon: ReactNode;
@@ -22,21 +23,11 @@ export interface HelpEntry {
   blocks: Block[];
 }
 
-const TAG_TEXT: Record<(typeof ALL_TAGS)[number], string> = {
-  blink: "Eyes closed.",
-  missed_focus: "Focus missed the face.",
-  motion_blur: "Blurred by movement (unintentional).",
-  creative_blur: "Blur that looks intentional, such as panning. Never auto-rejected on its own.",
-  underexposed: "Too dark.",
-  overexposed: "Highlights are clipped.",
-  duplicate_burst: "Another frame in the same burst was chosen as the keeper.",
-};
-
 const badge = "flex items-center gap-0.5 rounded px-1 text-[10px]";
 
 const LEGEND_FLAGS: LegendItem[] = [
   { icon: <Flag className="size-3.5 fill-green-500 text-green-500" />, label: "Pick flag", text: "You (or Auto) picked this photo." },
-  { icon: <X className="size-4 text-red-500" strokeWidth={3} />, label: "Reject flag", text: "Rejected. The thumbnail is dimmed. Nothing is deleted." },
+  { icon: <X className="size-4 text-red-500" strokeWidth={3} />, label: "Reject flag", text: "Rejected. The picture is dimmed. Nothing is deleted." },
   { icon: <Stars n={3} />, label: "Stars", text: "Your rating, 0 to 5. Click a star to rate; click the same star to clear." },
   {
     icon: (
@@ -53,9 +44,22 @@ const LEGEND_FLAGS: LegendItem[] = [
 
 const LEGEND_TAGS: LegendItem[] = ALL_TAGS.map((t) => ({
   icon: <span className={`rounded px-1 text-[9px] font-semibold leading-4 ${TAG_STYLE[t]}`}>{TAG_SHORT[t]}</span>,
-  label: t.replace("_", " "),
-  text: TAG_TEXT[t],
+  label: tagName(t).replace(/^./, (c) => c.toUpperCase()),
+  text: TAG_MEANING[t], // one source with the hover text of the thumbnails
 }));
+
+const LEGEND_STRIPS: LegendItem[] = [
+  {
+    icon: <span className="w-full truncate bg-red-950/85 px-1 text-[10px] leading-4 text-red-100"><b>Auto-rejected</b> · Reason</span>,
+    label: "Rejected strip",
+    text: "Rejected, and by whom (you or Auto), with Sieve's reason",
+  },
+  {
+    icon: <span className="w-full truncate border-t border-dashed border-red-400/60 bg-sky-950/85 px-1 text-[10px] leading-4 text-sky-100"><b>Sieve suggests reject</b></span>,
+    label: "Suggestion strip",
+    text: "Sieve suggests rejecting this photo. Nothing has changed until you press X or Apply suggestions",
+  },
+];
 
 const LEGEND_BADGES: LegendItem[] = [
   {
@@ -64,8 +68,8 @@ const LEGEND_BADGES: LegendItem[] = [
         <Layers className="size-3" />★
       </span>
     ),
-    label: "Burst keeper",
-    text: "Sieve's best frame of a burst (shots taken within about a second or two of each other).",
+    label: "Best of burst",
+    text: "Sieve's choice of the best frame of a burst (shots taken within about a second or two of each other).",
   },
   {
     icon: (
@@ -74,7 +78,7 @@ const LEGEND_BADGES: LegendItem[] = [
       </span>
     ),
     label: "Burst frame",
-    text: "Another frame of a burst. \"Collapse bursts\" in the filter bar shows only keepers.",
+    text: "Another frame of a burst. \"Collapse bursts\" in the filter bar shows only the best frame of each burst.",
   },
   {
     icon: (
@@ -93,6 +97,17 @@ const LEGEND_BADGES: LegendItem[] = [
     text: "The photo whose edit is copied to the rest of its scene.",
   },
   { icon: <span className="rounded bg-neutral-800/90 px-1 text-[10px] font-semibold text-neutral-200">+JPG</span>, label: "+JPG", text: "A camera JPEG next to this RAW was paired with it at import." },
+  {
+    icon: (
+      <span className={`${badge} bg-red-900 font-semibold text-red-100`}>
+        <ImageOff className="size-3" />
+        Unreadable
+      </span>
+    ),
+    label: "Unreadable",
+    text: "The file could not be decoded. It may be damaged or still copying.",
+  },
+  { icon: <FileCheck className="size-3.5 text-emerald-500" />, label: "Saved check", text: "Loupe only: the sidecar is up to date (Saved to the .xmp next to the original)." },
   { icon: <CloudUpload className="size-3.5 text-amber-400" />, label: "Not saved yet", text: "This photo's changes have not been written to its XMP sidecar yet." },
   { icon: <AlertTriangle className="size-3.5 text-red-400" />, label: "Sidecar error", text: "The sidecar could not be written. Hover for the reason." },
   {
@@ -127,11 +142,11 @@ export const HELP: HelpEntry[] = [
           "0 to 5 sets the stars. 6 to 9 set a color label.",
           "Shift+Z and Shift+X flag and then move to the next photo.",
           "Left / Right move between photos. Space opens the Loupe, and in the Loupe it zooms between Fit and 1:1.",
-          "C opens Compare: two photos side by side. Tab switches the active pane. K makes the active frame the burst keeper and picks it.",
+          "C opens Compare: two photos side by side. Tab switches the active pane. K makes the active frame the best of its burst and picks it.",
           "Cmd+Z undoes the last culling change.",
         ],
       },
-      { p: "Bursts: photos shot close together are grouped, and Sieve marks the best frame as the keeper. Use Collapse bursts in the filter bar to see only keepers, or Cmd+Shift+B to select a whole burst." },
+      { p: "Bursts: photos shot close together are grouped, and Sieve marks the best frame of each burst. Use Collapse bursts in the filter bar to see only the best frame of each burst, or Cmd+Shift+B to select a whole burst." },
       { p: "After Analyze, photos get tags (blink, missed focus, ...). Click a tag in the filter bar to show it, click again to hide it. See the Icons entry for what each one means." },
     ],
   },
@@ -156,13 +171,13 @@ export const HELP: HelpEntry[] = [
     title: "Apply suggestions (Auto)",
     keywords: "auto analyze suggested rejects review undo",
     blocks: [
-      { p: "Analyze scores every photo. Apply suggestions (top bar, More menu) copies Sieve's suggested flag and star rating onto the photos, so you start from a first pass instead of a blank slate." },
+      { p: "Analyze scores every photo. Apply suggestions (the \"Sieve suggests … Apply…\" button in the Cull summary, or More > Apply suggestions…) copies Sieve's suggested flag and star rating onto the photos, so you start from a first pass instead of a blank slate." },
       {
         ul: [
           "Scope: the selected photos or everything in view.",
           "By default it skips photos you already flagged or rated. Untick that to overwrite them.",
           "Photos that were not analyzed yet are skipped.",
-          "Flags it sets are marked as automatic, so they can be told apart from yours. It does not touch labels, edits or files.",
+          "Flags it sets are marked as automatic, so they can be told apart from yours. It does not change color labels or edits. Like any flag or rating, the result is written to the XMP sidecars (right away with auto-save on, or when you press Cmd+S).",
           "Undo brings the old flags and ratings back (the Undo button in the message, or Cmd+Z).",
         ],
       },
@@ -172,11 +187,11 @@ export const HELP: HelpEntry[] = [
   {
     id: "keepers",
     title: "Keepers",
-    keywords: "keeper rule edit export not rejected",
+    keywords: "keeper rule edit export not rejected best of burst",
     blocks: [
       { p: "Keepers are the photos that move on to the Edit and Export steps. By default that is everything you have not rejected." },
-      { p: "To change the rule, open the Keepers menu in the Edit step (Plan view). The choices:" },
-      { ul: KEEPER_RULES.map((k) => `${k.label}: ${k.long}.`) },
+      { p: "To change the rule, use \"Change keeper rule\" in the Cull summary bar (under the toolbar), the Keepers menu in the Edit plan, or the Export dialog. The choices:" },
+      { ul: DISPLAY_ORDER.map((i) => `${KEEPER_RULES[i].label}: ${KEEPER_RULES[i].long}.`) },
       { p: "The \"Continue to Edit\" button shows how many keepers the current rule gives." },
     ],
   },
@@ -187,6 +202,7 @@ export const HELP: HelpEntry[] = [
     blocks: [
       { legend: LEGEND_FLAGS, title: "Flags, stars and labels" },
       { legend: LEGEND_TAGS, title: "Culling tags" },
+      { legend: LEGEND_STRIPS, title: "Strips on thumbnails" },
       { legend: LEGEND_BADGES, title: "Badges on thumbnails" },
       { legend: LEGEND_STATUS, title: "Save status (top bar)" },
     ],
@@ -218,7 +234,7 @@ export const HELP: HelpEntry[] = [
           "Flags are stored as xmpDM:pick / xmpDM:good. Lightroom Classic reads them from version 13.2. Older versions show the stars and labels but not the flags.",
           "New photos: when you import a folder into Lightroom, it reads the sidecars, so your culling shows up.",
           "Photos already in a Lightroom catalog: select them, then Metadata > Read Metadata from Files.",
-          "Going back: Lightroom writes its changes to the sidecars with Cmd+S (Metadata > Save Metadata to Files), or automatically if you turn on \"Automatically write changes into XMP\" in Catalog Settings.",
+          "Going back: Lightroom writes its changes to the sidecars with Cmd+S (Metadata > Save Metadata to Files), or automatically if you turn on \"Automatically write changes into XMP\" in Catalog Settings > Metadata. If Lightroom shows the \"metadata changed externally\" badge on a thumbnail, click it and choose Import Settings from Disk.",
           "Sieve re-reads sidecars that another app changed when a project opens and when the window regains focus.",
           "Do not save from both apps at the same moment. Save in one, then switch to the other.",
         ],

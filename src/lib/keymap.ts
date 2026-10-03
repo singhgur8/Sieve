@@ -90,6 +90,7 @@ export type ActionId =
   | "filterBar"
   | "cheatSheet"
   | "help"
+  | "capsAdvance"
   | "dialogConfirm"
   | "dialogCancel";
 
@@ -144,8 +145,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "unflag", group: "Culling", label: "Unflag", chords: [c("u")], modes: ALL, display: ["U"], where: "Everywhere" },
   { id: "rate", group: "Culling", label: "Star rating", chords: digits(0, 5), modes: ALL, display: ["0-5"], where: "Everywhere" },
   { id: "label", group: "Culling", label: "Color label (red, yellow, green, blue)", chords: digits(6, 9), modes: ALL, display: ["6-9"], where: "Everywhere" },
-  { id: "keeper", group: "Culling", label: "Make this frame the burst keeper and Pick it", chords: [c("k")], modes: ["compare"], display: ["K"], where: "Compare" },
-  { id: "keeperSet", group: "Culling", label: "Make the active photo its burst keeper", chords: [c("k", { shift: true })], modes: ALL, display: ["Shift+K"], where: "Everywhere" },
+  { id: "keeper", group: "Culling", label: "Make this frame the best of its burst and Pick it", chords: [c("k")], modes: ["compare"], display: ["K"], where: "Compare" },
+  { id: "keeperSet", group: "Culling", label: "Make the active photo the best of its burst", chords: [c("k", { shift: true })], modes: ALL, display: ["Shift+K"], where: "Everywhere" },
   { id: "undoCull", group: "Culling", label: "Undo culling change", chords: [c("z", { mod: true })], modes: LIB, display: ["Cmd+Z"], where: "Outside Develop" },
   { id: "redoCull", group: "Culling", label: "Redo culling change", chords: [c("z", { mod: true, shift: true })], modes: LIB, display: ["Cmd+Shift+Z"], where: "Outside Develop" },
   { id: "anchor", group: "Scenes", label: "Toggle scene anchor / make representative", chords: [c("a", { shift: true })], modes: ALL, display: ["Shift+A"], where: "Edit step: make representative; elsewhere: toggle anchor" },
@@ -159,6 +160,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "prevScene", group: "Workflow", label: "Previous scene", chords: [c("n", { shift: true })], modes: ["grid", "develop"], display: ["Shift+N"], where: "Edit step: Plan, Develop" },
   { id: "applyScene", group: "Workflow", label: "Apply to scene", chords: [c("Enter", { mod: true, shift: true })], modes: ["grid", "develop"], display: ["Cmd+Shift+Enter"], where: "Edit step: Plan, Develop" },
   { id: "planSkip", group: "Workflow", label: "Skip / include the focused scene", chords: [], modes: ALL, display: ["S"], where: "Edit step: Plan", external: true },
+  { id: "capsAdvance", group: "Culling", label: "Auto-advance while Caps Lock is on", chords: [], modes: ALL, display: ["Caps Lock"], where: "Everywhere", external: true },
   { id: "planStop", group: "Workflow", label: "Stop applying", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Plan (while applying)", external: true },
   { id: "autoEdit", group: "Workflow", label: "Auto edit (my style)", chords: [c("u", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+U"], where: "Edit step: Plan, Develop" },
 
@@ -233,7 +235,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "export", group: "App", label: "Export...", chords: [c("e", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+E"], where: "Everywhere" },
   { id: "import", group: "App", label: "Import folder...", chords: [c("i", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+I"], where: "Everywhere" },
   { id: "cheatSheet", group: "App", label: "Keyboard shortcuts", chords: [c("?", { shift: "any" }), c("/", { mod: true })], modes: ALL, display: ["?", "Cmd+/"], where: "Everywhere" },
-  { id: "help", group: "App", label: "Help & FAQ", chords: [c("F1")], modes: ALL, display: ["F1"], where: "Everywhere" },
+  { id: "help", group: "App", label: "Help & FAQ", chords: [c("F1"), c("?", { mod: true, shift: "any" })], modes: ALL, display: ["F1", "Cmd+?"], where: "Everywhere" },
   { id: "dialogConfirm", group: "Dialogs", label: "Confirm (Export: Cmd+Enter)", chords: [], modes: ALL, display: ["Enter"], where: "Topmost dialog", external: true },
   { id: "dialogCancel", group: "Dialogs", label: "Cancel / close", chords: [], modes: ALL, display: ["Esc"], where: "Topmost dialog", external: true },
 ];

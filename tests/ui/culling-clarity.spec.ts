@@ -160,7 +160,7 @@ test.describe("rejected pile with reasons", () => {
     // Suggested but not applied: unflagged photos the engine would reject carry a "Suggested:" line.
     await expect.poll(async () => page.locator('[data-testid^="suggested-reason-"]').count()).toBeGreaterThan(0);
     const sug = await page.locator('[data-testid^="suggested-reason-"]').first().textContent();
-    expect(sug).toMatch(/^Suggested: \S/);
+    expect(sug).toMatch(/^Sieve suggests reject · \S/);
 
     await page.getByTestId("cull-sum-rejected").click();
     await expectReadoutMatchesGrid(page);
@@ -175,7 +175,7 @@ test.describe("rejected pile with reasons", () => {
     await page.getByTestId("cull-sum-rejected").click(); // filter off
     await expectReadoutMatchesGrid(page);
     await page.getByTestId("more-menu").click();
-    await expect(page.getByTestId("apply-info")).toContainText("only on photos you have not touched");
+    await expect(page.getByTestId("apply-info")).toContainText("only on photos you have not flagged or rated");
     await page.getByTestId("apply-suggestions").click();
     await expect(page.getByTestId("apply-explain")).toContainText("Rejected view");
     await page.getByTestId("apply-confirm").click();
@@ -227,7 +227,7 @@ test.describe("hover text on icons", () => {
     expect(await untitled(page, '[data-testid^="cell-"]')).toEqual([]);
     // Burst badge says how big the burst is and whether this frame is the keeper.
     const burst = page.locator('[data-testid^="burst-badge-"]').first();
-    await expect(burst).toHaveAttribute("title", /Burst of \d+ — (this is the keeper|not the keeper)/);
+    await expect(burst).toHaveAttribute("title", /Burst of \d+ — (best frame \(Sieve.s choice\)|not the best frame)/);
     // Tag chips carry the reason text.
     const tag = page.locator('[data-testid^="cell-"] span[title^="blink:"], [data-testid^="cell-"] span[title^="missed focus:"], [data-testid^="cell-"] span[title^="duplicate burst:"]').first();
     await expect(tag).toHaveAttribute("title", /: \S/);

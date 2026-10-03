@@ -4,10 +4,10 @@ import { tagName } from "./format";
 
 /** Words for each tag when the engine gave no reason text of its own. */
 export const TAG_MEANING: Record<CullTag, string> = {
-  blink: "Eyes closed in this frame",
-  missed_focus: "The subject or face is not sharp",
+  blink: "Eyes closed",
+  missed_focus: "The face or subject is not sharp",
   motion_blur: "Blurred by camera or subject movement",
-  creative_blur: "Intentional blur (panning, bokeh), not treated as a defect",
+  creative_blur: "Intentional blur (panning, bokeh). Never rejected on its own",
   underexposed: "Too dark",
   overexposed: "Highlights are blown out",
   duplicate_burst: "A better frame of the same burst exists",
@@ -45,10 +45,10 @@ export function keeperFormula(s: CullSummary): string {
 
 /** Hover text for every place that says how many photos go on to Edit / Export. */
 export function keeperTitle(s: CullSummary | null | undefined, lead: string): string {
-  return s ? `${lead}. ${keeperFormula(s)}. Change the keeper rule in the Cull step or the Edit plan.` : lead;
+  return s ? `${lead}. ${keeperFormula(s)}. Change the keeper rule in the Cull summary bar, the Edit plan or the Export dialog.` : lead;
 }
 
-/** Texts of the engine's reasons for this photo ("Eyes closed", "Duplicate in burst (keeper DSC0123)"). */
+/** Texts of the engine's reasons for this photo ("Eyes closed", "Duplicate in burst (best DSC0123)"). */
 export function reasonTexts(e: RawImageEntry): string[] {
   return (e.quality?.reasons ?? []).map((r) => r.text).filter(Boolean);
 }
@@ -61,28 +61,46 @@ export function tagReason(e: RawImageEntry, tag: CullTag): string {
 
 export const tagTitle = (e: RawImageEntry, tag: CullTag) => `${tagName(tag)}: ${tagReason(e, tag)}`;
 
+/** Reason kinds that are notes, not defects (never a headline). */
+const NOTE_KINDS = new Set(["creative_blur"]);
+
+/** The reason to lead with: the first defect, skipping notes such as intentional blur. */
+export function headlineReason(e: RawImageEntry): string | null {
+  const rs = e.quality?.reasons ?? [];
+  return (rs.find((r) => r.text && !NOTE_KINDS.has(r.kind)) ?? null)?.text ?? null;
+}
+
 export interface RejectInfo {
   /** "Rejected by you" / "Auto-rejected". */
   origin: string;
   who: "user" | "auto";
   reasons: string[];
+  /** First defect reason (notes skipped), or null. */
+  headline: string | null;
+  /** Joins the origin and the reasons: "Rejected by you · Sieve noted: …" / "Auto-rejected · …". */
+  lead: string;
 }
 
 /** Why a rejected photo is rejected: who did it and the engine's reasons. Null when not rejected. */
 export function rejectInfo(e: RawImageEntry): RejectInfo | null {
   if (e.pick !== "reject") return null;
   const auto = e.pickOrigin === "auto";
-  return { origin: auto ? "Auto-rejected" : "Rejected by you", who: auto ? "auto" : "user", reasons: reasonTexts(e) };
+  return { origin: auto ? "Auto-rejected" : "Rejected by you", who: auto ? "auto" : "user", reasons: reasonTexts(e), headline: headlineReason(e), lead: auto ? " · " : " · Sieve noted: " };
 }
 
-/** "Suggested: Eyes closed" for an unflagged photo the engine would reject (not applied). */
-export function suggestedReject(e: RawImageEntry): string | null {
+/** "Sieve suggests reject · Eyes closed" for an unflagged photo the engine would reject (not applied). */
+export function suggestedReject(e: RawImageEntry): { lead: string; reason: string } | null {
   if (e.pick !== "unflagged" || e.quality?.suggestedPick !== "reject") return null;
-  return `Suggested: ${reasonTexts(e)[0] ?? "low quality score"}`;
+  return { lead: "Sieve suggests reject", reason: headlineReason(e) ?? "Low quality score" };
 }
 
-/** DSC0001.ARW -> DSC0001.xmp (the sidecar Sieve writes next to the original). */
-export const sidecarName = (fileName: string) => fileName.replace(/\.[^./]+$/, "") + ".xmp";
+const NON_RAW_EXT = new Set(["jpg", "jpeg", "tif", "tiff", "png", "heic", "heif", "webp"]);
+
+/** DSC0001.ARW -> DSC0001.xmp; JPEG/TIFF/PNG/HEIC keep their extension: DSC0001.JPG -> DSC0001.JPG.xmp (mirrors `xmp::sidecar_path`). */
+export function sidecarName(fileName: string): string {
+  const ext = /\.([^./]+)$/.exec(fileName)?.[1]?.toLowerCase();
+  return ext && NON_RAW_EXT.has(ext) ? fileName + ".xmp" : fileName.replace(/\.[^./]+$/, "") + ".xmp";
+}
 
 /** Hover text of the flag icon of a photo. */
 export function flagTitle(e: RawImageEntry): string {
