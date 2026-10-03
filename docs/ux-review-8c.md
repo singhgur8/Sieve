@@ -265,3 +265,32 @@ summary bar on one row (29 px at 1280 and 1440, also with 3- and 4-digit counts)
 ### Open P0 / P1 after Re-check 1
 P0: none. P1 (5): P1-1 remainder (dialog `stars only` count/copy), P1-5 remainder (`bursts.rs:94` fallback string, rust-engine-dev), P1-8 remainder (Help / dialog button name and "not touched"),
 N1 (stack above dialogs), N2 (filter bar overflow at 1280 with the origin chip). All five are frontend-only except P1-5's engine string. No contract changes needed.
+
+## Re-check 2 (2026-10-03)
+
+Branch `phase-8c-feedback` @ 33c41fd, read-only. Mock backend (`vite --port 1463`): `/?mock=201&keepers=not_rejected` and `/?mock=2000&keepers=not_rejected`, with
+`window.__mockActivity` for the corner stack; 1280×800 and 1440×900. Scratchpad driver `r2.cjs`, screenshots `shots/{1280,1440}-NN-*.png` (not in the repo).
+
+**Summary: open P0 0 · P1 0.** Every Re-check 1 item is fixed as specified, and the fixes did not introduce any new P0 or P1 problem.
+
+### Per-item verdict
+
+| Item | Verdict | Evidence |
+|---|---|---|
+| P1-1 remainder (stars only) | **Resolved** | Bar `Suggestions: 20 picks · 8 rejects · 43 stars only — Apply…`. The dialog says `71 will be updated: 20 picked · 8 rejected · 43 stars only`, plus a secondary line `Stars are set on 67 of them`. The three bar numbers appear verbatim in the dialog, and 20 + 8 + 43 = 71. After Apply the button is gone (`1280-02`). At 2000 photos: `139 picks · 118 rejects · 458 stars only`. |
+| P1-5 remainder (engine string) | **Resolved** | `src-tauri/src/ml/bursts.rs:94` now reads `"Sieve chose that one as the best of the burst"`. No user-facing "the keeper" is left in `src-tauri/src` (the remaining hits are identifiers and doc comments). Reasons already stored in a catalog update on the next rescore, as agreed. |
+| P1-8 remainder (button name, "not touched") | **Resolved** | Help ▸ Apply suggestions names `"Suggestions: … — Apply…" button at the right of the Cull summary`. The dialog's `apply-explain` says "only on photos you have not flagged or rated" (`1280-02`). |
+| N1 (stack above dialogs) | **Resolved** | `useModalCount()` (useSyncExternalStore on `lib/modal.ts`) plus `helpState.open` drive `behindDialogs`. The widget is `z-40` with the Apply dialog, Help, and the More popover open, and goes back to `z-[65]` on close. With Help on the legend page and three corner rows (saving, pasting, failed scene), `elementFromPoint` over the stack's column returns `help-panel` at both sizes. The rows sit dimmed under the overlay (`1280-03-help-legend-activity.png`). |
+| N2 (filter bar overflow) | **Resolved** | `/?mock=2000`, `118 auto` on: `filter-bar` scrollWidth = clientWidth (1280 / 1440). The chip reads `Auto ×`, with the full wording in its title. At 1280, Metadata and Clear are icon-only in a trailing group (Clear's right edge 1268), and at 1440 they have labels (`1280-06`, `1440-06`). Clear resets to `Showing 1000 of 1000`. |
+| N3 (legend strip icons) | **Resolved** | Plain 56×12 bars, red, and sky with a dashed red top border. No truncated text (`1280-03`). |
+| N4 (zero split part) | **Resolved** | `(7 by you, 0 auto)`: `0 auto` is a `SPAN`, `7 by you` is a button, and there are no stray spaces. |
+| N5 (origin in flag-chip title) | **Resolved** | `pick-reject` title: `Rejected 118 (auto only — clear "Auto ×" to see all)`. |
+| N6 (Help direct path) | **Resolved** | "Or click N auto in the Cull summary to see only Auto's rejects." is present. |
+
+### New observations (P2 only)
+- R2-1. At 1280, once a metadata chip is added to the origin filter (`Auto ×` + `File type: ARW ×`), the tag group shrinks (783 → 705 px). The fade then hides `Match any` and half of `duplicate burst` (`1280-08-2000-auto-metachip.png`). This is the spec'd fallback, and nothing the user needs to leave the filter is lost: Clear stays visible. If it becomes a complaint, move `Match any` to the front of the tag group or into the tag chips' context menu.
+- R2-2. Toasts (bottom-left) still draw above the Help overlay (`1280-03`). They cover only empty nav space and keep Undo reachable, so no change is proposed.
+- R2-3. At 1440 the toolbar's Sort select truncates to `Capture tim` (`1440-06`). This is not new in 8c. Give the select `min-w-[7.5rem]`, or let the size slider shrink first.
+
+### Open P0 / P1 after Re-check 2
+P0: none. P1: none. Three new P2s (R2-1 to R2-3) are optional. Phase 8c's UX items are clear for the QA gate.
