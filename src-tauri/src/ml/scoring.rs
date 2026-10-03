@@ -32,7 +32,9 @@
 //! keeper by `bursts::demote`, never rejected for being duplicates.
 
 use super::{AutoTag, FaceMetrics, ImageMetrics, Scored, MODEL_VERSION};
-use crate::ipc::types::{CullTag, CullThresholds, FaceInfo, PickFlag, QualityScore, ShootType};
+use crate::ipc::types::{
+    CullTag, CullThresholds, FaceInfo, PickFlag, QualityScore, ShootType, SuggestionReason, SuggestionReasonKind,
+};
 
 /// Minimum detector confidence for a face to be judged.
 pub const MIN_CONSIDER_SCORE: f32 = 0.6;
@@ -179,6 +181,52 @@ fn composition_score(f: &FaceMetrics) -> f32 {
     s.clamp(0.0, 1.0)
 }
 
+/// Missed-focus reason text when a face decided focus; [`super::bursts`] appends the
+/// face's sharpness relative to the burst's best to reasons starting with it.
+pub const FACE_SOFT: &str = "Face is soft";
+/// A score component below this is named in the `low_score` reason.
+pub const LOW_PART: f32 = 0.6;
+
+/// Why `creative_blur` fired.
+#[derive(Debug, Clone, Copy)]
+enum CreativeKind {
+    /// An in-focus primary with a soft co-subject (shallow depth of field).
+    SoftSecondary,
+    /// A soft face cut off by the frame in a sharp frame (detail shot).
+    CroppedFace,
+    /// Sharp frame, mostly blurred tiles.
+    Bokeh,
+}
+
+/// Rounded percentage of a 0..=1 share.
+fn pct(share: f32) -> u32 {
+    (share.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
+/// Mid-tone the exposure estimate aims at (sRGB-encoded mean luma of a typical frame).
+const TARGET_LUMA: f32 = 0.42;
+
+/// Rough exposure offset of an sRGB-encoded mean luma from [`TARGET_LUMA`] in stops
+/// (gamma 2.2), rounded to half a stop: "about −2.5 EV". An estimate (scene content and the
+/// camera's tone curve move the mean too), hence "about".
+pub fn ev_text(mean_luma: f32) -> String {
+    let ev = 2.2 * (mean_luma.max(0.002) / TARGET_LUMA).log2();
+    let ev = (ev * 2.0).round() / 2.0;
+    let sign = if ev < 0.0 {
+        "\u{2212}"
+    } else if ev > 0.0 {
+        "+"
+    } else {
+        ""
+    };
+    let mag = ev.abs();
+    if mag.fract() == 0.0 {
+        format!("about {sign}{mag:.0} EV")
+    } else {
+        format!("about {sign}{mag:.1} EV")
+    }
+}
+
 pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Scored {
     let n = m.faces.len();
     let considered: Vec<bool> =
@@ -198,6 +246,8 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
     let mut faces = Vec::with_capacity(n);
     let mut blinking: Vec<usize> = Vec::new();
     let mut judged_open: Vec<f32> = Vec::new();
+    // Judged faces with a known eye state (the "of N faces" in the blink reason).
+    let mut judged_eyes = 0usize;
     for (i, f) in m.faces.iter().enumerate() {
         let state = eye_state(f, t.blink_ear);
         let judged = f.frontal
@@ -214,6 +264,7 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         };
         if judged {
             judged_open.extend(openness);
+            judged_eyes += usize::from(openness.is_some());
         }
         faces.push(FaceInfo {
             bbox: f.bbox,
@@ -243,21 +294,29 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
 
     // Focus. Faces decide when a frontal focus face exists; otherwise the whole frame.
     // The primary is the sharpest subject, so any sharp subject means "in focus".
-    let (missed_focus, motion) = match primary {
-        Some(_) if any_sharp_face => (None, false),
+    // `face_focus`: the focus verdict came from a face (else from the whole frame).
+    let (missed_focus, motion, face_focus) = match primary {
+        Some(_) if any_sharp_face => (None, false, true),
         Some(p) if has_frontal_focus_face => {
             let f = &m.faces[p];
             let soft = f.sharpness < t.face_sharpness_min;
-            (soft.then(|| margin_conf(f.sharpness, t.face_sharpness_min)), soft && f.anisotropy >= MOTION_ANISOTROPY)
+            (
+                soft.then(|| margin_conf(f.sharpness, t.face_sharpness_min)),
+                soft && f.anisotropy >= MOTION_ANISOTROPY,
+                true,
+            )
         }
         _ => {
             let soft = m.global_sharpness < t.global_sharpness_min;
             (
                 soft.then(|| margin_conf(m.global_sharpness, t.global_sharpness_min)),
                 soft && m.tiles.anisotropy >= MOTION_ANISOTROPY,
+                false,
             )
         }
     };
+    // Why `creative_blur` fired (for its reason text).
+    let mut creative: Option<CreativeKind> = None;
     if let Some(c) = missed_focus {
         tags.push(AutoTag { tag: CullTag::MissedFocus, confidence: c });
         if motion {
@@ -279,9 +338,17 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         let bokeh = m.tiles.p50 < BOKEH_TILE_P50 && sharp_frame;
         // A soft face cut off by the frame in an otherwise sharp frame: detail shot.
         let soft_cropped = sharp_frame && (0..n).any(|i| considered[i] && m.faces[i].truncated && !faces[i].in_focus);
+        let soft_face = soft_secondary;
         let soft_secondary = soft_secondary || soft_cropped;
         if soft_secondary || bokeh {
             tags.push(AutoTag { tag: CullTag::CreativeBlur, confidence: if soft_secondary { 0.7 } else { 0.6 } });
+            creative = Some(if soft_face {
+                CreativeKind::SoftSecondary
+            } else if soft_cropped {
+                CreativeKind::CroppedFace
+            } else {
+                CreativeKind::Bokeh
+            });
         }
     }
 
@@ -386,6 +453,97 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         }
     };
 
+    // Reasons (v18), most important first: what forced a reject, then the defects that cap
+    // the stars / withhold `pick`, then a low score nothing else explains, then notes.
+    let mut rs: Vec<(u8, SuggestionReason)> = Vec::new();
+    let mut push = |rank: u8, kind: SuggestionReasonKind, text: String| {
+        rs.push((rank, SuggestionReason { kind, text, related_image_id: None }))
+    };
+    if missed_focus.is_some() {
+        let text = match (face_focus, severe_focus) {
+            (true, false) => FACE_SOFT.to_string(),
+            (true, true) => format!("{FACE_SOFT} and nothing else in the frame is sharp"),
+            (false, false) => "Whole frame is soft".to_string(),
+            (false, true) => "Out of focus: nothing in the frame is sharp".to_string(),
+        };
+        push(if severe_focus { 0 } else { 1 }, SuggestionReasonKind::MissedFocus, text);
+        if motion {
+            push(2, SuggestionReasonKind::MotionBlur, "Motion blur".to_string());
+        }
+    }
+    if !blinking.is_empty() {
+        let mut text = if judged_eyes > 1 {
+            format!("Eyes closed on {} of {judged_eyes} faces", blinking.len())
+        } else {
+            "Eyes closed".to_string()
+        };
+        if laughing {
+            text.push_str(" (laughing)");
+        }
+        push(if eyes_matter { 3 } else { 7 }, SuggestionReasonKind::Blink, text);
+    }
+    let tagged = |tag: CullTag| tags.iter().any(|a| a.tag == tag);
+    let gross_dark = e.mean_luma < GROSS_DARK_LUMA;
+    if tagged(CullTag::Underexposed) || gross_dark {
+        let text = if gross_dark {
+            format!("Far too dark to recover ({})", ev_text(e.mean_luma))
+        } else if e.mean_luma < t.underexposed_mean_luma {
+            format!("Underexposed ({})", ev_text(e.mean_luma))
+        } else {
+            format!("Underexposed ({}% of the frame is pure black)", pct(e.clipped_shadows_pct))
+        };
+        push(if gross_dark { 0 } else { 4 }, SuggestionReasonKind::Underexposed, text);
+    }
+    let gross_face = face_blown >= GROSS_FACE_BLOWN;
+    let gross_frame = m.highlights.blown >= GROSS_FRAME_BLOWN;
+    if tagged(CullTag::Overexposed) || gross_face || gross_frame {
+        let (rank, text) = if gross_face {
+            (0, format!("Face blown out beyond recovery ({}% of the skin)", pct(face_blown)))
+        } else if gross_frame {
+            (0, format!("Blown out beyond recovery ({}% of the frame)", pct(m.highlights.blown)))
+        } else if face_blown > t.overexposed_clip_pct {
+            (4, format!("Blown highlights on the face ({}% of the skin)", pct(face_blown)))
+        } else {
+            (4, format!("Overexposed ({}% of the frame is blown out)", pct(m.highlights.blown)))
+        };
+        push(rank, SuggestionReasonKind::Overexposed, text);
+    }
+    let explained = defect || badly_exposed || gross_exposure;
+    if suggested_pick != PickFlag::Pick && !explained {
+        // Name the weakest part of the score when it is clearly weak.
+        let mut weak: Vec<(f32, &str)> = vec![
+            (sharp_score(m.global_sharpness, t.global_sharpness_min), "the frame is a bit soft"),
+            (exposure_score(m, face_blown), "the exposure is off"),
+        ];
+        match eyes_open {
+            Some(v) => weak.push((v, "the eyes are not fully open")),
+            None if eyes_weighted => weak.push((UNJUDGED_EYES, "no clear view of the eyes")),
+            None => {}
+        }
+        if let Some(s) = face_sharpness {
+            weak.push((sharp_score(s, t.face_sharpness_min), "the face is a bit soft"));
+        }
+        if let Some(c) = composition {
+            weak.push((c, "the face is awkwardly placed in the frame"));
+        }
+        let lead = if suggested_pick == PickFlag::Reject { "Very low overall score" } else { "Low overall score" };
+        let text = match weak.iter().filter(|w| w.0 < LOW_PART).min_by(|a, b| a.0.total_cmp(&b.0)) {
+            Some((_, what)) => format!("{lead}: {what}"),
+            None => lead.to_string(),
+        };
+        push(6, SuggestionReasonKind::LowScore, text);
+    }
+    if let Some(kind) = creative {
+        let text = match kind {
+            CreativeKind::SoftSecondary => "Shallow focus: a second face is soft (looks intentional)",
+            CreativeKind::CroppedFace => "Soft face at the frame edge (detail shot)",
+            CreativeKind::Bokeh => "Shallow depth of field (mostly background blur)",
+        };
+        push(8, SuggestionReasonKind::CreativeBlur, text.to_string());
+    }
+    rs.sort_by_key(|r| r.0);
+    let reasons: Vec<SuggestionReason> = rs.into_iter().map(|r| r.1).collect();
+
     Scored {
         quality: QualityScore {
             overall,
@@ -398,8 +556,7 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
             model_version: MODEL_VERSION.to_string(),
             suggested_rating,
             suggested_pick,
-            // v18: filled by vision-ml-dev (Phase 8c "Suggestion reasons").
-            reasons: Vec::new(),
+            reasons,
         },
         faces,
         tags,
@@ -637,6 +794,247 @@ pub(crate) mod tests {
         assert_ne!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
         m.highlights.blown = GROSS_FRAME_BLOWN;
         assert_eq!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
+    }
+
+    fn kinds(s: &Scored) -> Vec<SuggestionReasonKind> {
+        s.quality.reasons.iter().map(|r| r.kind).collect()
+    }
+
+    fn text_of(s: &Scored, kind: SuggestionReasonKind) -> String {
+        s.quality.reasons.iter().find(|r| r.kind == kind).map(|r| r.text.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn clean_pick_has_no_reasons() {
+        let s = score(&metrics(vec![face(0.4, 0.15, 0.7, 0.28)]), &default_thresholds(W), W);
+        assert!(s.quality.reasons.is_empty(), "{:?}", s.quality.reasons);
+    }
+
+    #[test]
+    fn blink_reason() {
+        let t = default_thresholds(W);
+        let s = score(&metrics(vec![face(0.4, 0.15, 0.7, 0.05)]), &t, W);
+        assert_eq!(kinds(&s), vec![SuggestionReasonKind::Blink]);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Blink), "Eyes closed");
+        assert_eq!(s.quality.reasons[0].related_image_id, None);
+        // Group: names how many of the judged faces blinked.
+        let s = score(&metrics(vec![face(0.2, 0.1, 0.7, 0.28), face(0.6, 0.1, 0.68, 0.05)]), &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Blink), "Eyes closed on 1 of 2 faces");
+        let mut laughing = face(0.4, 0.15, 0.7, 0.05);
+        laughing.mouth_open = Some(0.4);
+        let s = score(&metrics(vec![laughing]), &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Blink), "Eyes closed (laughing)");
+    }
+
+    #[test]
+    fn missed_focus_reasons() {
+        let t = default_thresholds(W);
+        // Soft face, sharp detail elsewhere.
+        let s = score(&metrics(vec![face(0.4, 0.15, 0.3, 0.28)]), &t, W);
+        assert_eq!(kinds(&s), vec![SuggestionReasonKind::MissedFocus]);
+        assert_eq!(text_of(&s, SuggestionReasonKind::MissedFocus), FACE_SOFT);
+        // Nothing sharp anywhere (the reject).
+        let mut m = metrics(vec![face(0.4, 0.15, 0.3, 0.28)]);
+        m.global_sharpness = t.global_sharpness_min - SEVERE_GLOBAL_MARGIN - 0.01;
+        let s = score(&m, &t, W);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(s.quality.reasons[0].kind, SuggestionReasonKind::MissedFocus);
+        assert_eq!(s.quality.reasons[0].text, "Face is soft and nothing else in the frame is sharp");
+        // No faces: the whole frame decides.
+        let mut m = metrics(vec![]);
+        m.global_sharpness = t.global_sharpness_min - 0.01;
+        assert_eq!(text_of(&score(&m, &t, W), SuggestionReasonKind::MissedFocus), "Whole frame is soft");
+        m.global_sharpness = 0.05;
+        assert_eq!(
+            text_of(&score(&m, &t, W), SuggestionReasonKind::MissedFocus),
+            "Out of focus: nothing in the frame is sharp"
+        );
+    }
+
+    #[test]
+    fn motion_blur_reason_follows_missed_focus() {
+        let t = default_thresholds(W);
+        let mut moving = face(0.4, 0.15, 0.3, 0.28);
+        moving.anisotropy = 0.5;
+        let s = score(&metrics(vec![moving]), &t, W);
+        assert_eq!(kinds(&s), vec![SuggestionReasonKind::MissedFocus, SuggestionReasonKind::MotionBlur]);
+        assert_eq!(text_of(&s, SuggestionReasonKind::MotionBlur), "Motion blur");
+    }
+
+    #[test]
+    fn creative_blur_reasons() {
+        let t = default_thresholds(W);
+        // Soft groom behind a sharp bride.
+        let s = score(&metrics(vec![face(0.2, 0.15, 0.3, 0.28), face(0.6, 0.14, 0.72, 0.28)]), &t, W);
+        assert!(has(&s, CullTag::CreativeBlur));
+        assert!(text_of(&s, SuggestionReasonKind::CreativeBlur).contains("second face is soft"));
+        // Detail shot with a cropped soft face.
+        let mut cropped = face(0.0, 0.45, 0.2, 0.28);
+        cropped.truncated = true;
+        let s = score(&metrics(vec![cropped]), &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::CreativeBlur), "Soft face at the frame edge (detail shot)");
+        // Bokeh-heavy sharp frame.
+        let mut m = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m.tiles.p50 = 0.2;
+        let s = score(&m, &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::CreativeBlur), "Shallow depth of field (mostly background blur)");
+        // A note, never a reason ahead of a defect.
+        let mut m = metrics(vec![face(0.4, 0.15, 0.7, 0.05)]);
+        m.tiles.p50 = 0.2;
+        assert_eq!(kinds(&score(&m, &t, W)), vec![SuggestionReasonKind::Blink, SuggestionReasonKind::CreativeBlur]);
+    }
+
+    #[test]
+    fn underexposed_reasons() {
+        let t = default_thresholds(W);
+        let mut m = metrics(vec![]);
+        m.exposure.mean_luma = 0.1;
+        let s = score(&m, &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Underexposed), "Underexposed (about \u{2212}4.5 EV)");
+        m.exposure.mean_luma = 0.3;
+        m.exposure.clipped_shadows_pct = 0.4;
+        let s = score(&m, &t, W);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Underexposed), "Underexposed (40% of the frame is pure black)");
+        m.exposure.mean_luma = GROSS_DARK_LUMA / 2.0;
+        let s = score(&m, &t, W);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(s.quality.reasons[0].kind, SuggestionReasonKind::Underexposed);
+        assert!(s.quality.reasons[0].text.starts_with("Far too dark to recover"), "{:?}", s.quality.reasons);
+    }
+
+    #[test]
+    fn overexposed_reasons() {
+        let t = default_thresholds(W);
+        let mut blown = face(0.4, 0.15, 0.7, 0.28);
+        blown.blown = 0.3;
+        let s = score(&metrics(vec![blown.clone()]), &t, W);
+        assert_eq!(kinds(&s), vec![SuggestionReasonKind::Overexposed]);
+        assert_eq!(text_of(&s, SuggestionReasonKind::Overexposed), "Blown highlights on the face (30% of the skin)");
+        blown.blown = 0.6;
+        let s = score(&metrics(vec![blown]), &t, W);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(s.quality.reasons[0].text, "Face blown out beyond recovery (60% of the skin)");
+        let mut m = metrics(vec![]);
+        m.highlights.blown = 0.65;
+        assert_eq!(
+            text_of(&score(&m, &t, W), SuggestionReasonKind::Overexposed),
+            "Overexposed (65% of the frame is blown out)"
+        );
+        m.highlights.blown = 0.8;
+        assert_eq!(
+            text_of(&score(&m, &t, W), SuggestionReasonKind::Overexposed),
+            "Blown out beyond recovery (80% of the frame)"
+        );
+    }
+
+    #[test]
+    fn low_score_reason_names_the_weakest_part() {
+        let t = default_thresholds(W);
+        // No faces, frame only just sharp enough: no tag, not good enough for a pick.
+        let mut m = metrics(vec![]);
+        m.global_sharpness = t.global_sharpness_min + 0.02;
+        let s = score(&m, &t, W);
+        assert!(s.tags.is_empty(), "{:?}", s.tags);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Unflagged);
+        assert_eq!(kinds(&s), vec![SuggestionReasonKind::LowScore]);
+        assert_eq!(text_of(&s, SuggestionReasonKind::LowScore), "Low overall score: the frame is a bit soft");
+        // A defect explains itself: no extra low-score reason.
+        let s = score(&metrics(vec![face(0.4, 0.15, 0.3, 0.28)]), &t, W);
+        assert!(!kinds(&s).contains(&SuggestionReasonKind::LowScore));
+        // Landscape blink is not a defect: a non-pick still says why.
+        let l = ShootType::Landscape;
+        let mut m = metrics(vec![face(0.4, 0.15, 0.7, 0.05)]);
+        m.global_sharpness = t.global_sharpness_min + 0.02;
+        let s = score(&m, &default_thresholds(l), l);
+        if s.quality.suggested_pick != PickFlag::Pick {
+            assert!(kinds(&s).contains(&SuggestionReasonKind::LowScore), "{:?}", s.quality.reasons);
+        }
+    }
+
+    #[test]
+    fn ev_estimate() {
+        assert_eq!(ev_text(TARGET_LUMA), "about 0 EV");
+        assert_eq!(ev_text(0.2), "about \u{2212}2.5 EV");
+        assert_eq!(ev_text(0.6), "about +1 EV");
+    }
+
+    /// Synthetic scored set: every non-pick suggestion has a reason, every reject's first
+    /// reason is one that rejects, every emitted tag has a reason of the same kind.
+    #[test]
+    fn every_non_pick_and_every_tag_has_a_reason() {
+        let tag_kind = |t: CullTag| match t {
+            CullTag::Blink => SuggestionReasonKind::Blink,
+            CullTag::MissedFocus => SuggestionReasonKind::MissedFocus,
+            CullTag::MotionBlur => SuggestionReasonKind::MotionBlur,
+            CullTag::CreativeBlur => SuggestionReasonKind::CreativeBlur,
+            CullTag::Underexposed => SuggestionReasonKind::Underexposed,
+            CullTag::Overexposed => SuggestionReasonKind::Overexposed,
+            CullTag::DuplicateBurst => SuggestionReasonKind::DuplicateBurst,
+        };
+        let (mut n, mut rejects, mut unflagged) = (0, 0, 0);
+        let shoots = [
+            ShootType::Wedding,
+            ShootType::Portrait,
+            ShootType::General,
+            ShootType::Sports,
+            ShootType::Event,
+            ShootType::Landscape,
+        ];
+        for st in shoots {
+            let t = default_thresholds(st);
+            for sharp in [0.1, 0.3, 0.5, 0.7, 0.9] {
+                for ear in [0.05, 0.28] {
+                    for global in [0.05, 0.3, 0.5, 0.8] {
+                        for luma in [0.02, 0.1, 0.45, 0.9] {
+                            for blown in [0.0, 0.3, 0.7] {
+                                for (faces, x, aniso, p50) in
+                                    [(0, 0.4, 0.05, 0.6), (1, 0.4, 0.05, 0.6), (1, 0.0, 0.5, 0.2), (2, 0.1, 0.05, 0.6)]
+                                {
+                                    let mut fs: Vec<FaceMetrics> = Vec::new();
+                                    if faces >= 1 {
+                                        let mut f = face(x, 0.15, sharp, ear);
+                                        f.anisotropy = aniso;
+                                        f.blown = blown;
+                                        fs.push(f);
+                                    }
+                                    if faces == 2 {
+                                        fs.push(face(0.6, 0.14, 0.9 - sharp, 0.28));
+                                    }
+                                    let mut m = metrics(fs);
+                                    m.global_sharpness = global;
+                                    m.exposure.mean_luma = luma;
+                                    m.highlights.blown = blown;
+                                    m.tiles.anisotropy = aniso;
+                                    m.tiles.p50 = p50;
+                                    let s = score(&m, &t, st);
+                                    n += 1;
+                                    let q = &s.quality;
+                                    if q.suggested_pick != PickFlag::Pick {
+                                        assert!(!q.reasons.is_empty(), "{st:?} {m:?} -> {q:?}");
+                                    }
+                                    if q.suggested_pick == PickFlag::Reject {
+                                        rejects += 1;
+                                        assert_ne!(q.reasons[0].kind, SuggestionReasonKind::CreativeBlur, "{q:?}");
+                                    }
+                                    if q.suggested_pick == PickFlag::Unflagged {
+                                        unflagged += 1;
+                                    }
+                                    for tag in &s.tags {
+                                        assert!(
+                                            q.reasons.iter().any(|r| r.kind == tag_kind(tag.tag)),
+                                            "tag {:?} without reason: {q:?}",
+                                            tag.tag
+                                        );
+                                    }
+                                    assert!(q.reasons.iter().all(|r| !r.text.is_empty() && !r.text.ends_with('.')));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(rejects > 100 && unflagged > 100, "{n} frames: {rejects} rejects, {unflagged} unflagged");
     }
 
     #[test]

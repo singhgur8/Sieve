@@ -120,7 +120,7 @@ test.describe("cull summary and keepers", () => {
   test("keeper rule menu lists 'Everything not rejected' first and the formula follows the rule", async ({ page }) => {
     await openProject(page);
     await page.getByTestId("cull-sum-rule").click();
-    const items = page.getByTestId("keeper-rule-menu").locator("button");
+    const items = page.getByTestId("keeper-rule-menu").locator("button[role=menuitemradio]");
     await expect(items.first()).toHaveAttribute("data-testid", "keeper-rule-4");
     await expect(items.first()).toHaveAttribute("aria-checked", "true");
     await expect(items.nth(1)).toHaveAttribute("data-testid", "keeper-rule-0");
@@ -143,7 +143,7 @@ test.describe("cull summary and keepers", () => {
     await expect(page.getByTestId("plan-keeper-formula")).toContainText(`Keepers ${k} = `);
     await expect(page.getByTestId("plan-keeper-formula")).toContainText("rejected are left out");
     await page.getByTestId("plan-keepers-rule").click();
-    await expect(page.getByTestId("keeper-rule-menu").locator("button").first()).toHaveAttribute("data-testid", "keeper-rule-4");
+    await expect(page.getByTestId("keeper-rule-menu").locator("button[role=menuitemradio]").first()).toHaveAttribute("data-testid", "keeper-rule-4");
     await page.keyboard.press("Escape");
     await shot(page, "clarity-plan-formula");
     await page.getByTestId("step-export").click();

@@ -745,7 +745,7 @@ export function ExportDialog({ selectionIds, filteredIds, keeperIds, summary, on
               aria-disabled={!canExport}
               data-testid="export-go"
               data-disabled={!canExport}
-              title={problem ? `${problem.text} (click to jump to it)` : "Export (Cmd+Enter)"}
+              title={busy ? "The export is starting. Wait a moment." : problem ? `${problem.text} (click to jump to it)` : "Export (Cmd+Enter)"}
               className={`rounded-md bg-amber-500 px-4 py-1 text-sm font-medium text-neutral-950 hover:bg-amber-400 ${canExport ? "" : "opacity-40"}`}
             >
               Export {ids.length}

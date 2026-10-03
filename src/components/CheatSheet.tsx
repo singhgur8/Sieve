@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { keymapGroups, type Mode } from "../lib/keymap";
 import { Dialog } from "./Dialog";
+import { openHelp } from "../lib/helpStore";
 
 /** Shortcut reference generated from the keymap definition. */
 const FIRST: Record<"develop" | "library", string[]> = {
@@ -73,6 +74,16 @@ export function CheatSheet({ onClose, mode = "grid", editStep = false }: { onClo
         <h2 className="shrink-0 font-semibold">
           Keyboard shortcuts <span className="ml-2 text-xs font-normal text-neutral-400" data-testid="cheat-subtitle">Showing {editStep ? "Edit step" : mode === "develop" ? "Develop" : "Library"} first</span>
         </h2>
+        <button
+          onClick={() => {
+            onClose();
+            openHelp();
+          }}
+          data-testid="cheat-open-help"
+          className="shrink-0 text-xs text-sky-300 hover:underline"
+        >
+          Help &amp; FAQ (F1)
+        </button>
         <input
           ref={input}
           data-autofocus

@@ -2,6 +2,7 @@
 import { ChevronDown } from "lucide-react";
 import type { KeeperRule } from "../ipc";
 import { Menu, menuItem } from "./Menu";
+import { HelpLink } from "./HelpLink";
 
 /**
  * Menu order is the array order, except that "Everything not rejected" (the default since IPC v18) is shown first.
@@ -23,6 +24,7 @@ export const ruleLabel = (r: KeeperRule) => KEEPER_RULES.find((x) => sameRule(x.
 export function RuleItems({ current, onPick }: { current: KeeperRule; onPick: (r: KeeperRule) => void }) {
   return (
     <div className="w-80 py-1" data-testid="keeper-rule-menu">
+      <div className="flex justify-end px-3 pb-1"><HelpLink id="keepers" label="What are keepers?" /></div>
       {DISPLAY_ORDER.map((i) => {
         const k = KEEPER_RULES[i];
         const on = sameRule(k.rule, current);

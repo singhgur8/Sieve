@@ -89,6 +89,7 @@ export type ActionId =
   | "import"
   | "filterBar"
   | "cheatSheet"
+  | "help"
   | "dialogConfirm"
   | "dialogCancel";
 
@@ -232,6 +233,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "export", group: "App", label: "Export...", chords: [c("e", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+E"], where: "Everywhere" },
   { id: "import", group: "App", label: "Import folder...", chords: [c("i", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+I"], where: "Everywhere" },
   { id: "cheatSheet", group: "App", label: "Keyboard shortcuts", chords: [c("?", { shift: "any" }), c("/", { mod: true })], modes: ALL, display: ["?", "Cmd+/"], where: "Everywhere" },
+  { id: "help", group: "App", label: "Help & FAQ", chords: [c("F1")], modes: ALL, display: ["F1"], where: "Everywhere" },
   { id: "dialogConfirm", group: "Dialogs", label: "Confirm (Export: Cmd+Enter)", chords: [], modes: ALL, display: ["Enter"], where: "Topmost dialog", external: true },
   { id: "dialogCancel", group: "Dialogs", label: "Cancel / close", chords: [], modes: ALL, display: ["Esc"], where: "Topmost dialog", external: true },
 ];

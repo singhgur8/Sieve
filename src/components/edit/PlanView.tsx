@@ -6,6 +6,7 @@ import type { CullSummary } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import { rowInTab, type PlanTab, type SceneRow, type Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
+import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import { Menu, menuItem } from "../Menu";
 import { KeeperRuleMenu, RuleItems, ruleLabel } from "../KeeperRule";
 import { keeperEquation } from "../../lib/cull";
@@ -76,6 +77,7 @@ export function PlanView(p: Props) {
   }, [p.focusId]);
 
   const busy = wf.busy;
+  const applying = useActivityRunning("apply_scene");
   const style = wf.style;
 
   let body: React.ReactNode;
@@ -214,8 +216,8 @@ export function PlanView(p: Props) {
             <button
               className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
               data-testid="plan-apply-all"
-              disabled={pending.length === 0 || busy != null}
-              title={pending.length === 0 ? "Edit or auto edit a scene first" : "Copies each edited scene's edit to the rest of its scene, matching exposure and white balance per photo"}
+              disabled={pending.length === 0 || busy != null || applying}
+              title={applying ? BUSY_WHY.apply_scene : pending.length === 0 ? "Edit or auto edit a scene first" : "Copies each edited scene's edit to the rest of its scene, matching exposure and white balance per photo"}
               onClick={() => void wf.applyAll(p.onReview, p.onFocus)}
             >
               Apply {plural(pending.length, "edited scene")} ({pendingTargets})
@@ -370,7 +372,8 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const shown = others.slice(0, Math.min(memberShown, fit));
   const more = others.length - shown.length;
   const busyHere = wf.busy?.kind === "scene" && wf.busy.sceneId === id;
-  const anyBusy = wf.busy != null;
+  const applying = useActivityRunning("apply_scene");
+  const anyBusy = wf.busy != null || applying;
   const undo = wf.sceneUndo(id);
   const newKeepers = r.ui === "applied" ? r.unapplied.length : 0;
   const applyLabel = newKeepers > 0 ? `Apply to ${newKeepers} new` : r.ui === "stale" ? `Re-apply to ${r.targets}` : `Apply to ${r.targets}`;
@@ -438,7 +441,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
             className="h-7 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid={`plan-apply-${id}`}
             disabled={!canApply || anyBusy}
-            title={canApply ? (newKeepers > 0 ? `Copies this edit to the ${newKeepers} keepers added since it was applied.` : `Copies this edit to ${r.targets} photos, matching exposure and white balance to each.`) : "No other keepers in this scene"}
+            title={applying ? BUSY_WHY.apply_scene : canApply ? (newKeepers > 0 ? `Copies this edit to the ${newKeepers} keepers added since it was applied.` : `Copies this edit to ${r.targets} photos, matching exposure and white balance to each.`) : "No other keepers in this scene"}
             onClick={() => void wf.applyScene(id, "match", p.onReview)}
           >
             {applyLabel}

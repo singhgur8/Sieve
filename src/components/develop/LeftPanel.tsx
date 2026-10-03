@@ -2,6 +2,7 @@
 import { useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Loader2, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
 import { hint } from "../../lib/keymap";
+import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import type { AdjustmentHistory, NormRect, StyleGroup, StylePreset } from "../../ipc";
 import type { Copied } from "../../lib/clipboard";
 import { useSnapshots } from "../../hooks/useDevelopV14";
@@ -83,7 +84,8 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
       /* not remembered */
     }
   };
-  const pasteTitle = copied
+  const pasting = useActivityRunning("paste_sync");
+  const pasteTitle = pasting ? BUSY_WHY.paste_sync : copied
     ? `Paste ${copied.fields.length} settings${copied.fromName ? ` from ${copied.fromName.replace(/\.[^.]+$/, "")}` : ""} to ${targetCount} photo${targetCount === 1 ? "" : "s"}${hint("paste")}`
     : `Copy settings first${hint("copy")}`;
 
@@ -307,7 +309,7 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
         >
           <ClipboardCopy className="size-3.5" /> Copy…
         </button>
-        <button className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40" disabled={!copied} onClick={onPaste} title={pasteTitle} data-testid="paste-settings">
+        <button className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40" disabled={!copied || pasting} onClick={onPaste} title={pasteTitle} data-testid="paste-settings">
           <ClipboardPaste className="size-3.5" /> Paste
         </button>
       </div>

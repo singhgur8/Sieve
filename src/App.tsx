@@ -13,6 +13,8 @@ import { CullSummaryBar } from "./components/CullSummaryBar";
 import { keeperFormula } from "./lib/cull";
 import { TopBar } from "./components/TopBar";
 import { XmpExplainer } from "./components/XmpStatus";
+import { MetadataRow } from "./components/MetadataFilterRow";
+import { useMetaRowOpen } from "./lib/metaFilter";
 import { FilterBar, FilterExtras, filterSummaryText, FilterSummary, isFiltered, useFilterCounts } from "./components/FilterBar";
 import { GridToolbar, type Mode } from "./components/GridToolbar";
 import { PhotoGrid } from "./components/PhotoGrid";
@@ -37,6 +39,10 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ModelsDialog } from "./components/ModelsCard";
 import { useModels } from "./lib/models";
 import { CheatSheet } from "./components/CheatSheet";
+import { ActivityWidget } from "./components/ActivityWidget";
+import { HelpPanel } from "./components/HelpPanel";
+import { openHelp } from "./lib/helpStore";
+import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
@@ -79,6 +85,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const importOptsRef = useRef(importOpts);
   importOptsRef.current = importOpts;
   const [filtersOpen, setFiltersOpen] = useState(true);
+  const metaOpen = useMetaRowOpen();
   const [exportOpen, setExportOpen] = useState<{ sel: number[]; keepers?: number[] } | null>(null);
   const [exportedCount, setExportedCount] = useState<number | null>(null);
   const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
@@ -132,7 +139,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
-  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
+  const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata);
+  // "of M" in the readouts is the unfiltered total (the metadata filter changes `counts`, not this).
+  const totals = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
   // Cull summary (picked / unflagged / rejected / keepers): follows culling changes, analysis and the keeper rule.
   const analysisRunning = status.analysis?.running ?? false;
   const cullSum = useCullSummary(projectId, [rawLib.epoch, analysisRunning, status.catalog?.keeperRule]);
@@ -141,7 +150,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating";
+    query.picks.length > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -484,7 +493,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const writeXmp = useCallback(async () => {
     const t = targets();
-    if (t.length === 0) return;
+    if (t.length === 0 || isActivityRunning("xmp_save")) return;
     try {
       const r = await unwrap(commands.writeXmp(t));
       status.noteXmpFailures([], t.filter((i) => !r.failed.some((f) => f.imageId === i)));
@@ -1240,6 +1249,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return importFolder();
       case "cheatSheet":
         return setCheatOpen(true);
+      case "help":
+        return openHelp();
     }
   });
 
@@ -1420,9 +1431,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
-            <FilterBar query={uiQuery} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
+            <>
+              <FilterBar query={uiQuery} setQuery={setQuery} counts={counts} onLocate={() => locateFolder()} />
+              {metaOpen && <MetadataRow query={query} setQuery={setQuery} epoch={lib.epoch} />}
+            </>
           ) : (
-            <FilterSummary query={uiQuery} shown={ids.length} total={counts?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
+            <FilterSummary query={uiQuery} shown={ids.length} total={totals?.total ?? null} sceneNumber={scenes.number} onEdit={() => setFiltersOpen(true)} unit={keepersStep ? "keepers" : ""} />
           )}
           <GridToolbar
             query={query}
@@ -1431,7 +1445,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onSize={setSize}
             selectedCount={sel.selected.size}
             total={ids.length}
-            catalogTotal={counts?.total ?? null}
+            catalogTotal={totals?.total ?? null}
             unit={keepersStep ? "keepers" : "photos"}
             capsLock={caps}
             autoAdvance={autoAdvance}
@@ -1478,7 +1492,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         <FilterSummary
           query={uiQuery}
           shown={ids.length}
-          total={counts?.total ?? null}
+          total={totals?.total ?? null}
           unit={keepersStep ? "keepers" : ""}
           sceneNumber={scenes.number}
           onEdit={() => {
@@ -1555,7 +1569,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onRate={ratePhoto}
             onFlag={flagPhoto}
             filterSummary={{
-              text: filterSummaryText(uiQuery, ids.length, counts?.total ?? null, scenes.number, keepersStep ? "keepers" : ""),
+              text: filterSummaryText(uiQuery, ids.length, totals?.total ?? null, scenes.number, keepersStep ? "keepers" : ""),
               onEdit: () => {
                 changeMode("grid");
                 setFiltersOpen(true);
@@ -1679,6 +1693,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         />
       )}
       <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <HelpPanel onShortcuts={() => setCheatOpen(true)} />
+      <ActivityWidget />
     </main>
   );
 }
