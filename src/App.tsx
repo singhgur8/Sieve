@@ -1137,6 +1137,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return develop.current?.cropSwap();
       case "cropLock":
         return develop.current?.cropLock();
+      case "cropOverlay":
+        return develop.current?.cropOverlay();
+      case "cropOverlayRotate":
+        return develop.current?.cropOverlayRotate();
+      case "cropReset":
+        return develop.current?.cropReset();
       case "panelsToggle":
         return toggleSidePanels();
       case "panelsHide":
