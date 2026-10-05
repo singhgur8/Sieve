@@ -132,8 +132,12 @@ test.describe("P0-2 crop keys and P1-3 floating crop bar", () => {
   test("floating crop bar: bottom centre, 36 px, Original default, 24 px inset, aspect remembered", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await openDevelop(page);
-    // Scroll the Adjust panel away from the Crop section first (R used to leave the controls off-screen).
-    await page.getByTestId("adjust-panel").evaluate((el) => (el.scrollTop = 2000));
+    // The bar stands in for the Crop panel only while the right panel is hidden (UX 8d P2-9); with it shown there is no bar.
+    await page.keyboard.press("r");
+    await expect(page.getByTestId("crop-panel")).toBeVisible();
+    await expect(page.getByTestId("crop-bar")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Tab");
     await page.keyboard.press("r");
     const bar = await box(page, "crop-bar");
     const viewer = await box(page, "viewer");
@@ -152,7 +156,6 @@ test.describe("P0-2 crop keys and P1-3 floating crop bar", () => {
 
     // Bar controls work without the panel: aspect, angle, swap, cancel.
     await page.getByTestId("cropbar-aspect").selectOption("1:1");
-    await expect(page.getByTestId("crop-aspect")).toHaveValue("1:1");
     await page.getByTestId("cropbar-angle").fill("2.5");
     await expect(page.getByTestId("cropbar-angle-value")).toHaveText("+2.5°");
     await page.getByTestId("cropbar-angle").dblclick();

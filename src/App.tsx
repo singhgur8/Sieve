@@ -151,6 +151,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const clip = useClipboard();
   // Auto Sync (Develop): remembered for the session; switched on by "Edit N selected" / "Edit all in scene".
   const [autoSync, setAutoSync] = useState(false);
+  // A crop / mask tool is active in Develop: toasts move off the viewer's corner handles.
+  const [devTool, setDevTool] = useState(false);
   const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata, query.pickOrigin);
   // "of M" in the readouts is the unfiltered total (the metadata filter changes `counts`, not this).
   const totals = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
@@ -924,7 +926,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const applySuggestions = (t: number[], onlyUnset: boolean, kinds: SuggestionKinds) =>
     void run(async () => {
       const before = await unwrap(commands.getCullSnapshot(t));
-      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, kinds));
+      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, kinds.picks && kinds.rejects && kinds.stars ? null : kinds));
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
       status.refreshXmp();
@@ -1558,6 +1560,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       {infoOpen && (
         <PhotoInfoPanel
           imageId={mode === "compare" && cmp ? cmp[cmp.focus] : (active ?? null)}
+          side={mode === "develop" ? "left" : "right"}
           refetchKey={`${lib.epoch}:${active != null ? lib.version(active) : 0}`}
           onClose={() => setInfoOpen(false)}
           onEditTime={() => {
@@ -1739,6 +1742,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             key={devEpoch}
             ref={develop}
             autoSync={autoSync}
+            onToolActive={setDevTool}
             onAutoSync={setAutoSync}
             lib={lib}
             sel={sel}
@@ -1882,7 +1886,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           }}
         />
       )}
-      <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <Toasts api={toasts} placement={mode === "develop" ? (devTool ? "tool" : "top") : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
       <HelpPanel onShortcuts={() => setCheatOpen(true)} />
       <ActivityWidget behindDialogs={exportOpen != null || modalOpenCount > 0 || helpState.open} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
         <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />

@@ -109,7 +109,7 @@ test("N4 / P1-7: the reject split is a chip group; a zero Auto chip stays a butt
   await expect(page.getByTestId("auto-zero-note")).toContainText("No photos were auto-rejected yet");
   await expect(page.getByTestId("auto-zero-note")).toContainText("Sieve suggests rejecting");
   await page.getByTestId("auto-zero-apply").click();
-  await expect(page.getByTestId("apply-dialog")).toBeVisible();
+  await expect(page.getByTestId("filter-suggested")).toBeVisible();
 });
 
 test("N3: Help legend strips are bars without text", async ({ page }) => {

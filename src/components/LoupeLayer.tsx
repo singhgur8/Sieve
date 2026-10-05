@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useReducer, useRef, useState } from "react";
 import { Flag, X } from "lucide-react";
 import { commands, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
@@ -10,7 +10,7 @@ import { CompareBar, CompareTag } from "./CompareBar";
 import { usePanels } from "../lib/panels";
 import { usePrefetchNeighbours } from "../hooks/usePrefetch";
 import { FIT, ZoomPane, fillScale, scaleForPct, zoomAt, type Metrics, type View } from "./ZoomPane";
-import { ZOOM_PRESETS, type ZoomPreset } from "../lib/zoom";
+import { getLastZoomIn, rememberZoom, ZOOM_PRESETS, type ZoomPreset } from "../lib/zoom";
 
 /** Compare pair: `a` is the Select (the keeper so far), `b` the Candidate. `focus` is the active pane. */
 export interface CompareState {
@@ -86,11 +86,14 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
     const v = viewRef.current;
     if (v.scale > 1.001) return setView(FIT);
     const a = at ?? m.hover ?? { x: m.cw / 2, y: m.ch / 2 };
-    setView(zoomAt(m, Math.max(1.5, scaleForPct(m, 100)), a.x, a.y, 100));
+    const p = getLastZoomIn();
+    if (p === "fill") return setView(zoomAt(m, fillScale(m), a.x, a.y));
+    setView(zoomAt(m, Math.max(1.5, scaleForPct(m, p)), a.x, a.y, p));
   };
   const setPreset = (p: ZoomPreset) => {
     const m = metrics.current;
     if (!m) return;
+    rememberZoom(p);
     if (p === "fit") return setView(FIT);
     const pct = typeof p === "number" ? p : undefined;
     const scale = typeof p === "number" ? scaleForPct(m, p) : fillScale(m);
@@ -131,6 +134,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
 
   const posId = mode === "compare" && compare ? compare[compare.focus] : activeId;
   const posIdx = posId != null ? lib.ids.indexOf(posId) : -1;
+  const [, bumpMeasured] = useReducer((n: number) => n + 1, 0);
   const zoomLabel = view.scale <= 1.001 ? "Fit" : `${Math.round((metrics.current ? (metrics.current.fitW / metrics.current.natW) * view.scale : view.scale) * 100)}%`;
 
   return (
@@ -159,7 +163,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-testid={`compare-pane-${k}`}
                   data-image-id={id}
                 >
-                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} onClickZoom={(x, y) => toggle({ x, y })} testId={`zoom-${k}`} rescaleActual={k === "b"} />
+                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onMeasured={bumpMeasured} onFocus={() => onFocusPane(k)} onClickZoom={(x, y) => toggle({ x, y })} testId={`zoom-${k}`} rescaleActual={k === "b"} />
                   <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
                 </div>
               );
@@ -167,7 +171,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
           </>
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
-            <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} onClickZoom={(x, y) => toggle({ x, y })} testId="zoom-a" />
+            <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} onMeasured={bumpMeasured} onClickZoom={(x, y) => toggle({ x, y })} testId="zoom-a" />
             <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
           </div>
         ) : null}
@@ -201,7 +205,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
           </div>
           <div
             className="rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
-            title={`Zoom level${faces.length > 0 ? `, ${faces.length} face${faces.length > 1 ? "s" : ""} found (F steps through them)` : ""}. Space or a click zooms to 100% at the cursor and back to Fit; zoom and position stay while you step through photos`}
+            title={`Zoom level${faces.length > 0 ? `, ${faces.length} face${faces.length > 1 ? "s" : ""} found (F steps through them)` : ""}. Space or a click toggles Fit and the last zoom you chose (100% by default) at the cursor; zoom and position stay while you step through photos`}
             data-testid="zoom-label"
           >
             {zoomLabel}

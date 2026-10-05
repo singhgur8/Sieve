@@ -303,7 +303,6 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                   >
                     {auto.busy ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} Auto
                   </button>
-                  <span className="min-w-0 truncate text-[11px] text-neutral-400">tone and white balance from this photo</span>
                 </div>
                 <div className="flex h-7 items-center gap-2" data-testid="bw-mode">
                   <span className="w-[72px] shrink-0 text-xs text-neutral-300">Treatment</span>
@@ -356,7 +355,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                       title={`Auto tone only: exposure, contrast, highlights, shadows, whites, blacks (white balance is untouched)${hint("autoTone")}`}
                       data-testid="auto-tone"
                     >
-                      {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto
+                      {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto tone
                     </button>
                   }
                 >

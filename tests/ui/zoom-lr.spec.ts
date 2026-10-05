@@ -86,7 +86,12 @@ test.describe("loupe zoom like Lightroom", () => {
     expect(await attr(page, "zoom-a", "data-scale")).toBeGreaterThanOrEqual(1);
     await page.getByTestId("zoom-preset-fit").click();
     await expect(label).toContainText("Fit");
-    // Presets do not steal Space from the keymap.
+    // Space returns to the last zoom-in preset chosen (Fill here); with 100% chosen it is 100%.
+    await page.keyboard.press("Space");
+    await expect(page.getByTestId("zoom-preset-fill")).toHaveAttribute("aria-pressed", "true");
+    await page.getByTestId("zoom-preset-100").click();
+    await page.getByTestId("zoom-preset-fit").click();
+    await expect(label).toContainText("Fit");
     await page.keyboard.press("Space");
     await expect(label).toContainText("100%");
     // Drag pans, and a drag does not toggle zoom.

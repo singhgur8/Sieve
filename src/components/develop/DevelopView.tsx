@@ -38,7 +38,7 @@ import { useUpright } from "../../hooks/useUpright";
 import { cropAngleForRotation } from "../../lib/transform";
 import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, loadCropAspect, loadOverlay, nextOverlay, previewRotation, saveOverlay, toStored } from "../../lib/crop";
-import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
+import { getLastZoomIn, rememberZoom, ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 import { developPlaceholder } from "../../lib/entryImage";
 
@@ -94,6 +94,8 @@ type Dialog = { kind: "copy" | "sync" | "preset" } | null;
 interface Props {
   /** Auto Sync (Lightroom): while on, every committed edit goes to the other selected photos (state lives in App, session-long). */
   autoSync?: boolean;
+  /** A crop or mask tool is active (the app moves toasts away from the handles). */
+  onToolActive?: (on: boolean) => void;
   onAutoSync?: (on: boolean) => void;
   lib: Library;
   sel: SelectionApi;
@@ -169,7 +171,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ autoSync = false, onAutoSync, onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ autoSync = false, onToolActive, onAutoSync, onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -266,6 +268,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const fw = info?.fullWidth ?? 0;
   const fh = info?.fullHeight ?? 0;
   const masks = useMasks({ editor, id, onError, onNotice });
+  const toolActive = cropTool !== null || (masks.open && !!masks.tool);
+  useEffect(() => {
+    onToolActive?.(toolActive);
+    return () => onToolActive?.(false);
+  }, [toolActive]); // eslint-disable-line react-hooks/exhaustive-deps
   const masksRef = useRef(masks);
   masksRef.current = masks;
 
@@ -402,7 +409,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     (at?: { x: number; y: number }) => {
       if (cropRef.current) return;
       if (latest.current.zoom.on) setZoom({ on: false, cx: 0.5, cy: 0.5 });
-      else zoomTo(100, at ?? hoverRef.current);
+      else zoomTo(getLastZoomIn(), at ?? hoverRef.current);
     },
     [zoomTo],
   );
@@ -922,7 +929,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} />
         </div>
       )}
-      {cropTool && <CropBar crop={cropApi} />}
+      {/* The right panel is the home of the crop controls (Lightroom); the floating bar only stands in while that panel is hidden (Tab). */}
+      {cropTool && (panels.right || masks.open) && <CropBar crop={cropApi} />}
       {guideOn && imageAspect > 0 && !compare && (
         <GuideOverlay guides={editor.adj.transform.guides ?? []} size={size} imageAspect={imageAspect} orientation={orientation} onChange={upright.setGuides} />
       )}
@@ -973,7 +981,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             key={String(z.id)}
             className={`${vbtn(activePreset === z.id)} ${i === 0 ? "rounded-r-none" : i === ZOOM_PRESETS.length - 1 ? "rounded-l-none" : "rounded-none"}`}
             onMouseDown={(e) => e.preventDefault()}
-            onClick={() => zoomTo(z.id)}
+            onClick={() => (rememberZoom(z.id), zoomTo(z.id))}
             title={`${z.title}${z.id === "fit" || z.id === 100 ? hint("zoomDevelop") : ""}`}
             aria-pressed={activePreset === z.id}
             data-testid={`zoom-${z.id}`}
@@ -1085,7 +1093,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               navUrl={editor.navUrl ?? editor.main?.url ?? thumbUrl}
               zoom={zoom}
               region={region}
-              onPreset={(pr) => zoomTo(pr)}
+              onPreset={(pr) => (rememberZoom(pr), zoomTo(pr))}
               activePreset={activePreset}
               onZoom={(z) => cropRef.current || setZoom(z)}
               onCopy={(alt) => (alt ? copyWith(rememberedCopyFields()) : setDialog({ kind: "copy" }))}

@@ -73,8 +73,9 @@ export function describeApply(o: SceneApplyOptions | null): string {
   const m = (o ?? (DEFAULT_SCENE_APPLY_OPTIONS as unknown as SceneApplyOptions)).matchOptions;
   const matched = [m.matchExposure && "exposure", m.matchWhiteBalance && "white balance", m.matchTone && "tone"].filter(Boolean) as string[];
   const copied = m.copyFields.length;
-  const head = matched.length > 0 ? `${matched.join(" + ")} matched per photo` : "nothing matched per photo";
-  return copied > 0 ? `${head}; ${copied} setting groups copied as they are (grain, clarity, HSL, curves...)` : head;
+  const list = matched.length > 1 ? `${matched.slice(0, -1).join(", ")} and ${matched[matched.length - 1]}` : (matched[0] ?? "");
+  const head = matched.length > 0 ? `${list[0].toUpperCase()}${list.slice(1)} matched per photo` : "Nothing matched per photo";
+  return copied > 0 ? `${head}; everything else copied (grain, clarity, HSL, curves…)` : head;
 }
 
 interface Deps {
@@ -477,7 +478,7 @@ export function useWorkflow(d: Deps) {
         const skippedIds = out?.skippedIds ?? [];
         const sk = skippedIds.length;
         const tid = toasts.push(
-          `Applied ${label} to ${plural(n, "photo")}${sk > 0 ? `; ${sk} skipped because you edited them` : ""}${need > 0 ? ` · ${need} need a look` : ""}. ${describeApply(options)}`,
+          `Applied ${label} to ${plural(n, "photo")}. ${describeApply(options)}.${sk > 0 ? ` ${sk} skipped because you edited them.` : ""}${need > 0 ? ` ${need} ${need === 1 ? "needs" : "need"} a look.` : ""}`,
           {
             action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
             secondary:
@@ -530,7 +531,7 @@ export function useWorkflow(d: Deps) {
         const head = r.cancelled ? `Stopped after ${plural(r.scenes.length, "scene")} (${plural(n, "photo")})` : `Applied ${plural(r.scenes.length, "scene")} to ${plural(n, "photo")}`;
         const skippedAll = r.scenes.flatMap((s) => s.skippedIds);
         const tid = toasts.push(
-          `${head}${skippedAll.length > 0 ? `; ${skippedAll.length} skipped because you edited them` : ""}${needN > 0 ? ` · ${needN} need a look` : ""}. ${describeApply(null)}`,
+          `${head}. ${describeApply(null)}.${skippedAll.length > 0 ? ` ${skippedAll.length} skipped because you edited them.` : ""}${needN > 0 ? ` ${needN} ${needN === 1 ? "needs" : "need"} a look.` : ""}`,
           {
             action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
             secondary:

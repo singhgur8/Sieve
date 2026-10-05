@@ -57,10 +57,10 @@ export function applyBlock(r: SceneRow | undefined): { reason: string; fix?: App
 export const FIX_LABEL: Record<ApplyFix, string> = { open: "Open representative", include: "Include scene" };
 
 /** The reason a scene cannot be applied, in place, with its one-click fix. */
-export function ApplyWhy({ block, onFix, testid, className = "" }: { block: { reason: string; fix?: ApplyFix } | null; onFix?: (fix: ApplyFix) => void; testid: string; className?: string }) {
+export function ApplyWhy({ block, onFix, testid, className = "" }: { block: { reason: string; fix?: ApplyFix; soft?: boolean } | null; onFix?: (fix: ApplyFix) => void; testid: string; className?: string }) {
   if (!block) return null;
   return (
-    <span className={`flex min-w-0 items-center gap-1.5 text-[11px] text-amber-300 ${className}`} data-testid={testid}>
+    <span className={`flex min-w-0 items-center gap-1.5 text-[11px] ${block.soft ? "text-neutral-400" : "text-amber-300"} ${className}`} data-testid={testid}>
       <span className="truncate">{block.reason}</span>
       {block.fix && onFix && (
         <button className="shrink-0 whitespace-nowrap text-sky-300 hover:underline" data-testid={`${testid}-fix`} onClick={() => onFix(block.fix!)}>

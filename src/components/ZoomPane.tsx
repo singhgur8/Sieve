@@ -61,6 +61,8 @@ interface Props {
   view: View;
   onView: (v: View) => void;
   metricsRef: React.MutableRefObject<Metrics | null>;
+  /** The pane measured something new (preview decoded, viewport resized): the owner re-reads `metricsRef` (the zoom label). */
+  onMeasured?: () => void;
   testId?: string;
   onFocus?: () => void;
   maxScale?: number;
@@ -71,7 +73,7 @@ interface Props {
 }
 
 /** Fit / zoom / pan surface for one preview (uses the 2048px preview, thumbnail underneath while loading). */
-export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 64, rescaleActual = true, onClickZoom }: Props) {
+export function ZoomPane({ entry, version, view, onView, metricsRef, onMeasured, testId, onFocus, maxScale = 64, rescaleActual = true, onClickZoom }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   // The preview is decoded off-screen first; it is only mounted once it can paint in full. Until then the
@@ -128,6 +130,11 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
   const y = clampPos(size.h / 2 - view.cy * dh, size.h, dh);
   // The pointer position lives on the shared metrics object (not per pane) so Compare's two panes agree on it.
   metricsRef.current = { fitW, fitH, natW: (nat?.w ?? nw) * k, natH: (nat?.h ?? nh) * k, cw: size.w, ch: size.h, x, y, dw, dh, hover: metricsRef.current?.hover ?? null };
+  // The owner renders the zoom label from `metricsRef`, which this render just updated: tell it to read again, or a
+  // label rendered against the thumbnail's size (before the preview decoded) would stay until the next unrelated render.
+  useEffect(() => {
+    onMeasured?.();
+  }, [nat?.w, nat?.h, k, size.w, size.h, nw, nh]); // eslint-disable-line react-hooks/exhaustive-deps
   const setHover = (h: { x: number; y: number } | null) => {
     if (metricsRef.current) metricsRef.current.hover = h;
   };

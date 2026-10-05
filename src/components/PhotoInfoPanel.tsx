@@ -1,7 +1,7 @@
 // Per-photo info (Lightroom's Metadata panel): file, capture time (corrected, with the original when different), camera,
 // exposure, size, GPS and sidecar of the ONE photo that is active. Not to be confused with the gallery "Metadata filter".
 import { Clock, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useLayoutEffect, useState, type ReactNode } from "react";
 import { formatTime, formatShutter, trimNum } from "../lib/format";
 import { sourceLabel } from "../lib/captureTime";
 import { usePhotoMetadata } from "../hooks/usePhotoMetadata";
@@ -29,14 +29,27 @@ interface Props {
   onClose: () => void;
   onEditTime: () => void;
   onRevert: (id: number) => void;
+  /** Develop: the card sits over the left panel (the sliders stay usable); elsewhere over the top-right of the content area. */
+  side?: "left" | "right";
 }
 
-export function PhotoInfoPanel({ imageId, refetchKey, onClose, onEditTime, onRevert }: Props) {
+export function PhotoInfoPanel({ imageId, refetchKey, onClose, onEditTime, onRevert, side = "right" }: Props) {
+  // Anchored below the bars (summary, Continue, Suggestions) at the top of the content area, never on top of them.
+  const [top, setTop] = useState(56);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const r = document.querySelector("[data-mode]")?.getBoundingClientRect();
+      setTop(side === "left" ? 300 : r ? Math.round(r.top) + 8 : 56);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [side]);
   const { meta: m, error } = usePhotoMetadata(imageId, refetchKey);
   const edited = m != null && m.captureTimeSource !== "exif" && m.originalCapturedAtMs !== m.capturedAtMs;
   const exposure = m ? [m.shutterSeconds != null ? formatShutter(m.shutterSeconds) : null, m.aperture != null ? `f/${trimNum(m.aperture)}` : null, m.iso != null ? `ISO ${m.iso}` : null].filter(Boolean) : [];
   return (
-    <aside className="fixed right-3 top-14 z-40 flex max-h-[calc(100vh-7rem)] w-80 flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900/95 text-xs shadow-xl" data-testid="photo-info" aria-label="Photo info">
+    <aside style={{ top, maxHeight: `calc(100vh - ${top + 24}px)` }} className={`fixed ${side === "left" ? "left-3" : "right-3"} z-40 flex w-80 flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900/95 text-xs shadow-xl`} data-testid="photo-info" aria-label="Photo info">
       <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
         <h2 className="flex-1 text-xs font-semibold text-neutral-100">Photo info</h2>
         <span className="text-[10px] text-neutral-500">this photo only</span>

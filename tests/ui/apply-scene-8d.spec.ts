@@ -70,8 +70,8 @@ test.describe("apply to scene (8d)", () => {
     const applied = log.indexOf("apply_scene_edit");
     expect(saved).toBeGreaterThanOrEqual(0);
     expect(saved).toBeLessThan(applied);
-    await expect(notice(page)).toContainText("exposure + white balance matched per photo");
-    await expect(notice(page)).toContainText("copied as they are");
+    await expect(notice(page)).toContainText("Exposure and white balance matched per photo");
+    await expect(notice(page)).toContainText("everything else copied");
 
     // The target got the grain.
     await page.getByTestId("film-2").click();
