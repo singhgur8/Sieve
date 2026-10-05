@@ -85,6 +85,7 @@ export function completeAdjustments(adj: ParametricAdjustments, format?: ImageFo
     crop: adj.crop ?? d.crop,
     profile: adj.profile ?? d.profile,
     masks: adj.masks ?? d.masks,
+    transform: adj.transform ?? d.transform,
   };
 }
 
@@ -148,6 +149,7 @@ const ADJUSTMENT_FIELD_SET: Record<AdjustmentField, true> = {
   noise_reduction_luminance: true,
   noise_reduction_color: true,
   process_version: true,
+  transform: true,
 };
 
 /** Every `AdjustmentField`, in panel order (fields mask "select all"). */
@@ -185,6 +187,7 @@ export const ADJUSTMENT_FIELD_LABELS: Record<AdjustmentField, string> = {
   noise_reduction_luminance: "Luminance noise reduction",
   noise_reduction_color: "Color noise reduction",
   process_version: "Process version",
+  transform: "Transform",
 };
 
 /**
@@ -273,6 +276,9 @@ export function copyAdjustmentFields(
       case "masks":
         out.masks = s.masks.map(transferableMaskGroup);
         break;
+      case "transform":
+        out.transform = s.transform;
+        break;
       default:
         out[f] = s[f];
     }
@@ -284,12 +290,12 @@ export function copyAdjustmentFields(
 const SUBSET_FIELDS: readonly AdjustmentField[] = ["noise_reduction_luminance", "noise_reduction_color"];
 
 /**
- * Everything except `crop`, `masks` and the noise-reduction subsets (mirror of Rust
- * `AdjustmentField::DEFAULT_SYNC`): the default selection for Sync / Copy Settings and scene
- * matching (per-frame geometry).
+ * Everything except `crop`, `masks`, `transform` and the noise-reduction subsets (mirror of
+ * Rust `AdjustmentField::DEFAULT_SYNC`): the default selection for Sync / Copy Settings and
+ * scene matching (per-frame geometry).
  */
 export const DEFAULT_SYNC_FIELDS = ALL_ADJUSTMENT_FIELDS.filter(
-  (f) => f !== "crop" && f !== "masks" && !SUBSET_FIELDS.includes(f),
+  (f) => f !== "crop" && f !== "masks" && f !== "transform" && !SUBSET_FIELDS.includes(f),
 );
 
 // ---------------------------------------------------------------------------
@@ -554,6 +560,7 @@ export function lerpAdjustments(a0: ParametricAdjustments, b0: ParametricAdjustm
     crop: lerpCrop(a.crop, b.crop, t),
     profile: lerpProfile(a.profile, b.profile, t),
     masks: nearB ? b.masks : a.masks,
+    transform: nearB ? b.transform : a.transform,
   };
 }
 

@@ -352,7 +352,8 @@ const ENTRY_SELECT: &str = "
            i.scene_id, i.scene_anchor,
            i.companion_path, i.develop_warnings,
            i.missing_since_ms,
-           i.pick_origin, i.xmp_mtime_ms IS NOT NULL, q.reasons_json
+           i.pick_origin, i.xmp_mtime_ms IS NOT NULL, q.reasons_json,
+           i.exif_captured_at_ms, i.capture_time_source
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -427,6 +428,8 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
         },
         capture: CaptureMeta {
             captured_at_ms: r.get(8)?,
+            original_captured_at_ms: r.get(54)?,
+            capture_time_source: CaptureTimeSource::parse(&r.get::<_, String>(55)?).unwrap_or_default(),
             iso: r.get(9)?,
             shutter_seconds: r.get(10)?,
             aperture: r.get(11)?,
@@ -1566,7 +1569,9 @@ pub fn record_extraction(
                  camera_make = COALESCE(?2, camera_make),
                  camera_model = COALESCE(?3, camera_model),
                  sensor_layout = COALESCE(?4, sensor_layout),
-                 lens = ?5, captured_at_ms = ?6, iso = ?7, shutter_s = ?8, aperture = ?9,
+                 lens = ?5, exif_captured_at_ms = ?6,
+                 captured_at_ms = CASE WHEN capture_time_source = 'exif' THEN ?6 ELSE captured_at_ms END,
+                 iso = ?7, shutter_s = ?8, aperture = ?9,
                  focal_length_mm = ?10, width = ?11, height = ?12, orientation = ?13
              WHERE id = ?1",
         )?

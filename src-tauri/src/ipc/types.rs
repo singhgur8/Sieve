@@ -163,7 +163,19 @@ pub struct CaptureMeta {
     /// burst grouping. EXIF `DateTimeOriginal` is camera-local wall-clock time with no
     /// zone, so it is stored as that wall-clock time *interpreted as UTC* ("naive" ms):
     /// display with `timeZone: "UTC"`; differences between frames are exact.
+    ///
+    /// v19: this is the **corrected** capture time (Lightroom's "Edit Capture Time"), used by
+    /// sorting, burst grouping, scenes, filters, export naming and project date ranges. It
+    /// equals `originalCapturedAtMs` unless `captureTimeSource` is `sidecar` or `user`.
     pub captured_at_ms: Option<i64>,
+    /// v19: capture time read from the file itself (EXIF `DateTimeOriginal` + sub-seconds),
+    /// same "naive" ms convention. Never changed by `edit_capture_time` or sidecar reads.
+    /// `null` when the file has none (or its metadata was not extracted yet).
+    #[serde(default)]
+    pub original_captured_at_ms: Option<i64>,
+    /// v19: where `capturedAtMs` comes from.
+    #[serde(default)]
+    pub capture_time_source: CaptureTimeSource,
     pub iso: Option<u32>,
     #[specta(type = Option<Number>)]
     pub shutter_seconds: Option<f64>,
@@ -172,6 +184,22 @@ pub struct CaptureMeta {
     #[specta(type = Option<Number>)]
     pub focal_length_mm: Option<f32>,
     pub lens: Option<String>,
+}
+
+string_enum! {
+    /// Origin of `CaptureMeta.capturedAtMs` (IPC v19, `images.capture_time_source`).
+    #[derive(Default)]
+    pub enum CaptureTimeSource {
+        /// The file's own EXIF time (`originalCapturedAtMs`).
+        #[default]
+        Exif => "exif",
+        /// A corrected time read from the XMP sidecar (`exif:DateTimeOriginal`, else
+        /// `photoshop:DateCreated`) that differs from the file's EXIF time, e.g. after
+        /// Lightroom's "Edit Capture Time".
+        Sidecar => "sidecar",
+        /// Corrected in Sieve (`edit_capture_time`); written to the sidecar.
+        User => "user",
+    }
 }
 
 /// Where the embedded preview for an image stands. Pixels are JPEG files under
@@ -1164,6 +1192,215 @@ impl Default for CropSettings {
     }
 }
 
+string_enum! {
+    /// Lightroom Transform panel "Upright" mode (IPC v19). `crs:PerspectiveUpright` stores it
+    /// as an integer: 0 off, 1 auto, 2 full, 3 level, 4 vertical, 5 guided (ExifTool's crs
+    /// table; [`UprightMode::crs_value`] / [`UprightMode::from_crs`]).
+    #[derive(Default)]
+    pub enum UprightMode {
+        #[default]
+        Off => "off",
+        /// Balanced level + vertical + aspect correction.
+        Auto => "auto",
+        /// Horizon / dominant horizontal lines level (rotation only).
+        Level => "level",
+        /// Level + converging verticals.
+        Vertical => "vertical",
+        /// Level + vertical + horizontal perspective.
+        Full => "full",
+        /// From the user's guide lines (`TransformSettings.guides`, 2..=4).
+        Guided => "guided",
+    }
+}
+
+impl UprightMode {
+    /// `crs:PerspectiveUpright` value.
+    pub fn crs_value(self) -> u8 {
+        match self {
+            UprightMode::Off => 0,
+            UprightMode::Auto => 1,
+            UprightMode::Full => 2,
+            UprightMode::Level => 3,
+            UprightMode::Vertical => 4,
+            UprightMode::Guided => 5,
+        }
+    }
+
+    /// Inverse of [`Self::crs_value`]; unknown values -> `None`.
+    pub fn from_crs(v: i64) -> Option<UprightMode> {
+        Some(match v {
+            0 => UprightMode::Off,
+            1 => UprightMode::Auto,
+            2 => UprightMode::Full,
+            3 => UprightMode::Level,
+            4 => UprightMode::Vertical,
+            5 => UprightMode::Guided,
+            _ => return None,
+        })
+    }
+}
+
+/// One Guided Upright guide line (v19), endpoints in the **sensor frame** (normalized 0..=1
+/// of the un-oriented, uncropped image, like masks and `crs:UprightFourSegments_N`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UprightGuide {
+    pub start: NormPoint,
+    pub end: NormPoint,
+}
+
+/// A `crs:` property kept verbatim (name without the `crs:` prefix, value as written).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CrsProperty {
+    pub name: String,
+    pub value: String,
+}
+
+/// The perspective correction an Upright mode solved for one photo (v19): from
+/// `auto_upright` (Sieve's line detection) or read from a Lightroom sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UprightSolution {
+    /// Mode it was solved for. Rendered only while it equals `TransformSettings.upright`.
+    pub mode: UprightMode,
+    /// Row-major 3x3 homography (9 finite values) mapping a point of the corrected frame to
+    /// the source, both normalized 0..=1 in the sensor frame (un-oriented, before crop); the
+    /// manual sliders apply on top. Identity = `[1,0,0, 0,1,0, 0,0,1]`.
+    #[specta(type = Vec<Number>)]
+    pub matrix: Vec<f64>,
+    /// In-plane rotation part of the solve, degrees (positive = counter-clockwise), e.g. the
+    /// horizon angle `level` corrected. Informational (UI readout, tests).
+    #[specta(type = Number)]
+    pub rotation_deg: f32,
+    /// Lightroom's own Upright state read from the sidecar, kept verbatim and written back
+    /// unchanged while `mode` is still the sidecar's (`UprightVersion`, `UprightTransform_0..5`,
+    /// `UprightTransformCount`, `UprightFocalMode`, `UprightFocalLength35mm`,
+    /// `UprightCenterMode`, `UprightCenterNormX/Y`, `UprightPreview`, `UprightDependentDigest`,
+    /// `UprightGuidedDependentDigest`, `UprightFourSegments*`). Empty when solved by Sieve.
+    pub crs: Vec<CrsProperty>,
+}
+
+impl UprightSolution {
+    pub const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+}
+
+/// Lightroom Transform panel (IPC v19). Field <-> `crs:` mapping (Process 2012+; `xmp/crs.rs`
+/// implements it, rust-engine-dev):
+///
+/// | Field | crs property | Range / format |
+/// |---|---|---|
+/// | `upright` | `PerspectiveUpright` | 0..=5, see [`UprightMode`] |
+/// | `guides` | `UprightFourSegmentsCount` + `UprightFourSegments_0..3` | 0..=4 lines |
+/// | `vertical` | `PerspectiveVertical` | -100..=100, signed integer |
+/// | `horizontal` | `PerspectiveHorizontal` | -100..=100, signed integer |
+/// | `rotate` | `PerspectiveRotate` | -10..=10 degrees, signed, 1 decimal |
+/// | `aspect` | `PerspectiveAspect` | -100..=100, signed integer |
+/// | `scale` | `PerspectiveScale` | 50..=150 (default 100), integer |
+/// | `offsetX` / `offsetY` | `PerspectiveX` / `PerspectiveY` | -100..=100, signed, 2 decimals |
+/// | `constrainCrop` | `CropConstrainToWarp` | 0 / 1 |
+/// | `solution.crs` | `UprightVersion`, `UprightTransform_*`, `UprightFocal*`, `UprightCenter*`, `UprightPreview`, `Upright*DependentDigest` | verbatim |
+///
+/// Default = Lightroom's (off, sliders 0, scale 100, constrain off) and neutral. Renders
+/// (preview, export) apply `solution` (when its mode is current) then the sliders, before
+/// the crop; with `constrainCrop` the crop is limited to the warped image area.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformSettings {
+    pub upright: UprightMode,
+    /// Guided Upright lines (at most 4; Guided needs 2+ to have an effect).
+    #[serde(default)]
+    pub guides: Vec<UprightGuide>,
+    #[specta(type = Number)]
+    pub vertical: f32,
+    #[specta(type = Number)]
+    pub horizontal: f32,
+    /// Degrees.
+    #[specta(type = Number)]
+    pub rotate: f32,
+    #[specta(type = Number)]
+    pub aspect: f32,
+    /// Percent.
+    #[specta(type = Number)]
+    pub scale: f32,
+    #[specta(type = Number)]
+    pub offset_x: f32,
+    #[specta(type = Number)]
+    pub offset_y: f32,
+    pub constrain_crop: bool,
+    /// Solved Upright correction (`auto_upright`, or read from the sidecar); `null` for
+    /// `off` or not solved yet.
+    #[serde(default)]
+    pub solution: Option<UprightSolution>,
+}
+
+impl Default for TransformSettings {
+    fn default() -> Self {
+        Self {
+            upright: UprightMode::Off,
+            guides: Vec::new(),
+            vertical: 0.0,
+            horizontal: 0.0,
+            rotate: 0.0,
+            aspect: 0.0,
+            scale: 100.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            constrain_crop: false,
+            solution: None,
+        }
+    }
+}
+
+impl TransformSettings {
+    pub const MAX_GUIDES: usize = 4;
+
+    /// Returns a description of the first invalid value, if any.
+    pub fn validate(&self) -> Result<(), String> {
+        fn check(name: &str, v: f32, min: f32, max: f32) -> Result<(), String> {
+            if v.is_finite() && (min..=max).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("transform.{name} = {v} is outside {min}..={max}"))
+            }
+        }
+        check("vertical", self.vertical, -100.0, 100.0)?;
+        check("horizontal", self.horizontal, -100.0, 100.0)?;
+        check("rotate", self.rotate, -10.0, 10.0)?;
+        check("aspect", self.aspect, -100.0, 100.0)?;
+        check("scale", self.scale, 50.0, 150.0)?;
+        check("offsetX", self.offset_x, -100.0, 100.0)?;
+        check("offsetY", self.offset_y, -100.0, 100.0)?;
+        if self.guides.len() > Self::MAX_GUIDES {
+            return Err(format!("transform.guides: at most {} guides", Self::MAX_GUIDES));
+        }
+        for g in &self.guides {
+            for p in [g.start, g.end] {
+                if !(p.x.is_finite() && p.y.is_finite() && (0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y)) {
+                    return Err("transform.guides points must lie within 0..=1".into());
+                }
+            }
+        }
+        if let Some(sol) = &self.solution {
+            if sol.matrix.len() != 9 || sol.matrix.iter().any(|v| !v.is_finite()) {
+                return Err("transform.solution.matrix must hold 9 finite numbers".into());
+            }
+            if !sol.rotation_deg.is_finite() {
+                return Err("transform.solution.rotationDeg must be finite".into());
+            }
+            for p in &sol.crs {
+                let name_ok = !p.name.is_empty()
+                    && p.name.len() <= 64
+                    && p.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if !name_ok || p.value.len() > 4096 {
+                    return Err(format!("transform.solution.crs: invalid property {:?}", p.name));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A Look / creative profile (`<crs:Look>`): Adobe Raw looks (Adobe Color, Adobe Monochrome,
 /// ...), creative profiles (Artistic, B&W, Modern, Vintage) and third-party looks. Resolved
 /// at render time by `uuid` from the installed look profiles (`profiles::ProfileLibrary`,
@@ -1421,6 +1658,10 @@ pub struct ParametricAdjustments {
     /// [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
     #[serde(default)]
     pub masks: Vec<MaskGroup>,
+    /// Transform panel (IPC v19): Upright + manual perspective sliders (see
+    /// [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+    #[serde(default)]
+    pub transform: TransformSettings,
 }
 
 impl ParametricAdjustments {
@@ -1591,6 +1832,7 @@ impl ParametricAdjustments {
             }
         }
         validate_masks(&self.masks)?;
+        self.transform.validate()?;
         Ok(())
     }
 
@@ -1640,6 +1882,7 @@ impl ParametricAdjustments {
                 AdjustmentField::Profile => self.profile = src.profile.clone(),
                 // AI mattes belong to the source image: the target recomputes them.
                 AdjustmentField::Masks => self.masks = src.masks.iter().map(MaskGroup::transferable).collect(),
+                AdjustmentField::Transform => self.transform = src.transform.clone(),
             }
         }
     }
@@ -1664,6 +1907,7 @@ impl ParametricAdjustments {
     ///   `crop` unless both enabled: the nearer side's; `profile`: look amount linear when both
     ///   sides have the same camera profile and look, else the nearer side's.
     /// - v10 `masks`: the nearer side's (never interpolated).
+    /// - v19 `transform`: the nearer side's (per-frame geometry, never interpolated).
     pub fn lerp(a: &ParametricAdjustments, b: &ParametricAdjustments, t: f32) -> ParametricAdjustments {
         let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
         let l = |x: f32, y: f32| x + (y - x) * t;
@@ -1815,6 +2059,7 @@ impl ParametricAdjustments {
             },
             profile: ProfileSettings::lerp(&a.profile, &b.profile, t),
             masks: if near_b { b.masks.clone() } else { a.masks.clone() },
+            transform: if near_b { b.transform.clone() } else { a.transform.clone() },
         }
     }
 }
@@ -1880,6 +2125,11 @@ string_enum! {
         NoiseReductionColor => "noise_reduction_color",
         /// `processVersion` (v14, Lightroom's "Process Version" copy item).
         ProcessVersion => "process_version",
+        /// `transform` (v19: Upright mode, guides, solved Upright values and the manual
+        /// Transform sliders; Lightroom's "Upright Mode" + "Upright Transforms" + "Transform
+        /// Adjustments" copy items). Not in [`AdjustmentField::DEFAULT_SYNC`] (per-frame
+        /// geometry, like `crop`).
+        Transform => "transform",
     }
 }
 
@@ -1958,6 +2208,7 @@ impl AdjustmentField {
         AdjustmentField::Crop,
         AdjustmentField::Profile,
         AdjustmentField::ProcessVersion,
+        AdjustmentField::Transform,
     ];
 }
 
@@ -1981,6 +2232,10 @@ string_enum! {
         /// Navigator panel + preset/profile hover previews (v14): independent of `main`, so a
         /// hover never supersedes the loupe render.
         Navigator => "navigator",
+        /// Temporary previews on the main image (v19, `render_preview_variant`): hover preset
+        /// preview and press-and-hold "without this panel". Independent of `main`, so going
+        /// back to the edit is just showing the last `main` URL again (no re-render).
+        Preview => "preview",
     }
 }
 
@@ -2127,6 +2382,12 @@ pub struct AdjustmentHistory {
     pub current_entry_id: Option<HistoryEntryId>,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// v19: the preset last applied to this photo (`apply_preset`) while its settings still
+    /// carry it: `null` once any setting the preset owns (its `fields`) differs from what the
+    /// apply produced (a slider change, another preset, undo past the apply...). Redo back
+    /// to the apply highlights it again. Drives the preset browser's highlight.
+    #[serde(default)]
+    pub applied_preset_id: Option<PresetId>,
 }
 
 /// Adjustments + history after an undo/redo/jump.
@@ -2214,6 +2475,7 @@ impl Default for ParametricAdjustments {
             crop: CropSettings::default(),
             profile: ProfileSettings::default(),
             masks: Vec::new(),
+            transform: TransformSettings::default(),
         }
     }
 }
@@ -4318,6 +4580,9 @@ string_enum! {
         SceneApply => "scene_apply",
         /// `apply_style_prediction` ("Auto edit (my style)").
         StylePrediction => "style_prediction",
+        /// `paste_settings` / `sync_settings` / `paste_previous` (v19): Copy / Paste / Sync to
+        /// an arbitrary selection.
+        Paste => "paste",
     }
 }
 
@@ -4524,6 +4789,9 @@ pub struct Project {
     pub cover_thumbnail_path: Option<String>,
     /// Culling profile of this shoot (`set_project_shoot_type`).
     pub shoot_type: ShootType,
+    /// How readily culling suggests reject for this shoot (v19,
+    /// `set_project_reject_strictness`; default `balanced`).
+    pub reject_strictness: RejectStrictness,
     /// Guided-workflow step (`set_workflow_step`).
     pub workflow_step: WorkflowStep,
     pub created_at_ms: i64,
@@ -4583,6 +4851,180 @@ pub struct RemoveProjectResult {
     /// Catalog images removed (their files, sidecars and exports are untouched).
     pub removed_images: u32,
     pub removed_folders: u32,
+}
+
+// ---------------------------------------------------------------------------
+// IPC v19 (Phase 8d): capture time, per-photo metadata, Upright, preview variants, reject
+// strictness
+// ---------------------------------------------------------------------------
+
+/// Earliest capture time `edit_capture_time` may produce (1900-01-01, naive ms).
+pub const MIN_CAPTURE_TIME_MS: i64 = -2_208_988_800_000;
+/// Latest capture time `edit_capture_time` may produce (2200-01-01, naive ms).
+pub const MAX_CAPTURE_TIME_MS: i64 = 7_258_118_400_000;
+
+/// How `edit_capture_time` changes the selected photos' corrected capture time (Lightroom's
+/// Metadata > Edit Capture Time). Times are "naive" ms (see `CaptureMeta.capturedAtMs`).
+/// Photos without a capture time are skipped unless the mode gives them one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum CaptureTimeEdit {
+    /// "Shift by set number of hours" (any ms): every photo's time + `offsetMs`.
+    Shift { offset_ms: i64 },
+    /// "Adjust to a specified date and time": `referenceId` (one of the ids, the active
+    /// photo) gets `capturedAtMs`; the other photos shift by the same offset. A reference
+    /// without a capture time gets it and nothing else changes.
+    SetExact { reference_id: ImageId, captured_at_ms: i64 },
+    /// Sync two cameras: `referenceId` (a frame of the camera with the right clock) and
+    /// `targetId` (a frame of the other camera taken at the same moment); every photo in
+    /// `ids` (the other camera's frames, normally including `targetId`) shifts by
+    /// `reference - target`. Both need a capture time; they may be outside `ids`.
+    SyncCameras { reference_id: ImageId, target_id: ImageId },
+    /// "Revert capture time to original": back to the file's EXIF time
+    /// (`originalCapturedAtMs`, source `exif`).
+    Revert,
+}
+
+/// One photo's corrected capture time (undo of `edit_capture_time` via
+/// `restore_capture_times`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureTimeSnapshot {
+    pub image_id: ImageId,
+    pub captured_at_ms: Option<i64>,
+    pub source: CaptureTimeSource,
+}
+
+/// Result of `edit_capture_time`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureTimeEditResult {
+    /// Photos whose corrected time changed (refetch with `get_images`; sort order, bursts and
+    /// scene bounds follow).
+    pub changed_ids: Vec<ImageId>,
+    /// Photos left alone: no capture time to shift, or already at the target time.
+    pub skipped_ids: Vec<ImageId>,
+    /// Offset applied (`shift` / `set_exact` / `sync_cameras`); `null` for `revert`.
+    pub offset_ms: Option<i64>,
+    /// The changed photos' times before the edit: pass to `restore_capture_times` to undo.
+    pub previous: Vec<CaptureTimeSnapshot>,
+}
+
+/// GPS position from the file's EXIF (WGS84 decimal degrees).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GpsLocation {
+    /// -90..=90, north positive.
+    #[specta(type = Number)]
+    pub latitude: f64,
+    /// -180..=180, east positive.
+    #[specta(type = Number)]
+    pub longitude: f64,
+    /// Metres above sea level.
+    #[specta(type = Option<Number>)]
+    pub altitude_m: Option<f64>,
+}
+
+/// Everything the Library "Metadata" panel shows for one photo (`get_image_metadata`, v19).
+/// Catalog facts plus a few EXIF values read from the file on demand (`null` when absent or
+/// unreadable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageMetadata {
+    pub image_id: ImageId,
+    /// Absolute path of the original.
+    pub path: String,
+    pub file_name: String,
+    /// Directory holding the original.
+    pub folder_path: String,
+    pub format: ImageFormat,
+    /// Lower-case extension without the dot ("arw").
+    pub extension: String,
+    pub file_size: i64,
+    pub file_mtime_ms: i64,
+    /// Corrected capture time (`CaptureMeta.capturedAtMs`).
+    pub captured_at_ms: Option<i64>,
+    /// The file's own EXIF time (`CaptureMeta.originalCapturedAtMs`).
+    pub original_captured_at_ms: Option<i64>,
+    pub capture_time_source: CaptureTimeSource,
+    pub camera: CameraInfo,
+    pub lens: Option<String>,
+    pub iso: Option<u32>,
+    #[specta(type = Option<Number>)]
+    pub shutter_seconds: Option<f64>,
+    #[specta(type = Option<Number>)]
+    pub aperture: Option<f32>,
+    #[specta(type = Option<Number>)]
+    pub focal_length_mm: Option<f32>,
+    /// From the file (EXIF `FocalLengthIn35mmFormat`).
+    #[specta(type = Option<Number>)]
+    pub focal_length_35mm: Option<f32>,
+    /// From the file (EXIF `ExposureBiasValue`), EV.
+    #[specta(type = Option<Number>)]
+    pub exposure_compensation_ev: Option<f32>,
+    /// From the file (EXIF `Flash` bit 0).
+    pub flash_fired: Option<bool>,
+    /// From the file (EXIF `BodySerialNumber` / maker notes).
+    pub camera_serial: Option<String>,
+    /// Sensor pixel size (as in `RawImageEntry`).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// EXIF orientation 1..=8.
+    pub orientation: Option<u8>,
+    /// From the file; `null` = no GPS data.
+    pub gps: Option<GpsLocation>,
+    /// Where the XMP sidecar is (or would be written).
+    pub sidecar_path: String,
+    /// The sidecar exists on disk now.
+    pub sidecar_exists: bool,
+    /// Paired camera JPEG/HEIC (`RawImageEntry.companionPath`).
+    pub companion_path: Option<String>,
+    /// The original is missing at `path` (`RawImageEntry.missingSinceMs` set).
+    pub missing: bool,
+}
+
+/// Result of `auto_upright` (v19). Nothing is saved: the UI sets
+/// `transform.upright = mode`, `transform.solution = solution` and commits one history entry
+/// ("Upright: Auto"...).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UprightResult {
+    pub mode: UprightMode,
+    /// `null` when the photo has no usable lines for this mode (Lightroom then leaves the
+    /// photo as it is); `message` says so.
+    pub solution: Option<UprightSolution>,
+    /// User-facing note, e.g. "No straight lines found for Vertical"; `null` on success.
+    pub message: Option<String>,
+}
+
+/// A temporary variation of the live settings for `render_preview_variant` (v19). Nothing is
+/// saved and no history entry is written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum PreviewVariant {
+    /// What applying the preset would give (same as `resolve_preset`): hover preview on the
+    /// main image.
+    Preset { preset_id: PresetId },
+    /// The live settings with these groups back at the photo's format defaults:
+    /// press-and-hold a panel's "changed" dot to see the photo without that panel. Non-empty.
+    WithoutFields { fields: Vec<AdjustmentField> },
+}
+
+string_enum! {
+    /// How readily culling turns defects into reject suggestions (v19, per project,
+    /// `set_project_reject_strictness`). Applied by the scorer (vision-ml-dev) on top of the
+    /// shoot type's `CullThresholds`.
+    #[derive(Default)]
+    pub enum RejectStrictness {
+        /// Only clear failures are suggested for reject.
+        Conservative => "conservative",
+        /// Default.
+        #[default]
+        Balanced => "balanced",
+        /// Burst duplicates, any closed eyes on the main subject and soft focus are
+        /// suggested for reject.
+        Aggressive => "aggressive",
+    }
 }
 
 /// One item of Lightroom's Copy Settings dialog (a checkbox).
@@ -4682,7 +5124,7 @@ pub fn copy_settings_groups() -> Vec<CopySettingsGroup> {
                 unsupported("Lens Vignetting"),
             ],
         ),
-        group("transform", "Transform", vec![unsupported("Upright & Transform")]),
+        group("transform", "Transform", vec![item("Upright & Transform", &[F::Transform])]),
         group("effects", "Effects", vec![item("Post-Crop Vignetting", &[F::Vignette]), item("Grain", &[F::Grain])]),
         group("calibration", "Calibration", vec![item("Calibration", &[F::Calibration])]),
         group("masking", "Masking", vec![item("Masks", &[F::Masks])]),
@@ -4986,8 +5428,8 @@ mod tests {
         t.copy_fields(&e, &[AdjustmentField::Crop]);
         assert_eq!(t, e, "ALL groups together cover every field");
         // v10: DEFAULT_SYNC = ALL minus crop and masks (v14: and the two noise-reduction
-        // subsets, covered by the `noise_reduction` umbrella).
-        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 4, AdjustmentField::ALL.len());
+        // subsets, covered by the `noise_reduction` umbrella; v19: and transform).
+        assert_eq!(AdjustmentField::DEFAULT_SYNC.len() + 5, AdjustmentField::ALL.len());
         assert!(!AdjustmentField::DEFAULT_SYNC.contains(&AdjustmentField::Masks));
 
         // Out-of-range / malformed values.
@@ -5067,5 +5509,75 @@ mod tests {
         assert_eq!(ImageFormat::from_extension("hif"), Some(ImageFormat::Heic));
         assert!(ImageFormat::Raf.is_raw() && !ImageFormat::Tiff.is_raw());
         assert!(ImageFormat::Jpeg.pairs_with_raw() && !ImageFormat::Png.pairs_with_raw());
+    }
+
+    #[test]
+    fn v19_transform_validates_copies_and_maps_to_crs() {
+        let d = ParametricAdjustments::default();
+        assert_eq!(d.transform, TransformSettings::default());
+        assert_eq!((d.transform.upright, d.transform.scale), (UprightMode::Off, 100.0));
+        // Stored JSON without `transform` still loads (serde default).
+        let mut v = serde_json::to_value(&d).unwrap();
+        v.as_object_mut().unwrap().remove("transform");
+        assert_eq!(serde_json::from_value::<ParametricAdjustments>(v).unwrap(), d);
+
+        for m in UprightMode::ALL {
+            assert_eq!(UprightMode::from_crs(m.crs_value() as i64), Some(*m));
+        }
+        assert_eq!(UprightMode::Full.crs_value(), 2);
+        assert_eq!(UprightMode::Level.crs_value(), 3);
+        assert_eq!(UprightMode::from_crs(6), None);
+
+        let e = ParametricAdjustments {
+            transform: TransformSettings {
+                upright: UprightMode::Guided,
+                guides: vec![UprightGuide { start: NormPoint { x: 0.1, y: 0.1 }, end: NormPoint { x: 0.1, y: 0.9 } }],
+                vertical: -20.0,
+                rotate: 1.5,
+                scale: 90.0,
+                constrain_crop: true,
+                solution: Some(UprightSolution {
+                    mode: UprightMode::Guided,
+                    matrix: UprightSolution::IDENTITY.to_vec(),
+                    rotation_deg: 0.5,
+                    crs: vec![CrsProperty { name: "UprightVersion".into(), value: "151388160".into() }],
+                }),
+                ..TransformSettings::default()
+            },
+            ..ParametricAdjustments::default()
+        };
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+        assert!(!e.is_neutral());
+        let mut t = ParametricAdjustments::default();
+        t.copy_fields(&e, AdjustmentField::DEFAULT_SYNC);
+        assert_eq!(t.transform, TransformSettings::default(), "DEFAULT_SYNC leaves the transform alone");
+        t.copy_fields(&e, &[AdjustmentField::Transform]);
+        assert_eq!(t, e);
+        assert!(AdjustmentField::PASTE_PREVIOUS.contains(&AdjustmentField::Transform));
+        assert_eq!(ParametricAdjustments::lerp(&d, &e, 0.7).transform, e.transform);
+
+        let bad = |f: fn(&mut TransformSettings)| {
+            let mut a = ParametricAdjustments::default();
+            f(&mut a.transform);
+            a.validate().unwrap_err()
+        };
+        bad(|t| t.rotate = 10.5);
+        bad(|t| t.scale = 40.0);
+        bad(|t| t.offset_x = f32::NAN);
+        bad(|t| {
+            t.guides = vec![UprightGuide { start: NormPoint { x: 0.0, y: 0.0 }, end: NormPoint { x: 1.2, y: 0.0 } }]
+        });
+        bad(|t| {
+            t.solution =
+                Some(UprightSolution { mode: UprightMode::Auto, matrix: vec![1.0], rotation_deg: 0.0, crs: vec![] })
+        });
+        bad(|t| {
+            t.solution = Some(UprightSolution {
+                mode: UprightMode::Auto,
+                matrix: UprightSolution::IDENTITY.to_vec(),
+                rotation_deg: 0.0,
+                crs: vec![CrsProperty { name: "bad name".into(), value: String::new() }],
+            })
+        });
     }
 }
