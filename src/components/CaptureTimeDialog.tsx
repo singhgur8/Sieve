@@ -270,6 +270,13 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
       aria-selected={tab === t}
       data-testid={`capture-tab-${t}`}
       onClick={() => setTab(t)}
+      onKeyDown={(e) => {
+        // Enter applies (a focused tab button would otherwise swallow it as a click on itself).
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void apply();
+        }
+      }}
       className={`rounded px-2.5 py-1 ${tab === t ? "bg-sky-800 text-sky-100" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
     >
       {label}

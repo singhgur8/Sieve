@@ -32,7 +32,7 @@ test.describe("apply to scene (8d)", () => {
     await openPlan(page);
     const [a] = await sceneIds(page);
     // Plan: the untouched scene says why, Apply all says why.
-    await expect(page.getByTestId(`plan-apply-why-${a}`)).toContainText("Edit the representative first");
+    await expect(page.getByTestId(`plan-status-${a}`)).toContainText("To do: edit this photo"); // P2-11: the status line is the reason, with the link
     await expect(page.getByTestId("plan-apply-all-why")).toContainText("Edit a scene's representative first");
     await shot(page, "8d-apply-why-plan");
 

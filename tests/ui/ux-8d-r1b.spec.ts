@@ -25,6 +25,30 @@ test.describe("R1-3 step 1: the crop tool renders the whole warped frame", () =>
   });
 });
 
+test.describe("R1-3 v19.3 warp outline", () => {
+  test("Constrain Crop on + Vertical: the tool starts at the constrained crop and a corner stops at the warp edge", async ({ page }) => {
+    await openDevelop(page);
+    await openSection(page, "transform");
+    await page.getByTestId("upright-vertical").click();
+    await page.getByTestId("tf-constrain").check();
+    await clearCalls(page);
+    await page.keyboard.press("r");
+    await expect(page.getByTestId("crop-overlay")).toBeVisible();
+    await expect.poll(async () => (await calls(page, "get_transform_bounds")).length).toBeGreaterThan(0);
+    const rect = async () => JSON.parse((await page.getByTestId("crop-rect").getAttribute("data-rect"))!) as { l: number; t: number; r: number; b: number };
+    await expect.poll(async () => (await rect()).l).toBeGreaterThan(0.04); // the auto-constrained frame, not the full frame
+    await page.keyboard.press("a"); // free
+    const h = (await page.getByTestId("crop-handle-nw").boundingBox())!;
+    const f = (await page.getByTestId("crop-frame").boundingBox())!;
+    await page.mouse.move(h.x + h.width / 2, h.y + h.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(f.x + 1, f.y + 1, { steps: 6 });
+    await page.mouse.up();
+    const r = await rect();
+    expect(r.l).toBeGreaterThan(0.04); // stopped at the warp edge (the left edge leans in by ~0.06 at the bottom)
+  });
+});
+
 test.describe("R1-4 Edit Capture Time at 1280x800", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -186,7 +210,7 @@ test.describe("R1-P2-10 crop handle modifiers", () => {
     await page.keyboard.down("Shift");
     await page.mouse.move(x, y);
     await page.mouse.down();
-    await page.mouse.move(x - 120, y - 10, { steps: 5 });
+    await page.mouse.move(x - 150, y - 150, { steps: 5 });
     await page.mouse.up();
     await page.keyboard.up("Shift");
     const r = await rectOf(page);

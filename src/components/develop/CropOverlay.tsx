@@ -49,10 +49,52 @@ export interface CropTool {
   rotating?: boolean;
 }
 
+/** Warped image outline (v19.3 `validQuad`): 4 points, fractions of the corrected frame, clockwise on screen. */
+export type Quad = [number, number][];
+
+/** All four corners of `r` inside the convex polygon `q` (either winding). */
+export function insideQuad(r: Rect, q: Quad, eps = 1e-6): boolean {
+  let area = 0;
+  for (let i = 0; i < q.length; i++) {
+    const [x0, y0] = q[i];
+    const [x1, y1] = q[(i + 1) % q.length];
+    area += x0 * y1 - x1 * y0;
+  }
+  const sgn = area >= 0 ? 1 : -1;
+  for (const [px, py] of [[r.l, r.t], [r.r, r.t], [r.r, r.b], [r.l, r.b]]) {
+    for (let i = 0; i < q.length; i++) {
+      const [x0, y0] = q[i];
+      const [x1, y1] = q[(i + 1) % q.length];
+      if (sgn * ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) < -eps) return false;
+    }
+  }
+  return true;
+}
+
+/** Inside the rotated frame and (when the image is warped) inside the warp outline. */
+const validRect = (r: Rect, aspect: number, rot: number, quad: Quad | null) => (!rot || insideRotated(r, aspect, rot)) && (!quad || insideQuad(r, quad));
+
+/** Largest scaling of `rect` (same ratio, about the outline's centroid) that is valid for the rotated frame and the warp outline. */
+function fitValid(rect: Rect, aspect: number, rot: number, quad: Quad): Rect {
+  const first = rot ? fitInsideRotated(rect, aspect, rot) : rect;
+  if (insideQuad(first, quad)) return first;
+  const cx = quad.reduce((a, p) => a + p[0], 0) / quad.length;
+  const cy = quad.reduce((a, p) => a + p[1], 0) / quad.length;
+  const at = (k: number): Rect => ({ l: cx + (first.l - cx) * k, r: cx + (first.r - cx) * k, t: cy + (first.t - cy) * k, b: cy + (first.b - cy) * k });
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 30; i++) {
+    const m = (lo + hi) / 2;
+    if (validRect(at(m), aspect, rot, quad)) lo = m;
+    else hi = m;
+  }
+  return at(Math.max(0, lo - 1e-6));
+}
+
 /** Keeps the tool's rectangle inside the straightened (rotated) image: Lightroom "constrain to image". */
-export function constrainTool(tool: CropTool, imageAspect: number, orientation: number): CropTool {
+export function constrainTool(tool: CropTool, imageAspect: number, orientation: number, quad: Quad | null = null): CropTool {
   const rot = tool.constrain ? previewRotation(tool.angle, orientation) : 0;
-  const rect = rot ? fitInsideRotated(tool.base, imageAspect, rot) : tool.base;
+  const rect = tool.constrain && quad ? fitValid(tool.base, imageAspect, rot, quad) : rot ? fitInsideRotated(tool.base, imageAspect, rot) : tool.base;
   return rectEq(rect, tool.rect) ? tool : { ...tool, rect };
 }
 
@@ -70,14 +112,14 @@ export const withBase = (tool: CropTool, rect: Rect): CropTool => ({ ...tool, re
 export const resetTool = (tool: CropTool): CropTool => ({ ...tool, rect: FULL, base: FULL, angle: 0, aspect: "original", flip: false, customRatio: undefined, rotating: false, angleTool: false });
 
 /** Largest step from `from` (valid) towards `to` that keeps the rect inside the rotated image (bisection; keeps a locked ratio). */
-function approach(from: Rect, to: Rect, aspect: number, rot: number): Rect {
-  if (!rot || insideRotated(to, aspect, rot)) return to;
+function approach(from: Rect, to: Rect, aspect: number, rot: number, quad: Quad | null = null): Rect {
+  if ((!rot && !quad) || validRect(to, aspect, rot, quad)) return to;
   const at = (t: number): Rect => ({ l: from.l + (to.l - from.l) * t, t: from.t + (to.t - from.t) * t, r: from.r + (to.r - from.r) * t, b: from.b + (to.b - from.b) * t });
   let lo = 0;
   let hi = 1;
   for (let i = 0; i < 20; i++) {
     const m = (lo + hi) / 2;
-    if (insideRotated(at(m), aspect, rot)) lo = m;
+    if (validRect(at(m), aspect, rot, quad)) lo = m;
     else hi = m;
   }
   return at(lo);
@@ -149,7 +191,7 @@ interface Props {
    * Seam for the Upright / Transform warp outline (v19.3, R1-3): the valid image area as 4 points, fractions of the corrected
    * frame (clockwise), or null / undefined = the rotated frame only. "Constrain to image" and the paper fill will use it.
    */
-  validQuad?: [number, number][] | null;
+  validQuad?: Quad | null;
 }
 
 const HANDLE_POS: Record<Handle, { x: number; y: number; cursor: string }> = {
@@ -238,7 +280,7 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     // Lightroom modifiers: Alt resizes about the centre, Shift keeps the current ratio of a free crop for this drag.
     const keep = e.shiftKey && fr == null ? ((d.rect.r - d.rect.l) / Math.max(1e-6, d.rect.b - d.rect.t)) : fr;
     const next = d.kind === "move" ? moveRect(d.rect, x - d.x, y - d.y) : e.altKey ? resizeCentred(d.rect, d.kind, x, y, keep) : resizeRect(d.rect, d.kind, x, y, keep);
-    onChange(withBase(tool, approach(d.rect, next, imageAspect, tool.constrain ? rot : 0)));
+    onChange(withBase(tool, approach(d.rect, next, imageAspect, tool.constrain ? rot : 0, tool.constrain ? validQuad : null)));
   };
   const up = () => {
     drag.current = null;

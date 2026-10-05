@@ -31,7 +31,7 @@ import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
 import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
-import { CropOverlay, constrainTool, newTool, refit, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
+import { CropOverlay, constrainTool, newTool, refit, resetTool, swapTool, toggleLockTool, type CropTool, type Quad } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { GuideOverlay } from "./GuideOverlay";
 import { useUpright } from "../../hooks/useUpright";
@@ -327,13 +327,56 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     (t: CropTool | ((prev: CropTool) => CropTool)) =>
       setCropTool((prev) => {
         const next = typeof t === "function" ? (prev ? t(prev) : prev) : t;
-        return next ? constrainTool(next, frameAspectRef.current, orientationRef.current) : next;
+        return next ? constrainTool(next, frameAspectRef.current, orientationRef.current, quadRef.current) : next;
       }),
     [],
   );
-  const startCrop = useCallback((carry?: CropTool | null) => {
+  // Warped image outline (v19.3 get_transform_bounds) while the crop tool is open: "Constrain to image" keeps the rectangle inside it.
+  const [quad, setQuad] = useState<Quad | null>(null);
+  const quadRef = useRef<Quad | null>(null);
+  quadRef.current = quad;
+  const cropOpen = cropTool !== null;
+  const transformKey = JSON.stringify(editor.adj.transform);
+  const adjLive = useRef(editor.adj);
+  adjLive.current = editor.adj;
+  useEffect(() => {
+    if (!cropOpen || id == null) {
+      setQuad(null);
+      return;
+    }
+    let live = true;
+    const timer = setTimeout(() => {
+      unwrap(commands.getTransformBounds(id, adjLive.current))
+        .then((b) => {
+          if (!live) return;
+          quadRef.current = b.validQuad;
+          setQuad(b.validQuad);
+          changeCrop((t) => t); // re-fit the rectangle to the new outline
+        })
+        .catch(() => {});
+    }, 150); // debounced: Transform sliders may be dragged while the tool is open
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [cropOpen, id, transformKey, changeCrop]);
+  const startCrop = useCallback(async (carry?: CropTool | null) => {
     if (id == null) return;
-    const c = editor.adj.crop;
+    let c = editor.adj.crop;
+    let q: Quad | null = null;
+    if (editor.adj.transform.constrainCrop) {
+      // The photo currently shows the auto-constrained crop: start from that rectangle (R1-3).
+      try {
+        const b = await unwrap(commands.getTransformBounds(id, editor.adj));
+        q = b.validQuad;
+        if (q && b.constrainedCrop?.enabled) c = b.constrainedCrop;
+      } catch {
+        /* no outline: today's behaviour */
+      }
+      if (idRefDev.current !== id) return;
+    }
+    quadRef.current = q;
+    setQuad(q);
     masksRef.current.endTool();
     setGuideOn(false);
     setCropMsg(null);
@@ -346,8 +389,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       t = { ...t, overlay: carry.overlay, overlayOrient: carry.overlayOrient, constrain: carry.constrain };
       if (!c.enabled) t = refit({ ...t, aspect: carry.aspect, flip: carry.flip, customRatio: carry.customRatio }, frameAspect);
     }
-    setCropTool(constrainTool(t, frameAspect, orientation));
-  }, [id, editor.adj.crop, orientation, frameAspect]);
+    setCropTool(constrainTool(t, frameAspect, orientation, q));
+  }, [id, editor.adj, orientation, frameAspect]);
   // Re-open the crop tool on the next photo (R1-1) as soon as it is loaded.
   useEffect(() => {
     if (!reopen || id == null || editor.loading || !editor.info || editor.info.imageId !== id || !(frameAspect > 0)) return;
@@ -392,7 +435,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [id, changeCrop, onError]);
   const idRefDev = useRef(id);
   idRefDev.current = id;
-  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: () => startCrop(), change: changeCrop, commit: commitCrop, cancel: cancelCrop, autoStraighten: () => void autoStraighten(), autoBusy: cropBusy, autoMessage: cropMsg };
+  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: () => void startCrop(), change: changeCrop, commit: commitCrop, cancel: cancelCrop, autoStraighten: () => void autoStraighten(), autoBusy: cropBusy, autoMessage: cropMsg };
   const toggleGuided = useCallback(() => {
     if (guideRef.current) return setGuideOn(false);
     if (idRefDev.current == null) return;
@@ -1010,7 +1053,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       )}
       {cropTool && imageAspect > 0 && (
         <div className="absolute" style={{ inset: CROP_INSET }} data-testid="crop-inset">
-          <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} />
+          <CropOverlay tool={cropTool} size={{ w: Math.max(0, size.w - 2 * CROP_INSET), h: Math.max(0, size.h - 2 * CROP_INSET) }} imageAspect={imageAspect} orientation={orientation} onChange={changeCrop} validQuad={quad} />
         </div>
       )}
       {/* The right panel is the home of the crop controls (Lightroom); the floating bar only stands in while that panel is hidden (Tab). */}
