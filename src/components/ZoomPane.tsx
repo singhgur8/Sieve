@@ -7,8 +7,8 @@ export interface View {
   scale: number;
   cx: number;
   cy: number;
-  /** True while the view is 1:1 (100%) of the decoded preview: re-derived when the preview finishes decoding. */
-  actual?: boolean;
+  /** Set while the zoom is pinned to a percentage of the decoded preview's pixels (100 = 1:1): re-derived when the preview finishes decoding or the photo changes. */
+  pct?: number;
 }
 export const FIT: View = { scale: 1, cx: 0.5, cy: 0.5 };
 
@@ -19,7 +19,40 @@ export interface Metrics {
   natH: number;
   cw: number;
   ch: number;
+  /** Where the image's top-left sits in the pane, its displayed size, and the last pointer position over the pane (pane px, null when outside). */
+  x: number;
+  y: number;
+  dw: number;
+  dh: number;
+  hover: { x: number; y: number } | null;
 }
+
+/**
+ * Zoom to `scale` (relative to fit) keeping the image point under pane position (mx, my) fixed: the Lightroom
+ * behaviour for Space / click. The resulting centre is clamped so the image never leaves the pane.
+ */
+export function zoomAt(m: Metrics, scale: number, mx: number, my: number, pct?: number): View {
+  if (scale <= 1.001) return FIT;
+  const px = (mx - m.x) / m.dw;
+  const py = (my - m.y) / m.dh;
+  const ndw = m.fitW * scale;
+  const ndh = m.fitH * scale;
+  const clampC = (c: number, vp: number, d: number) => {
+    const lo = vp / 2 / d;
+    return Math.min(1 - lo, Math.max(lo, c));
+  };
+  return {
+    scale,
+    pct,
+    cx: ndw <= m.cw ? 0.5 : clampC((m.cw / 2 - (mx - px * ndw)) / ndw, m.cw, ndw),
+    cy: ndh <= m.ch ? 0.5 : clampC((m.ch / 2 - (my - py * ndh)) / ndh, m.ch, ndh),
+  };
+}
+
+/** Scale (relative to fit) at which the preview shows `pct` percent of its own pixels. */
+export const scaleForPct = (m: Metrics, pct: number) => (m.fitW > 0 ? ((pct / 100) * m.natW) / m.fitW : 1);
+/** Scale (relative to fit) at which the image covers the whole pane. */
+export const fillScale = (m: Metrics) => (m.fitW > 0 && m.fitH > 0 ? Math.max(m.cw / m.fitW, m.ch / m.fitH) : 1);
 
 interface Props {
   entry: RawImageEntry | undefined;
@@ -30,12 +63,14 @@ interface Props {
   testId?: string;
   onFocus?: () => void;
   maxScale?: number;
-  /** Re-derive a 1:1 zoom when the preview decodes (Compare: only the pane that owns the shared metrics). */
+  /** Re-derive a pinned-percentage zoom when the preview decodes (Compare: only the pane that owns the shared metrics). */
   rescaleActual?: boolean;
+  /** Space-less click on the image (no drag): Lightroom toggles Fit / 100% at that point. */
+  onClickZoom?: (mx: number, my: number) => void;
 }
 
 /** Fit / zoom / pan surface for one preview (uses the 2048px preview, thumbnail underneath while loading). */
-export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 16, rescaleActual = true }: Props) {
+export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onFocus, maxScale = 16, rescaleActual = true, onClickZoom }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   // The preview is decoded off-screen first; it is only mounted once it can paint in full. Until then the
@@ -84,16 +119,20 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
   const clampPos = (p: number, viewport: number, d: number) => (d <= viewport ? (viewport - d) / 2 : Math.min(0, Math.max(viewport - d, p)));
   const x = clampPos(size.w / 2 - view.cx * dw, size.w, dw);
   const y = clampPos(size.h / 2 - view.cy * dh, size.h, dh);
-  metricsRef.current = { fitW, fitH, natW: nat?.w ?? nw, natH: nat?.h ?? nh, cw: size.w, ch: size.h };
+  // The pointer position lives on the shared metrics object (not per pane) so Compare's two panes agree on it.
+  metricsRef.current = { fitW, fitH, natW: nat?.w ?? nw, natH: nat?.h ?? nh, cw: size.w, ch: size.h, x, y, dw, dh, hover: metricsRef.current?.hover ?? null };
+  const setHover = (h: { x: number; y: number } | null) => {
+    if (metricsRef.current) metricsRef.current.hover = h;
+  };
 
-  // 1:1 was chosen against the thumbnail's dimensions if Space came before the preview decoded: re-derive it
-  // against the real pixels (and after a resize) so "100%" stays 100%.
-  const wantScale = fitW > 0 ? Math.max(1, (nat?.w ?? nw) / fitW) : 1;
+  // A percentage zoom chosen against the thumbnail's dimensions (before the preview decoded) or against the
+  // previous photo is re-derived against the real pixels (and after a resize) so "100%" stays 100%.
+  const wantScale = fitW > 0 && view.pct ? Math.max(1, ((view.pct / 100) * (nat?.w ?? nw)) / fitW) : 1;
   useEffect(() => {
-    if (!rescaleActual || !view.actual || !nat || Math.abs(view.scale - wantScale) < 0.001) return;
+    if (!rescaleActual || !view.pct || !nat || Math.abs(view.scale - wantScale) < 0.001) return;
     onView({ ...view, scale: wantScale });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nat?.w, nat?.h, wantScale, view.actual, rescaleActual]);
+  }, [nat?.w, nat?.h, wantScale, view.pct, rescaleActual]);
 
   const latest = useRef({ view, dw, dh, x, y, size, onView, maxScale });
   latest.current = { view, dw, dh, x, y, size, onView, maxScale };
@@ -120,36 +159,66 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  const drag = useRef<{ sx: number; sy: number; x: number; y: number } | null>(null);
+  // Drag to pan. The view is committed at most once per animation frame; only the CSS translate changes.
+  const drag = useRef<{ sx: number; sy: number; x: number; y: number; moved: boolean } | null>(null);
+  const raf = useRef(0);
+  const pending = useRef<View | null>(null);
+  useEffect(() => () => cancelAnimationFrame(raf.current), []);
+  const flush = () => {
+    raf.current = 0;
+    const v = pending.current;
+    pending.current = null;
+    if (v) latest.current.onView(v);
+  };
   const onPointerDown = (e: React.PointerEvent) => {
     onFocus?.();
-    if (view.scale <= 1) return;
-    drag.current = { sx: e.clientX, sy: e.clientY, x, y };
+    if (e.button !== 0) return;
+    drag.current = { sx: e.clientX, sy: e.clientY, x, y, moved: false };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
+  const local = (e: React.PointerEvent) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
   const onPointerMove = (e: React.PointerEvent) => {
+    setHover(local(e));
     const d = drag.current;
     if (!d) return;
+    if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 4) return;
+    d.moved = true;
+    if (view.scale <= 1) return;
     const nx = d.x + e.clientX - d.sx;
     const ny = d.y + e.clientY - d.sy;
-    onView({ scale: view.scale, actual: view.actual, cx: (size.w / 2 - nx) / dw, cy: (size.h / 2 - ny) / dh });
+    pending.current = { scale: view.scale, pct: view.pct, cx: (size.w / 2 - nx) / dw, cy: (size.h / 2 - ny) / dh };
+    if (!raf.current) raf.current = requestAnimationFrame(flush);
   };
-  const onPointerUp = () => {
+  const onPointerUp = (e: React.PointerEvent) => {
+    const d = drag.current;
     drag.current = null;
+    if (d && !d.moved && onClickZoom) {
+      const p = local(e);
+      onClickZoom(p.x, p.y);
+    }
+  };
+  const onPointerLeave = () => {
+    setHover(null);
   };
 
-  const style = { width: dw, height: dh, transform: `translate(${x}px, ${y}px)` } as const;
+  const style = { width: dw, height: dh, transform: `translate3d(${x}px, ${y}px, 0)` } as const;
   const imgClass = "pointer-events-none absolute left-0 top-0 max-w-none select-none";
   return (
     <div
       ref={ref}
       data-testid={testId}
       data-scale={view.scale}
-      className={`relative size-full overflow-hidden bg-black ${view.scale > 1 ? "cursor-grab active:cursor-grabbing" : ""}`}
+      data-cx={view.cx.toFixed(4)}
+      data-cy={view.cy.toFixed(4)}
+      className={`relative size-full overflow-hidden bg-black ${view.scale > 1 ? "cursor-grab active:cursor-grabbing" : onClickZoom ? "cursor-zoom-in" : ""}`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onDoubleClick={() => onView(view.scale > 1 ? FIT : { scale: Math.max(1, (metricsRef.current?.natW ?? fitW) / fitW), cx: 0.5, cy: 0.5, actual: true })}
+      onPointerCancel={() => (drag.current = null)}
+      onPointerLeave={onPointerLeave}
     >
       {thumbUrl && <img key={thumbUrl} src={thumbUrl} alt="" draggable={false} className={imgClass} style={style} data-testid="zoom-thumb" />}
       {t?.status === "failed" && (

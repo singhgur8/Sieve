@@ -188,8 +188,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "filterBar", group: "Navigate", label: "Show / hide the filter bar", chords: [c("f", { mod: true })], modes: ALL, display: ["Cmd+F"], where: "Library" },
 
   // ---- view ----
-  { id: "zoomLoupe", group: "View", label: "Zoom Fit / 1:1 (never leaves the view)", chords: [c(" ")], modes: ["loupe", "compare"], display: ["Space"], where: "Loupe, Compare" },
-  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100%", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
+  { id: "zoomLoupe", group: "View", label: "Zoom Fit / 1:1 at the cursor (never leaves the view; zoom stays while you step with the arrows)", chords: [c(" ")], modes: ["loupe", "compare"], display: ["Space"], where: "Loupe, Compare" },
+  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100% at the cursor (stays while you step with the arrows)", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
   { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },

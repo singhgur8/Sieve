@@ -34,6 +34,7 @@ import { CropOverlay, constrainTool, swapTool, toggleLockTool, type CropTool } f
 import { CropBar, type CropApi } from "./CropPanel";
 import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, loadCropAspect, previewRotation, toStored } from "../../lib/crop";
+import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 
 export interface DevelopHandle {
@@ -226,24 +227,24 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   masksRef.current = masks;
 
   // Region of the frame visible at 100%: committed immediately on toggle/resize, debounced after a pan.
-  const latest = useRef({ zoom, size, fw, fh });
-  latest.current = { zoom, size, fw, fh };
+  const zs = zoom.s ?? 1;
+  const latest = useRef({ zoom, size, fw, fh, main: editor.main });
+  latest.current = { zoom, size, fw, fh, main: editor.main };
   const commitRegion = useCallback(() => {
     const l = latest.current;
-    setRegion(visibleRegion(l.zoom, l.size, l.fw, l.fh));
+    const k = l.zoom.s ?? 1;
+    setRegion(visibleRegion(l.zoom, l.size, l.fw * k, l.fh * k));
   }, []);
   useEffect(() => {
     commitRegion();
-  }, [zoom.on, size, fw, fh, id, commitRegion]);
+  }, [zoom.on, zs, size, fw, fh, id, commitRegion]);
   const panTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const onPanEnd = useCallback(() => {
     clearTimeout(panTimer.current);
     panTimer.current = setTimeout(commitRegion, 120);
   }, [commitRegion]);
   useEffect(() => () => clearTimeout(panTimer.current), []);
-  // New image: back to fit.
-  // (Compare keeps the shared zoom while the Candidate changes.)
-  useEffect(() => setZoom({ on: false, cx: 0.5, cy: 0.5 }), [idA]);
+  // Zoom level and position persist while stepping through photos (Lightroom); the crop tool and Esc still go back to Fit.
 
   // ---- crop tool ----
   useEffect(() => setCropTool(null), [id]);
@@ -287,7 +288,44 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   imageAspectRef.current = imageAspect;
   const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: changeCrop, commit: commitCrop, cancel: cancelCrop };
 
-  const toggleZoom = useCallback((at?: { x: number; y: number }) => cropRef.current || setZoom((z) => (z.on ? { on: false, cx: 0.5, cy: 0.5 } : { on: true, cx: at?.x ?? 0.5, cy: at?.y ?? 0.5 })), []);
+  // Zoom to a preset keeping the image point under `at` (viewer px; the viewer centre by default) fixed.
+  const hoverRef = useRef<{ x: number; y: number } | null>(null);
+  const zoomTo = useCallback((p: ZoomPreset, at?: { x: number; y: number } | null) => {
+    const l = latest.current;
+    if (cropRef.current) return;
+    // Frame size not known yet (photo still opening): only the plain Fit / 100% toggles can be honoured.
+    if (l.fw <= 0 || l.size.w <= 0) return setZoom(p === "fit" ? { on: false, cx: 0.5, cy: 0.5 } : p === 100 ? { on: true, cx: 0.5, cy: 0.5 } : l.zoom);
+    const fitS = Math.min(l.size.w / l.fw, l.size.h / l.fh);
+    const s = p === "fit" ? 0 : p === "fill" ? Math.max(l.size.w / l.fw, l.size.h / l.fh) : p / 100;
+    if (s <= fitS + 0.001) return setZoom({ on: false, cx: 0.5, cy: 0.5 });
+    const k = l.zoom.s ?? 1;
+    const box = frameBox(l.zoom, l.size, l.fw * k, l.fh * k, l.main);
+    const a = at ?? { x: l.size.w / 2, y: l.size.h / 2 };
+    const px = box && box.w > 0 ? (a.x - box.x) / box.w : 0.5;
+    const py = box && box.h > 0 ? (a.y - box.y) / box.h : 0.5;
+    const axis = (pp: number, am: number, vp: number, full: number) => {
+      const d = full * s;
+      if (d <= vp) return 0.5;
+      const lo = vp / 2 / d;
+      return Math.min(1 - lo, Math.max(lo, pp + (vp / 2 - am) / d));
+    };
+    setZoom({ on: true, cx: axis(px, a.x, l.size.w, l.fw), cy: axis(py, a.y, l.size.h, l.fh), s: Math.abs(s - 1) < 0.0005 ? undefined : s });
+  }, []);
+  /** Space / double click: Fit <-> 100% at the cursor. */
+  const toggleZoom = useCallback(
+    (at?: { x: number; y: number }) => {
+      if (cropRef.current) return;
+      if (latest.current.zoom.on) setZoom({ on: false, cx: 0.5, cy: 0.5 });
+      else zoomTo(100, at ?? hoverRef.current);
+    },
+    [zoomTo],
+  );
+  const activePreset: ZoomPreset | null = !zoom.on
+    ? "fit"
+    : ((): ZoomPreset | null => {
+        if (fw > 0 && size.w > 0 && Math.abs(zs - Math.max(size.w / fw, size.h / fh)) < 0.001) return "fill";
+        return ([50, 100, 200, 400] as const).find((n) => Math.abs(zs * 100 - n) < 0.5) ?? null;
+      })();
 
   // Warm the develop cache for filmstrip neighbours.
   useEffect(() => {
@@ -681,7 +719,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
-  const box = frameBox(zoom, size, fw, fh, editor.main);
+  const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);
   const frame: Frame | null = useMemo(() => (fw > 0 && fh > 0 ? { orientation, crop: editor.adj.crop, w: fw, h: fh } : null), [orientation, editor.adj.crop, fw, fh]);
   const boxRef = useRef(box);
   boxRef.current = box;
@@ -712,8 +750,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       onSplitPos={setSplitPos}
       zoom={zoom}
       size={size}
-      fw={ed.info?.fullWidth ?? 0}
-      fh={ed.info?.fullHeight ?? 0}
+      fw={(ed.info?.fullWidth ?? 0) * zs}
+      fh={(ed.info?.fullHeight ?? 0) * zs}
+      hoverRef={hoverRef}
       loading={ed.loading}
       placeholder={placeholderFor(pid)}
       onSize={setSize}
@@ -797,13 +836,20 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       <button className={vbtn(!!compare)} onClick={() => onToggleCompare?.()} title={`Compare two photos side by side${hint("compare")}`} aria-pressed={!!compare} data-testid="develop-compare">
         <Columns3 className="size-3.5" /> Compare
       </button>
-      <div className="flex gap-px" role="group" aria-label="Zoom" data-testid="zoom-toggle" data-zoom={zoom.on ? "100" : "fit"}>
-        <button className={`${vbtn(!zoom.on)} rounded-r-none`} onClick={() => zoom.on && toggleZoom()} title={`Fit${hint("zoomDevelop")}`} aria-pressed={!zoom.on} data-testid="zoom-fit">
-          Fit
-        </button>
-        <button className={`${vbtn(zoom.on)} rounded-l-none`} onClick={() => !zoom.on && toggleZoom()} title={`Zoom to 100%${hint("zoomDevelop")}`} aria-pressed={zoom.on} data-testid="zoom-100">
-          100%
-        </button>
+      <div className="flex gap-px" role="group" aria-label="Zoom" data-testid="zoom-toggle" data-zoom={zoom.on ? String(Math.round(zs * 100)) : "fit"}>
+        {ZOOM_PRESETS.map((z, i) => (
+          <button
+            key={String(z.id)}
+            className={`${vbtn(activePreset === z.id)} ${i === 0 ? "rounded-r-none" : i === ZOOM_PRESETS.length - 1 ? "rounded-l-none" : "rounded-none"}`}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => zoomTo(z.id)}
+            title={`${z.title}${z.id === "fit" || z.id === 100 ? hint("zoomDevelop") : ""}`}
+            aria-pressed={activePreset === z.id}
+            data-testid={`zoom-${z.id}`}
+          >
+            {z.label}
+          </button>
+        ))}
       </div>
       {entry && (
         <span className="ml-2 flex items-center gap-1" data-testid="develop-flags" data-pick={entry.pick} data-rating={entry.rating}>
@@ -907,6 +953,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               navUrl={editor.main?.url ?? thumbUrl}
               zoom={zoom}
               region={region}
+              onPreset={(pr) => zoomTo(pr)}
+              activePreset={activePreset}
               onZoom={(z) => cropRef.current || setZoom(z)}
               onCopy={(alt) => (alt ? copyWith(rememberedCopyFields()) : setDialog({ kind: "copy" }))}
               onPaste={doPaste}

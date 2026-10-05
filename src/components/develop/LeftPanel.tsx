@@ -8,6 +8,7 @@ import type { Copied } from "../../lib/clipboard";
 import { useSnapshots } from "../../hooks/useDevelopV14";
 import { Menu, menuItem } from "../Menu";
 import type { Zoom } from "./Viewer";
+import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 
 const GROUPS_KEY = "sieve.presetGroups.v1";
 
@@ -45,6 +46,9 @@ interface Props {
   zoom: Zoom;
   region: NormRect | null;
   onZoom: (z: Zoom) => void;
+  /** Navigator zoom presets. */
+  onPreset: (p: ZoomPreset) => void;
+  activePreset: ZoomPreset | null;
   /** Copy… (Alt held: copy with the remembered fields, no dialog). */
   onCopy: (alt: boolean) => void;
   onPaste: () => void;
@@ -67,7 +71,7 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   );
 }
 
-export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onCopy, onPaste, copied }: Props) {
+export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onPreset, activePreset, onCopy, onPaste, copied }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>(loadGroups);
   const [removingGroup, setRemovingGroup] = useState<number | null>(null);
@@ -96,13 +100,21 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           id="navigator"
           title="Navigator"
           action={
-            <span className="flex gap-2 text-[11px]">
-              <button className={!zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => zoom.on && onZoom({ on: false, cx: 0.5, cy: 0.5 })} data-testid="nav-fit" aria-pressed={!zoom.on}>
-                FIT
-              </button>
-              <button className={zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => !zoom.on && onZoom({ on: true, cx: 0.5, cy: 0.5 })} data-testid="nav-100" aria-pressed={zoom.on}>
-                100%
-              </button>
+            <span className="flex gap-1.5 text-[11px]" role="group" aria-label="Zoom presets">
+              {ZOOM_PRESETS.map((z) => (
+                <button
+                  key={String(z.id)}
+                  className={activePreset === z.id ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"}
+                  onMouseDown={(e) => e.preventDefault()}
+                  tabIndex={-1}
+                  onClick={() => onPreset(z.id)}
+                  title={z.title}
+                  data-testid={z.id === "fit" ? "nav-fit" : `nav-${z.id}`}
+                  aria-pressed={activePreset === z.id}
+                >
+                  {z.id === "fit" ? "FIT" : z.label}
+                </button>
+              ))}
             </span>
           }
         >
@@ -325,7 +337,7 @@ function Navigator({ url, label, zoom, region, onZoom }: { url: string | null; l
   const pan = (e: React.PointerEvent) => {
     const r = box.current?.getBoundingClientRect();
     if (!r || !zoom.on) return;
-    onZoom({ on: true, cx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), cy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) });
+    onZoom({ ...zoom, on: true, cx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), cy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) });
   };
   // The frame (3:2) is filled by the image at its own aspect: percentages keep the region overlay exact.
   const wPct = aspect >= 1.5 ? 100 : (aspect / 1.5) * 100;

@@ -141,7 +141,7 @@ export const HELP: HelpEntry[] = [
           "Z picks, X rejects, U clears the flag. P also picks.",
           "0 to 5 sets the stars. 6 to 9 set a color label.",
           "Shift+Z and Shift+X flag and then move to the next photo.",
-          "Left / Right move between photos. Space opens the Loupe, and in the Loupe it zooms between Fit and 1:1.",
+          "Left / Right move between photos. Space opens the Loupe. In the Loupe, Compare and Develop, Space (or a click in the Loupe) zooms between Fit and 1:1 at the point under the cursor, and the zoom and position stay while you step with Left / Right. The zoom buttons add Fill, 50%, 200% and 400%; drag to pan.",
           "C opens Compare: two photos side by side. Tab switches the active pane. K makes the active frame the best of its burst and picks it.",
           "Cmd+Z undoes the last culling change.",
         ],
