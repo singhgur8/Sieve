@@ -1197,7 +1197,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (mode === "develop" && LEAVES_CROP.includes(def.id) && develop.current?.isCropping()) {
       const d = def;
       const ev = e;
-      void develop.current.commitPendingTool().then(() => runKey(d, ev));
+      void develop.current.commitPendingTool(def.id === "saveXmp").then(() => runKey(d, ev));
       return;
     }
     return runKey(def, e);
@@ -1365,7 +1365,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "undoAdj": {
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
-        if (d?.revertTool()) return; // uncommitted crop tool changes go first (R2-1)
+        if (d?.revertTool(Math.max(cull.undoAt(), wf.lastBatch?.at ?? 0, d.lastCommitAt()))) return; // uncommitted crop tool changes go first (R2-1)
         if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) {
           return wf.undoLast();
         }

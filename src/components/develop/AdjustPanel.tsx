@@ -286,7 +286,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
       {masks.open ? (
         <div className="min-h-0 flex-1">{masks.panel}</div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" data-testid="adjust-scroll">
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" style={{ overflowAnchor: "none" }} data-testid="adjust-scroll">
           <CropPanel crop={crop} />
           {browser.open ? (
             <ProfileBrowser editor={editor} catalog={catalog} importing={importing} onImport={onImportStyles} hover={hover} onClose={() => browser.setOpen(false)} />

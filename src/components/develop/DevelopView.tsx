@@ -58,7 +58,7 @@ export interface DevelopHandle {
   /** Enter: apply the crop (no-op when the tool is inactive). */
   commitCrop: () => void;
   /** Leaving the crop tool any way but Esc / Cancel commits it (Lightroom); resolves after the saves landed. A photo change within Develop re-opens the tool on the next photo. */
-  commitPendingTool: () => Promise<void>;
+  commitPendingTool: (stay?: boolean) => Promise<void>;
   /** Esc: discard the crop tool; true when it was active (so the caller does not also leave Develop). */
   cancelCrop: () => boolean;
   undo: () => void;
@@ -71,7 +71,7 @@ export interface DevelopHandle {
   escape: () => void;
   isCropping: () => boolean;
   /** First Cmd+Z with uncommitted crop tool changes reverts the tool; true when it did. */
-  revertTool: () => boolean;
+  revertTool: (newest?: number) => boolean;
   cropSwap: () => void;
   cropLock: () => void;
   /** O: next crop guide overlay; Shift+O: rotate it; Cmd+Alt+R: reset the crop tool. */
@@ -308,7 +308,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setCropTool(null);
     setGuideOn(false);
     setCropMsg(null);
-    setReopen(carryRef.current);
+    setReopen((prev) => carryRef.current ?? prev); // R3-P2-2: a pending re-open survives a quick second step
     carryRef.current = null;
   }, [id]);
   const upright = useUpright(editor, id, onError);
@@ -366,8 +366,20 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [cropOpen, id, transformKey, changeCrop]);
   /** JSON of the stored crop the open tool was seeded from: a different stored crop means a change from outside the tool (R2-1). */
   const toolBaseline = useRef("");
+  const panelScroll = useRef<{ el: Element; top: number } | null>(null);
+  /** R3-P2-3: when the tool first became dirty (0 = clean). */
+  const dirtyAt = useRef(0);
+  const toolDirty = !!cropTool?.dirty;
+  useEffect(() => {
+    dirtyAt.current = toolDirty ? Date.now() : 0;
+  }, [toolDirty]);
   const startCrop = useCallback(async (carry?: CropTool | null) => {
     if (id == null) return;
+    // R3-P2-1: capture the panel scroll before the crop panel is inserted (user-opened tool only).
+    if (!carry && !cropRef.current && !panelScroll.current) {
+      const sc = document.querySelector<HTMLElement>('[data-testid="adjust-scroll"]');
+      if (sc) panelScroll.current = { el: sc, top: sc.scrollTop };
+    }
     let c = editor.adj.crop;
     let q: Quad | null = null;
     const tf = editor.adj.transform;
@@ -416,9 +428,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     void startCrop({ ...t, dirty: false });
   }, [storedCropKey, editor.loading, startCrop]);
   /** First Cmd+Z with uncommitted tool changes: back to the seed, history untouched (R2-1). */
-  const revertTool = useCallback(() => {
+  const revertTool = useCallback((newest = 0) => {
     const t = cropRef.current;
-    if (!t?.dirty) return false;
+    if (!t?.dirty || dirtyAt.current < newest) return false; // a later action (slider, cull, batch) is undone first
     void startCrop({ ...t, dirty: false });
     onNotice("Crop changes undone");
     return true;
@@ -436,20 +448,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     editor.change((a) => ({ ...a, crop: next }), "Crop");
   }, [editor, orientation, frameAspect]);
   // R2-P2-1: bring the crop panel into view when the tool opens (Transform may push it below the fold); restore the scroll on close.
-  const panelScroll = useRef<{ el: Element; top: number } | null>(null);
+  useLayoutEffect(() => {
+    if (cropOpen) return;
+    const s = panelScroll.current;
+    panelScroll.current = null;
+    if (s && s.el.isConnected) (s.el as HTMLElement).scrollTop = s.top;
+  }, [cropOpen]);
   useEffect(() => {
-    if (!cropOpen) {
-      const s = panelScroll.current;
-      panelScroll.current = null;
-      if (s && s.el.isConnected) (s.el as HTMLElement).scrollTop = s.top;
-      return;
-    }
+    if (!cropOpen) return;
     const t = window.setTimeout(() => {
       const panel = document.querySelector('[data-testid="crop-panel"]');
-      if (!panel || panelScroll.current) return;
-      let sc: HTMLElement | null = panel.parentElement;
-      while (sc && sc.scrollHeight <= sc.clientHeight + 1) sc = sc.parentElement;
-      if (sc) panelScroll.current = { el: sc, top: sc.scrollTop };
+      if (!panel) return;
+      if (!panelScroll.current) {
+        let sc: HTMLElement | null = panel.parentElement;
+        while (sc && sc.scrollHeight <= sc.clientHeight + 1) sc = sc.parentElement;
+        if (sc) panelScroll.current = { el: sc, top: sc.scrollTop };
+      }
       panel.scrollIntoView({ block: "nearest" });
     }, 0);
     return () => window.clearTimeout(t);
@@ -495,10 +509,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, []);
   const guided = { active: guideOn, toggle: toggleGuided };
   /** Every exit from the crop tool except Esc / Cancel commits it; `carry` re-opens it on the next photo. */
-  const commitPendingTool = useCallback(async () => {
+  const commitPendingTool = useCallback(async (stay = false) => {
     const t = cropRef.current;
     if (t) {
-      carryRef.current = t;
+      if (stay) setReopen(t); // R3-P2-3b: Cmd+S keeps the tool open on this photo
+      else carryRef.current = t;
       window.setTimeout(() => {
         if (carryRef.current === t) carryRef.current = null; // the exit was not a photo change
       }, 1500);
