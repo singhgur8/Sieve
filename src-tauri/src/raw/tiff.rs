@@ -71,6 +71,10 @@ const SUB_SEC_TIME_DIGITIZED: u16 = 0x9292;
 const PIXEL_X_DIMENSION: u16 = 0xA002;
 const PIXEL_Y_DIMENSION: u16 = 0xA003;
 const LENS_MODEL: u16 = 0xA434;
+/// EXIF `BodySerialNumber` (v19.2 `CameraInfo.serial`).
+const BODY_SERIAL: u16 = 0xA431;
+/// DNG / IFD0 `CameraSerialNumber` (fallback when `BodySerialNumber` is absent).
+const CAMERA_SERIAL: u16 = 0xC62F;
 
 const MAX_ENTRIES: u16 = 1024;
 const MAX_IFDS: usize = 64;
@@ -228,6 +232,8 @@ impl<'a, S: ByteSource + ?Sized> Tiff<'a, S> {
                 PIXEL_X_DIMENSION => set(&mut m.pixel_width, self.uint(e)),
                 PIXEL_Y_DIMENSION => set(&mut m.pixel_height, self.uint(e)),
                 LENS_MODEL => set(&mut m.lens, self.string(e)),
+                BODY_SERIAL => set(&mut m.body_serial, self.string(e)),
+                CAMERA_SERIAL => set(&mut m.camera_serial, self.string(e)),
                 _ => {}
             }
         }

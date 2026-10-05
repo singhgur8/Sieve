@@ -213,6 +213,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (v17: scenes it cannot apply are left out and listed in `skippedScenes`) |
 | `undo_edit_batch` / `undoEditBatch` (v14; linear since v16: `conflict` when photos were edited after the batch, v17: or a scene apply was made from its settings) | `batchId: number` | `UndoBatchResult` |
 | `get_edit_batches` / `getEditBatches` (v16) | `batchIds: number[]` | `EditBatchInfo[]` |
+| `sync_delta` / `syncDelta` (v19.2, Auto Sync) | `sourceId: number, before: ParametricAdjustments, after: ParametricAdjustments, targetIds: number[], options: SyncDeltaOptions \| null` | `SyncDeltaResult` (source + targets in one `sync` batch; exposure / WB relative by default) |
 | `paste_previous` / `pastePrevious` (v14) | `targetIds: number[], previousId: number, fields: AdjustmentField[] \| null` | `null` |
 | `import_style_folder` / `importStyleFolder` (v14) | `path: string` | `ImportStyleReport` |
 | `list_styles` / `listStyles` (v14) | – | `StyleLibrary` |
@@ -790,7 +791,7 @@ migrations tracked by `PRAGMA user_version`.
 | `catalog_meta` | `shoot_type` (default for new projects), `burst_window_ms`, `auto_analyze`, `xmp_auto_sync` (+ `xmp_auto_sync_user_set`, v12), `keeper_rule` (JSON `KeeperRule`, v12; `mode` since v16), `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
 | `projects` | one shoot (v12): name, `cover_image_id` (NULL = automatic), `shoot_type`, `workflow_step`, `created_at`, `last_opened_at`, `reject_strictness` (v17) |
 | `folders` | imported roots; `project_id` (v12, every folder in exactly one project; cascade on project delete) |
-| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF (`captured_at_ms` = corrected capture time since v17, `exif_captured_at_ms` = the file's own, `capture_time_source` exif/sidecar/user), rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity) |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF (`captured_at_ms` = corrected capture time since v17, `exif_captured_at_ms` = the file's own, `capture_time_source` exif/sidecar/user), rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity), `camera_serial` / `camera_serial_read` (v18: body serial from EXIF; `read = 0` = imported before v18, filled by the background `db::camera_serial::backfill`) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) + `reasons_json` (v16, JSON `SuggestionReason[]`) |
@@ -908,6 +909,17 @@ reference pair / revert) and `restore` (undo by snapshots) write it, mark the si
 bounds; the command kicks a rescore so bursts regroup. Extraction never overwrites a correction. Sidecars: the XMP
 read path applies `exif:DateTimeOriginal` (else `photoshop:DateCreated`) through `apply_sidecar_time` (source
 `sidecar` when it differs from EXIF); the writer writes the corrected time back when the source is not `exif`.
+
+Camera bodies (v18, IPC v19.2): `images.camera_serial` (EXIF `BodySerialNumber`, else DNG `CameraSerialNumber`;
+written by extraction, backfilled for older imports on a background thread at startup). `CameraInfo.serial`,
+`MetadataFilter.bodies` / `MetadataFilterOptions.bodies` (make + model + serial), and `sync_cameras` scopes
+`body` / `model` (`db::capture_time::camera_scope_ids`: every photo of the target's project with that camera,
+regardless of the grid's filters).
+
+Auto Sync (IPC v19.2): `develop::sync_delta` finds the groups an edit changed (`before` vs `after`, never crop /
+masks / transform), writes `after` to the source and the change to each target (exposure added, white balance
+shifted in mireds + tint added, as-shot sides resolved through `DevelopCache::info`; other groups copied), all in
+one `edit_batches` row of kind `sync`, so one `undo_edit_batch` reverts every photo.
 
 Transform: `ParametricAdjustments.transform` (Upright mode + guides, manual sliders, constrain crop, solved
 `UprightSolution` = 3x3 homography in the sensor frame plus Lightroom's own Upright crs values kept verbatim).

@@ -27,6 +27,10 @@ pub struct MetaBuilder {
     pub sensor_size: Option<(u32, u32)>,
     /// Container says the CFA is X-Trans (RAF `XTransLayout` tag).
     pub xtrans_hint: bool,
+    /// EXIF `BodySerialNumber` (v19.2).
+    pub body_serial: Option<String>,
+    /// IFD0 / DNG `CameraSerialNumber` (fallback for `body_serial`).
+    pub camera_serial: Option<String>,
 }
 
 impl MetaBuilder {
@@ -54,7 +58,9 @@ impl MetaBuilder {
             iso_speed,
             pixel_width,
             pixel_height,
-            sensor_size
+            sensor_size,
+            body_serial,
+            camera_serial
         );
         self.xtrans_hint |= other.xtrans_hint;
     }
@@ -95,9 +101,11 @@ impl MetaBuilder {
             _ => None,
         };
 
+        let serial = self.body_serial.or(self.camera_serial).and_then(|s| clean_serial(&s));
         ImageMeta {
             make,
             model: self.model,
+            serial,
             lens: self.lens,
             sensor_layout,
             captured_at_ms,
@@ -129,6 +137,17 @@ pub struct ImageMeta {
     pub height: Option<u32>,
     /// EXIF orientation 1..=8.
     pub orientation: Option<u16>,
+    /// Body serial number (v19.2; `BodySerialNumber`, else `CameraSerialNumber`), trimmed;
+    /// `None` when absent or not a plausible serial.
+    pub serial: Option<String>,
+}
+
+/// A trimmed serial, or `None` when it is empty, has no letter or digit, or is all zeros
+/// (some bodies write "0000000" when they have none).
+pub fn clean_serial(s: &str) -> Option<String> {
+    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\0').trim();
+    let plausible = t.chars().any(|c| c.is_ascii_alphanumeric()) && t.chars().any(|c| c != '0') && t.len() <= 64;
+    plausible.then(|| t.to_owned())
 }
 
 pub fn camera_make(make: &str) -> CameraMake {

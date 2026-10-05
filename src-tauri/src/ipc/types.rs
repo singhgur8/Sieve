@@ -152,6 +152,12 @@ pub struct CameraInfo {
     pub make: CameraMake,
     pub model: Option<String>,
     pub sensor_layout: SensorLayout,
+    /// v19.2: body serial number from EXIF (`BodySerialNumber`, else DNG `CameraSerialNumber`),
+    /// read at import / thumbnail re-extraction and backfilled in the background for photos
+    /// imported before v19.2 (`null` until then, or when the file has none). Tells two bodies
+    /// of the same model apart (`CameraBody`, Edit Capture Time > sync cameras).
+    #[serde(default)]
+    pub serial: Option<String>,
 }
 
 /// EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
@@ -2568,6 +2574,13 @@ pub struct ImageQuery {
     /// Lightroom-style Library Filter "Metadata" constraints (v18; default: none).
     #[serde(default)]
     pub metadata: MetadataFilter,
+    /// v19.2: only photos with a **pending** suggestion of this kind (`null` = no constraint):
+    /// analysed, unflagged and 0 stars (what `apply_suggestions(onlyUnset = true)` would change),
+    /// with `suggestedPick = reject` (`reject`), `pick` (`pick`), or no flag but
+    /// `suggestedRating > 0` (`rating`). Counts: `CullSummary.suggested*Pending`,
+    /// `FilterCounts.suggested*`.
+    #[serde(default)]
+    pub suggested: Option<PendingSuggestion>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2599,11 +2612,24 @@ impl Default for ImageQuery {
             project_id: None,
             keepers_only: false,
             metadata: MetadataFilter::default(),
+            suggested: None,
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
             limit: 200,
         }
+    }
+}
+
+string_enum! {
+    /// Kind of a pending culling suggestion (v19.2, `ImageQuery.suggested`).
+    pub enum PendingSuggestion {
+        /// Sieve suggests reject.
+        Reject => "reject",
+        /// Sieve suggests pick.
+        Pick => "pick",
+        /// No flag suggested, but stars (`suggestedRating > 0`).
+        Rating => "rating",
     }
 }
 
@@ -2637,6 +2663,17 @@ pub struct CameraFilter {
     pub model: Option<String>,
 }
 
+/// One camera body (v19.2): make + model + body serial. `model = null` = model unknown,
+/// `serial = null` = serial unknown (not read yet, or the file has none). Matches exactly
+/// (a `null` field matches only photos where that value is unknown).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraBody {
+    pub make: CameraMake,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+}
+
 /// Library Filter "Metadata" constraints (v18, `ImageQuery.metadata`, also accepted by
 /// `get_filter_counts`). All fields optional on the wire; each set field narrows the result
 /// (AND across fields, OR within a list). Values come from `get_metadata_filter_options`.
@@ -2650,6 +2687,10 @@ pub struct MetadataFilter {
     pub extensions: Vec<String>,
     /// Camera body (make + model) is one of these.
     pub cameras: Vec<CameraFilter>,
+    /// v19.2: camera body (make + model + serial, `CameraBody`) is one of these; the per-body
+    /// refinement of `cameras` (two ILCE-7M4 bodies are two entries). Values come from
+    /// `MetadataFilterOptions.bodies`.
+    pub bodies: Vec<CameraBody>,
     /// Lens is one of these; `null` = lens unknown.
     pub lenses: Vec<Option<String>>,
     pub iso: Option<NumberRange>,
@@ -2692,6 +2733,14 @@ pub struct ExtensionCount {
 #[serde(rename_all = "camelCase")]
 pub struct CameraCount {
     pub camera: CameraFilter,
+    pub count: u32,
+}
+
+/// v19.2 `MetadataFilterOptions.bodies` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraBodyCount {
+    pub body: CameraBody,
     pub count: u32,
 }
 
@@ -2742,6 +2791,11 @@ pub struct MetadataFilterOptions {
     pub formats: Vec<FormatCount>,
     pub extensions: Vec<ExtensionCount>,
     pub cameras: Vec<CameraCount>,
+    /// v19.2: per body (make + model + serial), ignoring `metadata.bodies`; ordered like
+    /// `cameras`, then by serial (unknown serial last). Label a body with its serial's last
+    /// digits when two entries share make + model.
+    #[serde(default)]
+    pub bodies: Vec<CameraBodyCount>,
     pub lenses: Vec<LensCount>,
     pub isos: Vec<NumberCount>,
     /// Rounded to 0.1 mm.
@@ -2846,6 +2900,15 @@ pub struct FilterCounts {
     pub burst_non_keepers: u32,
     /// Images whose original is missing (`ImageQuery.missingOnly`; IPC v13).
     pub missing: u32,
+    /// v19.2: pending suggestions (`ImageQuery.suggested`) in the counted images: reject /
+    /// pick / stars only. Over a project without other constraints they equal
+    /// `CullSummary.suggestedRejectPending` / `suggestedPickPending` / `suggestedRatingPending`.
+    #[serde(default)]
+    pub suggested_reject: u32,
+    #[serde(default)]
+    pub suggested_pick: u32,
+    #[serde(default)]
+    pub suggested_rating: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -3880,6 +3943,24 @@ pub struct MatchApplication {
 // UX additions (IPC v8)
 // ---------------------------------------------------------------------------
 
+/// Which suggestions `apply_suggestions` copies (v19.2; `null` = all). A suggested `pick` flag
+/// is copied with `picks`, a suggested `reject` with `rejects`, a suggested "no flag" (which
+/// clears a flag, only possible with `onlyUnset = false`) only with both; `suggestedRating`
+/// is copied with `stars`. Anything not selected stays as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionKinds {
+    pub picks: bool,
+    pub rejects: bool,
+    pub stars: bool,
+}
+
+impl Default for SuggestionKinds {
+    fn default() -> Self {
+        Self { picks: true, rejects: true, stars: true }
+    }
+}
+
 /// Result of `apply_suggestions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -4600,6 +4681,9 @@ string_enum! {
         /// `paste_settings` / `sync_settings` / `paste_previous` (v19): Copy / Paste / Sync to
         /// an arbitrary selection.
         Paste => "paste",
+        /// `sync_delta` (v19.2): one Auto Sync commit, the source photo's edit plus the same
+        /// change on every target.
+        Sync => "sync",
     }
 }
 
@@ -4639,6 +4723,60 @@ pub struct EditBatchResult {
     /// History label of every entry of the batch, e.g. "Apply to Scene", "Auto Edit (My Style)".
     pub label: String,
     pub changed_ids: Vec<ImageId>,
+}
+
+/// Options of `sync_delta` (v19.2; `null` = defaults).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SyncDeltaOptions {
+    /// Changed groups applied **relatively** (the source's change is added to each target's
+    /// own value) instead of copied. Only `exposure` (EV added, clamped to -5..=5) and
+    /// `white_balance` (temperature shifted in mireds, tint added, clamped to the slider
+    /// ranges; an `as_shot` target is resolved to its camera as-shot values first) can be
+    /// relative; anything else -> `invalid_argument`. Default both. `[]` = copy everything
+    /// (Lightroom's Auto Sync).
+    pub relative: Vec<AdjustmentField>,
+    /// Only consider these groups (`null` = every group except the per-frame ones). Groups in
+    /// [`SyncDeltaOptions::NEVER_SYNCED`] are never synced even when listed.
+    pub fields: Option<Vec<AdjustmentField>>,
+    /// History label of the source's and the targets' entries (`null` = "Auto Sync"; 1..=100
+    /// chars). The UI passes what it would pass to `save_adjustments` (e.g. "Exposure").
+    pub label: Option<String>,
+}
+
+impl Default for SyncDeltaOptions {
+    fn default() -> Self {
+        Self { relative: Self::RELATIVE.to_vec(), fields: None, label: None }
+    }
+}
+
+impl SyncDeltaOptions {
+    /// Groups that can be (and by default are) applied relatively.
+    pub const RELATIVE: &'static [AdjustmentField] = &[AdjustmentField::Exposure, AdjustmentField::WhiteBalance];
+    /// Per-frame groups Auto Sync never copies (Lightroom: crop, masks, transform).
+    pub const NEVER_SYNCED: &'static [AdjustmentField] =
+        &[AdjustmentField::Crop, AdjustmentField::Masks, AdjustmentField::Transform];
+    /// Default history label.
+    pub const DEFAULT_LABEL: &'static str = "Auto Sync";
+}
+
+/// Result of `sync_delta` (v19.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeltaResult {
+    /// One batch (kind `sync`) holding the source's edit and every changed target; `batchId =
+    /// null` when nothing changed. `undo_edit_batch(batch.batchId)` reverts all of them.
+    pub batch: EditBatchResult,
+    /// The groups that differed between `before` and `after` and were synced (in
+    /// `AdjustmentField` order); empty = nothing to sync.
+    pub fields: Vec<AdjustmentField>,
+    /// Of `fields`, those applied relatively.
+    pub relative_fields: Vec<AdjustmentField>,
+    /// Targets whose white balance was copied absolutely because their (or the source's)
+    /// as-shot white balance could not be resolved (file missing / unreadable).
+    pub absolute_wb_ids: Vec<ImageId>,
+    /// The source's history after the commit (as `save_adjustments` returns it).
+    pub history: AdjustmentHistory,
 }
 
 /// Result of `apply_scene_edit` / `apply_all_edited_scenes`: one batch for the whole call.
@@ -4893,13 +5031,37 @@ pub enum CaptureTimeEdit {
     /// without a capture time gets it and nothing else changes.
     SetExact { reference_id: ImageId, captured_at_ms: i64 },
     /// Sync two cameras: `referenceId` (a frame of the camera with the right clock) and
-    /// `targetId` (a frame of the other camera taken at the same moment); every photo in
-    /// `ids` (the other camera's frames, normally including `targetId`) shifts by
-    /// `reference - target`. Both need a capture time; they may be outside `ids`.
-    SyncCameras { reference_id: ImageId, target_id: ImageId },
+    /// `targetId` (a frame of the other camera taken at the same moment); the photos of
+    /// `scope` shift by `reference - target`. Both need a capture time; they may be outside
+    /// `ids`. v19.2 `scope` (optional, default `selected` = the v19 behaviour): `selected`
+    /// moves `ids`; `body` / `model` move **every** photo of the target's project taken with
+    /// the target's body (make + model + serial) / model (make + model), whatever the grid
+    /// shows, and ignore `ids` (pass `[]`). With `body` / `model` the reference must not be
+    /// in that set (`invalid_argument`: same camera).
+    SyncCameras {
+        reference_id: ImageId,
+        target_id: ImageId,
+        #[serde(default)]
+        scope: CameraSyncScope,
+    },
     /// "Revert capture time to original": back to the file's EXIF time
     /// (`originalCapturedAtMs`, source `exif`).
     Revert,
+}
+
+string_enum! {
+    /// Which photos `CaptureTimeEdit::SyncCameras` moves (v19.2).
+    #[derive(Default)]
+    pub enum CameraSyncScope {
+        /// The `ids` passed to `edit_capture_time` (v19 behaviour; "The selected photos").
+        #[default]
+        Selected => "selected",
+        /// Every photo in the target's project from the target's body (make + model + serial;
+        /// an unknown serial matches photos of that model with an unknown serial).
+        Body => "body",
+        /// Every photo in the target's project from the target's make + model (any serial).
+        Model => "model",
+    }
 }
 
 /// One photo's corrected capture time (undo of `edit_capture_time` via

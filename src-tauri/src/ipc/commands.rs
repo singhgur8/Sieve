@@ -667,6 +667,62 @@ pub async fn sync_settings(
     Ok(r)
 }
 
+/// Auto Sync (v19.2): commits the active photo's edit `before` -> `after` to `sourceId` (its
+/// stored settings become `after`) and the same change to every photo in `targetIds`, as one
+/// undoable batch of kind `sync` (`undo_edit_batch(result.batch.batchId)` reverts the source
+/// and all targets). Only the groups that differ between `before` and `after` are touched
+/// (never crop / masks / transform); `options.relative` groups (default exposure + white
+/// balance) are applied relatively, the others copied (see [`SyncDeltaOptions`]). In Auto
+/// Sync mode the UI commits through this command **instead of** `save_adjustments` (one
+/// call per committed edit). Duplicates and the source in `targetIds` are ignored. Resolving
+/// an `as_shot` white balance decodes that photo (cached by the develop cache). Atomic;
+/// unknown image -> `not_found`; invalid settings / options -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_delta(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    xmp: State<'_, XmpSync>,
+    source_id: ImageId,
+    before: ParametricAdjustments,
+    after: ParametricAdjustments,
+    target_ids: Vec<ImageId>,
+    options: Option<SyncDeltaOptions>,
+) -> AppResult<SyncDeltaResult> {
+    let options = options.unwrap_or_default();
+    let (b, a, t, o) = (before.clone(), after.clone(), target_ids.clone(), options.clone());
+    let need = catalog.run(move |c| develop::sync_delta::as_shot_needed(c, source_id, &b, &a, &t, &o)).await?;
+    let mut as_shot = std::collections::HashMap::new();
+    if !need.is_empty() {
+        let sources = source_images(&catalog, need).await?;
+        let cache = develop.inner().clone();
+        let found = blocking(move || {
+            use rayon::prelude::*;
+            Ok(sources
+                .par_iter()
+                .filter_map(|src| cache.info(src).ok().and_then(|i| i.as_shot).map(|v| (src.id, v)))
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        as_shot.extend(found);
+    }
+    let n = target_ids.len() as u32 + 1;
+    let activity = start_multi_activity(&app, n, "Syncing settings to");
+    let result = catalog
+        .run(move |c| {
+            develop::sync_delta::sync_delta_recorded(c, source_id, &before, &after, &target_ids, &options, &as_shot)
+        })
+        .await;
+    end_activity(activity, &result, |_| format!("Synced settings to {}", super::activity::photos(n)));
+    let r = result?;
+    if !r.batch.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
+}
+
 /// Resets `ids` to neutral adjustments ("Reset" history entry). Atomic.
 #[tauri::command]
 #[specta::specta]
@@ -979,7 +1035,9 @@ pub async fn list_burst_groups(
 /// Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
 /// `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
 /// With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
-/// photos. Atomic; unknown ids -> `not_found`.
+/// photos. v19.2 `kinds` (`null` = all): copy only suggested picks / rejects / stars (see
+/// [`SuggestionKinds`]), e.g. `{picks: false, rejects: true, stars: false}` flags only the
+/// suggested rejects. Atomic; unknown ids -> `not_found`.
 /// For undo, take `get_cull_snapshot(ids)` first.
 #[tauri::command]
 #[specta::specta]
@@ -989,8 +1047,10 @@ pub async fn apply_suggestions(
     xmp: State<'_, XmpSync>,
     ids: Vec<ImageId>,
     only_unset: bool,
+    kinds: Option<SuggestionKinds>,
 ) -> AppResult<ApplySuggestionsResult> {
-    let result = catalog.run(move |c| repo::apply_suggestions(c, &ids, only_unset)).await?;
+    let kinds = kinds.unwrap_or_default();
+    let result = catalog.run(move |c| repo::apply_suggestions_kinds(c, &ids, only_unset, kinds)).await?;
     if result.applied > 0 {
         xmp.notify(&app);
     }
@@ -2472,7 +2532,8 @@ pub async fn remove_project(
 
 /// Lightroom's "Edit Capture Time" for `ids` (any selection): shift by an offset, set the
 /// active photo to an exact time (the others follow by the same offset), sync two cameras
-/// from a reference pair, or revert to the files' own time (see [`CaptureTimeEdit`]). The
+/// from a reference pair (v19.2: the selected photos, or every photo of the target's body /
+/// model in its project), or revert to the files' own time (see [`CaptureTimeEdit`]). The
 /// original EXIF time is kept (`CaptureMeta.originalCapturedAtMs`); the corrected time is
 /// what sorting, bursts, scenes, filters and export naming use, and is written to the
 /// sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated`; marks them dirty, notifies
@@ -2519,9 +2580,9 @@ pub async fn restore_capture_times(
 
 /// Everything the Library Metadata panel shows for photo `id`: file facts, original and
 /// corrected capture time, camera, lens, exposure, size, GPS, sidecar. Unknown id ->
-/// `not_found`. Body: architect (catalog values); rust-engine-dev adds the values read from
-/// the file (`gps`, `focalLength35mm`, `exposureCompensationEv`, `flashFired`,
-/// `cameraSerial`), which are `null` until then.
+/// `not_found`. Catalog values plus a few read from the file (`gps`, `focalLength35mm`,
+/// `exposureCompensationEv`, `flashFired`; `cameraSerial` from the catalog since v19.2, else
+/// the file).
 #[tauri::command]
 #[specta::specta]
 pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<ImageMetadata> {
@@ -2535,7 +2596,8 @@ pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> App
     m.focal_length_35mm = f.focal_length_35mm;
     m.exposure_compensation_ev = f.exposure_compensation_ev;
     m.flash_fired = f.flash_fired;
-    m.camera_serial = f.camera_serial;
+    // v19.2: the catalog's serial (read at import) wins; the file's for photos not read yet.
+    m.camera_serial = m.camera_serial.or(f.camera_serial);
     m.gps = f.gps;
     Ok(m)
 }

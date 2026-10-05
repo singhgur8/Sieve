@@ -270,7 +270,7 @@ fn two_camera_capture_time_on_real_raws() {
     let sync_r = db::capture_time::edit(
         &mut conn,
         &canon,
-        &CaptureTimeEdit::SyncCameras { reference_id: fuji[0], target_id: canon[0] },
+        &CaptureTimeEdit::SyncCameras { reference_id: fuji[0], target_id: canon[0], scope: Default::default() },
     )
     .unwrap();
     sync.write_dirty(None).unwrap();

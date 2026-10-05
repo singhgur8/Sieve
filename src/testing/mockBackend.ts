@@ -88,8 +88,15 @@ import type {
   RejectStrictness,
   UprightMode,
   UprightResult,
+  CameraBody,
+  EditBatchKind,
+  PendingSuggestion,
+  SuggestionKinds,
+  SyncDeltaOptions,
+  SyncDeltaResult,
+  WhiteBalance,
 } from "../ipc";
-import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS } from "../ipc";
+import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS, ALL_ADJUSTMENT_FIELDS } from "../ipc";
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
 const LABELS = [null, null, null, "red", "yellow", "green", "blue", "purple"] as const;
@@ -379,7 +386,7 @@ export function installMockBackend(count: number) {
       path: `/shoot/DSC${String(id).padStart(5, "0")}.ARW`,
       fileName: `DSC${String(id).padStart(5, "0")}.ARW`,
       format: "arw",
-      camera: { make: "sony", model: "ILCE-7M4", sensorLayout: "bayer" },
+      camera: { make: "sony", model: "ILCE-7M4", sensorLayout: "bayer", serial: "06258214" },
       capture: {
         capturedAtMs: base + i * 300 + group * 20000,
         iso: 100 * (1 + (i % 6)),
@@ -463,7 +470,7 @@ export function installMockBackend(count: number) {
         Object.assign(r, { fileName: `${stem}.JPG`, path: r.path.replace(/\.[^.]+$/, ".JPG"), format: "jpeg" });
       } else if (r.id % 4 === 1) {
         Object.assign(r, { fileName: `${stem}.RAF`, path: r.path.replace(/\.[^.]+$/, ".RAF"), format: "raf" });
-        r.camera = { make: "fujifilm", model: "X-T5", sensorLayout: "x_trans" };
+        r.camera = { make: "fujifilm", model: "X-T5", sensorLayout: "x_trans", serial: "61000657" };
         r.capture = { ...r.capture, lens: "XF33mmF1.4 R LM WR", focalLengthMm: 33, aperture: 1.4 };
       }
       if (r.id % 6 === 0) r.capture = { ...r.capture, lens: null };
@@ -471,9 +478,15 @@ export function installMockBackend(count: number) {
   }
   // v19: original EXIF time = corrected time until edited. `?twocams=1`: every 3rd frame is a Canon whose
   // clock ran 1 h ahead (Edit Capture Time > sync cameras fixture); default data stays one Sony body.
+  // v19.2 `?twobodies=1`: every 3rd frame comes from a second ILCE-7M4 (serial 05119876) whose clock ran
+  // 1 h ahead (same model, different body).
   for (const r of rows) {
+    if (params0.get("twobodies") === "1" && r.id % 3 === 0) {
+      r.camera = { ...r.camera, serial: "05119876" };
+      r.capture = { ...r.capture, capturedAtMs: (r.capture.capturedAtMs ?? 0) + 3_600_000 };
+    }
     if (params0.get("twocams") === "1" && r.id % 3 === 0) {
-      r.camera = { make: "canon", model: "EOS R5", sensorLayout: "bayer" };
+      r.camera = { make: "canon", model: "EOS R5", sensorLayout: "bayer", serial: "032021001234" };
       r.fileName = r.fileName.replace("DSC", "IMG_").replace(/\.ARW$/, ".CR3");
       r.path = `/shoot/${r.fileName}`;
       r.format = "cr3";
@@ -650,6 +663,13 @@ export function installMockBackend(count: number) {
   const originOk = (r: RawImageEntry, o: PickOrigin | null | undefined) =>
     o == null || (r.pick !== "unflagged" && (o === "auto" ? r.pickOrigin === "auto" : r.pickOrigin !== "auto"));
 
+  /** v19.2 `ImageQuery.suggested` (Rust `repo::suggested_sql`): untouched (analysed, unflagged, 0 stars) with that suggestion. */
+  const pendingOk = (r: RawImageEntry, kind: PendingSuggestion) => {
+    if (!r.quality || r.pick !== "unflagged" || r.rating !== 0) return false;
+    if (kind === "reject") return r.quality.suggestedPick === "reject";
+    if (kind === "pick") return r.quality.suggestedPick === "pick";
+    return r.quality.suggestedPick === "unflagged" && r.quality.suggestedRating > 0;
+  };
   function query(q: ImageQuery): number[] {
     let out = rows.filter((r) => {
       if (!inScope(r, q.folderId, q.projectId)) return false;
@@ -668,6 +688,7 @@ export function installMockBackend(count: number) {
       if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
       if (q.missingOnly && r.missingSinceMs == null) return false;
       if (q.keepersOnly && !keeper(r)) return false;
+      if (q.suggested != null && !pendingOk(r, q.suggested)) return false;
       if (!metaOk(r, q.metadata)) return false;
       return true;
     });
@@ -706,6 +727,7 @@ export function installMockBackend(count: number) {
       if (!m.extensions.map((e) => e.toLowerCase()).includes(extOf(r))) return false;
     }
     if (on("cameras") && m.cameras?.length && !m.cameras.some((c) => c.make === r.camera.make && (blank(c.model) ?? null) === blank(r.camera.model))) return false;
+    if (on("bodies") && m.bodies?.length && !m.bodies.some((b) => b.make === r.camera.make && blank(b.model) === blank(r.camera.model) && blank(b.serial) === blank(r.camera.serial))) return false;
     if (on("lenses") && m.lenses?.length && !m.lenses.some((l) => (l == null ? null : l.trim()) === blank(r.capture.lens))) return false;
     if (on("iso") && !inRange(r.capture.iso, m.iso)) return false;
     if (on("focalLengthMm") && !inRange(round1(r.capture.focalLengthMm), m.focalLengthMm)) return false;
@@ -757,6 +779,17 @@ export function installMockBackend(count: number) {
       cameras: tally("cameras", (r) => ({ make: r.camera.make, model: blank(r.camera.model) }))
         .map(({ key, count }) => ({ camera: key, count }))
         .sort((a, b) => Number(a.camera.model == null) - Number(b.camera.model == null) || a.camera.make.localeCompare(b.camera.make) || (a.camera.model ?? "").localeCompare(b.camera.model ?? "")),
+      // v19.2: per body (Rust `metadata_filter_options` order: known models by make/model, then serial, unknown last).
+      bodies: tally("bodies", (r): CameraBody => ({ make: r.camera.make, model: blank(r.camera.model), serial: blank(r.camera.serial) }))
+        .map(({ key, count }) => ({ body: key, count }))
+        .sort(
+          (a, b) =>
+            Number(a.body.model == null) - Number(b.body.model == null) ||
+            (a.body.make < b.body.make ? -1 : a.body.make > b.body.make ? 1 : 0) ||
+            (a.body.model ?? "").localeCompare(b.body.model ?? "") ||
+            Number(a.body.serial == null) - Number(b.body.serial == null) ||
+            (a.body.serial ?? "").localeCompare(b.body.serial ?? ""),
+        ),
       lenses: tally("lenses", (r) => blank(r.capture.lens))
         .map(({ key, count }) => ({ lens: key, count }))
         .sort((a, b) => nullsLast(a.lens, b.lens, (x, y) => x.localeCompare(y))),
@@ -837,6 +870,9 @@ export function installMockBackend(count: number) {
       burstGroups: new Set(scope.map((r) => r.burstGroupId).filter((g) => g != null)).size,
       burstNonKeepers: scope.filter((r) => r.burstGroupId != null && !r.isBurstKeeper).length,
       missing: scope.filter((r) => r.missingSinceMs != null).length,
+      suggestedReject: scope.filter((r) => pendingOk(r, "reject")).length,
+      suggestedPick: scope.filter((r) => pendingOk(r, "pick")).length,
+      suggestedRating: scope.filter((r) => pendingOk(r, "rating")).length,
     };
   }
 
@@ -1104,7 +1140,7 @@ export function installMockBackend(count: number) {
   // v17: `bases` = representatives the batch (an apply) was made from, with the batch that wrote their settings.
   const batches = new Map<
     number,
-    { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[]; bases: { imageId: number; base: number }[] }
+    { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[]; bases: { imageId: number; base: number }[]; kind?: EditBatchKind }
   >();
   let batchSeq = 0;
   // IPC v15: skipped scenes, frames the last apply covered, apply cancel flag.
@@ -1191,11 +1227,12 @@ export function installMockBackend(count: number) {
       batchId,
       label: b.label,
       kind:
-        b.label === "Auto Edit (My Style)"
+        b.kind ??
+        (b.label === "Auto Edit (My Style)"
           ? "style_prediction"
           : b.label === "Paste Settings" || b.label === "Sync Settings" || b.label === "Paste from Previous"
             ? "paste"
-            : "scene_apply",
+            : "scene_apply"),
       createdAtMs: b.createdAt,
       undoneAtMs: b.undoneAt,
       imageCount: b.items.length,
@@ -1264,6 +1301,53 @@ export function installMockBackend(count: number) {
       });
     }
     return out;
+  }
+  /**
+   * v19.2 `sync_delta` (Rust `develop::sync_delta`): the source gets `after`, every target the changed groups (never
+   * crop / masks / transform), exposure and white balance relatively by default; one batch of kind `sync`.
+   * As-shot white balance resolves to the mock's as-shot value (5200 K, +8).
+   */
+  function syncDelta(sourceId: number, before0: ParametricAdjustments, after0: ParametricAdjustments, targetIds: number[], options: SyncDeltaOptions | null): SyncDeltaResult {
+    const before = completeAdjustments(before0);
+    const after = completeAdjustments(after0);
+    const relative = options?.relative ?? (["exposure", "white_balance"] as AdjustmentField[]);
+    const bad = relative.find((f) => f !== "exposure" && f !== "white_balance");
+    if (bad) throw { kind: "invalid_argument", message: `${bad} cannot be synced relatively (only exposure and white_balance)` };
+    const label = options?.label ?? "Auto Sync";
+    if (label.length === 0 || label.length > 100) throw { kind: "invalid_argument", message: "label must be 1..=100 characters" };
+    for (const id of [sourceId, ...targetIds]) if (!byId.get(id)) throw { kind: "not_found", message: `image ${id}` };
+    const NEVER: AdjustmentField[] = ["crop", "masks", "transform", "noise_reduction_luminance", "noise_reduction_color"];
+    const all = ALL_ADJUSTMENT_FIELDS;
+    const only = options?.fields ?? null;
+    const fields = all.filter((f) => !NEVER.includes(f) && (!only || only.includes(f)) && JSON.stringify(copyFields(after, before, [f])) !== JSON.stringify(after));
+    const relFields = fields.filter((f) => relative.includes(f));
+    const asShot = { temperatureK: 5200, tint: 8 };
+    const vals = (wb: WhiteBalance) => (wb.mode === "custom" ? { temperatureK: wb.temperatureK, tint: wb.tint } : asShot);
+    const shiftWb = (t: WhiteBalance): WhiteBalance => {
+      if (JSON.stringify(before.whiteBalance) === JSON.stringify(after.whiteBalance)) return t;
+      if (after.whiteBalance.mode === "as_shot") return after.whiteBalance;
+      const [b, a, c] = [vals(before.whiteBalance), vals(after.whiteBalance), vals(t)];
+      const m = Math.max(1e6 / c.temperatureK + 1e6 / a.temperatureK - 1e6 / b.temperatureK, 20);
+      return { mode: "custom", temperatureK: Math.round(Math.min(50000, Math.max(2000, 1e6 / m))), tint: Math.round(Math.min(150, Math.max(-150, c.tint + a.tint - b.tint))) };
+    };
+    const items: MockBatchItem[] = [];
+    const src = batchCommit(sourceId, after, label, null, null);
+    if (src) items.push(src);
+    const seen = new Set([sourceId]);
+    if (fields.length)
+      for (const id of targetIds) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const cur = completeAdjustments(getAdj(id));
+        let next = copyFields(cur, after, fields.filter((f) => !relFields.includes(f)));
+        if (relFields.includes("exposure")) next = { ...next, exposure: Math.round(Math.min(5, Math.max(-5, cur.exposure + after.exposure - before.exposure)) * 100) / 100 };
+        if (relFields.includes("white_balance")) next = { ...next, whiteBalance: shiftWb(cur.whiteBalance) };
+        const it = batchCommit(id, next, label, null, null);
+        if (it) items.push(it);
+      }
+    const batchId = recordItems(label, items, []);
+    if (batchId != null) batches.get(batchId)!.kind = "sync";
+    return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, fields, relativeFields: relFields, absoluteWbIds: [], history: historyDto(sourceId) };
   }
   /** Commits `fn` on every image as one undoable batch (only images that change are recorded). */
   function recordBatch(label: string, ids: number[], fn: (a: ParametricAdjustments) => ParametricAdjustments, sceneIds: number[] = []): EditBatchResult {
@@ -1618,17 +1702,24 @@ export function installMockBackend(count: number) {
         case "read_xmp":
           return { ...ok, skipped: ids.length };
         case "apply_suggestions": {
+          // v19.2 `kinds` (null = all): picks / rejects / stars; a suggested "no flag" needs both flag kinds.
+          const kinds = (args.kinds as SuggestionKinds | null | undefined) ?? { picks: true, rejects: true, stars: true };
+          for (const i of ids) if (!byId.get(i)) throw { kind: "not_found", message: `image ${i}` };
           let applied = 0;
           ids.forEach((i) => {
             const r = byId.get(i);
             if (!r?.quality) return;
             if (args.onlyUnset && (r.pick !== "unflagged" || r.rating !== 0)) return;
+            const sp = r.quality.suggestedPick;
+            const takeFlag = sp === "pick" ? kinds.picks : sp === "reject" ? kinds.rejects : kinds.picks && kinds.rejects;
+            const nextPick = takeFlag ? sp : r.pick;
+            const nextRating = kinds.stars ? r.quality.suggestedRating : r.rating;
             // v18.1: only real changes count as applied.
-            if (r.pick === r.quality.suggestedPick && r.rating === r.quality.suggestedRating) return;
-            r.rating = r.quality.suggestedRating;
+            if (r.pick === nextPick && r.rating === nextRating) return;
+            r.rating = nextRating;
             // v18: a flag "Auto" changes is `auto`; an unchanged flag keeps its origin.
-            if (r.pick !== r.quality.suggestedPick) r.pickOrigin = r.quality.suggestedPick === "unflagged" ? null : "auto";
-            r.pick = r.quality.suggestedPick;
+            if (r.pick !== nextPick) r.pickOrigin = nextPick === "unflagged" ? null : "auto";
+            r.pick = nextPick;
             r.xmp = { ...r.xmp, dirty: true };
             applied++;
           });
@@ -1856,6 +1947,10 @@ export function installMockBackend(count: number) {
           guardWrite();
           const src = getAdj(args.sourceId as number);
           return recordBatch("Sync Settings", [...new Set(args.targetIds as number[])], (a) => copyFields(a, src, args.fields as AdjustmentField[]));
+        }
+        case "sync_delta": {
+          guardWrite();
+          return syncDelta(args.sourceId as number, args.before as ParametricAdjustments, args.after as ParametricAdjustments, args.targetIds as number[], (args.options as SyncDeltaOptions | null) ?? null);
         }
         case "reset_adjustments":
           return batch(ids, "Reset", () => neutral());
@@ -2451,7 +2546,20 @@ export function installMockBackend(count: number) {
             if (!r) throw { kind: "not_found", message: `image ${i}` };
             return r;
           };
-          const targets = list.map(rowOf);
+          let targets = list.map(rowOf);
+          // v19.2: sync by body / model moves every photo of the target's project with that camera (ids ignored).
+          if (mode.kind === "sync_cameras" && mode.scope && mode.scope !== "selected") {
+            const t = rowOf(mode.targetId);
+            rowOf(mode.referenceId);
+            const proj = projectOfFolder(t.folderId);
+            const same = (r: RawImageEntry) =>
+              r.camera.make === t.camera.make && blank(r.camera.model) === blank(t.camera.model) && (mode.scope === "model" || blank(r.camera.serial) === blank(t.camera.serial));
+            targets = rows
+              .filter((r) => projectOfFolder(r.folderId) === proj && same(r))
+              .sort((a, b) => Number(a.capture.capturedAtMs == null) - Number(b.capture.capturedAtMs == null) || (a.capture.capturedAtMs ?? 0) - (b.capture.capturedAtMs ?? 0) || a.id - b.id);
+            if (targets.some((r) => r.id === mode.referenceId))
+              throw { kind: "invalid_argument", message: "the reference photo is from the camera being moved; pick a frame from the other camera" };
+          }
           let offset: number | null = null;
           if (mode.kind === "shift") offset = mode.offsetMs;
           else if (mode.kind === "set_exact") {
@@ -2522,7 +2630,7 @@ export function installMockBackend(count: number) {
             focalLength35mm: r.capture.focalLengthMm,
             exposureCompensationEv: r.id % 4 === 0 ? -0.7 : 0,
             flashFired: false,
-            cameraSerial: "1234567",
+            cameraSerial: r.camera.serial ?? null,
             width: r.width,
             height: r.height,
             orientation: r.orientation,

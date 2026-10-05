@@ -95,6 +95,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::goto_history,
             commands::paste_settings,
             commands::sync_settings,
+            commands::sync_delta,
             commands::reset_adjustments,
             commands::apply_preset,
             commands::list_presets,
@@ -359,6 +360,24 @@ pub fn run() {
                 luts.clone(),
             )
             .with_masks(mask_cache.clone(), segmenter.clone());
+            // Camera serials of photos imported before v19.2 (migration 0018), off the startup path.
+            {
+                let catalog_path = path.clone();
+                let _ = std::thread::Builder::new().name("serial-backfill".into()).spawn(move || {
+                    let run = || -> ipc::error::AppResult<u32> {
+                        let conn = db::open(&catalog_path)?;
+                        if db::camera_serial::unread_count(&conn)? == 0 {
+                            return Ok(0);
+                        }
+                        db::camera_serial::backfill(&conn)
+                    };
+                    match run() {
+                        Ok(n) if n > 0 => eprintln!("read camera serials of {n} photo(s)"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("camera serial backfill: {}", e.message),
+                    }
+                });
+            }
             // Masks catch-up (migration 0010) + orphaned matte sweep, off the startup path.
             {
                 let xmp = app.state::<XmpSync>().inner().clone();

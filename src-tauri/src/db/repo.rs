@@ -353,7 +353,7 @@ const ENTRY_SELECT: &str = "
            i.companion_path, i.develop_warnings,
            i.missing_since_ms,
            i.pick_origin, i.xmp_mtime_ms IS NOT NULL, q.reasons_json,
-           i.exif_captured_at_ms, i.capture_time_source
+           i.exif_captured_at_ms, i.capture_time_source, i.camera_serial
     FROM images i
     LEFT JOIN thumbnails t ON t.image_id = i.id
     LEFT JOIN quality_scores q ON q.image_id = i.id";
@@ -425,6 +425,7 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
             make: enum_col(r, 5, CameraMake::parse)?,
             model: r.get(6)?,
             sensor_layout: enum_col(r, 7, SensorLayout::parse)?,
+            serial: r.get(56)?,
         },
         capture: CaptureMeta {
             captured_at_ms: r.get(8)?,
@@ -569,6 +570,7 @@ enum Facet {
     Format,
     Extension,
     Camera,
+    Body,
     Lens,
     Iso,
     FocalLength,
@@ -595,6 +597,23 @@ fn lens_sql(p: &str) -> String {
 
 fn model_sql(p: &str) -> String {
     format!("NULLIF(TRIM({p}camera_model), '')")
+}
+
+/// Body serial with blank values read as unknown (v19.2).
+fn serial_sql(p: &str) -> String {
+    format!("NULLIF(TRIM({p}camera_serial), '')")
+}
+
+/// `{p}`-prefixed predicate: the photo has a pending suggestion of `kind` (v19.2
+/// `ImageQuery.suggested`): analysed, unflagged, 0 stars, and the suggestion matches. The
+/// `CullSummary.suggested*Pending` / `apply_suggestions(onlyUnset)` rule.
+fn suggested_sql(kind: PendingSuggestion, p: &str) -> String {
+    let q = match kind {
+        PendingSuggestion::Reject => "suggested_pick = 'reject'",
+        PendingSuggestion::Pick => "suggested_pick = 'pick'",
+        PendingSuggestion::Rating => "suggested_pick NOT IN ('pick', 'reject') AND suggested_rating > 0",
+    };
+    format!("({p}pick = 'unflagged' AND {p}rating = 0 AND {p}id IN (SELECT image_id FROM quality_scores WHERE {q}))")
 }
 
 /// `{p}`-prefixed "has develop edits" (same as `RawImageEntry.hasEdits`).
@@ -657,6 +676,20 @@ fn metadata_clauses(
             ors.push(format!("({p}camera_make = ? AND {} IS ?)", model_sql(p)));
             args.push(Value::Text(c.make.as_str().to_owned()));
             args.push(c.model.as_ref().map_or(Value::Null, |s| Value::Text(s.trim().to_owned())));
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+    if on(Facet::Body) && !m.bodies.is_empty() {
+        let mut ors = Vec::with_capacity(m.bodies.len());
+        for b in &m.bodies {
+            ors.push(format!("({p}camera_make = ? AND {} IS ? AND {} IS ?)", model_sql(p), serial_sql(p)));
+            args.push(Value::Text(b.make.as_str().to_owned()));
+            let blank = |v: &Option<String>| match v.as_deref().map(str::trim) {
+                Some(t) if !t.is_empty() => Value::Text(t.to_owned()),
+                _ => Value::Null,
+            };
+            args.push(blank(&b.model));
+            args.push(blank(&b.serial));
         }
         clauses.push(format!("({})", ors.join(" OR ")));
     }
@@ -797,6 +830,9 @@ fn query_filter_skip(
     if q.keepers_only {
         let rule = keepers.ok_or_else(|| AppError::internal("keepersOnly without a keeper rule"))?;
         clauses.push(keeper_predicate(rule, "i."));
+    }
+    if let Some(kind) = q.suggested {
+        clauses.push(suggested_sql(kind, "i."));
     }
     metadata_clauses(&q.metadata, "i.", skip, &mut clauses, &mut args)?;
     if let Some(folder) = q.folder_id {
@@ -968,6 +1004,7 @@ fn filter_counts_impl(
         ),
     };
     let fast = scope.is_all() && keepers.is_none() && metadata.is_empty() && pick_origin.is_none();
+    let mut suggest_scope = String::new();
     let (pick_sql, tag_sql, burst_sql, missing_sql) = match fast {
         true => (
             // Grouping by folder first follows `idx_images_folder_pick_rating` (0011)
@@ -990,6 +1027,7 @@ fn filter_counts_impl(
                 ),
             };
             let (f, fi) = (format!("{f}{meta_f}"), format!("{fi}{meta_fi}"));
+            suggest_scope.clone_from(&fi);
             scoped = [
                 format!("SELECT pick, rating, COUNT(*) FROM images WHERE {f} GROUP BY pick, rating"),
                 format!(
@@ -1037,6 +1075,17 @@ fn filter_counts_impl(
     (c.burst_groups, c.burst_non_keepers) =
         conn.prepare_cached(burst_sql)?.query_row(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?;
     c.missing = conn.prepare_cached(missing_sql)?.query_row(params_from_iter(args.iter()), |r| r.get(0))?;
+    // v19.2 pending suggestions (`suggested_sql`); only untouched rows are visited.
+    let suggest_where = if fast { String::new() } else { format!(" AND {}", suggest_scope) };
+    let suggest_sql = format!(
+        "SELECT COALESCE(SUM(q.suggested_pick = 'reject'), 0), COALESCE(SUM(q.suggested_pick = 'pick'), 0),
+                COALESCE(SUM(q.suggested_pick NOT IN ('pick', 'reject') AND q.suggested_rating > 0), 0)
+         FROM images i JOIN quality_scores q ON q.image_id = i.id
+         WHERE i.pick = 'unflagged' AND i.rating = 0{suggest_where}"
+    );
+    (c.suggested_reject, c.suggested_pick, c.suggested_rating) = conn
+        .prepare_cached(&suggest_sql)?
+        .query_row(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     Ok(c)
 }
 
@@ -1170,6 +1219,17 @@ pub fn metadata_filter_options(conn: &Connection, q: &ImageQuery) -> AppResult<M
             b.camera.make.as_str(),
             &b.camera.model,
         ))
+    });
+    grouped(Facet::Body, &format!("i.camera_make, {}, {}", model_sql("i."), serial_sql("i.")), 3, &mut |r, count| {
+        let make = CameraMake::parse(&r.get::<_, String>(0)?).unwrap_or(CameraMake::Other);
+        o.bodies.push(CameraBodyCount { body: CameraBody { make, model: r.get(1)?, serial: r.get(2)? }, count });
+        Ok(())
+    })?;
+    o.bodies.sort_by(|a, b| {
+        let key = |c: &CameraBody| {
+            (c.model.is_none(), c.make.as_str(), c.model.clone(), c.serial.is_none(), c.serial.clone())
+        };
+        key(&a.body).cmp(&key(&b.body))
     });
     grouped(Facet::Lens, &lens_sql("i."), 1, &mut |r, count| {
         o.lenses.push(LensCount { lens: r.get(0)?, count });
@@ -1582,7 +1642,8 @@ pub fn record_extraction(
                  capture_time_source = CASE WHEN capture_time_source = 'sidecar' AND captured_at_ms IS ?6
                                             THEN 'exif' ELSE capture_time_source END,
                  iso = ?7, shutter_s = ?8, aperture = ?9,
-                 focal_length_mm = ?10, width = ?11, height = ?12, orientation = ?13
+                 focal_length_mm = ?10, width = ?11, height = ?12, orientation = ?13,
+                 camera_serial = COALESCE(?14, camera_serial), camera_serial_read = 1
              WHERE id = ?1",
         )?
         .execute(params![
@@ -1599,6 +1660,7 @@ pub fn record_extraction(
             m.width,
             m.height,
             m.orientation,
+            m.serial,
         ])?;
     }
     let now = now_ms();
@@ -1734,23 +1796,50 @@ pub fn apply_suggestions(
     ids: &[ImageId],
     only_unset: bool,
 ) -> AppResult<ApplySuggestionsResult> {
+    apply_suggestions_kinds(conn, ids, only_unset, SuggestionKinds::default())
+}
+
+/// [`apply_suggestions`] copying only the suggestion kinds in `kinds` (v19.2, see
+/// [`SuggestionKinds`]): a suggested pick flag with `picks`, a suggested reject with `rejects`,
+/// a suggested "no flag" only with both, the suggested stars with `stars`. An image counts as
+/// applied only when its flag or stars change.
+pub fn apply_suggestions_kinds(
+    conn: &mut Connection,
+    ids: &[ImageId],
+    only_unset: bool,
+    kinds: SuggestionKinds,
+) -> AppResult<ApplySuggestionsResult> {
     let tx = conn.savepoint()?;
     let mut applied = 0;
     {
-        let mut stmt = tx.prepare(
-            "UPDATE images SET
-                 rating = (SELECT suggested_rating FROM quality_scores WHERE image_id = ?1),
-                 pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1),
-                 pick_origin = CASE WHEN pick = (SELECT suggested_pick FROM quality_scores WHERE image_id = ?1)
-                                    THEN pick_origin ELSE 'auto' END
-             WHERE id = ?1
-               AND EXISTS (SELECT 1 FROM quality_scores q WHERE q.image_id = ?1
-                             AND (q.suggested_pick <> images.pick OR q.suggested_rating <> images.rating))
-               AND (?2 = 0 OR (pick = 'unflagged' AND rating = 0))",
+        let mut read = tx.prepare_cached(
+            "SELECT i.pick, i.rating, q.suggested_pick, q.suggested_rating
+             FROM images i LEFT JOIN quality_scores q ON q.image_id = i.id WHERE i.id = ?1",
+        )?;
+        let mut write = tx.prepare_cached(
+            "UPDATE images SET rating = ?2, pick = ?3,
+                 pick_origin = CASE WHEN pick = ?3 THEN pick_origin ELSE 'auto' END
+             WHERE id = ?1",
         )?;
         for &id in ids {
-            ensure_image(&tx, id)?;
-            applied += stmt.execute(params![id, only_unset])? as u32;
+            let row: Option<(String, u8, Option<String>, Option<u8>)> =
+                read.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+            let (pick, rating, s_pick, s_rating) = row.ok_or_else(|| AppError::not_found(format!("image {id}")))?;
+            let (Some(s_pick), Some(s_rating)) = (s_pick, s_rating) else { continue };
+            if only_unset && (pick != PickFlag::Unflagged.as_str() || rating != 0) {
+                continue;
+            }
+            let take_flag = match PickFlag::parse(&s_pick) {
+                Some(PickFlag::Pick) => kinds.picks,
+                Some(PickFlag::Reject) => kinds.rejects,
+                _ => kinds.picks && kinds.rejects,
+            };
+            let next_pick = if take_flag { s_pick } else { pick.clone() };
+            let next_rating = if kinds.stars { s_rating } else { rating };
+            if next_pick == pick && next_rating == rating {
+                continue;
+            }
+            applied += write.execute(params![id, next_rating, next_pick])? as u32;
         }
     }
     tx.commit()?;
@@ -2396,6 +2485,7 @@ mod tests {
             width: Some(4608),
             height: Some(3072),
             orientation: Some(8),
+            serial: Some("61000657".into()),
         };
         let files = ThumbFiles {
             thumb_path: "/c/thumbs/1_512.jpg".into(),
@@ -2411,7 +2501,12 @@ mod tests {
         let e = get_image(&conn, a).unwrap();
         assert_eq!(
             e.camera,
-            CameraInfo { make: CameraMake::Fujifilm, model: Some("X-T5".into()), sensor_layout: SensorLayout::XTrans }
+            CameraInfo {
+                make: CameraMake::Fujifilm,
+                model: Some("X-T5".into()),
+                sensor_layout: SensorLayout::XTrans,
+                serial: Some("61000657".into()),
+            }
         );
         assert_eq!(e.capture.captured_at_ms, Some(1_790_447_764_106));
         assert_eq!((e.capture.iso, e.capture.shutter_seconds, e.capture.aperture), (Some(125), Some(0.005), Some(1.4)));
@@ -2657,6 +2752,9 @@ mod tests {
                 burst_groups: 1,
                 burst_non_keepers: 1,
                 missing: 0,
+                suggested_reject: 0,
+                suggested_pick: 0,
+                suggested_rating: 0,
             }
         );
         let g = filter_counts(&conn, Some(2)).unwrap();
@@ -3212,5 +3310,138 @@ mod tests {
         // Keepers only: the rejected RAF disappears.
         let o = metadata_filter_options(&conn, &ImageQuery { keepers_only: true, ..Default::default() }).unwrap();
         assert!(o.formats.iter().all(|c| c.format != ImageFormat::Raf));
+    }
+
+    /// v19.2 (UX P1-4): camera bodies (make + model + serial) as a filter and a facet.
+    #[test]
+    fn camera_body_filter_and_facet() {
+        let conn = metadata_fixture();
+        conn.execute_batch(
+            "UPDATE images SET camera_serial = 'A1' WHERE id IN (1, 6);
+             UPDATE images SET camera_serial = ' B2 ' WHERE id = 2;",
+        )
+        .unwrap();
+        let body = |make, model: Option<&str>, serial: Option<&str>| CameraBody {
+            make,
+            model: model.map(str::to_owned),
+            serial: serial.map(str::to_owned),
+        };
+        let a1 = body(CameraMake::Sony, Some("ILCE-7M4"), Some("A1"));
+        let ids =
+            |bodies: Vec<CameraBody>| sorted(ids_for(&conn, meta(MetadataFilter { bodies, ..Default::default() })));
+        assert_eq!(ids(vec![a1.clone()]), [1, 6]);
+        assert_eq!(ids(vec![body(CameraMake::Sony, Some("ILCE-7M4"), Some("B2"))]), [2], "trimmed");
+        assert!(ids(vec![body(CameraMake::Sony, Some("ILCE-7M4"), None)]).is_empty(), "null serial = unknown only");
+        assert_eq!(ids(vec![body(CameraMake::Canon, Some("EOS R5"), None)]), [4]);
+        assert_eq!(ids(vec![a1.clone(), body(CameraMake::Other, None, None)]), [1, 5, 6]);
+
+        let o = metadata_filter_options(&conn, &ImageQuery::default()).unwrap();
+        assert_eq!(
+            o.bodies.iter().map(|c| (c.body.clone(), c.count)).collect::<Vec<_>>(),
+            [
+                (body(CameraMake::Canon, Some("EOS R5"), None), 1),
+                (body(CameraMake::Fujifilm, Some("X-T5"), None), 1),
+                (a1.clone(), 2),
+                (body(CameraMake::Sony, Some("ILCE-7M4"), Some("B2")), 1),
+                (body(CameraMake::Other, None, None), 1),
+            ]
+        );
+        // Cascade: the body facet ignores its own constraint, the camera facet follows it.
+        let q = meta(MetadataFilter { bodies: vec![a1], ..Default::default() });
+        let o = metadata_filter_options(&conn, &q).unwrap();
+        assert_eq!((o.total, o.bodies.len()), (2, 5));
+        assert_eq!(o.cameras.iter().map(|c| c.count).collect::<Vec<_>>(), [2]);
+        let counts = filter_counts_with(&conn, FolderScope::all(), false, &q.metadata, None).unwrap();
+        assert_eq!(counts.total, 2);
+        // The entry carries the serial.
+        assert_eq!(get_image(&conn, 1).unwrap().camera.serial.as_deref(), Some("A1"));
+    }
+
+    /// v19.2 (UX P1-5): `ImageQuery.suggested`, `FilterCounts.suggested*`, and
+    /// `apply_suggestions` per kind.
+    #[test]
+    fn suggested_filter_counts_and_apply_kinds() {
+        let mut conn = metadata_fixture();
+        // 1: picked by the user, suggested reject (not pending); 2: pending reject (1 star
+        // suggested); 4: pending pick (4 stars); 5: pending stars only; 6: rated, not pending.
+        for (id, pick, stars) in
+            [(1, "reject", 0), (2, "reject", 1), (4, "pick", 4), (5, "unflagged", 3), (6, "reject", 0)]
+        {
+            conn.execute(
+                "INSERT INTO quality_scores (image_id, overall, global_sharpness, clipped_highlights_pct,
+                         clipped_shadows_pct, mean_luma, model_version, analyzed_at, suggested_pick, suggested_rating)
+                 VALUES (?1, 0.5, 0.5, 0, 0, 0.5, 'v', 1, ?2, ?3)",
+                params![id, pick, stars],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE images SET rating = 2 WHERE id = 6", []).unwrap();
+        let q = |kind| ImageQuery { suggested: Some(kind), ..Default::default() };
+        assert_eq!(ids_for(&conn, q(PendingSuggestion::Reject)), [2]);
+        assert_eq!(ids_for(&conn, q(PendingSuggestion::Pick)), [4]);
+        assert_eq!(ids_for(&conn, q(PendingSuggestion::Rating)), [5]);
+        let c = filter_counts(&conn, FolderScope::all()).unwrap();
+        assert_eq!((c.suggested_reject, c.suggested_pick, c.suggested_rating), (1, 1, 1));
+        let s = cull_summary(&conn, &FolderScope::all()).unwrap();
+        assert_eq!(
+            (s.suggested_reject_pending, s.suggested_pick_pending, s.suggested_rating_pending),
+            (c.suggested_reject, c.suggested_pick, c.suggested_rating)
+        );
+        // Scoped / constrained counts take the slow path.
+        let jpeg = MetadataFilter { formats: vec![ImageFormat::Jpeg], ..Default::default() };
+        let c = filter_counts_with(&conn, FolderScope::all(), false, &jpeg, None).unwrap();
+        assert_eq!((c.suggested_reject, c.suggested_pick, c.suggested_rating), (0, 1, 1));
+        let facets = metadata_filter_options(&conn, &q(PendingSuggestion::Reject)).unwrap();
+        assert_eq!(facets.total, 1);
+
+        let all: Vec<ImageId> = (1..=6).collect();
+        let pick_rating = |conn: &Connection, id| {
+            let e = get_image(conn, id).unwrap();
+            (e.pick, e.rating, e.pick_origin)
+        };
+        // Rejects only: the pending reject is flagged, its suggested star is not copied.
+        let only = |picks, rejects, stars| SuggestionKinds { picks, rejects, stars };
+        let r = apply_suggestions_kinds(&mut conn, &all, true, only(false, true, false)).unwrap();
+        assert_eq!((r.applied, r.skipped), (1, 5));
+        assert_eq!(pick_rating(&conn, 2), (PickFlag::Reject, 0, Some(PickOrigin::Auto)));
+        assert_eq!(pick_rating(&conn, 4), (PickFlag::Unflagged, 0, None));
+        assert!(ids_for(&conn, q(PendingSuggestion::Reject)).is_empty());
+        // Stars only (2 is no longer untouched).
+        let r = apply_suggestions_kinds(&mut conn, &all, true, only(false, false, true)).unwrap();
+        assert_eq!(r.applied, 2);
+        assert_eq!(pick_rating(&conn, 4), (PickFlag::Unflagged, 4, None));
+        assert_eq!(pick_rating(&conn, 5).1, 3);
+        // Picks only without onlyUnset: the user's own flags with other suggestions stay.
+        let r = apply_suggestions_kinds(&mut conn, &all, false, only(true, false, false)).unwrap();
+        assert_eq!(r.applied, 1);
+        assert_eq!(pick_rating(&conn, 4), (PickFlag::Pick, 4, Some(PickOrigin::Auto)));
+        assert_eq!(pick_rating(&conn, 1).0, PickFlag::Pick, "suggested reject of a pick needs `rejects`");
+        // A suggested "no flag" clears a flag only with both flag kinds.
+        conn.execute("UPDATE images SET pick = 'pick' WHERE id = 5", []).unwrap();
+        assert_eq!(apply_suggestions_kinds(&mut conn, &[5], false, only(true, false, false)).unwrap().applied, 0);
+        assert_eq!(apply_suggestions_kinds(&mut conn, &[5], false, only(true, true, false)).unwrap().applied, 1);
+        assert_eq!(pick_rating(&conn, 5).0, PickFlag::Unflagged);
+        assert_eq!(
+            apply_suggestions_kinds(&mut conn, &[1, 99], false, SuggestionKinds::default()).unwrap_err().kind,
+            crate::ipc::error::ErrorKind::NotFound
+        );
+    }
+
+    /// v19.2: extraction records the body serial (and keeps a known one when a later read has none).
+    #[test]
+    fn extraction_records_camera_serial() {
+        let mut conn = metadata_fixture();
+        let serial = |c: &Connection| -> (Option<String>, bool) {
+            c.query_row("SELECT camera_serial, camera_serial_read FROM images WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(serial(&conn), (None, false));
+        let meta = raw::meta::ImageMeta { serial: Some("06258214".into()), ..Default::default() };
+        record_extraction(&mut conn, 1, Some(&meta), Err("x")).unwrap();
+        assert_eq!(serial(&conn), (Some("06258214".into()), true));
+        record_extraction(&mut conn, 1, Some(&raw::meta::ImageMeta::default()), Err("x")).unwrap();
+        assert_eq!(serial(&conn).0.as_deref(), Some("06258214"));
     }
 }

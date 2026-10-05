@@ -839,6 +839,97 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v19.2 — 2026-10-05 (Phase 8d feedback: camera bodies, project-wide camera sync, suggestion filter, Auto Sync)
+
+Driven by `docs/ux-review-8d.md` P1-1, P1-3, P1-4, P1-5 ([ARCH] items). Additive on the wire except one TS call
+signature (`applySuggestions` has a third argument). Schema v18 (`migrations/0018_camera_serial_sync.sql`):
+`images.camera_serial`, `images.camera_serial_read` (+ indexes `idx_images_folder_body`, partial
+`idx_images_serial_unread`); `edit_batches.kind` CHECK accepts `sync` (writable_schema edit, as 0009 / 0017).
+`src/ipc/bindings.ts` regenerated.
+
+Camera bodies (P1-4)
+- `CameraInfo.serial: string | null` (`#[serde(default)]`, optional in TS, always sent): EXIF `BodySerialNumber`
+  (else DNG `CameraSerialNumber`), trimmed; all-zero / blank values read as `null`. Written by thumbnail extraction
+  (`raw::meta::ImageMeta.serial`, `repo::record_extraction`: new imports and `regenerate_thumbnails`). Photos
+  imported before v19.2 are read by a background thread at startup (`db::camera_serial::backfill`, ~1-3 ms per
+  file, never blocks; missing originals are retried next launch). Until then their serial is `null`: refetch
+  entries (or the facet) when opening the capture-time dialog rather than caching serials for the session.
+- `ImageMetadata.cameraSerial` = the catalog's serial, else read from the file.
+- New `CameraBody {make, model | null, serial | null}`; `MetadataFilter.bodies?: CameraBody[]` (exact match; a
+  `null` model / serial matches only unknown values; blank = unknown); `MetadataFilterOptions.bodies?:
+  CameraBodyCount[]` (`{body, count}`; ignores `metadata.bodies`, like every facet ignores its own constraint;
+  order: known models by make / model, then serial, unknown serial last, unknown model last). `cameras` /
+  `CameraFilter` are unchanged (model level).
+
+Project-wide sync cameras (P1-3, P1-4)
+- `CaptureTimeEdit.sync_cameras` gains `scope?: CameraSyncScope` (`"selected"` default = v19 behaviour, moves
+  `ids`; `"body"` = every photo of the target's **project** with the target's make + model + serial; `"model"` =
+  make + model, any serial). With `body` / `model` the command ignores `ids` (pass `[]`) and the grid's filters,
+  and fails with `invalid_argument` ("the reference photo is from the camera being moved; ...") when the reference
+  is in that set. Result / undo unchanged (`changedIds`, `previous` -> `restore_capture_times`).
+- Preview counts for the dialog: `list_image_ids({projectId, metadata: {bodies: [targetBody]}})` (or `cameras` for
+  model scope) = exactly the photos that move; "including N hidden by the current filters" = that count minus the
+  same query with the grid's filters.
+
+Suggestion filter + apply per kind (P1-5)
+- `PendingSuggestion = "reject" | "pick" | "rating"`; `ImageQuery.suggested?: PendingSuggestion | null`: analysed,
+  unflagged, 0 stars, with that suggestion (`rating` = no flag suggested but stars) = the
+  `CullSummary.suggested*Pending` rule. Honoured by `list_images`, `list_image_ids`, `get_metadata_filter_options`.
+- `FilterCounts.suggestedReject / suggestedPick / suggestedRating` (`#[serde(default)]`): pending suggestions among
+  the counted images (follow `keepersOnly` / `metadata` / `pickOrigin`).
+- `apply_suggestions(ids, onlyUnset, kinds: SuggestionKinds | null)` — **new third argument** (`null` = all, the
+  v18.1 behaviour). `SuggestionKinds {picks, rejects, stars}`: suggested pick flags with `picks`, rejects with
+  `rejects`, a suggested "no flag" (clears a flag; only reachable with `onlyUnset = false`) only with both, the
+  suggested stars with `stars`. `{picks: false, rejects: true, stars: false}` over the project flags exactly the
+  `suggested: "reject"` photos and changes no rating. Counts for the dialog's checkboxes: `CullSummary`
+  `suggestedRejectPending` / `suggestedPickPending` / `suggestedRatingPending` (unchanged).
+
+Auto Sync / relative sync (P1-1)
+- `sync_delta(sourceId, before, after, targetIds, options: SyncDeltaOptions | null) -> SyncDeltaResult`. Writes
+  `after` to the source and the `before` -> `after` change to every target, as **one** undoable batch of new kind
+  `EditBatchKind::Sync` (`"sync"`) that includes the source: `undo_edit_batch(result.batch.batchId)` reverts all
+  photos (P1-1 item 5). Only groups that differ between `before` and `after` are touched (never `crop`, `masks`,
+  `transform`; `SyncDeltaResult.fields` lists them). `SyncDeltaOptions {relative?: AdjustmentField[] (default
+  ["exposure", "white_balance"]; anything else -> invalid_argument; [] = absolute copy like Lightroom), fields?:
+  AdjustmentField[] | null (limit), label?: string | null (history label of every entry, default "Auto Sync")}`.
+  Relative exposure: target + (after - before), clamped -5..5, 0.01 EV. Relative WB: temperature shifted in mireds,
+  tint added, clamped, rounded to whole K / tint; `as_shot` sides resolved to the camera as-shot values (the
+  command decodes those photos through the develop cache); a change *to* as-shot is copied; unresolvable as-shot ->
+  absolute copy, listed in `absoluteWbIds`. `SyncDeltaResult {batch: EditBatchResult, fields, relativeFields,
+  absoluteWbIds, history: AdjustmentHistory (the source's, as save_adjustments returns)}`. Duplicates / the source in
+  `targetIds` are ignored; atomic; unknown id -> `not_found`. Reports a `paste_sync` activity for 2+ photos.
+- With relative exposure / WB the matched-scene restriction of P1-1 item 4 is no longer needed: frames keep their
+  per-frame differences.
+
+Mock backend (`src/testing/mockBackend.ts`)
+- Entries carry `camera.serial` (Sony 06258214, Fuji 61000657, Canon 032021001234); new `?twobodies=1`: every 3rd
+  frame from a second ILCE-7M4 (serial 05119876) whose clock is 1 h ahead. `bodies` filter + facet, `suggested`
+  filter, `FilterCounts.suggested*`, `apply_suggestions` kinds, sync-cameras scopes (project-wide), `sync_delta`
+  (as-shot = 5200 K / +8, batch kind `sync`), `get_image_metadata.cameraSerial` from the entry.
+  Contract check: `tests/ui/ipc-v19-2-mock.spec.ts`.
+
+Who updates what
+- architect (done): types, schema v18, `raw::meta` / `raw::tiff` serial tags, `repo` (entry serial, bodies
+  filter / facet, suggested filter, filter counts, `apply_suggestions_kinds`, extraction), `db::camera_serial`
+  (backfill, started in `lib.rs`), `db::capture_time::{camera_scope_ids, edit}` scopes, `develop::sync_delta` +
+  command + registration, Rust tests, bindings, mock, `App.tsx` compile fix (`applySuggestions(t, onlyUnset, null)`).
+- frontend-dev:
+  1. P1-1: Auto Sync switch (`autoSync` keymap Cmd+Alt+Shift+A). While on with 2+ selected, commit each edit with
+     `commands.syncDelta(activeId, beforeCommit, afterCommit, otherSelectedIds, {label})` **instead of**
+     `saveAdjustments` (the source is written by it; use `result.history` like the save result). Cmd+Z right after:
+     `undoEditBatch(result.batch.batchId)`. Drop the matched-scene exclusion of exposure / WB (relative by default).
+  2. P1-3 / P1-4: group cameras by make + model + serial (`entry.camera.serial`, label `ILCE-7M4 (…8214)` when two
+     bodies share a model; `MetadataFilterOptions.bodies` has the project's bodies with counts); Sync tab sends
+     `{kind: "sync_cameras", referenceId, targetId, scope: "body"}` with `ids: []` (or `"model"` when serials are
+     unknown / the user picks the model; `"selected"` for "The selected photos"). Summary counts via
+     `listImageIds({projectId, metadata: {bodies: [body]}})`. Metadata filter Camera column: use `bodies`.
+  3. P1-5: `Review N suggested rejects` = grid query `suggested: "reject"`; `isFiltered` / `describeFilters` /
+     chips / `membershipSensitive` must know `suggested`; Apply dialog checkboxes -> `applySuggestions(ids, true,
+     {picks, rejects, stars})`, counts from `CullSummary` (or `FilterCounts.suggested*` for a filtered scope).
+- rust-engine-dev: nothing required; `raw::exif_info` keeps its own serial read for the Metadata panel fallback.
+  New extraction paths must keep filling `ImageMeta.serial`.
+- vision-ml-dev: nothing required.
+
 ## v19 — 2026-10-05 (Phase 8d: capture time, metadata panel, Transform / Upright, preset tracking, paste batches, reject strictness)
 
 Schema v17 (`migrations/0017_capture_transform.sql`): `images.exif_captured_at_ms` (backfilled from

@@ -921,7 +921,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const applySuggestions = (t: number[], onlyUnset: boolean) =>
     void run(async () => {
       const before = await unwrap(commands.getCullSnapshot(t));
-      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset));
+      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, null));
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
       status.refreshXmp();
