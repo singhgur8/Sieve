@@ -16,7 +16,7 @@ import {
   unwrap,
   completeAdjustments,
   defaultAdjustments,
-  type AdjustmentField,
+  type SyncDeltaResult,
   type AdjustmentHistory,
   type CompleteAdjustments,
   type DevelopInfo,
@@ -53,8 +53,13 @@ export interface EditorOptions {
   onChanged: (id: number) => void;
   /** A user commit / undo / redo wrote history (not a plain reload): batch Undo offers become unsafe. */
   onCommitted?: (id: number) => void;
-  /** After a commit was saved: the setting groups that edit changed (crop / masks / transform never listed). Auto Sync hangs here. */
-  onSaved?: (id: number, changed: AdjustmentField[]) => Promise<void> | void;
+  /**
+   * Auto Sync (v19.2 `sync_delta`): the other photos to sync to, or null / empty when it is off. A commit that changed a synced group is then
+   * saved through `sync_delta(id, before, after, targets)` (one batch that includes this photo, exposure / white balance relative) instead of `save_adjustments`.
+   */
+  autoSyncTargets?: (id: number) => number[] | null;
+  /** The result of such a commit (refresh the other photos, offer the batch Undo). */
+  onSynced?: (id: number, targets: number[], r: SyncDeltaResult) => Promise<void> | void;
   /** Source format of the image (selects the neutral defaults); RAW when unknown. */
   format?: ImageFormat;
   /** Render the full, uncropped frame (crop tool active). */
@@ -248,11 +253,18 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     const prev = baseRef.current;
     baseRef.current = snapshot;
     enqueue(async () => {
-      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
+      const label = labelWithValue(p.label, snapshot);
+      const targets = prev && changedFields(prev, snapshot).length > 0 ? (optsRef.current.autoSyncTargets?.(p.id) ?? []).filter((x) => x !== p.id) : [];
+      let h: AdjustmentHistory;
+      let synced: SyncDeltaResult | null = null;
+      if (targets.length > 0 && prev) {
+        synced = await unwrap(commands.syncDelta(p.id, prev, snapshot, targets, { label }));
+        h = synced.history;
+      } else h = await unwrap(commands.saveAdjustments(p.id, snapshot, label));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       optsRef.current.onCommitted?.(p.id);
-      if (optsRef.current.onSaved) await optsRef.current.onSaved(p.id, prev ? changedFields(prev, snapshot) : []);
+      if (synced) await optsRef.current.onSynced?.(p.id, targets, synced);
       // Profile / look availability warnings depend on the saved settings.
       const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {

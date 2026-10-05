@@ -28,9 +28,9 @@ const idle = "bg-neutral-800 text-neutral-200 hover:bg-neutral-700";
 const on = "bg-sky-800 text-sky-100 ring-1 ring-white/30";
 
 /** Exactly this pick filter (and nothing else about picks / keepers / flag origin) is on. */
-const onlyPicks = (q: Query, ...p: string[]) => !q.keepersOnly && q.pickOrigin == null && q.picks.length === p.length && p.every((x) => (q.picks as string[]).includes(x));
+const onlyPicks = (q: Query, ...p: string[]) => !q.keepersOnly && q.suggested == null && q.pickOrigin == null && q.picks.length === p.length && p.every((x) => (q.picks as string[]).includes(x));
 /** Exactly "rejected by `o`" is on (v18.1 `ImageQuery.pickOrigin`). */
-const onlyRejectedBy = (q: Query, o: PickOrigin) => !q.keepersOnly && q.pickOrigin === o && q.picks.length === 1 && q.picks[0] === "reject";
+const onlyRejectedBy = (q: Query, o: PickOrigin) => !q.keepersOnly && q.pickOrigin === o && q.suggested == null && q.picks.length === 1 && q.picks[0] === "reject";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -46,12 +46,13 @@ export function suggestionParts(s: CullSummary): string {
 }
 
 export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions, strictness, onStrictness }: Props) {
-  const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, pickOrigin: null, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
+  const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, pickOrigin: null, suggested: null, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
   const toggleRejectedBy = (o: PickOrigin) =>
-    setQuery((q) => (onlyRejectedBy(q, o) ? { ...q, picks: [], pickOrigin: null } : { ...q, keepersOnly: false, picks: ["reject"], pickOrigin: o }));
+    setQuery((q) => (onlyRejectedBy(q, o) ? { ...q, picks: [], pickOrigin: null } : { ...q, keepersOnly: false, suggested: null, picks: ["reject"], pickOrigin: o }));
   const keepersOn = !!query.keepersOnly;
   const formula = keeperEquation(s);
   const suggestions = suggestionParts(s);
+  const reviewRejects = () => setQuery((q) => (q.suggested === "reject" ? { ...q, suggested: null } : { ...q, keepersOnly: false, picks: [], pickOrigin: null, suggested: "reject" }));
   const [autoNote, setAutoNote] = useState<{ x: number; y: number } | null>(null);
   const seg = (active: boolean) => `whitespace-nowrap px-1.5 py-0.5 text-xs transition-colors ${active ? on : idle}`;
   const splitPart = (n: number, o: PickOrigin, label: string) => {
@@ -148,10 +149,10 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
                 data-testid="auto-zero-apply"
                 onClick={() => {
                   setAutoNote(null);
-                  onApplySuggestions();
+                  reviewRejects();
                 }}
               >
-                Review and apply suggestions…
+                Review them
               </button>
             </>
           ) : (
@@ -178,9 +179,22 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
           </select>
         </label>
         <span className="min-w-0 truncate" data-testid="strictness-explain">{STRICT_TEXT[strictness]}</span>
-        <span className="ml-auto text-neutral-300" data-testid="strictness-count" data-rejects={s.suggestedRejectPending} title="Photos you have not flagged or rated that Sieve would reject if you press Apply suggestions">
-          {s.suggestedRejectPending} reject {s.suggestedRejectPending === 1 ? "suggestion" : "suggestions"}
-        </span>
+        {s.suggestedRejectPending > 0 || query.suggested === "reject" ? (
+          <button
+            className={`ml-auto ${base} ${query.suggested === "reject" ? on : idle}`}
+            data-testid="strictness-count"
+            data-rejects={s.suggestedRejectPending}
+            aria-pressed={query.suggested === "reject"}
+            title="Show exactly the photos you have not flagged or rated that Sieve would reject, each with the reason. Nothing is rejected until you press Apply suggestions"
+            onClick={reviewRejects}
+          >
+            Review {s.suggestedRejectPending} suggested {s.suggestedRejectPending === 1 ? "reject" : "rejects"}
+          </button>
+        ) : (
+          <span className="ml-auto text-neutral-300" data-testid="strictness-count" data-rejects={s.suggestedRejectPending}>
+            0 reject suggestions
+          </span>
+        )}
       </div>
     )}
     </>

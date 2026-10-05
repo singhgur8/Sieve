@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type SuggestionKinds, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -95,7 +95,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const metaOpen = useMetaRowOpen();
   const [exportOpen, setExportOpen] = useState<{ sel: number[]; keepers?: number[] } | null>(null);
   const [exportedCount, setExportedCount] = useState<number | null>(null);
-  const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
+  const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[]; onlyRejects: boolean } | null>(null);
   // Scenes are an Edit-step concept inside a project: the strip starts hidden there (Shift+S shows it).
   const [scenesOpen, setScenesOpen] = useState(projectProp == null);
   // Edit step overview (the plan) replaces the grid while open; a project that was left in the Edit step reopens on it.
@@ -162,7 +162,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.pickOrigin != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
+    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -918,13 +918,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const askApplySuggestions = () => {
     if (ids.length === 0) return;
-    setApplyOpen({ selected: [...sel.selected], all: ids });
+    setApplyOpen({ selected: [...sel.selected], all: ids, onlyRejects: query.suggested === "reject" });
   };
 
-  const applySuggestions = (t: number[], onlyUnset: boolean) =>
+  const applySuggestions = (t: number[], onlyUnset: boolean, kinds: SuggestionKinds) =>
     void run(async () => {
       const before = await unwrap(commands.getCullSnapshot(t));
-      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, null));
+      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, kinds));
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
       status.refreshXmp();
@@ -1334,7 +1334,6 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
         if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) {
-          d?.undoAutoSyncedEdit(); // Auto Sync: the edited photo's own entry goes with the batch (one Cmd+Z reverts all)
           return wf.undoLast();
         }
         if (cull.undoAt() > (d?.lastCommitAt() ?? 0)) {
@@ -1568,15 +1567,17 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           onRevert={(id) => void applyCaptureTime([id], { kind: "revert" }, "Reverted capture time to original")}
         />
       )}
-      {captureOpen && <CaptureTimeDialog targetIds={captureOpen} activeId={active ?? null} viewIds={ids} onApply={applyCaptureTime} onCancel={() => setCaptureOpen(null)} />}
+      {captureOpen && <CaptureTimeDialog targetIds={captureOpen} activeId={active ?? null} viewIds={ids} projectId={projectId} onApply={applyCaptureTime} onCancel={() => setCaptureOpen(null)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
           selected={applyOpen.selected}
           all={applyOpen.all}
+          projectId={projectId}
+          onlyRejects={applyOpen.onlyRejects}
           onCancel={() => setApplyOpen(null)}
-          onConfirm={(t, onlyUnset) => {
+          onConfirm={(t, onlyUnset, kinds) => {
             setApplyOpen(null);
-            applySuggestions(t, onlyUnset);
+            applySuggestions(t, onlyUnset, kinds);
           }}
         />
       )}

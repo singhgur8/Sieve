@@ -423,7 +423,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
 
       {bar.count > 1 && bar.autoSync && (
         <p className="shrink-0 border-t border-neutral-800 px-3 py-1 text-[11px] leading-tight text-neutral-400" data-testid="auto-sync-note">
-          Auto Sync is on: changes go to all {bar.count} photos. Exposure and white balance are not synced yet and stay per photo.
+          Auto Sync is on: changes go to all {bar.count} photos. Exposure and white balance are applied as a change (each photo keeps its own difference).
         </p>
       )}
       <div className="flex h-9 shrink-0 gap-2 border-t border-neutral-800 px-3 py-1" data-testid="right-bar">
@@ -433,7 +433,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
             aria-checked={bar.autoSync}
             onClick={() => bar.onAutoSync(!bar.autoSync)}
             className={`flex shrink-0 items-center gap-1.5 rounded px-2 text-xs ${bar.autoSync ? "bg-sky-800 text-sky-50" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
-            title={`Every change goes to all ${bar.count} selected photos${hint("autoSync")}. Exposure and white balance are not synced yet (they stay per photo; Sync… copies them)`}
+            title={`Every change goes to all ${bar.count} selected photos${hint("autoSync")}. Exposure and white balance move by the same amount on each photo (relative); everything else is copied`}
             data-testid="auto-sync-switch"
           >
             <span className={`relative inline-block h-3 w-6 rounded-full ${bar.autoSync ? "bg-sky-300" : "bg-neutral-600"}`} aria-hidden>

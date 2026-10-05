@@ -3,12 +3,13 @@
 // The original file is never touched; the corrected time goes to the catalog and the XMP sidecar.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { commands, unwrap, type CaptureTimeEdit, type RawImageEntry } from "../ipc";
+import { commands, unwrap, type CameraBody, type CameraSyncScope, type CaptureTimeEdit, type RawImageEntry } from "../ipc";
+import { BASE_QUERY } from "../hooks/useLibrary";
 import { Dialog } from "./Dialog";
 import { HelpLink } from "./HelpLink";
 import { formatTime } from "../lib/format";
 import { formatOffset, fromInputValue, offsetFrom, toInputValue } from "../lib/captureTime";
-import { cameraLabel } from "../lib/metaFilter";
+import { bodyLabel } from "../lib/metaFilter";
 import { Thumb } from "./edit/bits";
 
 type Tab = "shift" | "set" | "sync" | "revert";
@@ -19,11 +20,15 @@ interface Props {
   activeId: number | null;
   /** Every photo in the current view (the sync tab shifts every frame of the other camera in it). */
   viewIds: number[];
+  /** The open project (the project-wide scopes count its photos); null = whole catalog. */
+  projectId?: number | null;
   onApply: (ids: number[], mode: CaptureTimeEdit, label: string) => Promise<void>;
   onCancel: () => void;
 }
 
-const camName = (e: RawImageEntry) => cameraLabel(e.camera);
+/** A body = make + model + serial (blank = unknown), as a stable key. */
+const bodyOf = (e: RawImageEntry): CameraBody => ({ make: e.camera.make, model: e.camera.model?.trim() || null, serial: e.camera.serial?.trim() || null });
+const camName = (e: RawImageEntry) => JSON.stringify(bodyOf(e));
 const field = "w-16 rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1 text-right text-neutral-100";
 const sel = "w-full rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1 text-neutral-100";
 
@@ -82,7 +87,7 @@ function FramePicker({ frames, value, onChange, testid, entries }: { frames: Raw
   );
 }
 
-export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCancel }: Props) {
+export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = null, onApply, onCancel }: Props) {
   const [tab, setTab] = useState<Tab>("shift");
   const [entries, setEntries] = useState<Map<number, RawImageEntry> | null>(null);
   const [busy, setBusy] = useState(false);
@@ -98,6 +103,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
   const [tgtCam, setTgtCam] = useState("");
   const [refFrame, setRefFrame] = useState<number | null>(null);
   const [tgtFrame, setTgtFrame] = useState<number | null>(null);
+  const [scope, setScope] = useState<CameraSyncScope>("body");
 
   const loadIds = useMemo(() => [...new Set([...targetIds, ...viewIds])], [targetIds, viewIds]);
   useEffect(() => {
@@ -136,6 +142,8 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
     return by;
   }, [entries, viewIds]);
   const camNames = [...cameras.keys()];
+  const bodies = camNames.map((k) => JSON.parse(k) as CameraBody);
+  const camLabel = (k: string) => bodyLabel(JSON.parse(k) as CameraBody, bodies);
   // Exactly one selected frame from each of two cameras: that is the pair ("this is the same moment"). The active photo's camera
   // is the one to fix (it is the last one you clicked); the other is the reference.
   const pair = useMemo(() => {
@@ -171,9 +179,35 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
   const refId = pickFrame(refCam, refFrame);
   const tgtId = pickFrame(tgtCam, tgtFrame);
   const syncOffset = timeOf(refId) != null && timeOf(tgtId) != null ? (timeOf(refId) as number) - (timeOf(tgtId) as number) : null;
-  // Scope seam (IPC v19.2 adds project-wide and per-body scopes): today the frames of the camera that are in the current view.
-  const syncScope = { kind: "view" as const, label: "in the current view" };
-  const syncTargets = viewIds.filter((id) => entries?.get(id) && camName(entries.get(id)!) === tgtCam && entries.get(id)!.capture.capturedAtMs != null);
+  // Scope (v19.2): every photo of the camera body / model in the PROJECT (filters ignored), or exactly the selection.
+  const tgtBody = tgtCam ? (JSON.parse(tgtCam) as CameraBody) : null;
+  const refBody = refCam ? (JSON.parse(refCam) as CameraBody) : null;
+  const viewTargets = viewIds.filter((id) => entries?.get(id) && camName(entries.get(id)!) === tgtCam && entries.get(id)!.capture.capturedAtMs != null);
+  const [scopeCounts, setScopeCounts] = useState<{ body: number; model: number } | null>(null);
+  useEffect(() => {
+    if (tab !== "sync" || !tgtBody) return;
+    let live = true;
+    const q = (metadata: object) => unwrap(commands.listImageIds({ ...BASE_QUERY, projectId: projectId ?? null, metadata }));
+    (async () => {
+      try {
+        const [body, model] = await Promise.all([q({ bodies: [tgtBody] }), q({ cameras: [{ make: tgtBody.make, model: tgtBody.model }] })]);
+        if (live) setScopeCounts({ body: body.length, model: model.length });
+        const inView = new Set(viewIds);
+        if (live) setHidden({ body: body.filter((i) => !inView.has(i)).length, model: model.filter((i) => !inView.has(i)).length });
+      } catch {
+        if (live) setScopeCounts(null);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [tab, tgtCam, projectId, viewIds]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [hidden, setHidden] = useState<{ body: number; model: number }>({ body: 0, model: 0 });
+  const sameModel = !!refBody && !!tgtBody && refBody.make === tgtBody.make && refBody.model === tgtBody.model;
+  const sameCamera = scope === "selected" ? false : scope === "model" ? sameModel : refCam === tgtCam;
+  const syncCount = scope === "selected" ? targetIds.length : (scopeCounts?.[scope] ?? viewTargets.length);
+  const syncHidden = scope === "selected" ? 0 : hidden[scope];
+  const scopeNoun = scope === "model" ? (tgtBody ? bodyLabel({ ...tgtBody, serial: null }, []) : "") : tgtCam ? camLabel(tgtCam) : "";
 
   // ---- what each tab would do ----
   const shiftOffset = offsetFrom(sign, h, m, s);
@@ -191,14 +225,15 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
           }
         : tab === "sync"
           ? {
-              ids: syncTargets,
+              ids: scope === "selected" ? targetIds : [],
               offset: syncOffset,
-              mode: refId != null && tgtId != null && syncOffset != null && syncOffset !== 0 ? { kind: "sync_cameras", referenceId: refId, targetId: tgtId } : null,
-              label: `Synced ${tgtCam} to ${refCam} (${syncOffset != null ? formatOffset(syncOffset) : ""})`,
+              mode: refId != null && tgtId != null && syncOffset != null && syncOffset !== 0 && !sameCamera ? { kind: "sync_cameras", referenceId: refId, targetId: tgtId, scope } : null,
+              label: `Synced ${tgtCam ? camLabel(tgtCam) : ""} to ${refCam ? camLabel(refCam) : ""} (${syncOffset != null ? formatOffset(syncOffset) : ""})`,
             }
           : { ids: targetIds, offset: null, mode: { kind: "revert" }, label: "Reverted capture time to original" };
 
-  const preview = plan.ids
+  const previewIds = tab === "sync" && scope !== "selected" ? viewTargets : plan.ids;
+  const preview = previewIds
     .map((id) => entries?.get(id))
     .filter((e): e is RawImageEntry => !!e && e.capture.capturedAtMs != null)
     .slice(0, 4)
@@ -207,7 +242,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
       const after = tab === "revert" ? (e.capture.originalCapturedAtMs ?? before) : plan.offset != null ? before + plan.offset : before;
       return { id: e.id, name: e.fileName, before, after };
     });
-  const changeCount = tab === "revert" ? plan.ids.filter((id) => (entries?.get(id)?.capture.captureTimeSource ?? "exif") !== "exif").length : plan.offset === 0 || plan.offset == null ? 0 : plan.ids.length;
+  const changeCount = tab === "revert" ? plan.ids.filter((id) => (entries?.get(id)?.capture.captureTimeSource ?? "exif") !== "exif").length : plan.offset === 0 || plan.offset == null ? 0 : tab === "sync" ? syncCount : plan.ids.length;
 
   const apply = async () => {
     if (!plan.mode || busy) return;
@@ -293,7 +328,9 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
                   <span className="font-medium text-neutral-300">Clock is right</span>
                   <select className={sel} value={refCam} onChange={(e) => (setRefCam(e.target.value), setRefFrame(null))} data-testid="capture-ref-cam" aria-label="Camera with the right clock">
                     {camNames.map((c) => (
-                      <option key={c}>{c}</option>
+                      <option key={c} value={c}>
+                        {camLabel(c)}
+                      </option>
                     ))}
                   </select>
                   {entries && <FramePicker frames={framesOf(refCam)} value={refId} onChange={setRefFrame} testid="capture-ref-frame" entries={entries} />}
@@ -302,20 +339,39 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
                   <span className="font-medium text-neutral-300">Clock to fix (these photos move)</span>
                   <select className={sel} value={tgtCam} onChange={(e) => (setTgtCam(e.target.value), setTgtFrame(null))} data-testid="capture-tgt-cam" aria-label="Camera to correct">
                     {camNames.map((c) => (
-                      <option key={c}>{c}</option>
+                      <option key={c} value={c}>
+                        {camLabel(c)}
+                      </option>
                     ))}
                   </select>
                   {entries && <FramePicker frames={framesOf(tgtCam)} value={tgtId} onChange={setTgtFrame} testid="capture-tgt-frame" entries={entries} />}
                 </div>
               </div>
-              {refCam === tgtCam && <p className="text-amber-300">Choose two different cameras.</p>}
+              <fieldset className="flex flex-col gap-1" data-testid="capture-scope-group">
+                <legend className="font-medium text-neutral-300">Which photos move</legend>
+                {([
+                  ["body", `This body: every ${tgtCam ? camLabel(tgtCam) : ""} photo in this project (${(scopeCounts?.body ?? viewTargets.length).toLocaleString()})`],
+                  ["model", `This camera model: every ${scopeNoun} photo from any body (${(scopeCounts?.model ?? viewTargets.length).toLocaleString()})`],
+                  ["selected", `The selected photos only (${targetIds.length.toLocaleString()})`],
+                ] as [CameraSyncScope, string][]).map(([k, label]) => (
+                  <label key={k} className="flex items-center gap-1.5 text-neutral-300">
+                    <input type="radio" name="capture-scope" checked={scope === k} onChange={() => setScope(k)} data-testid={`capture-scope-${k}`} />
+                    {label}
+                  </label>
+                ))}
+              </fieldset>
+              {sameCamera && (
+                <p className="text-amber-300" data-testid="capture-same-camera">
+                  {scope === "model" ? "The reference frame is from the same camera model as the photos to move. Choose another model, or the body scope." : "Choose two different cameras (or move only the selected photos)."}
+                </p>
+              )}
               {(refId == null || tgtId == null) && (
                 <p className="text-amber-300" data-testid="capture-sync-hint">
                   {refId == null && tgtId == null ? "Choose a frame from each camera." : "Choose the other frame."} Tip: Cmd-click one photo from each camera in the grid, then press Cmd+Shift+T.
                 </p>
               )}
-              <p className="text-neutral-400" data-testid="capture-scope" data-scope={syncScope.kind}>
-                Scope: every {tgtCam} photo {syncScope.label} ({syncTargets.length.toLocaleString()}) moves. Photos hidden by the current filters are not changed.
+              <p className="text-neutral-400" data-testid="capture-scope" data-scope={scope}>
+                {scope === "selected" ? `Only the ${targetIds.length.toLocaleString()} selected photos move.` : `Every ${scopeNoun} photo of this project moves, whatever the grid shows${syncHidden > 0 ? ` (including ${syncHidden.toLocaleString()} hidden by the current filters)` : ""}.`}
               </p>
             </>
           )}
@@ -331,7 +387,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
               ? "Nothing to change"
               : changeCount === 0
                 ? "No photos would change"
-                : `${changeCount} ${changeCount === 1 ? "photo" : "photos"} will change${plan.offset != null ? ` (${formatOffset(plan.offset)})` : ""}${tab === "sync" ? `: all ${syncTargets.length.toLocaleString()} ${tgtCam} photos ${syncScope.label}` : ""}`}
+                : `${changeCount} ${changeCount === 1 ? "photo" : "photos"} will change${plan.offset != null ? ` (${formatOffset(plan.offset)})` : ""}${tab === "sync" ? (scope === "selected" ? ": the selected photos" : `: all ${syncCount.toLocaleString()} ${scopeNoun} photos in this project${syncHidden > 0 ? ` (including ${syncHidden.toLocaleString()} hidden by the current filters)` : ""}`) : ""}`}
           </div>
           {changeCount > 0 &&
             preview.map((p) => (
@@ -352,7 +408,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
         </button>
         <button
           onClick={() => void apply()}
-          disabled={!entries || busy || !plan.mode || (tab === "sync" && (camNames.length < 2 || refCam === tgtCam)) || (tab !== "revert" && changeCount === 0)}
+          disabled={!entries || busy || !plan.mode || (tab === "sync" && (camNames.length < 2 || sameCamera)) || (tab !== "revert" && changeCount === 0)}
           className="rounded bg-emerald-700 px-3 py-1.5 font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
           data-testid="capture-apply"
         >

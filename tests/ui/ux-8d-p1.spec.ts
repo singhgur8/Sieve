@@ -99,7 +99,7 @@ test.describe("P1-3 Sync two cameras", () => {
     await expect(page.getByTestId("capture-tgt-frame-chosen")).toHaveAttribute("data-id", "3");
     await expect(page.getByTestId("capture-ref-frame-chosen").locator("img")).toBeVisible();
     await expect(page.getByTestId("capture-tgt-frame-chosen").locator("img")).toBeVisible();
-    await expect(page.getByTestId("capture-scope")).toContainText("in the current view");
+    await expect(page.getByTestId("capture-scope")).toContainText("of this project moves");
     await shot(page, "p1-3-sync-pair");
   });
 });
@@ -113,30 +113,33 @@ test.describe("P1-1 Auto Sync (frontend)", () => {
     await expect(page.getByTestId("develop-view")).toBeVisible();
   }
 
-  test("Edit N selected turns Auto Sync on; a committed slider change syncs only that group to the others, one Cmd+Z reverts all", async ({ page }) => {
+  test("Edit N selected turns Auto Sync on; a committed change is ONE sync_delta (source + 2 targets), one Cmd+Z reverts the whole batch", async ({ page }) => {
     await editThree(page);
     await expect(page.getByTestId("auto-sync-switch")).toHaveAttribute("aria-checked", "true");
     await expect(page.getByTestId("sync-settings")).toContainText("Auto Sync · 3");
     await clearCalls(page);
     await setSlider(page, "contrast", 25);
-    await expect.poll(async () => (await calls(page, "sync_settings")).length).toBe(1);
-    const c = (await calls(page, "sync_settings"))[0].args;
-    expect(c.fields).toEqual(["contrast"]);
+    await expect.poll(async () => (await calls(page, "sync_delta")).length).toBe(1);
+    const c = (await calls(page, "sync_delta"))[0].args as any;
     expect(c.targetIds).toHaveLength(2);
     expect([c.sourceId, ...c.targetIds].sort()).toEqual([1, 2, 3]);
+    expect(c.before.contrast).toBe(0);
+    expect(c.after.contrast).toBe(25);
+    expect((await calls(page, "save_adjustments")).length).toBe(0);
+    expect((await calls(page, "sync_settings")).length).toBe(0);
+    await expect(page.getByTestId("paste-undo-batch")).toBeVisible();
     await page.keyboard.press("Meta+z");
-    // One Cmd+Z: the batch undo reverts the 2 synced photos, the edited photo's own entry goes with it.
     await expect.poll(async () => (await calls(page, "undo_edit_batch")).length).toBe(1);
-    await expect.poll(async () => (await calls(page, "undo_adjustments")).length).toBe(1);
+    expect((await calls(page, "undo_adjustments")).length).toBe(0); // atomic: the batch includes the source
   });
 
-  test("exposure is not synced (held back until the relative command) and says so", async ({ page }) => {
+  test("exposure and white balance sync too, as a change (relative), through the same single call", async ({ page }) => {
     await editThree(page);
-    await expect(page.getByTestId("auto-sync-note")).toContainText("Exposure and white balance are not synced yet");
+    await expect(page.getByTestId("auto-sync-note")).toContainText("Exposure and white balance");
     await clearCalls(page);
     await setSlider(page, "exposure", 0.5);
-    await expect.poll(async () => (await calls(page, "save_adjustments")).length).toBe(1);
-    await expect(page.getByTestId("notice").last()).toContainText("Exposure and white balance are not synced");
+    await expect.poll(async () => (await calls(page, "sync_delta")).length).toBe(1);
+    expect(((await calls(page, "sync_delta"))[0].args as any).after.exposure).toBe(0.5);
     expect((await calls(page, "sync_settings")).length).toBe(0);
   });
 

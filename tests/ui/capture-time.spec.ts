@@ -98,8 +98,8 @@ test.describe("edit capture time", () => {
     await expect(page.getByTestId("capture-time-dialog")).toHaveCount(0);
     await expect.poll(() => order(page)).not.toEqual(before);
     const edit = (await calls(page, "edit_capture_time"))[0];
-    expect(edit.args.mode).toEqual({ kind: "sync_cameras", referenceId: 2, targetId: 3 });
-    expect((edit.args.ids as number[]).every((i) => i % 3 === 0)).toBe(true);
+    expect(edit.args.mode).toEqual({ kind: "sync_cameras", referenceId: 2, targetId: 3, scope: "body" });
+    expect(edit.args.ids).toEqual([]); // project-wide: the backend finds every photo of the body
     await page.getByTestId("capture-undo").click();
     await expect.poll(() => order(page)).toEqual(before);
   });

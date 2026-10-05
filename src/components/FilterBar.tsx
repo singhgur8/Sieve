@@ -33,6 +33,7 @@ export function isFiltered(q: Query): boolean {
     q.excludeTags.length > 0 ||
     q.picks.length > 0 ||
     q.pickOrigin != null ||
+    q.suggested != null ||
     q.minRating != null ||
     q.maxRating != null ||
     q.colorLabels.length > 0 ||
@@ -150,6 +151,16 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
             {p.label} <span className="opacity-70">{pickCount(p.key)}</span>
           </button>
         ))}
+        {query.suggested != null && (
+          <button
+            data-testid="filter-suggested"
+            onClick={() => setQuery((q) => ({ ...q, suggested: null }))}
+            title="Only photos Sieve suggests rejecting (nothing is flagged yet). Click to show every photo"
+            className={`${chip} flex items-center gap-1 bg-sky-800 text-sky-100 ring-1 ring-white/30`}
+          >
+            {query.suggested === "reject" ? "Suggested rejects" : query.suggested === "pick" ? "Suggested picks" : "Suggested stars"} <X className="size-3" aria-label="Remove" />
+          </button>
+        )}
         {query.pickOrigin != null && (
           <button
             data-testid="filter-origin"
@@ -293,6 +304,7 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   const parts: string[] = [];
   q.includeTags.forEach((t) => parts.push(tagName(t)));
   q.excludeTags.forEach((t) => parts.push(`no ${tagName(t)}`));
+  if (q.suggested) parts.push(q.suggested === "reject" ? "suggested rejects" : q.suggested === "pick" ? "suggested picks" : "suggested stars");
   const origin = originLabel(q);
   if (origin) parts.push(origin);
   else q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));
