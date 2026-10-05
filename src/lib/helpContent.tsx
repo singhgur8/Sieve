@@ -141,7 +141,7 @@ export const HELP: HelpEntry[] = [
           "Z picks, X rejects, U clears the flag. P also picks.",
           "0 to 5 sets the stars. 6 to 9 set a color label.",
           "Shift+Z and Shift+X flag and then move to the next photo.",
-          "Left / Right move between photos. Space opens the Loupe, and in the Loupe it zooms between Fit and 1:1.",
+          "Left / Right move between photos. Space opens the Loupe. In the Loupe, Compare and Develop, Space (or a click in the Loupe) zooms between Fit and 1:1 at the point under the cursor, and the zoom and position stay while you step with Left / Right. The zoom buttons add Fill, 50%, 200% and 400%; drag to pan.",
           "C opens Compare: two photos side by side. Tab switches the active pane. K makes the active frame the best of its burst and picks it.",
           "Cmd+Z undoes the last culling change.",
         ],
@@ -239,6 +239,33 @@ export const HELP: HelpEntry[] = [
           "Do not save from both apps at the same moment. Save in one, then switch to the other.",
         ],
       },
+    ],
+  },
+  {
+    id: "capture-time",
+    title: "Capture time and photo info",
+    keywords: "date time clock camera sync shift hours timezone daylight saving two cameras edit capture time metadata exif info panel",
+    blocks: [
+      { p: "Open Photo info (the Info button, or Cmd+I) to see the selected photo's capture date and time, camera, lens, exposure, size, GPS and sidecar. It follows your selection. The Metadata filter in the filter bar is different: it filters the whole gallery by camera, lens, ISO and so on." },
+      { p: "Camera clock wrong? Edit capture time (Photo info, More menu or Cmd+Shift+T) works like Lightroom's Edit Capture Time:" },
+      {
+        ul: [
+          "Shift by hours / minutes: moves the selected photos by the same amount (for example -1 h after forgetting daylight saving).",
+          "Set exact time: gives the active photo its true time; the other selected photos move by the same amount.",
+          "Sync two cameras: pick one frame from each camera that was taken at the same moment. Every photo of the second camera moves so its frame matches the first camera. A preview shows before and after.",
+          "Revert to original: back to the time stored in the file.",
+        ],
+      },
+      { p: "Sorting, bursts and scenes use the corrected time, so a mixed two-camera shoot falls into the right order. The original files are never changed; the correction is saved in the XMP sidecars (Lightroom corrections are picked up from them). Undo from the message, or Revert to original. The original time is shown next to the corrected one." },
+    ],
+  },
+  {
+    id: "reject-strictness",
+    title: "Reject strictness",
+    keywords: "conservative balanced aggressive suggestions reject auto cull strict",
+    blocks: [
+      { p: "In the Cull step, Reject strictness sets how readily Sieve suggests rejecting a photo, per project. Conservative: only clear failures. Balanced: the default. Aggressive: also burst duplicates, any closed eyes on the main subject and soft focus." },
+      { p: "Changing it re-evaluates the suggestions (the count next to it updates). Nothing is rejected until you press Apply suggestions, and you can undo that." },
     ],
   },
   {

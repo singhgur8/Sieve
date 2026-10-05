@@ -84,6 +84,9 @@ pub fn reject_if_clearly_worse(q: &mut QualityScore, keeper: &QualityScore, rule
     if keeper_defect {
         return false;
     }
+    if rule.same_face_only && (keeper.eyes_open.is_none() || q.eyes_open.is_none()) {
+        return false;
+    }
     let gap = |k: Option<f32>, m: Option<f32>| k.zip(m).map(|(k, m)| k - m);
     let clearly = gap(keeper.eyes_open, q.eyes_open).is_some_and(|d| d >= rule.eyes_gap)
         || gap(keeper.face_sharpness, q.face_sharpness).is_some_and(|d| d >= rule.face_sharpness_gap)
@@ -304,9 +307,19 @@ mod tests {
         // Face clearly softer.
         let mut soft = quality(0.8, Some(0.5), 0.8, Some(1.0));
         assert!(reject_if_clearly_worse(&mut soft, &keeper, balanced));
-        // Much lower overall score.
+        // Balanced compares the same judged face(s) only: a much lower overall score, or a
+        // frame whose eyes could not be judged (profile, other person), is not enough.
+        let mut low = quality(0.65, Some(0.65), 0.8, Some(1.0));
+        assert!(!reject_if_clearly_worse(&mut low, &keeper, balanced));
+        let mut unjudged = quality(0.5, Some(0.4), 0.8, None);
+        assert!(!reject_if_clearly_worse(&mut unjudged, &keeper, balanced));
+        let mut no_eyes_keeper = keeper.clone();
+        no_eyes_keeper.eyes_open = None;
+        let mut m = quality(0.5, Some(0.4), 0.8, Some(1.0));
+        assert!(!reject_if_clearly_worse(&mut m, &no_eyes_keeper, balanced));
+        // Aggressive also takes a clearly lower overall score.
         let mut low = quality(0.65, None, 0.8, None);
-        assert!(reject_if_clearly_worse(&mut low, &keeper, balanced));
+        assert!(reject_if_clearly_worse(&mut low, &keeper, RejectStrictness::Aggressive.rules().burst));
         // Conservative never rejects for the burst; aggressive takes smaller gaps.
         let mut c = quality(0.5, Some(0.2), 0.8, Some(0.2));
         assert!(!reject_if_clearly_worse(&mut c, &keeper, RejectStrictness::Conservative.rules().burst));

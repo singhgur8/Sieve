@@ -19,7 +19,7 @@ use tauri_specta::Event;
 use super::bursts::{
     add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts, reject_if_clearly_worse,
 };
-use super::scoring::score_with;
+use super::scoring::{score_with, RejectStrictness};
 use super::store::{self, BurstRow};
 use super::{AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
 use crate::db::{self, now_ms, projects, repo};
@@ -292,7 +292,6 @@ fn run_queue(
 
         // Each image is scored with its project's shoot type (IPC v14).
         let mut shoot = ShootTypes::default();
-        let strictness = store::reject_strictness(conn)?;
         for (id, _) in &batch {
             shoot.of_image(conn, *id)?;
         }
@@ -316,6 +315,7 @@ fn run_queue(
                 let recorded = match out.result {
                     Ok(metrics) => {
                         let (shoot_type, thresholds) = shoot.of_image(conn, out.id)?;
+                        let strictness = projects::reject_strictness_of_image(conn, out.id)?;
                         let scored = score_with(&metrics, &thresholds, shoot_type, strictness);
                         let recorded = store::record_measured(conn, out.id, &metrics, &scored)?;
                         if recorded {
@@ -371,8 +371,6 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let conn: &Connection = &tx;
     let mut shoot = ShootTypes::default();
-    let strictness = store::reject_strictness(conn)?;
-    let burst_rule = strictness.rules().burst;
     let window: u32 = conn
         .query_row("SELECT value FROM catalog_meta WHERE key = 'burst_window_ms'", [], |r| r.get::<_, String>(0))?
         .parse()
@@ -381,6 +379,7 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let mut scored = Vec::with_capacity(analyzed.len());
     for a in &analyzed {
         let (shoot_type, thresholds) = shoot.of_folder(conn, a.folder_id, a.id)?;
+        let strictness = shoot.strictness_of_folder(conn, a.folder_id, a.id)?;
         scored.push(score_with(&a.metrics, &thresholds, shoot_type, strictness));
     }
 
@@ -397,6 +396,8 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     for (folder, frames) in &by_folder {
         let Some((first, _)) = frames.first() else { continue };
         let burst_hash_distance = shoot.of_folder(conn, *folder, first.id)?.1.burst_hash_distance;
+        // A folder belongs to one project: one strictness for its bursts.
+        let burst_rule = shoot.strictness_of_folder(conn, *folder, first.id)?.rules().burst;
         let index: std::collections::HashMap<ImageId, usize> = frames.iter().map(|(f, i)| (f.id, *i)).collect();
         let times: std::collections::HashMap<ImageId, i64> =
             frames.iter().map(|(f, _)| (f.id, f.captured_at_ms)).collect();
@@ -456,6 +457,7 @@ struct ShootTypes {
     by_image: HashMap<ImageId, ShootType>,
     by_folder: HashMap<i64, ShootType>,
     thresholds: HashMap<ShootType, CullThresholds>,
+    strictness_by_folder: HashMap<i64, RejectStrictness>,
 }
 
 impl ShootTypes {
@@ -478,6 +480,17 @@ impl ShootTypes {
             }
         };
         self.thresholds(conn, st)
+    }
+
+    /// Reject strictness of `folder`'s project (IPC v19), resolved through one of its
+    /// images (`image`); `balanced` outside a project.
+    fn strictness_of_folder(&mut self, conn: &Connection, folder: i64, image: ImageId) -> AppResult<RejectStrictness> {
+        if let Some(s) = self.strictness_by_folder.get(&folder) {
+            return Ok(*s);
+        }
+        let s = projects::reject_strictness_of_image(conn, image)?;
+        self.strictness_by_folder.insert(folder, s);
+        Ok(s)
     }
 
     /// Shoot type of `folder`, resolved through one of its images (`image`).
@@ -669,7 +682,12 @@ mod tests {
             conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = ?1", [id], |r| r.get(0)).unwrap()
         };
         // Default (balanced): the clearly softer frame is a reject, its burst reason first.
-        assert_eq!(store::reject_strictness(&conn).unwrap(), crate::ml::scoring::RejectStrictness::Balanced);
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, shoot_type, created_at) VALUES (10, 'w', 'wedding', 0);
+             UPDATE folders SET project_id = 10 WHERE id = 1;",
+        )
+        .unwrap();
+        assert_eq!(projects::reject_strictness_of_image(&conn, 1).unwrap(), RejectStrictness::Balanced);
         rescore_all(&mut conn).unwrap();
         assert_eq!(repo::list_burst_groups(&conn, None).unwrap()[0].keeper_image_id, Some(2));
         assert_eq!(pick(&conn, 1), "reject");
@@ -679,12 +697,7 @@ mod tests {
         assert_eq!(pick(&conn, 3), "unflagged", "a near-equal frame stays a candidate");
         assert_eq!(pick(&conn, 2), "pick");
         // Conservative: burst frames are never rejected for being worse duplicates.
-        conn.execute(
-            "INSERT INTO catalog_meta (key, value) VALUES (?1, 'conservative')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [store::REJECT_STRICTNESS_KEY],
-        )
-        .unwrap();
+        projects::set_project_reject_strictness(&conn, 10, RejectStrictness::Conservative).unwrap();
         rescore_all(&mut conn).unwrap();
         assert_eq!(pick(&conn, 1), "unflagged");
         assert_eq!(reasons_of(&conn, 1)[0].kind, SuggestionReasonKind::DuplicateBurst);

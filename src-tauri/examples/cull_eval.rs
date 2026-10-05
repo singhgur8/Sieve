@@ -22,9 +22,8 @@ use std::time::Instant;
 
 use sieve_lib::db::{self, projects, repo};
 use sieve_lib::ipc::events::{AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady};
+use sieve_lib::ipc::types::RejectStrictness;
 use sieve_lib::ipc::types::{CullThresholds, ShootType};
-use sieve_lib::ml::scoring::RejectStrictness;
-use sieve_lib::ml::store;
 use sieve_lib::ml::worker::{self, AnalysisSink};
 use sieve_lib::ml::{AnalysisConfig, Analyzer};
 
@@ -88,13 +87,13 @@ fn main() {
     }
     if let Some(level) = arg(&args, "--strictness") {
         let level = RejectStrictness::parse(&level).expect("conservative | balanced | aggressive");
-        conn.execute(
-            "INSERT INTO catalog_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [store::REJECT_STRICTNESS_KEY, level.as_str()],
-        )
-        .unwrap();
+        for p in projects::list_projects(&conn).unwrap() {
+            projects::set_project_reject_strictness(&conn, p.id, level).unwrap();
+        }
     }
-    println!("reject strictness: {}", store::reject_strictness(&conn).unwrap().as_str());
+    let levels: Vec<&str> =
+        projects::list_projects(&conn).unwrap().iter().map(|p| p.reject_strictness.as_str()).collect();
+    println!("reject strictness (per project): {levels:?}");
     if let Some(json) = arg(&args, "--thresholds") {
         let mut v = serde_json::to_value(repo::cull_thresholds(&conn, shoot).unwrap()).unwrap();
         let patch: serde_json::Value = serde_json::from_str(&json).expect("thresholds JSON");

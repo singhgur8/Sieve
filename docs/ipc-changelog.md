@@ -839,6 +839,108 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v19 — 2026-10-05 (Phase 8d: capture time, metadata panel, Transform / Upright, preset tracking, paste batches, reject strictness)
+
+Schema v17 (`migrations/0017_capture_transform.sql`): `images.exif_captured_at_ms` (backfilled from
+`captured_at_ms`), `images.capture_time_source` (`exif` | `sidecar` | `user`, default `exif`);
+`adjustments.applied_preset_id` (FK presets, `ON DELETE SET NULL`) + `adjustments.applied_preset_json`;
+`projects.reject_strictness` (`conservative` | `balanced` | `aggressive`, default `balanced`); `edit_batches.kind`
+CHECK accepts `paste` (writable_schema edit, as 0009).
+
+Capture time (a)
+- `CaptureMeta.capturedAtMs` is now the **corrected** time (what sort, bursts, scenes, metadata filters, export
+  naming and project ranges use; no query changed). New `CaptureMeta.originalCapturedAtMs` (the file's EXIF time,
+  never edited) and `CaptureMeta.captureTimeSource: CaptureTimeSource` (`exif` | `sidecar` | `user`); both
+  `#[serde(default)]` (optional in TS, always sent).
+- `edit_capture_time(ids, mode: CaptureTimeEdit) -> CaptureTimeEditResult {changedIds, skippedIds, offsetMs,
+  previous: CaptureTimeSnapshot[]}`. Modes (tagged `kind`): `shift {offsetMs}`, `set_exact {referenceId,
+  capturedAtMs}` (reference must be in `ids`; others shift by the same offset; a reference without a time just
+  gets it), `sync_cameras {referenceId, targetId}` (offset = reference - target, applied to `ids`; both need a
+  time), `revert` (back to the EXIF time). Photos without a time are skipped. Atomic; duplicate id / out of
+  1900..2200 (`MIN_CAPTURE_TIME_MS` / `MAX_CAPTURE_TIME_MS`) -> `invalid_argument`. Marks sidecars dirty,
+  notifies auto-sync, refreshes scene bounds, kicks a rescore (bursts regroup).
+- `restore_capture_times(snapshots: CaptureTimeSnapshot[]) -> number[]` (undo / redo; changed ids).
+- Extraction (`repo::record_extraction`) writes `exif_captured_at_ms` and touches `captured_at_ms` only while the
+  source is `exif`, so re-extraction keeps corrections.
+- Helper for the XMP read path: `db::capture_time::apply_sidecar_time(conn, id, Option<naive ms>)` (equal to EXIF
+  or `None` -> `exif`; different -> `sidecar`; does not mark dirty).
+
+Per-photo metadata (b)
+- `get_image_metadata(id) -> ImageMetadata {imageId, path, fileName, folderPath, format, extension, fileSize,
+  fileMtimeMs, capturedAtMs, originalCapturedAtMs, captureTimeSource, camera, lens, iso, shutterSeconds, aperture,
+  focalLengthMm, focalLength35mm, exposureCompensationEv, flashFired, cameraSerial, width, height, orientation,
+  gps: GpsLocation {latitude, longitude, altitudeM} | null, sidecarPath, sidecarExists, companionPath, missing}`.
+  Catalog values are filled now; `focalLength35mm`, `exposureCompensationEv`, `flashFired`, `cameraSerial`, `gps`
+  are `null` until rust-engine-dev reads them from the file.
+
+Transform / Upright (c)
+- `ParametricAdjustments.transform: TransformSettings` (`#[serde(default)]`) = `{upright: UprightMode, guides:
+  UprightGuide[] (<= 4, sensor frame), vertical, horizontal (-100..100), rotate (-10..10 deg), aspect (-100..100),
+  scale (50..150, default 100), offsetX, offsetY (-100..100), constrainCrop, solution: UprightSolution | null}`.
+  `UprightMode` = `off | auto | level | vertical | full | guided` (`crs:PerspectiveUpright` 0 / 1 / 3 / 4 / 2 / 5:
+  `crs_value` / `from_crs`). `UprightSolution {mode, matrix: number[9] (row-major homography, corrected ->
+  source, sensor frame normalized), rotationDeg, crs: CrsProperty[] (Lightroom's Upright* values verbatim)}`.
+  `crs:` mapping table on `TransformSettings` (rust doc) and in architecture.md. Default is neutral, so `hasEdits`
+  / `neutral` are unchanged for existing rows.
+- `AdjustmentField::Transform` (`"transform"`): in `ALL`, `PASTE_PREVIOUS` and the Copy Settings "Transform" item
+  (now supported); not in `DEFAULT_SYNC` (per-frame geometry, like crop). `lerp`: the nearer side's.
+- `auto_upright(id, mode, adjustments | null) -> UprightResult {mode, solution | null, message | null}` (nothing
+  saved). **Stub**: no solution, message "Upright is not available yet".
+- TS mirrors updated (`completeAdjustments`, `ADJUSTMENT_FIELD_SET` / labels, `copyAdjustmentFields`,
+  `DEFAULT_SYNC_FIELDS`, `lerpAdjustments`).
+
+Applied preset + preview variants (d)
+- `AdjustmentHistory.appliedPresetId: number | null` (`#[serde(default)]`): set by `apply_preset`, reported while
+  every group in the preset's `fields` still equals what the apply produced (any owned change, undo past it, or
+  another preset clears it; redo restores it; deleting the preset clears it). Returned by `save_adjustments`,
+  `get_history`, undo / redo / goto.
+- `render_preview_variant(id, adjustments, variant: PreviewVariant, options) -> RenderedPreview | null`, variant
+  `preset {presetId}` (= `resolve_preset` on top of the live settings) or `without_fields {fields}` (those groups
+  back at the format defaults). No save, no history. Same latest-wins / `sieve://` path as `render_preview`.
+- `RenderSlot::Preview` (`"preview"`): use it for these renders so the `main` render stays (hover-out /
+  release = show the last `main` URL). TS `Record<RenderSlot, ...>` literals need a `preview` key (fixed in
+  `useEditor.ts`).
+
+Batch edits (e)
+- `paste_settings`, `sync_settings`, `paste_previous` now return `EditBatchResult` (was `null`) and record one
+  undoable batch of new kind `EditBatchKind::Paste` (`"paste"`); duplicates in the id list are ignored (were
+  applied twice); `batchId = null` when nothing changed; `undo_edit_batch(batchId)` takes the whole paste back
+  (linear-undo rules as for scene applies). History labels / `EditSource::Pasted` unchanged.
+
+Reject strictness (f)
+- `RejectStrictness` (`conservative | balanced | aggressive`, default `balanced`); `Project.rejectStrictness`;
+  `set_project_reject_strictness(projectId, strictness) -> null` (kicks a rescore; unknown -> `not_found`).
+  `db::projects::reject_strictness_of_image(conn, id)` for the scorer.
+
+Mock backend (`src/testing/mockBackend.ts`)
+- All new commands; capture times carry `originalCapturedAtMs` / `captureTimeSource`; `?twocams=1` makes every 3rd
+  frame a Canon EOS R5 (`IMG_xxxxx.CR3`) whose clock is 1 h ahead (sync-cameras fixture); `get_image_metadata`
+  gives GPS on every 5th frame; `auto_upright` returns a small rotation homography (`?upright=none` = no lines;
+  Guided needs 2 guides); paste / sync / paste previous record `paste` batches; `appliedPresetId` tracked;
+  projects carry `rejectStrictness`.
+
+Who updates what
+- architect (done): types, schema v17, commands + registration, `db::capture_time` (edit / restore / sidecar helper
+  / catalog metadata), extraction keeps corrections, `history::applied_preset` + `record_applied_preset`
+  (`styles::apply_preset` records), `styles::resolve_preview_variant`, `batches::apply_fields_recorded`, projects
+  SQL, Rust tests, bindings, TS mirrors, mock, `useEditor.ts` compile fix.
+- rust-engine-dev: XMP read: corrected time from `exif:DateTimeOriginal` (else `photoshop:DateCreated`; naive ms
+  incl. fractional seconds, ignore the zone offset like EXIF) via `db::capture_time::apply_sidecar_time`; XMP write:
+  when `capture_time_source != 'exif'` write `exif:DateTimeOriginal` + `photoshop:DateCreated`
+  (`YYYY-MM-DDTHH:MM:SS.ss`), when `exif` remove only values Sieve wrote (never clobber Lightroom's). `crs:` read /
+  write of `transform` per the mapping table (drop Perspective / Upright from `crs::unsupported_warnings` and from
+  the preserved-only list; keep `solution.crs` verbatim while the mode is unchanged; imported presets' Perspective
+  keys -> `AdjustmentField::Transform` in `styles/preset_file.rs`). Render + export: apply `solution` (when
+  `solution.mode == upright`) and the manual sliders before the crop, `constrainCrop`. Fill the file-read fields of
+  `get_image_metadata`. Upright solver (homography from detected lines) for `auto_upright`.
+- vision-ml-dev: line detection for `auto_upright` (Level / Vertical / Full / Auto / Guided); reject strictness in
+  the scorer (`projects::reject_strictness_of_image`, memoize like `ShootTypes` in `ml/worker.rs`).
+- frontend-dev: Metadata panel (`getImageMetadata`), Edit Capture Time dialog (`editCaptureTime` + undo via
+  `restoreCaptureTimes(result.previous)`; refetch `changedIds`); Transform panel (`transform`, `autoUpright`); preset
+  highlight from `AdjustmentHistory.appliedPresetId`; hover preview / press-and-hold via `renderPreviewVariant` in
+  slot `preview`; paste / sync results (`EditBatchResult`) into the batch undo UI; reject strictness control
+  (`Project.rejectStrictness`, `setProjectRejectStrictness`).
+
 ## v18.1 — 2026-10-03 (UX review 8c P1-1, P1-6)
 
 Suggestions pending = what Apply changes (P1-1)

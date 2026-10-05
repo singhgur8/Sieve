@@ -82,11 +82,11 @@ function MetaToggle({ query }: Pick<Props, "query">) {
         data-testid="meta-toggle"
         aria-pressed={open}
         onClick={() => setMetaRowOpen(!open)}
-        aria-label="Metadata"
-        title="Metadata: filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar"
+        aria-label="Metadata filter"
+        title="Metadata filter (all photos in view): filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar. For one photo's details open Photo info (Info button)"
         className={`${chip} flex items-center gap-1 ${open ? "bg-sky-800 text-sky-100" : off}`}
       >
-        <ListFilter className="size-3" /> <span className="hidden min-[1440px]:inline">Metadata</span>
+        <ListFilter className="size-3" /> <span className="hidden min-[1440px]:inline">Metadata filter</span>
         {n > 0 && <span className="opacity-80" data-testid="meta-active-count">{n}</span>}
       </button>
     </>

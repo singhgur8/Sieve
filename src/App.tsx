@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ActivityKind, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -44,6 +44,9 @@ import { HelpPanel } from "./components/HelpPanel";
 import { openHelp, useHelpState } from "./lib/helpStore";
 import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
+import { PhotoInfoPanel } from "./components/PhotoInfoPanel";
+import { CaptureTimeDialog } from "./components/CaptureTimeDialog";
+import { formatOffset } from "./lib/captureTime";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount, useModalCount } from "./lib/modal";
@@ -102,6 +105,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [healthDismissed, setHealthDismissed] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [captureOpen, setCaptureOpen] = useState<number[] | null>(null);
   useModels(); // keeps the download listeners alive so mask capabilities refresh even when no panel is open
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
@@ -929,6 +934,56 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     });
 
   /** Keeper rule changed from the Cull summary / Export dialog (the Edit plan has its own path through `wf`). */
+  /** Edit Capture Time: apply, refresh order / entries / panel, and offer Undo (restore_capture_times). */
+  const applyCaptureTime = useCallback(
+    async (target: number[], mode: CaptureTimeEdit, label: string) => {
+      try {
+        const res = await unwrap(commands.editCaptureTime(target, mode));
+        setCaptureOpen(null);
+        await rawLib.reload();
+        await rawLib.refreshAll();
+        status.refreshXmp();
+        if (res.changedIds.length === 0) return setNotice("No capture times changed");
+        const undo = async () => {
+          try {
+            await unwrap(commands.restoreCaptureTimes(res.previous));
+            await rawLib.reload();
+            await rawLib.refreshAll();
+            status.refreshXmp();
+            setNotice(`Undid: ${label}`);
+          } catch (e) {
+            reportError(e);
+          }
+        };
+        const off = res.offsetMs != null ? ` (${formatOffset(res.offsetMs)})` : "";
+        push(`${mode.kind === "revert" ? "Reverted" : "Changed"} capture time of ${plural(res.changedIds.length, "photo")}${mode.kind === "shift" || mode.kind === "revert" ? "" : off}${mode.kind === "shift" ? off : ""}`, {
+          action: { label: "Undo", testid: "capture-undo", onClick: () => void undo() },
+        });
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rawLib, status.refreshXmp, setNotice, push, reportError],
+  );
+
+  const changeRejectStrictness = useCallback(
+    async (strictness: RejectStrictness) => {
+      if (projectId == null) return;
+      try {
+        await unwrap(commands.setProjectRejectStrictness(projectId, strictness));
+        await refreshProject();
+        cullSum.refresh();
+        await rawLib.refreshAll();
+        setNotice(`Reject strictness: ${strictness}. Suggestions are being updated`);
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, refreshProject, cullSum.refresh, rawLib, setNotice, reportError],
+  );
+
   const changeKeeperRule = useCallback(
     async (rule: KeeperRule) => {
       try {
@@ -1137,6 +1192,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return develop.current?.cropSwap();
       case "cropLock":
         return develop.current?.cropLock();
+      case "cropOverlay":
+        return develop.current?.cropOverlay();
+      case "cropOverlayRotate":
+        return develop.current?.cropOverlayRotate();
+      case "cropReset":
+        return develop.current?.cropReset();
       case "panelsToggle":
         return toggleSidePanels();
       case "panelsHide":
@@ -1166,6 +1227,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return cmp ? focusPane(cmp.focus === "a" ? "b" : "a") : undefined;
       case "scenesToggle":
         return toggleScenes();
+      case "photoInfo":
+        return setInfoOpen((v) => !v);
+      case "captureTime": {
+        const t = targets();
+        if (t.length > 0) setCaptureOpen(t);
+        return;
+      }
       case "selectAll":
         return sel.selectAll();
       case "selectNone":
@@ -1373,6 +1441,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         onExport={() => void openExport()}
         onCheatSheet={() => setCheatOpen(true)}
         onModels={() => setModelsOpen(true)}
+        infoOpen={infoOpen}
+        onInfo={() => setInfoOpen((v) => !v)}
+        onCaptureTime={() => {
+          const t = targets();
+          if (t.length > 0) setCaptureOpen(t);
+        }}
         onLocate={() => locateFolder()}
         onRegenerate={() =>
           void run(async () => {
@@ -1405,6 +1479,19 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       {restoreOpen && catalog && <RestoreBackupDialog backups={catalog.health.backups} onCancel={() => setRestoreOpen(false)} onRestore={restoreBackup} />}
       {modelsOpen && <ModelsDialog onClose={() => setModelsOpen(false)} />}
+      {infoOpen && (
+        <PhotoInfoPanel
+          imageId={mode === "compare" && cmp ? cmp[cmp.focus] : (active ?? null)}
+          refetchKey={`${lib.epoch}:${active != null ? lib.version(active) : 0}`}
+          onClose={() => setInfoOpen(false)}
+          onEditTime={() => {
+            const t = targets();
+            if (t.length > 0) setCaptureOpen(t);
+          }}
+          onRevert={(id) => void applyCaptureTime([id], { kind: "revert" }, "Reverted capture time to original")}
+        />
+      )}
+      {captureOpen && <CaptureTimeDialog targetIds={captureOpen} activeId={active ?? null} viewIds={ids} onApply={applyCaptureTime} onCancel={() => setCaptureOpen(null)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
           selected={applyOpen.selected}
@@ -1489,7 +1576,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             filters={filtersOpen ? <FilterExtras query={uiQuery} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
           {project && step === "cull" && cullSum.summary && (
-            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} />
+            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} strictness={project.rejectStrictness} onStrictness={(v) => void changeRejectStrictness(v)} />
           )}
         </>
         )

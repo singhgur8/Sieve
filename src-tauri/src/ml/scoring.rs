@@ -100,18 +100,14 @@ pub const GROSS_DARK_LUMA: f32 = 0.04;
 /// the photographer keeps: tag + lowest stars, never an automatic reject.
 pub const SEVERE_GLOBAL_MARGIN: f32 = 0.05;
 
-/// How readily confident defects become a suggested reject (Phase 8d). `Conservative` is
-/// the Phase 7b behaviour (only defects beyond recovery); `Balanced` (default) also rejects
-/// clear missed focus / motion blur, closed eyes on the main subject, badly exposed frames
-/// and burst frames whose best frame is clearly better; `Aggressive` rejects every
-/// focus / motion / blink defect and smaller burst gaps. Calibration: `docs/decisions.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum RejectStrictness {
-    Conservative,
-    #[default]
-    Balanced,
-    Aggressive,
-}
+/// How readily confident defects become a suggested reject: the project's setting
+/// (IPC v19, `projects.reject_strictness`). `Conservative` is the Phase 7b behaviour (only
+/// defects beyond recovery); `Balanced` (default) also rejects clear missed focus / motion
+/// blur and closed eyes on a main-subject face, badly exposed frames and burst frames whose
+/// best frame is clearly better on the same face; `Aggressive` rejects every focus / motion /
+/// blink defect and smaller burst gaps. Thresholds: [`RejectStrictness::rules`];
+/// calibration: `docs/decisions.md`.
+pub use crate::ipc::types::RejectStrictness;
 
 /// Burst non-keepers are rejected when the burst's best frame is clearly better in one of
 /// these (and has no focus / blink defect itself): eyes more open, primary face sharper,
@@ -121,6 +117,9 @@ pub struct BurstReject {
     pub eyes_gap: f32,
     pub face_sharpness_gap: f32,
     pub overall_gap: f32,
+    /// Only compare when both frames have judged eyes (the same frontal face(s) seen in
+    /// both); otherwise the "better" frame may show a different person or angle.
+    pub same_face_only: bool,
 }
 
 /// Which closed-eye frames are rejected (only where eyes matter: not Landscape / Sports).
@@ -154,23 +153,17 @@ pub struct RejectRules {
     /// `overall` below max(this, `rejectMaxOverall`) rejects (stacked weaknesses).
     pub low_overall: f32,
     pub burst: Option<BurstReject>,
+    /// Focus / motion / blink reject only when a face is the main subject: the face that
+    /// decided is frontal and at least [`MAIN_SUBJECT_REL`] x the largest face; a frame with
+    /// a person whose face cannot be judged (turned away, profile) is not rejected on
+    /// whole-frame softness (ring / hand detail shots, backs).
+    pub main_subject_only: bool,
 }
 
+/// A face this share of the largest considered face's height (or more) is a main subject.
+pub const MAIN_SUBJECT_REL: f32 = 0.8;
+
 impl RejectStrictness {
-    pub const ALL: [RejectStrictness; 3] = [Self::Conservative, Self::Balanced, Self::Aggressive];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Conservative => "conservative",
-            Self::Balanced => "balanced",
-            Self::Aggressive => "aggressive",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|v| v.as_str() == s)
-    }
-
     pub fn rules(self) -> RejectRules {
         match self {
             Self::Conservative => RejectRules {
@@ -183,6 +176,7 @@ impl RejectStrictness {
                 frame_blown: GROSS_FRAME_BLOWN,
                 low_overall: 0.0,
                 burst: None,
+                main_subject_only: true,
             },
             Self::Balanced => RejectRules {
                 focus_global_margin: 0.0,
@@ -193,7 +187,13 @@ impl RejectStrictness {
                 face_blown: 0.35,
                 frame_blown: 0.7,
                 low_overall: 0.2,
-                burst: Some(BurstReject { eyes_gap: 0.3, face_sharpness_gap: 0.15, overall_gap: 0.2 }),
+                burst: Some(BurstReject {
+                    eyes_gap: 0.3,
+                    face_sharpness_gap: 0.15,
+                    overall_gap: f32::INFINITY,
+                    same_face_only: true,
+                }),
+                main_subject_only: true,
             },
             Self::Aggressive => RejectRules {
                 focus_global_margin: f32::INFINITY,
@@ -204,7 +204,13 @@ impl RejectStrictness {
                 face_blown: 0.25,
                 frame_blown: OVER_FRAME_BLOWN,
                 low_overall: 0.3,
-                burst: Some(BurstReject { eyes_gap: 0.15, face_sharpness_gap: 0.08, overall_gap: 0.1 }),
+                burst: Some(BurstReject {
+                    eyes_gap: 0.15,
+                    face_sharpness_gap: 0.08,
+                    overall_gap: 0.1,
+                    same_face_only: false,
+                }),
+                main_subject_only: false,
             },
         }
     }
@@ -553,15 +559,28 @@ pub fn score_with(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType, s
     // - stacked weaknesses (low `overall`).
     // Burst non-keepers are handled in `bursts::reject_if_clearly_worse`.
     let severe_focus = missed_focus.is_some() && m.global_sharpness < t.global_sharpness_min - SEVERE_GLOBAL_MARGIN;
+    // Main subject (see `RejectRules::main_subject_only`): a face verdict counts when the
+    // primary is a frontal face about as big as the largest; a whole-frame verdict only when
+    // no person's face is in a position to be the subject.
+    let main_face = |i: usize| m.faces[i].bbox.height >= MAIN_SUBJECT_REL * largest;
+    let subject_clear = !rules.main_subject_only
+        || if face_focus {
+            primary.is_some_and(|p| m.faces[p].frontal && main_face(p))
+        } else {
+            !(0..n).any(|i| subject[i] && judgeable(&m.faces[i]))
+        };
     let focus_reject = missed_focus.is_some()
+        && subject_clear
         && (m.global_sharpness < t.global_sharpness_min + rules.focus_global_margin
             || (face_focus && face_sharpness.is_some_and(|s| s < t.face_sharpness_min + rules.focus_face_margin)));
     let motion_ok_here = !matches!(shoot_type, ShootType::Sports) || strictness == RejectStrictness::Aggressive;
-    let motion_reject =
-        motion && motion_ok_here && m.global_sharpness < t.global_sharpness_min + rules.motion_global_margin;
+    let motion_reject = motion
+        && motion_ok_here
+        && subject_clear
+        && m.global_sharpness < t.global_sharpness_min + rules.motion_global_margin;
     let blink_matters = eyes_matter && !matches!(shoot_type, ShootType::Sports);
     let blink_reject = blink_matters
-        && !blinking.is_empty()
+        && blinking.iter().any(|&i| !rules.main_subject_only || main_face(i))
         && match rules.blink {
             BlinkReject::Never => false,
             BlinkReject::NotLaughing => !laughing,
@@ -988,6 +1007,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn balanced_rejects_need_a_face_as_main_subject() {
+        let t = default_thresholds(W);
+        use RejectStrictness::*;
+        let pick = |m: &ImageMetrics, s: RejectStrictness| score_with(m, &t, W, s).quality.suggested_pick;
+        // Ring / hand detail shot: a soft person whose face is turned away (not frontal), the
+        // whole frame soft-ish: no whole-frame focus reject while a person could be the subject.
+        let mut turned = face(0.4, 0.18, 0.3, 0.28);
+        turned.frontal = false;
+        let mut m = metrics(vec![turned]);
+        m.global_sharpness = t.global_sharpness_min - 0.01;
+        let s = score_with(&m, &t, W, Balanced);
+        assert!(has(&s, CullTag::MissedFocus));
+        assert_ne!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(pick(&m, Aggressive), PickFlag::Reject);
+        // The same soft frame without any person: rejected.
+        let mut m = metrics(vec![]);
+        m.global_sharpness = t.global_sharpness_min - 0.01;
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+        // Soft frontal face that is clearly smaller than another (turned) person's face:
+        // not the main subject, no balanced reject.
+        let mut big = face(0.1, 0.2, 0.3, 0.28);
+        big.frontal = false;
+        let mut m = metrics(vec![big, face(0.6, 0.12, 0.3, 0.28)]);
+        m.global_sharpness = t.global_sharpness_min - 0.02;
+        assert_ne!(pick(&m, Balanced), PickFlag::Reject);
+        // Closed eyes on a smaller background face (sharp, judged): tagged, no balanced reject.
+        let m = metrics(vec![face(0.1, 0.15, 0.7, 0.28), face(0.6, 0.11, 0.7, 0.05)]);
+        let s = score_with(&m, &t, W, Balanced);
+        assert!(has(&s, CullTag::Blink));
+        assert_ne!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(pick(&m, Aggressive), PickFlag::Reject);
+        // Two main subjects of the same size, one with closed eyes: rejected.
+        let m = metrics(vec![face(0.1, 0.15, 0.7, 0.28), face(0.6, 0.14, 0.7, 0.05)]);
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+    }
+
+    #[test]
     fn blink_rejects_follow_strictness_and_shoot_type() {
         use RejectStrictness::*;
         let closed = face(0.4, 0.15, 0.7, 0.05);
@@ -1023,7 +1079,7 @@ pub(crate) mod tests {
     #[test]
     fn conservative_matches_phase_7b_and_strictness_round_trips() {
         assert_eq!(RejectStrictness::default(), RejectStrictness::Balanced);
-        for s in RejectStrictness::ALL {
+        for &s in RejectStrictness::ALL {
             assert_eq!(RejectStrictness::parse(s.as_str()), Some(s));
         }
         assert_eq!(RejectStrictness::parse("strict"), None);
@@ -1295,7 +1351,7 @@ pub(crate) mod tests {
                                     m.highlights.blown = blown;
                                     m.tiles.anisotropy = aniso;
                                     m.tiles.p50 = p50;
-                                    for strictness in RejectStrictness::ALL {
+                                    for &strictness in RejectStrictness::ALL {
                                         let s = score_with(&m, &t, st, strictness);
                                         n += 1;
                                         let q = &s.quality;
