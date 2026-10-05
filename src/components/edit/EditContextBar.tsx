@@ -4,7 +4,7 @@ import type { SceneRow, Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import { Menu, menuItem } from "../Menu";
-import { AutoEditButton, StatusIcon } from "./bits";
+import { ApplyWhy, AutoEditButton, StatusIcon, applyBlock } from "./bits";
 
 interface Props {
   wf: Workflow;
@@ -17,6 +17,8 @@ interface Props {
   onMakeRep: (imageId: number) => void;
   onApplyOptions: (sceneId: number) => void;
   onReview: (sceneId: number, ids?: number[]) => void;
+  /** "Show" on the apply toast: the photos Apply skipped because the user edited them. */
+  onShowIds: (ids: number[], label: string) => void;
   onNextReview: () => void;
 }
 
@@ -38,6 +40,9 @@ export function EditContextBar(p: Props) {
   const busy = wf.busy != null || applying;
   const undo = row ? wf.sceneUndo(row.entry.sceneId) : null;
   const canApply = !!row && row.ui !== "todo" && row.ui !== "reset" && row.targets > 0 && !row.skipped;
+  const block0 = applyBlock(row);
+  // Opening the representative is pointless while it is the photo on screen.
+  const block = block0 && !block0.soft ? (isRep && block0.fix === "open" ? { ...block0, fix: undefined } : block0) : null;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
 
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
@@ -155,13 +160,19 @@ export function EditContextBar(p: Props) {
           disabled={!row || busy}
           onClick={() => row && wf.requestAutoEdit([row.entry.sceneId])}
         />
+        <ApplyWhy
+          block={block && !applying ? block : null}
+          testid="edit-apply-why"
+          className="max-w-[300px]"
+          onFix={(fix) => row && (fix === "open" ? p.onJump(row.entry.sceneId) : void wf.setSkipped(row.entry.sceneId, false))}
+        />
         <div className="flex">
           <button
             className="flex h-6 items-center whitespace-nowrap rounded-l-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid="edit-apply"
             disabled={!canApply || busy}
             title={applying ? BUSY_WHY.apply_scene : row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
-            onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview)}
+            onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview, p.onShowIds)}
           >
             {newKeepers > 0 ? `Apply to ${newKeepers} new` : `Apply to scene${row ? ` (${row.targets})` : ""}`}
           </button>
@@ -191,7 +202,7 @@ export function EditContextBar(p: Props) {
               return (
                 <div className="w-60 py-1">
                   {item("edit-apply-options", "Apply with options…", () => row && p.onApplyOptions(row.entry.sceneId), !canApply)}
-                  {item("edit-apply-exact", "Copy exactly (no matching)", () => row && void wf.applyScene(row.entry.sceneId, "exact", p.onReview), !canApply || busy)}
+                  {item("edit-apply-exact", "Copy exactly (no matching)", () => row && void wf.applyScene(row.entry.sceneId, "exact", p.onReview, p.onShowIds), !canApply || busy)}
                   {item("edit-undo-apply", "Undo apply", () => undo?.batch && void wf.undoBatch(undo.batch), !undo?.enabled, undo?.reason)}
                 </div>
               );

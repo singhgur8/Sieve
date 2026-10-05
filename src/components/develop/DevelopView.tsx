@@ -23,6 +23,7 @@ import { PeoplePicker } from "./PeoplePicker";
 import type { Frame } from "../../lib/maskGeom";
 import { formatShutter, LABEL_COLOR, trimNum } from "../../lib/format";
 import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
+import { registerFlush } from "../../lib/editFlush";
 import { AdjustPanel, type AutoApi } from "./AdjustPanel";
 import { useHoverPreview, useStyleLibrary } from "../../hooks/useDevelopV14";
 import { Dialog } from "../Dialog";
@@ -219,6 +220,17 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const editorRef = useRef(editor);
   editorRef.current = editor;
   const { info } = editor;
+  // Apply to scene / Match scene read the stored settings: they wait for these saves (lib/editFlush).
+  const flushA = editorA.flush;
+  const flushB = editorB.flush;
+  useEffect(
+    () =>
+      registerFlush(async () => {
+        await flushA();
+        await flushB();
+      }),
+    [flushA, flushB],
+  );
   const health = useEntryHealth(entry);
   // The original became reachable again (relocated folder): load the image that failed to open.
   const hadHealth = useRef(false);
