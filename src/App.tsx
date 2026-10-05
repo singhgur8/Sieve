@@ -1340,10 +1340,6 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       }
       case "copy":
         return develop.current?.copy();
-      case "copyAll":
-        return develop.current?.copyAll();
-      case "pasteAll":
-        return develop.current?.pasteAll();
       case "paste":
         if (mode === "develop") develop.current?.paste();
         else void pasteToSelection();
@@ -1734,6 +1730,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onNotice={setNotice}
             onCommitted={wf.noteCommit}
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
+            onBatch={wf.reportBatch}
             onBack={() => changeMode("grid")}
             onLocate={locateFolder}
             compare={cmp}

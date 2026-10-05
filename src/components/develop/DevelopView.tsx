@@ -79,9 +79,6 @@ export interface DevelopHandle {
   /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
   autoTone: () => void;
   autoWb: () => void;
-  /** Cmd+C / Cmd+V: copy every setting / paste them (one undoable step). */
-  copyAll: () => void;
-  pasteAll: () => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -93,6 +90,8 @@ interface Props {
   onNotice: (s: string) => void;
   /** Toast with an Undo action (multi-photo reset / preset). */
   onUndoToast: (msg: string, undo: () => void) => void;
+  /** Paste / sync result (v19 `EditBatchResult`): the workflow refreshes and shows the one-step Undo toast. */
+  onBatch: (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number) => Promise<boolean>;
   /** Photos whose history was just written by the user (commit, undo, batch edit): scene batch Undo offers must not outlive it. */
   onCommitted?: (ids: number[]) => void;
   onBack: () => void;
@@ -159,7 +158,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -217,6 +216,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     onCommitted: noteCommitted,
   });
   const editor = focusB ? editorB : editorA;
+  const onBatchRef = useRef(onBatch);
+  onBatchRef.current = onBatch;
   const editorRef = useRef(editor);
   editorRef.current = editor;
   const { info } = editor;
@@ -394,13 +395,6 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [run, afterBatch, onNotice],
   );
 
-  /** Current history entry of every photo (cap: bigger batches skip the Undo toast). */
-  const heads = useCallback(async (t: number[]): Promise<Map<number, number | null> | null> => {
-    if (t.length > 200) return null;
-    const m = new Map<number, number | null>();
-    for (const x of t) m.set(x, (await unwrap(commands.getHistory(x))).currentEntryId);
-    return m;
-  }, []);
 
   const doPaste = useCallback(() => {
     const c = getClipboard();
@@ -409,18 +403,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     if (!t.length) return;
     void run(async () => {
       await editor.flush();
-      const before = await heads(t);
-      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      // v19: one undoable batch (`EditBatchResult`); the workflow reports it with an Undo toast.
+      const r = await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
       await afterBatch(t);
-      const msg = `Pasted settings${t.length === 1 ? "" : ` to ${t.length} photos`}`;
-      if (!before) return onNotice(msg);
-      // Undo only the photos the paste changed (an unchanged photo has no new history entry).
-      const after = await heads(t);
-      const changed = t.filter((x) => after?.get(x) !== before.get(x));
-      if (changed.length === 0) return onNotice(`${msg} (no change)`);
-      onUndoToast(msg, undoBatch(changed, "paste"));
+      await onBatchRef.current(r, "Pasted settings", t.length);
     });
-  }, [targets, run, editor, afterBatch, onNotice, onUndoToast, heads, undoBatch]);
+  }, [targets, run, editor, afterBatch, onNotice]);
 
   /** Copy with `fields` (dialog confirm, or Alt-click with the remembered ones). */
   const copyWith = useCallback(
@@ -437,12 +425,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       const t = syncTargets;
       void run(async () => {
         await editor.flush();
-        await unwrap(commands.syncSettings(id, t, fields));
-        onNotice(`Synchronized ${fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`);
+        const r = await unwrap(commands.syncSettings(id, t, fields));
         await afterBatch(t);
+        await onBatchRef.current(r, `Synchronized ${fields.length} settings`, t.length);
       });
     },
-    [id, run, editor, afterBatch, onNotice, syncTargets],
+    [id, run, editor, afterBatch, syncTargets],
   );
 
   const doReset = useCallback(
@@ -480,17 +468,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         const t = targets();
         if (from == null || t.every((x) => x === from)) return onNotice("No previous photo to paste from");
         await editor.flush();
-        const before = await heads(t);
-        await unwrap(commands.pastePrevious(t, from, null));
+        const r = await unwrap(commands.pastePrevious(t, from, null));
         await afterBatch(t);
-        const msg = `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`;
-        if (!before) return onNotice(msg);
-        const after = await heads(t);
-        const changed = t.filter((x) => x !== from && after?.get(x) !== before.get(x));
-        if (changed.length === 0) return onNotice(`${msg} (no change)`);
-        onUndoToast(msg, undoBatch(changed, "paste from previous"));
+        await onBatchRef.current(r, `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`, t.length);
       }),
-    [run, targets, editor, heads, afterBatch, lib, onNotice, onUndoToast, undoBatch],
+    [run, targets, editor, afterBatch, lib, onNotice],
   );
 
   // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
@@ -771,10 +753,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       savePreset: () => setDialog({ kind: "preset" }),
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
-      copyAll: () => copyWith(rememberedCopyFields()),
-      pasteAll: doPaste,
     }),
-    [copyWith, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);

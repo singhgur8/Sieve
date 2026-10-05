@@ -78,8 +78,9 @@ export const Slider = memo(function Slider({
   const stepFor = (e: { shiftKey: boolean; altKey: boolean }) => {
     const base = textStep ?? step;
     // Fine only where the display can show it (Temp in 5 K steps, a 0.1-step slider with 2 digits...).
-    const fine = textStep != null || base * 0.1 >= 10 ** -digits - 1e-9;
-    return base * (e.shiftKey ? 10 : e.altKey && fine ? 0.1 : 1);
+    // Kelvin shows 10 K steps, so its fine step is 10 K (x0.2 of 50).
+    const fine = textStep != null ? 0.2 : base * 0.1 >= 10 ** -digits - 1e-9 ? 0.1 : 1;
+    return base * (e.shiftKey ? 10 : e.altKey ? fine : 1);
   };
   /** The slider position `sign` steps away (Kelvin-like sliders step in their typed unit); null = unchanged. */
   const nudgeValue = (sign: 1 | -1, e: { shiftKey: boolean; altKey: boolean }): number | null => {
@@ -234,10 +235,11 @@ export const Slider = memo(function Slider({
             } else if (e.key === "Tab") {
               // Commit and type into the next (previous with Shift) slider's value.
               e.preventDefault();
+              // This slider shows its text field right now, so find it by the field's position among the rows.
+              const rows = [...document.querySelectorAll<HTMLElement>('[data-testid^="slider-row-"]')].filter((r) => !r.querySelector("input[type=range]:disabled"));
+              const at = rows.findIndex((r) => r.dataset.testid === `slider-row-${id}`);
               finish(editing);
-              const all = [...document.querySelectorAll<HTMLButtonElement>('[data-testid^="slider-value-"]:not(:disabled)')];
-              const at = all.findIndex((b) => b.dataset.testid === `slider-value-${id}`);
-              const next = all[at + (e.shiftKey ? -1 : 1)];
+              const next = rows[at + (e.shiftKey ? -1 : 1)]?.querySelector<HTMLButtonElement>('[data-testid^="slider-value-"]');
               if (next) setTimeout(() => next.click(), 0);
             } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
               e.preventDefault();
