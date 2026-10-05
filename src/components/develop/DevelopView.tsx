@@ -23,6 +23,7 @@ import { PeoplePicker } from "./PeoplePicker";
 import type { Frame } from "../../lib/maskGeom";
 import { formatShutter, LABEL_COLOR, trimNum } from "../../lib/format";
 import { getClipboard, setClipboard, useClipboard } from "../../lib/clipboard";
+import { registerFlush } from "../../lib/editFlush";
 import { AdjustPanel, type AutoApi } from "./AdjustPanel";
 import { useHoverPreview, useStyleLibrary } from "../../hooks/useDevelopV14";
 import { Dialog } from "../Dialog";
@@ -214,6 +215,17 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   });
   const editor = focusB ? editorB : editorA;
   const { info } = editor;
+  // Apply to scene / Match scene read the stored settings: they wait for these saves (lib/editFlush).
+  const flushA = editorA.flush;
+  const flushB = editorB.flush;
+  useEffect(
+    () =>
+      registerFlush(async () => {
+        await flushA();
+        await flushB();
+      }),
+    [flushA, flushB],
+  );
   const health = useEntryHealth(entry);
   // The original became reachable again (relocated folder): load the image that failed to open.
   const hadHealth = useRef(false);
@@ -829,7 +841,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const prevId = usePreviousPhoto();
   const filmCell = wide ? 88 : FILM;
   // Walking ~30 fields through completeAdjustments is costly; only redo it when the settings actually change.
-  const modified = useMemo(() => modifiedFields(editor.adj, editor.defaults), [editor.adj, editor.defaults]);
+  // Only the settings dialogs need it: not recomputed per slider frame.
+  const dialogOpen = dialog != null;
+  const modified = useMemo(() => (dialogOpen ? modifiedFields(editor.adj, editor.defaults) : []), [dialogOpen, editor.adj, editor.defaults]);
   const dialogProps = { modified, hasLut: !!editor.adj.lut, hasMasks: editor.adj.masks.length > 0 };
   const filmIdx = id != null ? lib.ids.indexOf(id) : -1;
 
@@ -963,7 +977,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               onRedo={editor.redo}
               onGoto={editor.goto}
               targetCount={nTargets}
-              navUrl={editor.main?.url ?? thumbUrl}
+              navUrl={editor.navUrl ?? editor.main?.url ?? thumbUrl}
               zoom={zoom}
               region={region}
               onPreset={(pr) => zoomTo(pr)}

@@ -173,7 +173,6 @@ fn corrections_are_written_and_reverted() {
 #[ignore = "needs $SIEVE_CAPTURE_SET (copies of real RAWs + sidecars)"]
 fn two_camera_capture_time_on_real_raws() {
     use crate::db::repo;
-    use crate::ipc::types::ImportOptions;
     let set = PathBuf::from(std::env::var("SIEVE_CAPTURE_SET").expect("SIEVE_CAPTURE_SET"));
     let originals: Vec<PathBuf> =
         std::env::var("SIEVE_CAPTURE_ORIGINALS").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
@@ -186,7 +185,25 @@ fn two_camera_capture_time_on_real_raws() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = dir.path().join("cat.sqlite");
     let mut conn = db::open(&catalog).unwrap();
-    let summary = repo::import_folder(&mut conn, &set, &ImportOptions::raw_only(false)).unwrap();
+    // Rows registered directly: the set may hold symlinks to the read-only originals, which
+    // the folder import skips (sidecars are still written next to the link, in the set).
+    conn.execute("INSERT INTO folders (id, path, added_at) VALUES (1, ?1, 0)", [set.to_str().unwrap()]).unwrap();
+    let mut files: Vec<PathBuf> = fs::read_dir(&set)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| crate::raw::format_from_extension(p).is_some_and(|f| f.is_raw()))
+        .collect();
+    files.sort();
+    for p in &files {
+        let format = crate::raw::format_from_extension(p).unwrap();
+        conn.execute(
+            "INSERT INTO images (folder_id, path, file_name, format, camera_make, file_size, file_mtime_ms, imported_at)
+             VALUES (1, ?1, ?2, ?3, 'other', 1, 0, 0)",
+            params![p.to_str().unwrap(), p.file_name().unwrap().to_str().unwrap(), format.as_str()],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE images SET xmp_dirty = 0", []).unwrap();
     let rows: Vec<(ImageId, PathBuf)> = {
         let mut stmt = conn.prepare("SELECT id, path FROM images ORDER BY file_name").unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))
@@ -196,7 +213,7 @@ fn two_camera_capture_time_on_real_raws() {
     };
     // Import reads sidecars first, then ingest extracts the EXIF (as the app does).
     let sync = XmpSync::new(XmpSyncConfig { catalog_path: catalog.clone() });
-    sync.refresh_folder(summary.folder_id).unwrap();
+    sync.refresh_folder(1).unwrap();
     for (id, path) in &rows {
         let format = crate::raw::format_from_extension(path).unwrap();
         let ex = crate::raw::extract(path, format, &mut Vec::new()).unwrap();
@@ -242,10 +259,8 @@ fn two_camera_capture_time_on_real_raws() {
     println!("exiftool, Canon sidecars after the shift:\n{}", exif_json(canon_xmp.clone()));
     println!("exiftool, Canon originals (EXIF):\n{}", exif_json(canon_raws));
     for (id, p) in rows.iter().filter(|(id, _)| canon.contains(id)) {
-        let (cur, exif, _) = (|| {
-            let e = repo::get_image(&conn, *id).unwrap();
-            (e.capture.captured_at_ms, e.capture.original_captured_at_ms, e.capture.capture_time_source)
-        })();
+        let e = repo::get_image(&conn, *id).unwrap();
+        let (cur, exif) = (e.capture.captured_at_ms, e.capture.original_captured_at_ms);
         assert_eq!(cur.unwrap(), exif.unwrap() - H);
         let v = parse(&fs::read_to_string(super::resolve_sidecar(p)).unwrap()).unwrap();
         assert_eq!(v.capture_time_ms, cur, "{}", p.display());

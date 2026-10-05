@@ -1061,7 +1061,11 @@ fn develop(
     let lops_c = lops.filter(|o| o.any_local_operator());
     let lops_base = lops.is_some_and(LocalOps::has_tone_local);
     let adapt_ctx = ctx.filter(|_| local.tone_local.is_some() || lops_base);
+    let cancel = super::cancel::Cancel::current();
     rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        if cancel.is_set() {
+            return;
+        }
         let fy = (y as f32 + 0.5 - view.frame_y) / view.frame_h.max(1e-3);
         for x in 0..w {
             let p = &mut row[x * 3..x * 3 + 3];
@@ -1140,7 +1144,11 @@ fn to_working_with<F: Fn(f32, f32) -> (f32, f32) + Sync>(
     let mut rgb = vec![0.0f32; w * h * 3];
     let Some((field, to_field)) = field else {
         let mul = setup.mul.map(|m| m / 65535.0);
+        let cancel = super::cancel::Cancel::current();
         rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
+            if cancel.is_set() {
+                return;
+            }
             for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
                 let c = [
                     (f32::from(p[0]) * mul[0]).min(1.0),
@@ -1154,7 +1162,11 @@ fn to_working_with<F: Fn(f32, f32) -> (f32, f32) + Sync>(
     };
     let mul = setup.mul;
     let lo = (highlights::CLIP_LO * 65535.0) as u16;
+    let cancel = super::cancel::Cancel::current();
     rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).enumerate().for_each(|(y, (out, inp))| {
+        if cancel.is_set() {
+            return;
+        }
         let yc = y as f32 + 0.5;
         for (x, (o, p)) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0).enumerate() {
             let mut c = [0, 1, 2].map(|k| f32::from(p[k]) / 65535.0 * mul[k]);
@@ -1507,11 +1519,15 @@ pub fn render_masked(
     let (w, h) = (dev.width, dev.height);
     const BAND: usize = 8;
     let mut rgb = vec![0u8; w * h * 3];
+    let cancel = super::cancel::Cancel::current();
     let hist = rgb
         .par_chunks_mut(w * 3 * BAND)
         .zip(dev.rgb.par_chunks(w * 3 * BAND))
         .map(|(out, src)| {
             let mut hist = [[0u32; 256]; 4];
+            if cancel.is_set() {
+                return hist;
+            }
             for (o, s) in out.as_chunks_mut::<3>().0.iter_mut().zip(src.as_chunks::<3>().0) {
                 let q = [s[0], s[1], s[2]].map(|c| (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
                 o.copy_from_slice(&q);

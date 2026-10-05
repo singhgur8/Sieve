@@ -575,6 +575,7 @@ export function installMockBackend(count: number) {
     if (!p) throw { kind: "not_found", message: `project ${id}` };
     return p;
   };
+  const baseSuggest = new Map<number, PickFlag>();
   const keeper = (r: RawImageEntry) => params.get("nokeepers") !== "1" && isKeeperValues(catalog.keeperRule, r.pick, r.rating, r.quality?.suggestedPick);
   function projectDto(p: MockProject): Project {
     const photos = rows.filter((r) => p.folderIds.includes(r.folderId));
@@ -2545,6 +2546,14 @@ export function installMockBackend(count: number) {
         case "set_project_reject_strictness":
           guardWrite();
           requireProject(args.projectId as number).rejectStrictness = args.strictness as RejectStrictness;
+          // The scorer re-evaluates suggestions: conservative drops borderline rejects, aggressive adds every non-best burst frame.
+          for (const r of rows) {
+            if (!r.quality || projectOfFolder(r.folderId) !== (args.projectId as number)) continue;
+            const base = (baseSuggest.get(r.id) ?? (baseSuggest.set(r.id, r.quality.suggestedPick), r.quality.suggestedPick)) as PickFlag;
+            const st = args.strictness as RejectStrictness;
+            const next: PickFlag = st === "conservative" ? (base === "reject" && r.quality.overall >= 0.1 ? "unflagged" : base) : st === "aggressive" ? (base === "unflagged" && r.burstGroupId != null && !r.isBurstKeeper ? "reject" : base) : base;
+            r.quality = { ...r.quality, suggestedPick: next };
+          }
           return null;
         case "plugin:dialog|open":
           return (args.options as { directory?: boolean } | undefined)?.directory ? (window.__mockPickDir !== undefined ? window.__mockPickDir : "/mock/export/Smith Wedding") : "/mock/import/Moody Blue.cube";

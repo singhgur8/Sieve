@@ -86,7 +86,7 @@ test.describe("slider responsiveness", () => {
     expect((last.args.adjustments as { exposure: number }).exposure).toBeCloseTo(finalValue, 2);
   });
 
-  test("holding still for 150 ms mid-drag requests the full-quality render", async ({ page }) => {
+  test("holding still for 300 ms mid-drag requests the full-quality render", async ({ page }) => {
     await page.addInitScript(() => (window.__mockRenderDelay = () => 20));
     await openDevelop(page);
     await clearCalls(page);
@@ -97,7 +97,7 @@ test.describe("slider responsiveness", () => {
     await page.mouse.down();
     await page.mouse.move(box.x + box.width * 0.7, y, { steps: 4 });
     await page.mouse.move(box.x + box.width * 0.75, y, { steps: 2 });
-    await page.waitForTimeout(500); // pointer still down, no input
+    await page.waitForTimeout(700); // pointer still down, no input
     const edges = (await calls(page, "render_preview")).filter((c) => c.args.options.slot === "main").map((c) => c.args.options.maxEdge as number);
     expect(Math.min(...edges)).toBeLessThan(Math.max(...edges));
     expect(edges.at(-1)).toBe(Math.max(...edges));

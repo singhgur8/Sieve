@@ -38,6 +38,7 @@ pub mod store;
 pub mod style;
 pub mod style_model;
 pub mod thresholds;
+pub mod upright;
 pub mod worker;
 
 use std::path::{Path, PathBuf};

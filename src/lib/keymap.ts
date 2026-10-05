@@ -42,6 +42,8 @@ export type ActionId =
   | "zoomDevelop"
   | "face"
   | "info"
+  | "photoInfo"
+  | "captureTime"
   | "keeper"
   | "keeperSet"
   | "anchor"
@@ -64,6 +66,8 @@ export type ActionId =
   | "redoCull"
   | "copy"
   | "paste"
+  | "copyAll"
+  | "pasteAll"
   | "sync"
   | "syncQuiet"
   | "autoTone"
@@ -198,6 +202,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100% at the cursor (stays while you step with the arrows)", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
   { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
+  { id: "photoInfo", group: "View", label: "Show / hide the photo info panel (time, camera, exposure, file)", chords: [c("i", { mod: true })], modes: ALL, display: ["Cmd+I"], where: "Library, Develop" },
+  { id: "captureTime", group: "Library", label: "Edit capture time: shift, set or sync two cameras", chords: [c("t", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+T"], where: "Library, Develop" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },
 
   // ---- develop ----
@@ -213,6 +219,10 @@ export const KEYMAP: KeyDef[] = [
   { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
   { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
+  // Plain Cmd+C / Cmd+V: copy EVERY setting of the active photo (not crop / masks) and paste to every selected photo, one undoable
+  // batch. Library only for now; Develop reuses these ids by adding "develop" to `modes` and handling the action there.
+  { id: "copyAll", group: "Scenes", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: LIB, display: ["Cmd+C"], where: "Grid, Loupe, Compare" },
+  { id: "pasteAll", group: "Scenes", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: LIB, display: ["Cmd+V"], where: "Grid, Loupe, Compare" },
   { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
   { id: "syncQuiet", group: "Develop", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
   { id: "autoTone", group: "Develop", label: "Auto tone (Basic: Tone > Auto)", chords: [c("u", { mod: true })], modes: ["develop"], display: ["Cmd+U"], where: "Develop" },

@@ -1,6 +1,6 @@
 // Cull step readout: picked / unflagged / rejected (by you vs. auto) and how the keepers add up, every number a filter.
 import { Sparkles } from "lucide-react";
-import type { CullSummary, KeeperRule, PickOrigin } from "../ipc";
+import type { CullSummary, KeeperRule, PickOrigin, RejectStrictness } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { keeperEquation } from "../lib/cull";
 import { KeeperRuleMenu } from "./KeeperRule";
@@ -11,7 +11,16 @@ interface Props {
   setQuery: (fn: (q: Query) => Query) => void;
   onKeeperRule: (r: KeeperRule) => void;
   onApplySuggestions: () => void;
+  /** Project's reject strictness (v19) and its setter. */
+  strictness?: RejectStrictness;
+  onStrictness?: (v: RejectStrictness) => void;
 }
+
+const STRICT_TEXT: Record<RejectStrictness, string> = {
+  conservative: "Only clear failures (closed eyes, heavy blur, bad exposure) are suggested for reject.",
+  balanced: "Clear failures plus most missed focus are suggested for reject (the default).",
+  aggressive: "Also suggests reject for burst duplicates, any closed eyes on the main subject and soft focus.",
+};
 
 const base = "whitespace-nowrap rounded px-1.5 py-0.5 text-xs transition-colors";
 const idle = "bg-neutral-800 text-neutral-200 hover:bg-neutral-700";
@@ -35,7 +44,7 @@ export function suggestionParts(s: CullSummary): string {
     .join(" · ");
 }
 
-export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions }: Props) {
+export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions, strictness, onStrictness }: Props) {
   const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, pickOrigin: null, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
   const toggleRejectedBy = (o: PickOrigin) =>
     setQuery((q) => (onlyRejectedBy(q, o) ? { ...q, picks: [], pickOrigin: null } : { ...q, keepersOnly: false, picks: ["reject"], pickOrigin: o }));
@@ -60,6 +69,7 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
   };
   const splitBtn = (active: boolean) => `whitespace-nowrap rounded px-0.5 transition-colors ${active ? on : "hover:bg-neutral-800 hover:text-neutral-200"}`;
   return (
+    <>
     <div className="flex shrink-0 flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
       <button
         className={`${base} ${onlyPicks(query, "pick") ? on : idle}`}
@@ -115,5 +125,29 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
         </button>
       )}
     </div>
+    {strictness && onStrictness && (
+      <div className="flex shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-0.5 text-[11px] text-neutral-400" data-testid="strictness-row">
+        <label className="flex items-center gap-1.5">
+          <span className="text-neutral-300">Reject strictness</span>
+          <select
+            value={strictness}
+            onChange={(e) => onStrictness(e.target.value as RejectStrictness)}
+            className="rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs text-neutral-100"
+            data-testid="reject-strictness"
+            title="How readily Sieve suggests rejecting a photo. Changing it re-evaluates the suggestions; nothing is rejected until you apply them"
+            aria-label="Reject strictness"
+          >
+            <option value="conservative">Conservative</option>
+            <option value="balanced">Balanced</option>
+            <option value="aggressive">Aggressive</option>
+          </select>
+        </label>
+        <span className="min-w-0 truncate" data-testid="strictness-explain">{STRICT_TEXT[strictness]}</span>
+        <span className="ml-auto text-neutral-300" data-testid="strictness-count" data-rejects={s.suggestedRejectPending} title="Photos you have not flagged or rated that Sieve would reject if you press Apply suggestions">
+          {s.suggestedRejectPending} reject {s.suggestedRejectPending === 1 ? "suggestion" : "suggestions"}
+        </span>
+      </div>
+    )}
+    </>
   );
 }

@@ -34,7 +34,7 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 export const Slider = memo(function Slider({
   id,
   label,
-  value,
+  value: valueProp,
   min,
   max,
   step,
@@ -51,6 +51,21 @@ export const Slider = memo(function Slider({
   onReset,
   onAuto,
 }: Props) {
+  // While the user drags / nudges, the thumb and number follow the input on every event from local state, so they never
+  // wait for the parent (editor state, renders). Released (`onCommit`) -> back to the prop.
+  const [live, setLive] = useState<number | null>(null);
+  const value = live ?? valueProp;
+  // A gesture (pointer / key) is in progress: only then may `live` run ahead of the prop. Otherwise (programmatic
+  // input, or the value was changed elsewhere: reset, undo, preset) the prop wins, so `live` can never get stuck.
+  const gesture = useRef(false);
+  useEffect(() => {
+    if (!gesture.current) setLive(null);
+  }, [valueProp]);
+  const commit = () => {
+    gesture.current = false;
+    setLive(null);
+    onCommit();
+  };
   const shown = display ? display(value) : `${value > 0 && min < 0 ? "+" : ""}${value.toFixed(digits)}`;
   // Bipolar sliders are neutral at their centre / zero; 0-based ones at their minimum.
   const def = clamp(defaultValue ?? (min < 0 && max > 0 ? 0 : min), min, max);
@@ -117,10 +132,16 @@ export const Slider = memo(function Slider({
           step={step}
           value={value}
           disabled={disabled}
-          onChange={(e) => onInput(Number(e.target.value))}
-          onPointerUp={onCommit}
-          onKeyUp={(e) => (e.key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(e.key)) && onCommit()}
-          onBlur={onCommit}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setLive(v);
+            onInput(v);
+          }}
+          onPointerDown={() => (gesture.current = true)}
+          onKeyDown={() => (gesture.current = true)}
+          onPointerUp={commit}
+          onKeyUp={(e) => (e.key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(e.key)) && commit()}
+          onBlur={commit}
           onDoubleClick={disabled ? undefined : dbl}
         />
       </div>
