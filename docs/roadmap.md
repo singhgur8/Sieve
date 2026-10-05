@@ -328,7 +328,7 @@ never touch any other photo folder. Diagnosis of the live catalog was done on a 
   synthetic tilted horizon ≤ 0.3°, Vertical corrects converging verticals on a synthetic building; vs Camera Raw on
   ≥ 3 test frames with Lightroom Upright (if available in Jasmit XMPs) the angle within 0.5°; Playwright for crop
   interactions + keys.
-- [ ] **Loupe true 1:1 + toolbar fit** (architect → frontend-dev): Loupe / Compare 100%+ shows full-resolution detail
+- [x] **Loupe true 1:1 + toolbar fit** (architect → frontend-dev): Loupe / Compare 100%+ shows full-resolution detail
   (region render as in Develop) instead of 1:1 of the 2048 px preview; fix the pre-existing grid toolbar overflow at
   1280 px (`ux8b-fixes.spec.ts:169` P1-7, fails on main 4d66c57 too). Acceptance: Playwright — 100% in Loupe requests a
   full-res region; P1-7 green.

@@ -85,7 +85,7 @@ export function GridToolbar(p: Props) {
   return (
     <div className="flex h-8 shrink-0 items-center border-b border-neutral-800" data-testid="grid-toolbar-row">
     <div
-      className="flex h-full min-w-0 flex-1 items-center gap-x-3 overflow-x-auto overflow-y-hidden whitespace-nowrap px-3 text-xs text-neutral-300"
+      className="flex h-full min-w-0 flex-1 items-center gap-x-2 overflow-x-auto overflow-y-hidden whitespace-nowrap px-3 text-xs text-neutral-300"
       data-testid="grid-toolbar"
     >
       {p.leading}
