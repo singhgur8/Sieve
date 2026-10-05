@@ -6,6 +6,7 @@ import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
 import { BASE_QUERY } from "../hooks/useLibrary";
 import { describeMeta, metaActive, metaChips, setMetaRowOpen, useMetaRowOpen } from "../lib/metaFilter";
 import { MetaChips } from "./MetadataFilterRow";
+import { useWide } from "./edit/bits";
 
 const LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
 const PICKS: { key: PickFlag; label: string }[] = [
@@ -204,6 +205,7 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
 
 /** Rating / label / burst / folder filters (row 2 of the Library chrome, left of the view controls). */
 export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { query: Query; setQuery: Props["setQuery"]; counts: FilterCounts | null; catalog: CatalogState | null; onLocate?: () => void }) {
+  const roomy = useWide("(min-width: 1440px)"); // below this the burst checkbox label is shortened so the grid toolbar never overflows
   return (
     <>
       <div className="flex items-center gap-1">
@@ -257,7 +259,8 @@ export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { q
           onChange={(e) => setQuery((q) => ({ ...q, collapseBursts: e.target.checked }))}
         />
         <Layers className="size-3.5" />
-        Collapse bursts{counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers} hidden)` : ""}
+        {roomy ? "Collapse bursts" : "Bursts"}
+        {counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers}${roomy ? " hidden" : ""})` : ""}
       </label>
 
       {catalog && catalog.folders.length > 1 && (
