@@ -55,7 +55,14 @@ export const Slider = memo(function Slider({
   // wait for the parent (editor state, renders). Released (`onCommit`) -> back to the prop.
   const [live, setLive] = useState<number | null>(null);
   const value = live ?? valueProp;
+  // A gesture (pointer / key) is in progress: only then may `live` run ahead of the prop. Otherwise (programmatic
+  // input, or the value was changed elsewhere: reset, undo, preset) the prop wins, so `live` can never get stuck.
+  const gesture = useRef(false);
+  useEffect(() => {
+    if (!gesture.current) setLive(null);
+  }, [valueProp]);
   const commit = () => {
+    gesture.current = false;
     setLive(null);
     onCommit();
   };
@@ -200,6 +207,8 @@ export const Slider = memo(function Slider({
             setLive(v);
             onInput(v);
           }}
+          onPointerDown={() => (gesture.current = true)}
+          onKeyDown={() => (gesture.current = true)}
           onPointerUp={commit}
           onKeyDown={(e) => {
             // Focused slider: all four arrows step (Shift x10, Alt fine); Home / End / Page keys stay native.
