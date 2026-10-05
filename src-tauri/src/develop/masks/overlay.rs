@@ -136,17 +136,10 @@ pub fn render_overlay(
     let unorient = |w: u32, h: u32| if o >= 5 { (h, w) } else { (w, h) };
     let (sw, sh) = unorient(info.source_width, info.source_height);
     let (fw, fh) = unorient(info.full_width, info.full_height);
-    let (cw, ch, _) = eval::crop_frame(&adjustments.crop, sw, sh, o);
+    let geo = crate::develop::transform::Geometry::of(adjustments, fw, fh);
+    let (cw, ch, _) = eval::crop_frame(&geo.crop, sw, sh, o);
     let (width, height) = output_size(cw, ch, options.region, options.max_edge);
-    let geom = MaskGeometry {
-        sensor_width: fw,
-        sensor_height: fh,
-        orientation: o,
-        crop: adjustments.crop,
-        region: options.region,
-        width,
-        height,
-    };
+    let geom = MaskGeometry::of(&geo, fw, fh, o, options.region, width, height);
     let needs_guide = |s: &MaskShape| match s {
         MaskShape::Luminance(_) | MaskShape::Color(_) => true,
         MaskShape::Brush(b) => b.strokes.iter().any(|s| s.auto_mask),

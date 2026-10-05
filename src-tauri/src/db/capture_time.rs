@@ -306,6 +306,18 @@ mod tests {
         let meta = crate::raw::meta::ImageMeta { captured_at_ms: Some(12000), ..Default::default() };
         repo::record_extraction(&mut conn, 1, Some(&meta), Err("x")).unwrap();
         assert_eq!(time(&conn, 1), (Some(12000), Some(12000), CaptureTimeSource::Exif));
+
+        // Import reads sidecars before the EXIF is extracted: a sidecar time equal to the
+        // EXIF time found later is no correction; a different one stays.
+        conn.execute("UPDATE images SET exif_captured_at_ms = NULL, captured_at_ms = NULL WHERE id IN (1, 2)", [])
+            .unwrap();
+        assert!(apply_sidecar_time(&conn, 1, Some(12000)).unwrap());
+        assert!(apply_sidecar_time(&conn, 2, Some(99000)).unwrap());
+        assert_eq!(time(&conn, 1), (Some(12000), None, CaptureTimeSource::Sidecar));
+        repo::record_extraction(&mut conn, 1, Some(&meta), Err("x")).unwrap();
+        repo::record_extraction(&mut conn, 2, Some(&meta), Err("x")).unwrap();
+        assert_eq!(time(&conn, 1), (Some(12000), Some(12000), CaptureTimeSource::Exif));
+        assert_eq!(time(&conn, 2), (Some(99000), Some(12000), CaptureTimeSource::Sidecar));
     }
 
     #[test]

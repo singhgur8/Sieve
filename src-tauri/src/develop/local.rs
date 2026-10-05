@@ -705,6 +705,7 @@ mod tests {
             region: None,
             width: W,
             height: H,
+            warp: None,
         };
         let weights = evaluate(&adj.masks, &geom, 1, &NoMattes, None);
         let planes = LocalPlanes::build(&adj.masks, &weights);
@@ -861,6 +862,7 @@ mod tests {
             region: None,
             width: w,
             height: h,
+            warp: None,
         };
         let weights = evaluate(&masked_adj.masks, &geom, 1, &NoMattes, None);
         let planes = LocalPlanes::build(&masked_adj.masks, &weights);

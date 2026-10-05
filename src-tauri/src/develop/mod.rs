@@ -39,6 +39,7 @@ pub mod presets;
 pub mod source;
 pub mod tone;
 mod tone_data;
+pub mod transform;
 pub mod wb;
 
 use std::collections::{HashMap, VecDeque};
@@ -60,6 +61,7 @@ use crate::profiles::ProfileLibrary;
 
 use camera::Profile;
 use source::{LinearImage, Prepared, SourceMeta};
+use transform::Geometry;
 
 /// Tone contexts kept per image (white balance / calibration / profile variants: toggling
 /// between a few, e.g. before/after or presets, stays cached; ~1 MB each).
@@ -134,15 +136,17 @@ struct PrepKey {
     orientation: u8,
     max_edge: u32,
     region: Option<[u32; 4]>,
-    /// Crop (enabled flag + rect + angle bits); `None` = whole frame.
+    /// Effective crop (enabled flag + rect + angle bits); `None` = whole frame.
     crop: Option<[u32; 5]>,
+    /// Transform warp bits.
+    warp: Option<[u64; 9]>,
 }
 
 impl PrepKey {
-    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>, crop: &CropSettings) -> Self {
+    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>, geo: &Geometry) -> Self {
         let region = region.map(|r| [r.x.to_bits(), r.y.to_bits(), r.width.to_bits(), r.height.to_bits()]);
-        let crop = crop.enabled.then(|| [crop.top, crop.left, crop.bottom, crop.right, crop.angle].map(f32::to_bits));
-        PrepKey { orientation, max_edge, region, crop }
+        let (crop, warp) = geo.key();
+        PrepKey { orientation, max_edge, region, crop, warp }
     }
 }
 
@@ -171,8 +175,8 @@ impl Entry {
     }
 
     /// Prepared input for the key (computed and cached if needed).
-    fn prepared(&self, orientation: u8, crop: &CropSettings, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
-        let key = PrepKey::new(orientation, max_edge, region, crop);
+    fn prepared(&self, orientation: u8, geo: &Geometry, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
+        let key = PrepKey::new(orientation, max_edge, region, geo);
         {
             let mut list = lock(&self.prepared);
             if let Some(i) = list.iter().position(|(k, _)| *k == key) {
@@ -182,13 +186,18 @@ impl Entry {
                 return p;
             }
         }
-        let p = Arc::new(source::prepare(&self.image, orientation, crop, region, max_edge));
+        let p = Arc::new(source::prepare_geo(&self.image, orientation, geo, region, max_edge));
         let mut list = lock(&self.prepared);
         if list.len() >= PREPARED_PER_IMAGE {
             list.remove(0);
         }
         list.push((key, p.clone()));
         p
+    }
+
+    /// Geometry `adjustments` render with on this source (effective crop + Transform warp).
+    fn geometry(&self, adjustments: &ParametricAdjustments) -> Geometry {
+        Geometry::of(adjustments, self.image.full_width, self.image.full_height)
     }
 
     /// Camera profile + look for `settings` (cached for the last settings).
@@ -256,6 +265,7 @@ impl Entry {
         &self,
         orientation: u8,
         adjustments: &ParametricAdjustments,
+        geo: &Geometry,
         profile: &Profile,
     ) -> Option<pipeline::ToneContext> {
         let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
@@ -287,7 +297,7 @@ impl Entry {
             }
         };
         let (w, h) = (self.image.width, self.image.height);
-        Some((*base).clone().with_crop(&adjustments.crop, w, h, orientation))
+        Some((*base).clone().with_geometry(geo, w, h, orientation))
     }
 }
 
@@ -578,7 +588,8 @@ impl DevelopCache {
             return Ok(None);
         }
         let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), &adjustments.crop, options.region, options.max_edge);
+        let geo = entry.geometry(adjustments);
+        let prepared = entry.prepared(src.orientation(), &geo, options.region, options.max_edge);
         self.evict(src.id);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id)?,
@@ -589,10 +600,13 @@ impl DevelopCache {
             return Ok(None);
         }
         let profile = entry.profile(&adjustments.profile);
-        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
         let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
-        let (local, _) = self.local_planes(&entry, src, adjustments, &input, options.region);
-        let img = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, options.region);
+        let mut img = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        if let Some(c) = &prepared.coverage {
+            source::fill_outside_rgb8(&mut img.rgb, c);
+        }
         if !self.is_current(ticket) {
             return Ok(None);
         }
@@ -714,7 +728,8 @@ impl DevelopCache {
         luts: &LutLibrary,
     ) -> AppResult<RenderedPixels> {
         let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), &adjustments.crop, region, max_edge);
+        let geo = entry.geometry(adjustments);
+        let prepared = entry.prepared(src.orientation(), &geo, region, max_edge);
         self.evict(src.id);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id)?,
@@ -722,10 +737,13 @@ impl DevelopCache {
         };
         let lut_missing = adjustments.lut.is_some() && lut.is_none();
         let profile = entry.profile(&adjustments.profile);
-        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
         let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge), tone.as_ref());
-        let (local, _) = self.local_planes(&entry, src, adjustments, &input, region);
-        let image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, region);
+        let mut image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        if let Some(c) = &prepared.coverage {
+            source::fill_outside_rgb8(&mut image.rgb, c);
+        }
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
     }
@@ -740,6 +758,7 @@ impl DevelopCache {
         entry: &Entry,
         src: &SourceImage,
         adjustments: &ParametricAdjustments,
+        geo: &Geometry,
         input: &pipeline::RenderInput,
         region: Option<NormRect>,
     ) -> (Option<masks::LocalPlanes>, Vec<DevelopWarning>) {
@@ -751,15 +770,15 @@ impl DevelopCache {
         if mattes.needs_guide() {
             mattes.refine(|| Some(entry.sensor_guide()));
         }
-        let geom = masks::MaskGeometry {
-            sensor_width: entry.image.full_width,
-            sensor_height: entry.image.full_height,
-            orientation: src.orientation(),
-            crop: adjustments.crop,
+        let geom = masks::MaskGeometry::of(
+            geo,
+            entry.image.full_width,
+            entry.image.full_height,
+            src.orientation(),
             region,
-            width: input.width,
-            height: input.height,
-        };
+            input.width,
+            input.height,
+        );
         masks::render::local_planes(
             &adjustments.masks,
             &geom,

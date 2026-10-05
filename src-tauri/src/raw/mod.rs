@@ -12,6 +12,7 @@
 
 pub mod access;
 pub mod cr3;
+pub mod exif_info;
 pub mod heif;
 pub mod icc;
 pub mod imageio;

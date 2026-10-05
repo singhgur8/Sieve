@@ -374,6 +374,7 @@ fn main() {
             region: None,
             width: prep.width,
             height: prep.height,
+            warp: None,
         };
         let t = Instant::now();
         let weights = evaluate(&adj.masks, &geom, 1, &mattes, None);
