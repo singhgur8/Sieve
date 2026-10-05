@@ -308,7 +308,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setCropTool(null);
     setGuideOn(false);
     setCropMsg(null);
-    setReopen((prev) => carryRef.current ?? prev); // R3-P2-2: a pending re-open survives a quick second step
+    // a tool that was open (untouched, re-opened between two quick steps) is carried on too
+    const carried = carryRef.current ?? (cropRef.current && !cropRef.current.dirty ? cropRef.current : null); // read now: the updater runs later
+    setReopen((prev) => carried ?? prev); // R3-P2-2: a pending re-open survives a quick second step
     carryRef.current = null;
   }, [id]);
   const upright = useUpright(editor, id, onError);
