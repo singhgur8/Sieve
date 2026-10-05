@@ -357,7 +357,11 @@ impl<'a> LocalOps<'a> {
     pub fn apply_white_balance(&self, rgb: &mut [f32], w: usize) {
         let Some(d) = &self.wb else { return };
         let planes = self.planes;
+        let cancel = super::cancel::Cancel::current();
         rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+            if cancel.is_set() {
+                return;
+            }
             for (x, p) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let i = y * w + x;
                 let t = planes.value(LocalParam::Temperature, i) / 100.0;
@@ -460,7 +464,11 @@ impl<'a> LocalOps<'a> {
         let fine = sharp.then(|| parity::blur(&lum, w, h, (1.0 * s).max(0.35)));
         let soft = (sharp || noise).then(|| parity::blur(&lum, w, h, (2.5 * s).max(0.5)));
         let planes = self.planes;
+        let cancel = super::cancel::Cancel::current();
         img.rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+            if cancel.is_set() {
+                return;
+            }
             for (x, p) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let i = y * w + x;
                 let l = lum[i];

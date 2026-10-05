@@ -816,7 +816,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const prevId = usePreviousPhoto();
   const filmCell = wide ? 88 : FILM;
   // Walking ~30 fields through completeAdjustments is costly; only redo it when the settings actually change.
-  const modified = useMemo(() => modifiedFields(editor.adj, editor.defaults), [editor.adj, editor.defaults]);
+  // Only the settings dialogs need it: not recomputed per slider frame.
+  const dialogOpen = dialog != null;
+  const modified = useMemo(() => (dialogOpen ? modifiedFields(editor.adj, editor.defaults) : []), [dialogOpen, editor.adj, editor.defaults]);
   const dialogProps = { modified, hasLut: !!editor.adj.lut, hasMasks: editor.adj.masks.length > 0 };
   const filmIdx = id != null ? lib.ids.indexOf(id) : -1;
 
@@ -950,7 +952,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               onRedo={editor.redo}
               onGoto={editor.goto}
               targetCount={nTargets}
-              navUrl={editor.main?.url ?? thumbUrl}
+              navUrl={editor.navUrl ?? editor.main?.url ?? thumbUrl}
               zoom={zoom}
               region={region}
               onPreset={(pr) => zoomTo(pr)}
