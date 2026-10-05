@@ -435,6 +435,25 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     toolBaseline.current = JSON.stringify(next); // our own commit must not re-seed a tool
     editor.change((a) => ({ ...a, crop: next }), "Crop");
   }, [editor, orientation, frameAspect]);
+  // R2-P2-1: bring the crop panel into view when the tool opens (Transform may push it below the fold); restore the scroll on close.
+  const panelScroll = useRef<{ el: Element; top: number } | null>(null);
+  useEffect(() => {
+    if (!cropOpen) {
+      const s = panelScroll.current;
+      panelScroll.current = null;
+      if (s && s.el.isConnected) (s.el as HTMLElement).scrollTop = s.top;
+      return;
+    }
+    const t = window.setTimeout(() => {
+      const panel = document.querySelector('[data-testid="crop-panel"]');
+      if (!panel || panelScroll.current) return;
+      let sc: HTMLElement | null = panel.parentElement;
+      while (sc && sc.scrollHeight <= sc.clientHeight + 1) sc = sc.parentElement;
+      if (sc) panelScroll.current = { el: sc, top: sc.scrollTop };
+      panel.scrollIntoView({ block: "nearest" });
+    }, 0);
+    return () => window.clearTimeout(t);
+  }, [cropOpen]);
   const cancelCrop = useCallback(() => {
     if (!cropRef.current) return false;
     setCropTool(null);

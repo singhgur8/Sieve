@@ -166,7 +166,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
     if (!pair || openedOnSync.current) return;
     openedOnSync.current = true;
     setTab("sync");
-    window.setTimeout(() => document.querySelector<HTMLElement>('[data-testid="capture-ref-frame-search"]')?.focus(), 0);
+    window.setTimeout(() => document.querySelector<HTMLElement>('[data-testid="capture-tab-sync"]')?.focus(), 0);
     setTgtCam(camName(pair.fix));
     setRefCam(camName(pair.ref));
     setTgtFrame(pair.fix.id);
@@ -295,7 +295,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
       className="flex max-h-[90vh] w-[560px] flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 text-sm"
       onCancel={onCancel}
       onConfirm={() => void apply()}
-      canConfirm={() => !applyDisabled && !document.activeElement?.matches('[data-testid$="-search"]')}
+      canConfirm={() => !applyDisabled && (!document.activeElement?.matches('[data-testid$="-search"]') || !(document.activeElement as HTMLInputElement).value.trim())}
     >
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5" data-testid="capture-body">
       <h2 className="text-base font-semibold text-neutral-100">
