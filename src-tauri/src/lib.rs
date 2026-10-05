@@ -191,6 +191,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::auto_upright,
             commands::render_preview_variant,
             commands::set_project_reject_strictness,
+            // IPC v19.3
+            commands::get_transform_bounds,
         ])
         .events(collect_events![
             ImportProgress,

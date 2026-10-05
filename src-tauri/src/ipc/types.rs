@@ -5176,6 +5176,30 @@ pub struct UprightResult {
     pub message: Option<String>,
 }
 
+/// Result of `get_transform_bounds` (v19.3): the Transform / Upright warp's outline for the
+/// crop tool. Pure geometry of the live `adjustments` (no render).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformBounds {
+    /// The warped image's outline in the *uncropped corrected frame as displayed* (EXIF
+    /// orientation applied; fractions 0..=1 of a render with `crop.enabled = false`, the
+    /// crop tool's frame): the four source corners mapped through the warp, clockwise on
+    /// screen (y down). Points may lie outside 0..=1 (the warp pushes a corner past the frame
+    /// edge); the photo's pixels cover the intersection of this quad and the frame, the rest
+    /// renders white. `null` = no warp (the image covers the whole frame).
+    #[specta(type = Option<Vec<(Number, Number)>>)]
+    pub valid_quad: Option<Vec<(f64, f64)>>,
+    /// What Constrain Crop makes of `adjustments.crop` (stored crop convention: un-oriented
+    /// fractions + angle, as `CropSettings`): `adjustments.crop` unchanged when it already
+    /// fits inside the warped image, else the largest frame of the same aspect and angle
+    /// that fits; a disabled crop becomes the largest frame of the photo's aspect (enabled),
+    /// or stays as it is (disabled) when the warp already covers the whole frame (e.g.
+    /// Scale > 100).
+    /// Computed whatever `transform.constrainCrop` says (it is what a render shows when that
+    /// is on). `null` = no warp.
+    pub constrained_crop: Option<CropSettings>,
+}
+
 /// A temporary variation of the live settings for `render_preview_variant` (v19). Nothing is
 /// saved and no history entry is written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]

@@ -4,6 +4,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
+import { toStored } from "../lib/crop";
 import { completeAdjustments, lerpAdjustments, orientPoint } from "../ipc";
 import type {
   EditBatchInfo,
@@ -94,6 +95,7 @@ import type {
   SuggestionKinds,
   SyncDeltaOptions,
   SyncDeltaResult,
+  TransformBounds,
   WhiteBalance,
 } from "../ipc";
 import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS, ALL_ADJUSTMENT_FIELDS } from "../ipc";
@@ -2659,6 +2661,22 @@ export function installMockBackend(count: number) {
             solution: { mode, matrix: [Math.cos(rad), -Math.sin(rad), 0, Math.sin(rad), Math.cos(rad), 0, 0, k, 1], rotationDeg: deg, crs: [] },
             message: null,
           } satisfies UprightResult;
+        }
+        // v19.3: the mock does not warp pixels; it reports a keystone-like trapezoid (bottom corners pulled in by
+        // d = 0.06 with Upright on, plus |vertical| / 100 * 0.2) so the crop overlay's warp outline can be tested.
+        case "get_transform_bounds": {
+          guardOriginal(args.id as number);
+          const live = completeAdjustments(args.adjustments as ParametricAdjustments);
+          const t = live.transform;
+          const d = Math.min(0.3, (t.upright !== "off" ? 0.06 : 0) + (Math.abs(t.vertical) / 100) * 0.2);
+          if (d <= 0) return { validQuad: null, constrainedCrop: null } satisfies TransformBounds;
+          // Clockwise on screen (y down), display (oriented) fractions.
+          const validQuad: [number, number][] = [[0, 0], [1, 0], [1 - d, 1], [d, 1]];
+          // Mock simplification: an enabled crop is returned as is; a disabled one becomes the largest frame of the
+          // photo's aspect inside the trapezoid (height 1 - 2d, touching the bottom edge).
+          const o = byId.get(args.id as number)?.orientation ?? 1;
+          const constrainedCrop = live.crop.enabled ? live.crop : toStored({ l: d, t: 2 * d, r: 1 - d, b: 1 }, o, 0);
+          return { validQuad, constrainedCrop } satisfies TransformBounds;
         }
         case "render_preview_variant": {
           guardOriginal(args.id as number);

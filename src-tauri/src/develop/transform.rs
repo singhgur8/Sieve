@@ -24,7 +24,9 @@
 //! - Scale `s` %: zoom about the centre.
 //! - Offset X / Y: `+-100` shifts the image by a quarter of the frame (positive = right / up).
 
-use crate::ipc::types::{CropSettings, CrsProperty, ParametricAdjustments, TransformSettings, UprightMode};
+use crate::ipc::types::{
+    CropSettings, CrsProperty, ParametricAdjustments, TransformBounds, TransformSettings, UprightMode,
+};
 
 /// Row-major 3x3 homography.
 pub type Mat3 = [f64; 9];
@@ -262,6 +264,41 @@ impl Geometry {
             None => Some((x, y)),
         }
     }
+}
+
+/// Crop-tool bounds of `adj` on a sensor of `sensor_w x sensor_h` (un-oriented; only the
+/// aspect matters) shown with EXIF `orientation` (IPC v19.3 `get_transform_bounds`).
+pub fn bounds(adj: &ParametricAdjustments, sensor_w: u32, sensor_h: u32, orientation: u8) -> TransformBounds {
+    let aspect = f64::from(sensor_w.max(1)) / f64::from(sensor_h.max(1));
+    let Some(warp) = homography(&adj.transform, aspect) else {
+        return TransformBounds { valid_quad: None, constrained_crop: None };
+    };
+    TransformBounds {
+        valid_quad: warped_outline(&warp, orientation),
+        constrained_crop: Some(constrain_crop(&adj.crop, Some(&warp), aspect)),
+    }
+}
+
+/// The source rectangle's corners mapped into the corrected frame by the inverse of `warp`
+/// (corrected -> source), then into the oriented display frame; clockwise on screen.
+/// `None` when a corner has no finite image.
+fn warped_outline(warp: &Mat3, orientation: u8) -> Option<Vec<(f64, f64)>> {
+    let inv = invert(warp)?;
+    let o = super::parity::orientation_map(if (1..=8).contains(&orientation) { orientation } else { 1 });
+    let to_display = invert(&[o[0], o[1], o[2], o[3], o[4], o[5], 0.0, 0.0, 1.0])?;
+    let mut pts = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        .iter()
+        .map(|&(x, y)| apply(&inv, x, y).and_then(|(cx, cy)| apply(&to_display, cx, cy)))
+        .collect::<Option<Vec<_>>>()?;
+    if pts.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+        return None;
+    }
+    // Shoelace in y-down coordinates: positive = clockwise on screen.
+    let area: f64 = (0..4).map(|i| pts[i].0 * pts[(i + 1) % 4].1 - pts[(i + 1) % 4].0 * pts[i].1).sum();
+    if area < 0.0 {
+        pts.reverse();
+    }
+    Some(pts)
 }
 
 /// The four corners (TL, TR, BR, BL) of `crop`'s frame in the corrected frame, normalized,

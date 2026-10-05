@@ -1038,6 +1038,16 @@ export const commands = {
 	 *  per image with `db::projects::reject_strictness_of_image` (vision-ml-dev).
 	 */
 	setProjectRejectStrictness: (projectId: number, strictness: RejectStrictness) => typedError<null, AppError>(__TAURI_INVOKE("set_project_reject_strictness", { projectId, strictness })),
+	/**
+	 *  Crop-tool bounds of the live `adjustments` for photo `id` (v19.3, docs/ux-review-8d.md
+	 *  R1-3): the warped image's outline in the uncropped corrected frame as displayed, and what
+	 *  Constrain Crop makes of `adjustments.crop`. Pure geometry, no render (decodes the source
+	 *  on first use, as `get_develop_info`; instant while the photo is open in Develop). Both
+	 *  `null` without a Transform / Upright warp. The crop tool should render with
+	 *  `crop.enabled = false` and `transform.constrainCrop = false`: that frame is the one the
+	 *  quad refers to (full warped image, white outside the quad).
+	 */
+	getTransformBounds: (id: number, adjustments: ParametricAdjustments) => typedError<TransformBounds, AppError>(__TAURI_INVOKE("get_transform_bounds", { id, adjustments })),
 };
 
 /** Events */
@@ -4853,6 +4863,33 @@ export type TiffCompression = "none" | "lzw" |
 export type ToneCurve = {
 	parametric: ParametricCurve,
 	point: PointCurves,
+};
+
+/**
+ *  Result of `get_transform_bounds` (v19.3): the Transform / Upright warp's outline for the
+ *  crop tool. Pure geometry of the live `adjustments` (no render).
+ */
+export type TransformBounds = {
+	/**
+	 *  The warped image's outline in the *uncropped corrected frame as displayed* (EXIF
+	 *  orientation applied; fractions 0..=1 of a render with `crop.enabled = false`, the
+	 *  crop tool's frame): the four source corners mapped through the warp, clockwise on
+	 *  screen (y down). Points may lie outside 0..=1 (the warp pushes a corner past the frame
+	 *  edge); the photo's pixels cover the intersection of this quad and the frame, the rest
+	 *  renders white. `null` = no warp (the image covers the whole frame).
+	 */
+	validQuad: ([number, number])[] | null,
+	/**
+	 *  What Constrain Crop makes of `adjustments.crop` (stored crop convention: un-oriented
+	 *  fractions + angle, as `CropSettings`): `adjustments.crop` unchanged when it already
+	 *  fits inside the warped image, else the largest frame of the same aspect and angle
+	 *  that fits; a disabled crop becomes the largest frame of the photo's aspect (enabled),
+	 *  or stays as it is (disabled) when the warp already covers the whole frame (e.g.
+	 *  Scale > 100).
+	 *  Computed whatever `transform.constrainCrop` says (it is what a render shows when that
+	 *  is on). `null` = no warp.
+	 */
+	constrainedCrop: CropSettings | null,
 };
 
 /**

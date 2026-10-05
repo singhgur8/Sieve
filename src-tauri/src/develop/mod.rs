@@ -758,6 +758,18 @@ impl DevelopCache {
         Ok(DevelopInfo { image_id: src.id, as_shot, source_width, source_height, full_width, full_height, warnings })
     }
 
+    /// Crop-tool bounds of the live `adjustments` (IPC v19.3): pure geometry on the develop
+    /// source's aspect (decodes the source if not cached, as `info`).
+    pub fn transform_bounds(
+        &self,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+    ) -> AppResult<crate::ipc::types::TransformBounds> {
+        let entry = self.entry(src)?;
+        let img = &entry.image;
+        Ok(transform::bounds(adjustments, img.full_width, img.full_height, src.orientation()))
+    }
+
     /// Warms the cache for `sources` in the background (e.g. filmstrip neighbours) and
     /// returns immediately. Lower priority than `render`; must never panic.
     pub fn prefetch(&self, sources: Vec<SourceImage>) {

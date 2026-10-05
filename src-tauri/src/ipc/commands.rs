@@ -2677,6 +2677,28 @@ pub async fn auto_upright(
     Ok(UprightResult { mode, solution: outcome.solution, message: outcome.message })
 }
 
+/// Crop-tool bounds of the live `adjustments` for photo `id` (v19.3, docs/ux-review-8d.md
+/// R1-3): the warped image's outline in the uncropped corrected frame as displayed, and what
+/// Constrain Crop makes of `adjustments.crop`. Pure geometry, no render (decodes the source
+/// on first use, as `get_develop_info`; instant while the photo is open in Develop). Both
+/// `null` without a Transform / Upright warp. The crop tool should render with
+/// `crop.enabled = false` and `transform.constrainCrop = false`: that frame is the one the
+/// quad refers to (full warped image, white outside the quad).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_transform_bounds(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+) -> AppResult<TransformBounds> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let bounds = blocking(move || cache.transform_bounds(&src, &adjustments)).await;
+    note_if_missing(&catalog, id, bounds).await
+}
+
 /// Renders a temporary variation of the live `adjustments` (no save, no history entry): a
 /// preset applied on top (hover preview on the main image) or some groups reset to the
 /// format defaults (press-and-hold "without this panel"). Same render path as
