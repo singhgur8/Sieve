@@ -1,4 +1,5 @@
 // Cull step readout: picked / unflagged / rejected (by you vs. auto) and how the keepers add up, every number a filter.
+import { useState } from "react";
 import { Sparkles } from "lucide-react";
 import type { CullSummary, KeeperRule, PickOrigin, RejectStrictness } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
@@ -16,10 +17,10 @@ interface Props {
   onStrictness?: (v: RejectStrictness) => void;
 }
 
-const STRICT_TEXT: Record<RejectStrictness, string> = {
-  conservative: "Only clear failures (closed eyes, heavy blur, bad exposure) are suggested for reject.",
-  balanced: "Clear failures plus most missed focus are suggested for reject (the default).",
-  aggressive: "Also suggests reject for burst duplicates, any closed eyes on the main subject and soft focus.",
+export const STRICT_TEXT: Record<RejectStrictness, string> = {
+  conservative: "Only unusable frames: nothing in focus, far too dark or blown out, or several defects at once. Closed eyes and burst duplicates are never rejected.",
+  balanced: "Also missed focus or motion blur on the main subject, closed eyes on the main subject, and burst frames clearly worse than the best one.",
+  aggressive: "Also any closed eyes or soft focus, and weaker burst frames even when the difference is small. Expect some keepers among the suggestions.",
 };
 
 const base = "whitespace-nowrap rounded px-1.5 py-0.5 text-xs transition-colors";
@@ -51,23 +52,35 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
   const keepersOn = !!query.keepersOnly;
   const formula = keeperEquation(s);
   const suggestions = suggestionParts(s);
+  const [autoNote, setAutoNote] = useState<{ x: number; y: number } | null>(null);
+  const seg = (active: boolean) => `whitespace-nowrap px-1.5 py-0.5 text-xs transition-colors ${active ? on : idle}`;
   const splitPart = (n: number, o: PickOrigin, label: string) => {
+    const testid = `cull-sum-${o === "user" ? "by-you" : "auto"}`;
     const who = o === "user" ? "you rejected yourself (flag keys, sidecars, undo)" : "rejected by Apply suggestions (and not changed by you since)";
-    // A zero part is plain text: it would only show an empty grid.
-    if (n === 0 && !onlyRejectedBy(query, o)) return <span className="px-0.5" data-testid={`cull-sum-${o === "user" ? "by-you" : "auto"}`}>{label}</span>;
+    const pressed = onlyRejectedBy(query, o);
+    // A zero part would only show an empty grid: it explains itself instead (and points to the pending suggestions).
+    if (n === 0 && !pressed) {
+      return (
+        <button
+          className={seg(false)}
+          aria-pressed={false}
+          data-testid={testid}
+          title={`No photos are ${who}`}
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setAutoNote((cur) => (cur ? null : { x: Math.max(8, Math.min(r.left, window.innerWidth - 328)), y: r.bottom + 4 }));
+          }}
+        >
+          {label} <b>{n}</b>
+        </button>
+      );
+    }
     return (
-      <button
-        className={splitBtn(onlyRejectedBy(query, o))}
-        aria-pressed={onlyRejectedBy(query, o)}
-        data-testid={`cull-sum-${o === "user" ? "by-you" : "auto"}`}
-        title={`Show only the ${n} photos ${who}, each with the reason`}
-        onClick={() => toggleRejectedBy(o)}
-      >
-        {label}
+      <button className={seg(pressed)} aria-pressed={pressed} data-testid={testid} title={`Show only the ${n} photos ${who}, each with the reason`} onClick={() => toggleRejectedBy(o)}>
+        {label} <b>{n}</b>
       </button>
     );
   };
-  const splitBtn = (active: boolean) => `whitespace-nowrap rounded px-0.5 transition-colors ${active ? on : "hover:bg-neutral-800 hover:text-neutral-200"}`;
   return (
     <>
     <div className="flex shrink-0 flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
@@ -82,19 +95,17 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
       <button className={`${base} ${onlyPicks(query, "unflagged") ? on : idle}`} data-testid="cull-sum-unflagged" title={`Show the ${s.unflagged} photos you have not flagged yet (neither picked nor rejected)`} onClick={() => toggle("unflagged")}>
         Unflagged <b>{s.unflagged}</b>
       </button>
-      <button
-        className={`${base} ${onlyPicks(query, "reject") ? on : idle}`}
-        data-testid="cull-sum-rejected"
-        title={`Review the ${s.rejected} rejected photos, each with the reason it was rejected: ${s.rejectedByUser} by you, ${s.rejectedAuto} automatically`}
-        onClick={() => toggle("reject")}
-      >
-        Rejected <b>{s.rejected}</b>
-      </button>
-      <span className="text-neutral-400" data-testid="cull-sum-reject-split">
-        (
-        {splitPart(s.rejectedByUser, "user", `${s.rejectedByUser} by you,`)}{" "}
-        {splitPart(s.rejectedAuto, "auto", `${s.rejectedAuto} auto`)}
-        )
+      <span className="inline-flex shrink-0 divide-x divide-neutral-900 overflow-hidden rounded" data-testid="cull-sum-reject-split">
+        <button
+          className={seg(onlyPicks(query, "reject"))}
+          data-testid="cull-sum-rejected"
+          title={`Review the ${s.rejected} rejected photos, each with the reason it was rejected: ${s.rejectedByUser} by you, ${s.rejectedAuto} automatically`}
+          onClick={() => toggle("reject")}
+        >
+          Rejected <b>{s.rejected}</b>
+        </button>
+        {splitPart(s.rejectedByUser, "user", "By you")}
+        {splitPart(s.rejectedAuto, "auto", "Auto")}
       </span>
       <span className="mx-1 h-4 w-px bg-neutral-700" />
       <button
@@ -125,6 +136,30 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
         </button>
       )}
     </div>
+    {autoNote && (
+      <>
+        <div className="fixed inset-0 z-40" onClick={() => setAutoNote(null)} />
+        <div className="fixed z-50 w-80 rounded-lg border border-neutral-700 bg-neutral-900 p-2.5 text-xs text-neutral-200 shadow-xl" style={{ left: autoNote.x, top: autoNote.y }} data-testid="auto-zero-note" role="dialog">
+          {s.suggestedRejectPending > 0 ? (
+            <>
+              No photos were auto-rejected yet. Sieve suggests rejecting {s.suggestedRejectPending}.{" "}
+              <button
+                className="text-sky-300 underline hover:text-sky-200"
+                data-testid="auto-zero-apply"
+                onClick={() => {
+                  setAutoNote(null);
+                  onApplySuggestions();
+                }}
+              >
+                Review and apply suggestions…
+              </button>
+            </>
+          ) : (
+            <>No photos were auto-rejected yet, and Sieve has no reject suggestions at this strictness.</>
+          )}
+        </div>
+      </>
+    )}
     {strictness && onStrictness && (
       <div className="flex shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-0.5 text-[11px] text-neutral-400" data-testid="strictness-row">
         <label className="flex items-center gap-1.5">

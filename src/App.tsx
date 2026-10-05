@@ -51,7 +51,7 @@ import { formatOffset } from "./lib/captureTime";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount, useModalCount } from "./lib/modal";
-import { getClipboard, setClipboard } from "./lib/clipboard";
+import { getClipboard, setClipboard, useClipboard } from "./lib/clipboard";
 import { flushEdits } from "./lib/editFlush";
 import { clearFileHealth, describeReason, noteFailure } from "./lib/errors";
 import { HealthBanner, RestoreBackupDialog } from "./components/CatalogHealth";
@@ -148,6 +148,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
+  const clip = useClipboard();
+  // Auto Sync (Develop): remembered for the session; switched on by "Edit N selected" / "Edit all in scene".
+  const [autoSync, setAutoSync] = useState(false);
   const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata, query.pickOrigin);
   // "of M" in the readouts is the unfiltered total (the metadata filter changes `counts`, not this).
   const totals = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
@@ -1104,7 +1107,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       setCmp(null);
       setPlanOpen(false);
       setMode("develop");
-      setNotice(`Editing 1 of ${sceneIds.length}: Cmd+Alt+S syncs this photo's settings to the other ${sceneIds.length - 1}; reset and presets apply to all ${sceneIds.length}`);
+      if (sceneIds.length > 1) {
+        setAutoSync(true);
+        setNotice(`Editing ${sceneIds.length} photos. Auto Sync is on: changes go to all ${sceneIds.length} (exposure and white balance stay per photo for now). Turn it off to edit one`);
+      }
     },
     [sel, setNotice],
   );
@@ -1327,7 +1333,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "undoAdj": {
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
-        if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) return wf.undoLast();
+        if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) {
+          d?.undoAutoSyncedEdit(); // Auto Sync: the edited photo's own entry goes with the batch (one Cmd+Z reverts all)
+          return wf.undoLast();
+        }
         if (cull.undoAt() > (d?.lastCommitAt() ?? 0)) {
           lastUndone.current = "cull";
           return void cull.undo();
@@ -1355,6 +1364,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return develop.current?.sync();
       case "syncQuiet":
         return develop.current?.sync(true);
+      case "autoSync":
+        return develop.current?.toggleAutoSync();
       case "autoTone":
         return develop.current?.autoTone();
       case "autoWb":
@@ -1672,26 +1683,25 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       />
       )}
 
-      {mode === "grid" && !planOpen && (query.sceneId != null || sel.selected.size > 1) && (
-        <SelectionBar
-          selected={sel.selected.size}
-          sceneCount={query.sceneId != null ? ids.length : null}
-          hasActive={active != null}
-          onSelectAll={sel.selectAll}
-          onCopy={() => void copyActive()}
-          onPaste={() => void pasteToSelection()}
-          onSync={() => void syncSelection()}
-          onEditAll={() => {
-            const list = sel.selected.size > 1 ? ids.filter((i) => sel.selected.has(i)) : ids;
-            if (list.length > 0) editAllInScene(list, active != null && list.includes(active) ? active : list[0]);
-          }}
-        />
-      )}
-
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid {...gridProps} />
         </ErrorBoundary>
+        {mode === "grid" && !planOpen && (query.sceneId != null || sel.selected.size > 1) && !(project && step === "cull" && !clip && query.sceneId == null) && (
+          <SelectionBar
+            selected={sel.selected.size}
+            sceneCount={query.sceneId != null ? ids.length : null}
+            hasActive={active != null}
+            onSelectAll={sel.selectAll}
+            onCopy={() => void copyActive()}
+            onPaste={() => void pasteToSelection()}
+            onSync={() => void syncSelection()}
+            onEditAll={() => {
+              const list = sel.selected.size > 1 ? ids.filter((i) => sel.selected.has(i)) : ids;
+              if (list.length > 0) editAllInScene(list, active != null && list.includes(active) ? active : list[0]);
+            }}
+          />
+        )}
         {planOpen && project && step === "edit" && (
           <ErrorBoundary view="Plan" overlay onExit={() => setPlanOpen(false)}>
             <PlanView
@@ -1727,6 +1737,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           <DevelopView
             key={devEpoch}
             ref={develop}
+            autoSync={autoSync}
+            onAutoSync={setAutoSync}
             lib={lib}
             sel={sel}
             onError={reportError}

@@ -1,12 +1,15 @@
 // Edit Capture Time (Lightroom's Metadata > Edit Capture Time): shift the selection by h/m/s, set one photo's time exactly
 // (the others move by the same amount) or sync two cameras (pick one frame of each that happened at the same moment).
 // The original file is never touched; the corrected time goes to the catalog and the XMP sidecar.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { commands, unwrap, type CaptureTimeEdit, type RawImageEntry } from "../ipc";
 import { Dialog } from "./Dialog";
 import { HelpLink } from "./HelpLink";
 import { formatTime } from "../lib/format";
 import { formatOffset, fromInputValue, offsetFrom, toInputValue } from "../lib/captureTime";
+import { cameraLabel } from "../lib/metaFilter";
+import { Thumb } from "./edit/bits";
 
 type Tab = "shift" | "set" | "sync" | "revert";
 
@@ -20,9 +23,64 @@ interface Props {
   onCancel: () => void;
 }
 
-const camName = (e: RawImageEntry) => [e.camera.make, e.camera.model].filter(Boolean).join(" ") || "Unknown camera";
+const camName = (e: RawImageEntry) => cameraLabel(e.camera);
 const field = "w-16 rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1 text-right text-neutral-100";
 const sel = "w-full rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1 text-neutral-100";
+
+/** Searchable, virtualized list of one camera's frames (no cap) with the chosen frame's thumbnail and time underneath. */
+function FramePicker({ frames, value, onChange, testid, entries }: { frames: RawImageEntry[]; value: number | null; onChange: (id: number) => void; testid: string; entries: Map<number, RawImageEntry> }) {
+  const [q, setQ] = useState("");
+  const box = useRef<HTMLDivElement>(null);
+  const list = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return t ? frames.filter((e) => `${e.fileName} ${formatTime(e.capture.capturedAtMs as number)}`.toLowerCase().includes(t)) : frames;
+  }, [frames, q]);
+  const v = useVirtualizer({ count: list.length, getScrollElement: () => box.current, estimateSize: () => 24, overscan: 6 });
+  const chosen = value != null ? entries.get(value) : undefined;
+  return (
+    <div className="flex flex-col gap-1" data-testid={testid}>
+      <input className={sel} placeholder={`Search ${frames.length.toLocaleString()} frames by name or time…`} value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search frames" data-testid={`${testid}-search`} />
+      <div ref={box} className="h-28 overflow-y-auto rounded border border-neutral-700 bg-neutral-950" role="listbox" aria-label="Frames" data-testid={`${testid}-list`} data-count={list.length}>
+        <div className="relative w-full" style={{ height: v.getTotalSize() }}>
+          {v.getVirtualItems().map((r) => {
+            const e = list[r.index];
+            const on = e.id === value;
+            return (
+              <button
+                key={e.id}
+                role="option"
+                aria-selected={on}
+                className={`absolute left-0 flex h-6 w-full items-center justify-between gap-2 px-1.5 text-left ${on ? "bg-sky-800 text-sky-50" : "text-neutral-300 hover:bg-neutral-800"}`}
+                style={{ top: r.start }}
+                onClick={() => onChange(e.id)}
+                data-testid={`${testid}-opt-${e.id}`}
+              >
+                <span className="truncate">{e.fileName}</span>
+                <span className="shrink-0 tabular-nums text-neutral-400">{formatTime(e.capture.capturedAtMs as number)}</span>
+              </button>
+            );
+          })}
+        </div>
+        {list.length === 0 && <p className="p-2 text-neutral-500">No frame matches.</p>}
+      </div>
+      {chosen ? (
+        <div className="flex items-center gap-2" data-testid={`${testid}-chosen`} data-id={chosen.id}>
+          <Thumb entry={chosen} className="h-20 w-[120px] shrink-0 rounded" />
+          <div className="min-w-0 text-neutral-300">
+            <div className="truncate font-medium">{chosen.fileName}</div>
+            <div className="tabular-nums text-neutral-400" data-testid={`${testid}-time`}>
+              {formatTime(chosen.capture.capturedAtMs as number)}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <p className="text-neutral-500" data-testid={`${testid}-empty`}>
+          Choose a frame…
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCancel }: Props) {
   const [tab, setTab] = useState<Tab>("shift");
@@ -78,24 +136,43 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
     return by;
   }, [entries, viewIds]);
   const camNames = [...cameras.keys()];
+  // Exactly one selected frame from each of two cameras: that is the pair ("this is the same moment"). The active photo's camera
+  // is the one to fix (it is the last one you clicked); the other is the reference.
+  const pair = useMemo(() => {
+    if (!entries || targetIds.length !== 2) return null;
+    const a = entries.get(targetIds[0]);
+    const b = entries.get(targetIds[1]);
+    if (!a || !b || a.capture.capturedAtMs == null || b.capture.capturedAtMs == null || camName(a) === camName(b)) return null;
+    const fix = activeId === a.id ? a : b;
+    return { fix, ref: fix === a ? b : a };
+  }, [entries, targetIds, activeId]);
+  const openedOnSync = useRef(false);
   useEffect(() => {
-    if (camNames.length < 2 || (refCam && tgtCam)) return;
-    // The camera of the selected photos is the one to fix; the other one is the reference.
+    if (!pair || openedOnSync.current) return;
+    openedOnSync.current = true;
+    setTab("sync");
+    setTgtCam(camName(pair.fix));
+    setRefCam(camName(pair.ref));
+    setTgtFrame(pair.fix.id);
+    setRefFrame(pair.ref.id);
+  }, [pair]);
+  useEffect(() => {
+    if (camNames.length < 2 || (refCam && tgtCam) || pair) return;
+    // The camera of the selected photos is the one to fix; the other one is the reference. No frames are pre-picked.
     const selCam = targetIds.map((i) => entries?.get(i)).find(Boolean);
     const fix = selCam ? camName(selCam) : camNames[1];
     setTgtCam(fix);
     setRefCam(camNames.find((c) => c !== fix) ?? camNames[0]);
-  }, [camNames.join("|"), targetIds, entries]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [camNames.join("|"), targetIds, entries, pair]); // eslint-disable-line react-hooks/exhaustive-deps
   const framesOf = (cam: string) =>
     [...(cameras.get(cam) ?? [])].sort((a, b) => (a.capture.capturedAtMs ?? 0) - (b.capture.capturedAtMs ?? 0));
-  const pickFrame = (cam: string, cur: number | null) => {
-    const list = framesOf(cam);
-    if (cur != null && list.some((e) => e.id === cur)) return cur;
-    return (list.find((e) => targetIds.includes(e.id)) ?? list[0])?.id ?? null;
-  };
+  // An explicit pick only: nothing is guessed (an arbitrary pair would shift a whole camera by a meaningless offset).
+  const pickFrame = (cam: string, cur: number | null) => (cur != null && framesOf(cam).some((e) => e.id === cur) ? cur : null);
   const refId = pickFrame(refCam, refFrame);
   const tgtId = pickFrame(tgtCam, tgtFrame);
   const syncOffset = timeOf(refId) != null && timeOf(tgtId) != null ? (timeOf(refId) as number) - (timeOf(tgtId) as number) : null;
+  // Scope seam (IPC v19.2 adds project-wide and per-body scopes): today the frames of the camera that are in the current view.
+  const syncScope = { kind: "view" as const, label: "in the current view" };
   const syncTargets = viewIds.filter((id) => entries?.get(id) && camName(entries.get(id)!) === tgtCam && entries.get(id)!.capture.capturedAtMs != null);
 
   // ---- what each tab would do ----
@@ -160,18 +237,6 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
       {unit}
     </label>
   );
-  const frameSelect = (cam: string, value: number | null, set: (id: number) => void, tid: string) => (
-    <select className={sel} value={value ?? ""} onChange={(e) => set(Number(e.target.value))} data-testid={tid} aria-label="Frame">
-      {framesOf(cam)
-        .slice(0, 500)
-        .map((e) => (
-          <option key={e.id} value={e.id}>
-            {e.fileName} · {formatTime(e.capture.capturedAtMs as number)}
-          </option>
-        ))}
-    </select>
-  );
-
   return (
     <Dialog label="Edit capture time" testid="capture-time-dialog" className="flex max-h-[90vh] w-[560px] flex-col gap-3 overflow-y-auto rounded-lg border border-neutral-700 bg-neutral-900 p-5 text-sm" onCancel={onCancel}>
       <h2 className="text-base font-semibold text-neutral-100">
@@ -222,7 +287,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
             </p>
           ) : (
             <>
-              <p className="text-neutral-400">Pick one frame from each camera that was taken at the same moment (a shared clap, a group shot, or a burst fired together). Every photo of the second camera moves so its frame lands on the first camera&apos;s time.</p>
+              <p className="text-neutral-400">Pick one frame from each camera that was taken at the same moment (a shared clap, a group shot, or a burst fired together). Every photo of the camera to fix moves so its frame lands on the other camera&apos;s time. Check the two thumbnails show the same moment.</p>
               <div className="grid grid-cols-2 gap-3">
                 <div className="flex flex-col gap-1">
                   <span className="font-medium text-neutral-300">Clock is right</span>
@@ -231,7 +296,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
                       <option key={c}>{c}</option>
                     ))}
                   </select>
-                  {frameSelect(refCam, refId, setRefFrame, "capture-ref-frame")}
+                  {entries && <FramePicker frames={framesOf(refCam)} value={refId} onChange={setRefFrame} testid="capture-ref-frame" entries={entries} />}
                 </div>
                 <div className="flex flex-col gap-1">
                   <span className="font-medium text-neutral-300">Clock to fix (these photos move)</span>
@@ -240,10 +305,18 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
                       <option key={c}>{c}</option>
                     ))}
                   </select>
-                  {frameSelect(tgtCam, tgtId, setTgtFrame, "capture-tgt-frame")}
+                  {entries && <FramePicker frames={framesOf(tgtCam)} value={tgtId} onChange={setTgtFrame} testid="capture-tgt-frame" entries={entries} />}
                 </div>
               </div>
               {refCam === tgtCam && <p className="text-amber-300">Choose two different cameras.</p>}
+              {(refId == null || tgtId == null) && (
+                <p className="text-amber-300" data-testid="capture-sync-hint">
+                  {refId == null && tgtId == null ? "Choose a frame from each camera." : "Choose the other frame."} Tip: Cmd-click one photo from each camera in the grid, then press Cmd+Shift+T.
+                </p>
+              )}
+              <p className="text-neutral-400" data-testid="capture-scope" data-scope={syncScope.kind}>
+                Scope: every {tgtCam} photo {syncScope.label} ({syncTargets.length.toLocaleString()}) moves. Photos hidden by the current filters are not changed.
+              </p>
             </>
           )}
         </div>
@@ -258,7 +331,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, onApply, onCan
               ? "Nothing to change"
               : changeCount === 0
                 ? "No photos would change"
-                : `${changeCount} ${changeCount === 1 ? "photo" : "photos"} will change${plan.offset != null ? ` (${formatOffset(plan.offset)})` : ""}${tab === "sync" ? `: all ${tgtCam} frames in view` : ""}`}
+                : `${changeCount} ${changeCount === 1 ? "photo" : "photos"} will change${plan.offset != null ? ` (${formatOffset(plan.offset)})` : ""}${tab === "sync" ? `: all ${syncTargets.length.toLocaleString()} ${tgtCam} photos ${syncScope.label}` : ""}`}
           </div>
           {changeCount > 0 &&
             preview.map((p) => (

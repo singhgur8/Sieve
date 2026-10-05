@@ -16,6 +16,7 @@ import {
   unwrap,
   completeAdjustments,
   defaultAdjustments,
+  type AdjustmentField,
   type AdjustmentHistory,
   type CompleteAdjustments,
   type DevelopInfo,
@@ -27,6 +28,7 @@ import {
   type RenderSlot,
 } from "../ipc";
 import { labelWithValue, neutralAdjustments } from "../lib/adjust";
+import { changedFields } from "../lib/fieldGroups";
 
 export interface RenderView {
   imageId: number;
@@ -51,6 +53,8 @@ export interface EditorOptions {
   onChanged: (id: number) => void;
   /** A user commit / undo / redo wrote history (not a plain reload): batch Undo offers become unsafe. */
   onCommitted?: (id: number) => void;
+  /** After a commit was saved: the setting groups that edit changed (crop / masks / transform never listed). Auto Sync hangs here. */
+  onSaved?: (id: number, changed: AdjustmentField[]) => Promise<void> | void;
   /** Source format of the image (selects the neutral defaults); RAW when unknown. */
   format?: ImageFormat;
   /** Render the full, uncropped frame (crop tool active). */
@@ -121,6 +125,8 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   idRef.current = id;
   const adjRef = useRef(adj);
   const lastProfile = useRef("");
+  /** Settings as last loaded / saved: the next commit is diffed against it. */
+  const baseRef = useRef<CompleteAdjustments | null>(null);
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
   const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false, navigator: false, preview: false });
@@ -239,11 +245,14 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     flushAdj();
     endDraft();
     const snapshot = adjRef.current;
+    const prev = baseRef.current;
+    baseRef.current = snapshot;
     enqueue(async () => {
       const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       optsRef.current.onCommitted?.(p.id);
+      if (optsRef.current.onSaved) await optsRef.current.onSaved(p.id, prev ? changedFields(prev, snapshot) : []);
       // Profile / look availability warnings depend on the saved settings.
       const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
@@ -268,6 +277,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       .then(([a, h, i]) => {
         if (stale) return;
         setAdjBoth(a);
+        baseRef.current = adjRef.current;
         setHistory(h);
         setInfo(i);
         setLoading(false);
@@ -344,6 +354,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     (s: EditState, forId: number) => {
       if (idRef.current !== forId) return;
       setAdjBoth(s.adjustments);
+      baseRef.current = adjRef.current;
       setHistory(s.history);
       schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
       optsRef.current.onChanged(forId);
@@ -379,6 +390,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     const [a, h, i] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur)), unwrap(commands.getDevelopInfo(cur))]);
     if (idRef.current !== cur) return;
     setAdjBoth(a);
+    baseRef.current = adjRef.current;
     setHistory(h);
     setInfo(i);
     setLoading(false);

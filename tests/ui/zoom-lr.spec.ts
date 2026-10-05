@@ -139,7 +139,7 @@ test.describe("develop zoom like Lightroom", () => {
     expect(Number(await viewer.getAttribute("data-zoom-cy"))).toBeCloseTo(cy, 3);
     await page.getByTestId("zoom-200").click();
     await expect(viewer).toHaveAttribute("data-zoom-s", "2");
-    await page.getByTestId("nav-400").click();
+    await page.getByTestId("zoom-400").click();
     await expect(viewer).toHaveAttribute("data-zoom-s", "4");
     await page.getByTestId("nav-fit").click();
     await expect(viewer).toHaveAttribute("data-zoomed", "false");

@@ -73,7 +73,7 @@ export function StepBar(p: Props) {
               </span>
               <span className="font-medium">{LABEL[s]}</span>
               {sub && (
-                <span className={`${state === "active" ? "text-sky-200" : "text-neutral-400"} max-[1279px]:hidden`} data-testid={`step-${s}-sub`}>
+                <span className={`${state === "active" ? "text-sky-200" : "text-neutral-400"} max-[1439px]:hidden`} data-testid={`step-${s}-sub`}>
                   · {sub}
                 </span>
               )}

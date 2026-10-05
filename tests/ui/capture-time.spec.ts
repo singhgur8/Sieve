@@ -89,8 +89,9 @@ test.describe("edit capture time", () => {
     const sony = cams.find((c) => c !== canon)!;
     await page.getByTestId("capture-ref-cam").selectOption(sony);
     await page.getByTestId("capture-tgt-cam").selectOption(canon);
-    await page.getByTestId("capture-ref-frame").selectOption("2");
-    await page.getByTestId("capture-tgt-frame").selectOption("3");
+    await expect(page.getByTestId("capture-apply")).toBeDisabled(); // nothing is pre-picked from one selected photo
+    await page.getByTestId("capture-ref-frame-opt-2").click();
+    await page.getByTestId("capture-tgt-frame-opt-3").click();
     await expect(page.getByTestId("capture-preview")).not.toHaveAttribute("data-count", "0");
     await expect(page.getByTestId("capture-preview-3")).toBeVisible();
     await page.getByTestId("capture-apply").click();
@@ -109,13 +110,13 @@ test.describe("reject strictness", () => {
     await openHome(page, 201, "&keepers=not_rejected");
     await page.getByTestId("project-open-1").click();
     await expect(page.getByTestId("reject-strictness")).toHaveValue("balanced");
-    await expect(page.getByTestId("strictness-explain")).toContainText("default");
+    await expect(page.getByTestId("strictness-explain")).toContainText("closed eyes on the main subject");
     const n0 = Number(await page.getByTestId("strictness-count").getAttribute("data-rejects"));
     await clearCalls(page);
     await page.getByTestId("reject-strictness").selectOption("aggressive");
     await expect.poll(async () => (await calls(page, "set_project_reject_strictness")).length).toBe(1);
     expect((await calls(page, "set_project_reject_strictness"))[0].args).toMatchObject({ strictness: "aggressive" });
-    await expect(page.getByTestId("strictness-explain")).toContainText("burst duplicates");
+    await expect(page.getByTestId("strictness-explain")).toContainText("Expect some keepers among the suggestions");
     await expect.poll(async () => Number(await page.getByTestId("strictness-count").getAttribute("data-rejects"))).toBeGreaterThan(n0);
   });
 });

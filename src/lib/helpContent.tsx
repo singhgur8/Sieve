@@ -264,7 +264,7 @@ export const HELP: HelpEntry[] = [
     title: "Reject strictness",
     keywords: "conservative balanced aggressive suggestions reject auto cull strict",
     blocks: [
-      { p: "In the Cull step, Reject strictness sets how readily Sieve suggests rejecting a photo, per project. Conservative: only clear failures. Balanced: the default. Aggressive: also burst duplicates, any closed eyes on the main subject and soft focus." },
+      { p: "In the Cull step, Reject strictness sets how readily Sieve suggests rejecting a photo, per project. Conservative: only unusable frames (nothing in focus, far too dark or blown out, or several defects at once); closed eyes and burst duplicates are never rejected. Balanced (default): also missed focus or motion blur on the main subject, closed eyes on the main subject, and burst frames clearly worse than the best one. Aggressive: also any closed eyes or soft focus, and weaker burst frames even when the difference is small; expect some keepers among the suggestions." },
       { p: "Changing it re-evaluates the suggestions (the count next to it updates). Nothing is rejected until you press Apply suggestions, and you can undo that." },
     ],
   },
