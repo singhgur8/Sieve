@@ -1571,6 +1571,10 @@ pub fn record_extraction(
                  sensor_layout = COALESCE(?4, sensor_layout),
                  lens = ?5, exif_captured_at_ms = ?6,
                  captured_at_ms = CASE WHEN capture_time_source = 'exif' THEN ?6 ELSE captured_at_ms END,
+                 -- A sidecar time read before the EXIF was known (import reads sidecars first)
+                 -- that equals it is no correction.
+                 capture_time_source = CASE WHEN capture_time_source = 'sidecar' AND captured_at_ms IS ?6
+                                            THEN 'exif' ELSE capture_time_source END,
                  iso = ?7, shutter_s = ?8, aperture = ?9,
                  focal_length_mm = ?10, width = ?11, height = ?12, orientation = ?13
              WHERE id = ?1",

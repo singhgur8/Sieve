@@ -27,6 +27,7 @@ fn develop_write(adj: &ParametricAdjustments, look_source: Option<&str>) -> Desi
         seqs,
         profile: Some(ProfileWrite { settings: adj.profile.clone(), look_source: look_source.map(Arc::from) }),
         format: None,
+        capture_time: None,
     }
 }
 
@@ -399,4 +400,69 @@ fn dump_look_write() {
     adj.profile.look = Some(vivid(1.0));
     adj.tone_curve.point.master = vec![[0.0, 0.0], [128.0, 140.0], [255.0, 255.0]];
     println!("{}", merge(Some(LOOK_SIDECAR), &develop_write(&adj, Some(FAKE_VIVID))).unwrap());
+}
+
+const UPRIGHT_SIDECAR: &str = include_str!("fixtures/lightroom_upright.xmp");
+
+/// Lightroom Transform / Upright state (v19): read into `transform`, written back
+/// byte-for-byte when unchanged; edits replace only the changed values.
+#[test]
+fn transform_round_trip_and_edits() {
+    use crate::develop::transform;
+    use crate::ipc::types::{NormPoint, UprightGuide, UprightMode, UprightSolution};
+    let adj = parse(UPRIGHT_SIDECAR).unwrap().develop.unwrap();
+    let t = &adj.transform;
+    assert_eq!((t.upright, t.constrain_crop, t.scale, t.rotate), (UprightMode::Auto, true, 100.0, 0.0));
+    let sol = t.solution.as_ref().unwrap();
+    assert_eq!((sol.mode, sol.crs.len()), (UprightMode::Auto, crs::UPRIGHT_SOLUTION_KEYS.len() - 1));
+    // matrix = inverse of Lightroom's source -> corrected UprightTransform_1.
+    let raw = &sol.crs.iter().find(|p| p.name == "UprightTransform_1").unwrap().value;
+    let lr = transform::parse_matrix(raw).unwrap();
+    let m: [f64; 9] = sol.matrix.clone().try_into().unwrap();
+    let id = transform::mul(&lr, &m);
+    let id = id.map(|v| v / id[8]);
+    assert!(id.iter().zip(transform::IDENTITY).all(|(a, b)| (a - b).abs() < 1e-9));
+    assert!((sol.rotation_deg + 3.0).abs() < 0.2, "{}", sol.rotation_deg);
+    assert!(parse(UPRIGHT_SIDECAR).unwrap().warnings.is_empty(), "transform is rendered now");
+
+    let write = |a: &ParametricAdjustments| {
+        let mut want = develop_write(a, None);
+        want.rating = 0;
+        want.metadata_date = "2026-09-20T02:57:59-07:00".into();
+        merge(Some(UPRIGHT_SIDECAR), &want).unwrap()
+    };
+    assert_eq!(write(&adj), UPRIGHT_SIDECAR, "unchanged settings: byte-identical");
+
+    // A slider edit changes that value only; Lightroom's solve state stays.
+    let mut edited = adj.clone();
+    edited.transform.vertical = -12.0;
+    edited.transform.offset_y = 2.5;
+    let out = write(&edited);
+    assert!(out.contains("crs:PerspectiveVertical=\"-12\"") && out.contains("crs:PerspectiveY=\"+2.5\""));
+    assert!(out.contains("crs:PerspectiveX=\"0.00\"") && out.contains("crs:UprightTransform_4=\"0.967960666"));
+    assert_eq!(parse(&out).unwrap().develop.unwrap(), edited);
+
+    // Another mode solved by Sieve (no Lightroom state): the stale state is removed so
+    // Lightroom re-solves; guides are written.
+    let mut guided = adj.clone();
+    let g = UprightGuide { start: NormPoint { x: 0.1, y: 0.2 }, end: NormPoint { x: 0.15, y: 0.8 } };
+    guided.transform.upright = UprightMode::Guided;
+    guided.transform.guides = vec![g; 2];
+    guided.transform.solution = Some(UprightSolution {
+        mode: UprightMode::Guided,
+        matrix: UprightSolution::IDENTITY.to_vec(),
+        rotation_deg: 0.0,
+        crs: Vec::new(),
+    });
+    let out = write(&guided);
+    assert!(out.contains("crs:PerspectiveUpright=\"5\"") && !out.contains("UprightTransform_"));
+    assert!(out.contains("crs:UprightFourSegmentsCount=\"2\""));
+    assert!(out.contains("crs:UprightFourSegments_1=\"0.100000,0.200000,0.150000,0.800000\""));
+    let back = parse(&out).unwrap().develop.unwrap();
+    assert_eq!(back.transform.guides, guided.transform.guides);
+    assert_eq!(back.transform.solution, None);
+
+    // Neutral transform on a fresh sidecar adds nothing.
+    let fresh = merge(None, &develop_write(&ParametricAdjustments::default(), None)).unwrap();
+    assert!(!fresh.contains("Perspective") && !fresh.contains("Upright") && !fresh.contains("ConstrainToWarp"));
 }

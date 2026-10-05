@@ -18,7 +18,9 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use super::crs::{self, LookChange, PropertyEdit, SeqEdit};
-use crate::ipc::types::{DevelopWarning, ImageFormat, LookSettings, ParametricAdjustments, PickFlag, ProfileSettings};
+use crate::ipc::types::{
+    CaptureTimeSource, DevelopWarning, ImageFormat, LookSettings, ParametricAdjustments, PickFlag, ProfileSettings,
+};
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
@@ -80,6 +82,10 @@ pub struct SidecarValues {
     /// `crs:` features preserved but not rendered (`crs::unsupported_warnings`), stored as
     /// `RawImageEntry.developWarnings` by the read path (v9).
     pub warnings: Vec<DevelopWarning>,
+    /// Capture time (v19): `exif:DateTimeOriginal`, else `photoshop:DateCreated`, as naive ms
+    /// (wall-clock time read as UTC, fractional seconds kept, zone offset ignored, like the
+    /// EXIF time in the catalog). Lightroom's "Edit Capture Time" rewrites these.
+    pub capture_time_ms: Option<i64>,
 }
 
 /// The XMP-mapped state Sieve wants in the sidecar.
@@ -108,6 +114,133 @@ pub struct Desired {
     /// develop property (or point curve) the sidecar does not carry is only added when its
     /// value differs from that default ([`omitted_defaults`]); present ones are always updated.
     pub format: Option<ImageFormat>,
+    /// Capture time to reflect (v19, [`CaptureTimeWrite`]); `None` = leave the dates alone.
+    pub capture_time: Option<CaptureTimeWrite>,
+}
+
+/// The catalog's capture time for a sidecar write (v19).
+///
+/// - Corrected (`source` sidecar / user): `exif:DateTimeOriginal` and `photoshop:DateCreated`
+///   are set to the corrected time (Lightroom's form `YYYY-MM-DDTHH:MM:SS.fff`, keeping the
+///   zone offset the value already had); properties Sieve had to add are listed in
+///   `sieve:CaptureTimeAdded` so a revert can remove exactly those.
+/// - `exif` (no correction): properties Sieve added are removed; a remaining value that
+///   differs from the file's EXIF time (a reverted correction) goes back to the EXIF time.
+///   Values equal to it (Lightroom's own copy) and every other field are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureTimeWrite {
+    /// Corrected time, naive ms (`images.captured_at_ms`).
+    pub corrected_ms: Option<i64>,
+    /// The file's own EXIF time, naive ms (`images.exif_captured_at_ms`).
+    pub exif_ms: Option<i64>,
+    pub source: CaptureTimeSource,
+}
+
+/// Date properties carrying the capture time, in read priority order.
+pub const CAPTURE_TIME_PROPS: [(&str, &str); 2] = [(NS_EXIF, "DateTimeOriginal"), (NS_PHOTOSHOP, "DateCreated")];
+/// `sieve:` property listing the date properties Sieve added (comma separated local names).
+pub const CAPTURE_TIME_ADDED: &str = "CaptureTimeAdded";
+
+/// XMP date (`YYYY-MM-DDThh:mm[:ss[.s+]][Z|+hh:mm|-hh:mm]`) -> naive ms, ignoring the zone
+/// (the wall-clock time, as EXIF records it). Date-only values -> `None`.
+pub fn parse_xmp_datetime(v: &str) -> Option<i64> {
+    let v = v.trim();
+    let (date, time) = v.split_once('T')?;
+    // Zone: `Z` or the last `+` / `-` in the time part.
+    let time = time.strip_suffix('Z').unwrap_or(time);
+    let time = match time.rfind(['+', '-']) {
+        Some(i) => &time[..i],
+        None => time,
+    };
+    let (hms, frac) = match time.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (time, None),
+    };
+    let hms = if hms.matches(':').count() == 1 { format!("{hms}:00") } else { hms.to_owned() };
+    crate::raw::meta::parse_exif_datetime(&format!("{date} {hms}"), frac)
+}
+
+/// Zone suffix of an XMP date (`"-07:00"`, `"Z"`, or `""`).
+fn zone_suffix(v: &str) -> &str {
+    let v = v.trim();
+    let Some((_, time)) = v.split_once('T') else { return "" };
+    if time.ends_with('Z') {
+        return "Z";
+    }
+    match time.rfind(['+', '-']) {
+        Some(i) => &time[i..],
+        None => "",
+    }
+}
+
+/// Naive ms -> `YYYY-MM-DDThh:mm:ss[.fff]` + `zone`.
+pub fn format_xmp_datetime(ms: i64, zone: &str) -> String {
+    let secs = ms.div_euclid(1000);
+    let frac = ms.rem_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let mut out = format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60);
+    if frac != 0 {
+        out.push_str(&format!(".{frac:03}"));
+    }
+    out.push_str(zone);
+    out
+}
+
+fn write_capture_time(ed: &mut Editor<'_>, doc: &Doc, ct: &CaptureTimeWrite) {
+    let current = |ns: &str, local: &str| doc.scalars(ns, local).into_iter().next().map(|s| s.value.trim().to_owned());
+    let marker = current(crs::SIEVE_NS, CAPTURE_TIME_ADDED);
+    let added_before: Vec<String> = marker
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    match (ct.source, ct.corrected_ms) {
+        (CaptureTimeSource::Sidecar | CaptureTimeSource::User, Some(ms)) => {
+            let mut added = added_before.clone();
+            for (ns, local) in CAPTURE_TIME_PROPS {
+                match current(ns, local) {
+                    Some(v) if parse_xmp_datetime(&v) == Some(ms) => {}
+                    Some(v) => ed.set_scalar(ns, local, &format_xmp_datetime(ms, zone_suffix(&v))),
+                    None => {
+                        ed.set_scalar(ns, local, &format_xmp_datetime(ms, ""));
+                        if !added.iter().any(|a| a == local) {
+                            added.push(local.to_owned());
+                        }
+                    }
+                }
+            }
+            if added != added_before {
+                ed.set_scalar(crs::SIEVE_NS, CAPTURE_TIME_ADDED, &added.join(","));
+            }
+        }
+        _ => {
+            for (ns, local) in CAPTURE_TIME_PROPS {
+                let Some(v) = current(ns, local) else { continue };
+                if added_before.iter().any(|a| a == local) {
+                    ed.remove_scalar_if(ns, local, |_| true);
+                } else if let (Some(exif), Some(t)) = (ct.exif_ms, parse_xmp_datetime(&v)) {
+                    if t != exif {
+                        ed.set_scalar(ns, local, &format_xmp_datetime(exif, zone_suffix(&v)));
+                    }
+                }
+            }
+            if marker.is_some() {
+                ed.remove_scalar_if(crs::SIEVE_NS, CAPTURE_TIME_ADDED, |_| true);
+            }
+        }
+    }
 }
 
 /// Profile part of a develop write.
@@ -138,6 +271,7 @@ impl Desired {
             seqs: Vec::new(),
             profile: None,
             format: None,
+            capture_time: None,
         }
     }
 }
@@ -183,7 +317,11 @@ pub fn parse(src: &str) -> Result<SidecarValues> {
         Err(e) => (None, Some(e)),
     };
     let warnings = crs::unsupported_warnings(&source);
+    let capture_time_ms = CAPTURE_TIME_PROPS
+        .iter()
+        .find_map(|(ns, local)| doc.scalars(ns, local).into_iter().next().and_then(|s| parse_xmp_datetime(s.value)));
     Ok(SidecarValues {
+        capture_time_ms,
         rating,
         label,
         dm_pick,
@@ -654,6 +792,9 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
         }
     }
     ed.set_scalar(NS_XMP, "MetadataDate", &want.metadata_date);
+    if let Some(ct) = &want.capture_time {
+        write_capture_time(&mut ed, doc, ct);
+    }
     let top = ScopeSource { doc, scope: Scope::Top };
     let mut develop_edits: Vec<PropertyEdit> = want.develop.clone();
     if let Some(pw) = &want.profile {
@@ -693,6 +834,13 @@ fn merge_doc(src: &str, doc: &Doc, want: &Desired) -> Result<String> {
                 if cur >= want_pv {
                     continue;
                 }
+            }
+        }
+        // Transform values equal (as numbers) to the sidecar's keep Lightroom's formatting.
+        if let (true, Some(v)) = (edit.ns == crs::CRS_NS && crs::is_number_preserving(&edit.name), &edit.value) {
+            let current = crs::CrsSource::scalar(&top, crs::CRS_NS, &edit.name);
+            if current.is_some_and(|c| crs::same_numbers(c.trim(), v)) {
+                continue;
             }
         }
         match &edit.value {
@@ -1257,6 +1405,8 @@ fn preferred_prefix(uri: &str) -> &'static str {
         NS_LR => "lr",
         NS_XMP_DM => "xmpDM",
         NS_RDF => "rdf",
+        NS_EXIF => "exif",
+        NS_PHOTOSHOP => "photoshop",
         crs::CRS_NS => "crs",
         crs::SIEVE_NS => "sieve",
         _ => "ns",

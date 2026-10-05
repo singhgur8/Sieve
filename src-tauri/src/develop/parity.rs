@@ -1666,21 +1666,41 @@ pub fn grain(img: &mut Working, g: &Grain, seed: u64, scale: f32) {
 pub struct CropGeometry {
     pub width: u32,
     pub height: u32,
+    /// Output -> corrected frame (the source itself without a Transform warp).
     pub to_source: [f64; 6],
+    /// Corrected frame -> source homography (Transform / Upright, `develop::transform`);
+    /// `None` = no warp.
+    pub warp: Option<super::transform::Mat3>,
 }
 
 impl CropGeometry {
-    /// Maps normalized oriented output coordinates to normalized un-oriented source ones.
+    /// Maps normalized oriented output coordinates to normalized un-oriented corrected-frame
+    /// ones (the source without a warp).
     pub fn map(&self, x: f64, y: f64) -> (f64, f64) {
         let t = &self.to_source;
         (t[0] * x + t[1] * y + t[2], t[3] * x + t[4] * y + t[5])
     }
 
-    /// No rotation (the crop is an axis-aligned source rectangle).
+    /// Output -> source, through the warp (`None` behind the projection centre).
+    pub fn map_source(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (cx, cy) = self.map(x, y);
+        match &self.warp {
+            Some(m) => super::transform::apply(m, cx, cy),
+            None => Some((cx, cy)),
+        }
+    }
+
+    /// No rotation and no warp (the crop is an axis-aligned source rectangle).
     pub fn is_axis_aligned(&self) -> bool {
         let t = &self.to_source;
-        (t[1].abs() < 1e-12 && t[3].abs() < 1e-12) || (t[0].abs() < 1e-12 && t[4].abs() < 1e-12)
+        self.warp.is_none()
+            && ((t[1].abs() < 1e-12 && t[3].abs() < 1e-12) || (t[0].abs() < 1e-12 && t[4].abs() < 1e-12))
     }
+}
+
+/// [`crop_geometry`] of a render [`super::transform::Geometry`] (effective crop + warp).
+pub fn frame_geometry(geo: &super::transform::Geometry, src_w: u32, src_h: u32, orientation: u8) -> CropGeometry {
+    CropGeometry { warp: geo.warp, ..crop_geometry(&geo.crop, src_w, src_h, orientation) }
 }
 
 /// Oriented -> un-oriented normalized coordinate map for EXIF orientation `o` as
@@ -1753,7 +1773,7 @@ pub fn crop_geometry(crop: &CropSettings, src_w: u32, src_h: u32, orientation: u
     ];
     let (w, h) = (fw.round().max(1.0) as u32, fh.round().max(1.0) as u32);
     let (w, h) = if o >= 5 { (h, w) } else { (w, h) };
-    CropGeometry { width: w, height: h, to_source: m }
+    CropGeometry { width: w, height: h, to_source: m, warp: None }
 }
 
 #[cfg(test)]

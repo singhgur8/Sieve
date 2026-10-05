@@ -168,7 +168,6 @@ const META: &[&str] = &[
     "SDRShadows",
     "SDRWhites",
     "SDRBlend",
-    "CropConstrainToWarp",
     "CropConstrainToUnitSquare",
     "CropUnit",
     "CropWidth",
@@ -265,7 +264,15 @@ fn classify(name: &str) -> Class {
     if lens.iter().any(|p| name.starts_with(p)) {
         return Class::Feature(LENS);
     }
-    if name.starts_with("Perspective") || name.starts_with("Upright") || name == "AutoPerspective" {
+    // Transform (v19): sliders, Upright mode, Constrain Crop and guides are settings; the
+    // Upright solve state (`UprightTransform_*`, digests, ...) belongs to one photo.
+    if crs::is_number_preserving(name) {
+        return Class::Setting(F::Transform);
+    }
+    if name.starts_with("Upright") {
+        return Class::Meta;
+    }
+    if name.starts_with("Perspective") || name == "AutoPerspective" {
         return Class::Feature(TRANSFORM);
     }
     if name.starts_with("Retouch") || name.starts_with("SpotRemoval") || name.starts_with("RedEye") {

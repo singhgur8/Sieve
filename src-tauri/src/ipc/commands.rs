@@ -2519,7 +2519,19 @@ pub async fn restore_capture_times(
 #[tauri::command]
 #[specta::specta]
 pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<ImageMetadata> {
-    catalog.run(move |c| db::capture_time::image_metadata(c, id)).await
+    let mut m = catalog.run(move |c| db::capture_time::image_metadata(c, id)).await?;
+    if m.missing {
+        return Ok(m);
+    }
+    // File EXIF outside the catalog lock (a few hundred KB of the original at most).
+    let path = std::path::PathBuf::from(&m.path);
+    let f = blocking(move || Ok(crate::raw::exif_info::read(&path))).await?;
+    m.focal_length_35mm = f.focal_length_35mm;
+    m.exposure_compensation_ev = f.exposure_compensation_ev;
+    m.flash_fired = f.flash_fired;
+    m.camera_serial = f.camera_serial;
+    m.gps = f.gps;
+    Ok(m)
 }
 
 /// Solves Upright `mode` for photo `id` from the live `adjustments` (`null` = stored; Guided

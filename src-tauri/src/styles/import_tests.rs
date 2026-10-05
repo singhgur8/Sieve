@@ -235,8 +235,12 @@ fn check_exact(settings: &PresetSettings, base: &ParametricAdjustments) -> Vec<S
             continue;
         }
         let (Some(want), Some(got)) = (num(v), after.get(k).and_then(|g| num(g))) else { continue };
-        let range =
-            crs::PARITY_SCALARS.iter().find(|f| f.name == k).map(|f| (f.lo, f.hi)).unwrap_or(match k.as_str() {
+        let range = crs::PARITY_SCALARS
+            .iter()
+            .find(|f| f.name == k)
+            .map(|f| (f.lo, f.hi))
+            .or_else(|| crs::TRANSFORM_SCALARS.iter().find(|f| f.0 == k).map(|f| (f.1, f.2)))
+            .unwrap_or(match k.as_str() {
                 "Exposure2012" => (-5.0, 5.0),
                 "Temperature" => (2000.0, 50000.0),
                 "Tint" => (-150.0, 150.0),
@@ -316,6 +320,31 @@ fn synthetic_presets_apply_exactly_their_keys() {
     let after = properties(&leaked);
     assert!(allowed(&out_keys.keys()).iter().all(|k| k != "Vibrance"));
     assert_ne!(before.get("Vibrance"), after.get("Vibrance"));
+}
+
+/// Lightroom presets carrying Transform (v19): the sliders, Upright mode and Constrain Crop
+/// are applied as the Transform group (no warning); Upright's per-photo solve state is ignored.
+#[test]
+fn transform_presets_apply() {
+    use crate::ipc::types::{AdjustmentField, UprightMode};
+    let xmp = preset_xmp(
+        "Fix verticals",
+        r#"crs:PerspectiveUpright="4" crs:PerspectiveVertical="-20" crs:PerspectiveScale="110"
+            crs:PerspectiveRotate="0.0" crs:CropConstrainToWarp="1" crs:UprightVersion="151388160"
+            crs:UprightTransform_4="1,0,0,0,1,0,0,0,1""#,
+        "",
+    );
+    let p = preset_file::parse_xmp(&xmp).unwrap().unwrap();
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    assert_eq!(p.settings.fields(), vec![AdjustmentField::Transform]);
+    assert!(!p.settings.scalars.contains_key("UprightVersion"));
+    for b in bases() {
+        assert_eq!(check_exact(&p.settings, &b), Vec::<String>::new());
+        let out = p.settings.apply(&b).unwrap();
+        let t = &out.transform;
+        assert_eq!((t.upright, t.vertical, t.scale, t.constrain_crop), (UprightMode::Vertical, -20.0, 110.0, true));
+        assert_eq!(t.solution, None, "solved per photo (auto_upright)");
+    }
 }
 
 /// Imports real preset/profile folders and checks every preset: `SIEVE_STYLE_DIRS`

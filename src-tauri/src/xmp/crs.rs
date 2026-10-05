@@ -36,9 +36,9 @@
 
 use crate::develop::wb;
 use crate::ipc::types::{
-    is_valid_lut_id, CropSettings, CurvePoint, DevelopWarning, DevelopWarningCode, HslChannels, ImageFormat,
-    LookSettings, LutRef, ParametricAdjustments, ParametricCurve, PointCurves, ProfileSettings, VignetteStyle,
-    WhiteBalance,
+    is_valid_lut_id, CropSettings, CrsProperty, CurvePoint, DevelopWarning, DevelopWarningCode, HslChannels,
+    ImageFormat, LookSettings, LutRef, ParametricAdjustments, ParametricCurve, PointCurves, ProfileSettings,
+    TransformSettings, UprightMode, UprightSolution, VignetteStyle, WhiteBalance,
 };
 
 pub const CRS_NS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
@@ -158,6 +158,7 @@ pub fn encode(adj: &ParametricAdjustments) -> Vec<PropertyEdit> {
         }
     }
     out.extend(encode_parity(adj));
+    out.extend(encode_transform(&adj.transform));
     out.push(crs("HasSettings", Some("True".into())));
     let (lut_id, lut_amount) = match &adj.lut {
         Some(l) => (Some(l.id.clone()), Some(format!("{}", l.amount))),
@@ -277,6 +278,7 @@ pub fn decode_onto(src: &dyn CrsSource, adj: &mut ParametricAdjustments) -> Resu
         };
         adj.lut = Some(LutRef { id, amount });
     }
+    decode_transform(src, &mut adj.transform)?;
     decode_parity(src, adj)
 }
 
@@ -832,6 +834,172 @@ pub fn look_change(want: &ProfileSettings, current: Option<&ProfileSettings>, ha
     }
 }
 
+// ---------------------------------------------------------------------------
+// IPC v19: Transform / Upright (`ParametricAdjustments.transform`).
+// ---------------------------------------------------------------------------
+
+/// Scalar Transform sliders: `crs:` name, contract range, write format. Lightroom writes
+/// `PerspectiveRotate="0.0"` and `PerspectiveX="0.00"`; a value equal to the sidecar's (as a
+/// number) is never rewritten (`packet::merge`, [`is_number_preserving`]), so Lightroom's
+/// formatting stays byte-for-byte.
+pub const TRANSFORM_SCALARS: &[(&str, f32, f32, NumFormat)] = &[
+    ("PerspectiveVertical", -100.0, 100.0, NumFormat::Signed),
+    ("PerspectiveHorizontal", -100.0, 100.0, NumFormat::Signed),
+    ("PerspectiveRotate", -10.0, 10.0, NumFormat::SignedDecimal),
+    ("PerspectiveAspect", -100.0, 100.0, NumFormat::Signed),
+    ("PerspectiveScale", 50.0, 150.0, NumFormat::Plain),
+    ("PerspectiveX", -100.0, 100.0, NumFormat::Signed),
+    ("PerspectiveY", -100.0, 100.0, NumFormat::Signed),
+];
+pub const PERSPECTIVE_UPRIGHT: &str = "PerspectiveUpright";
+pub const CONSTRAIN_TO_WARP: &str = "CropConstrainToWarp";
+pub const GUIDE_COUNT: &str = "UprightFourSegmentsCount";
+/// `crs:UprightFourSegments_0..3`.
+pub const GUIDE_PREFIX: &str = "UprightFourSegments_";
+/// Lightroom's Upright solve state, kept verbatim in `UprightSolution.crs` (read in this
+/// order) and written back unchanged while the mode is the solved one; removed otherwise
+/// (Lightroom re-solves).
+pub const UPRIGHT_SOLUTION_KEYS: &[&str] = &[
+    "UprightVersion",
+    "UprightCenterMode",
+    "UprightCenterNormX",
+    "UprightCenterNormY",
+    "UprightFocalMode",
+    "UprightFocalLength35mm",
+    "UprightPreview",
+    "UprightTransformCount",
+    "UprightTransform_0",
+    "UprightTransform_1",
+    "UprightTransform_2",
+    "UprightTransform_3",
+    "UprightTransform_4",
+    "UprightTransform_5",
+    "UprightDependentDigest",
+    "UprightGuidedDependentDigest",
+];
+
+/// Transform properties whose sidecar value is kept when it parses to the same number(s) as
+/// the wanted one (Lightroom's own formatting, e.g. `"0.00"`, `"+5.0"`).
+pub fn is_number_preserving(name: &str) -> bool {
+    name == PERSPECTIVE_UPRIGHT
+        || name == CONSTRAIN_TO_WARP
+        || name == GUIDE_COUNT
+        || name.starts_with(GUIDE_PREFIX)
+        || TRANSFORM_SCALARS.iter().any(|(n, ..)| *n == name)
+}
+
+/// `true` when two property values hold the same numbers (comma / space separated lists
+/// included); booleans `True`/`False` count as 1/0.
+pub fn same_numbers(a: &str, b: &str) -> bool {
+    fn nums(s: &str) -> Option<Vec<f64>> {
+        s.split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.to_ascii_lowercase().as_str() {
+                "true" => Some(1.0),
+                "false" => Some(0.0),
+                t => t.trim_start_matches('+').parse::<f64>().ok(),
+            })
+            .collect()
+    }
+    match (nums(a), nums(b)) {
+        (Some(x), Some(y)) => {
+            x.len() == y.len() && x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-9 * p.abs().max(1.0))
+        }
+        _ => false,
+    }
+}
+
+fn format_guide(g: &crate::ipc::types::UprightGuide) -> String {
+    [g.start.x, g.start.y, g.end.x, g.end.y].map(|v| format!("{:.6}", v)).join(",")
+}
+
+fn parse_guide(raw: &str) -> Option<crate::ipc::types::UprightGuide> {
+    let v: Vec<f32> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.trim_start_matches('+').parse::<f32>().ok().filter(|x| x.is_finite()))
+        .collect::<Option<_>>()?;
+    let [x0, y0, x1, y1] = <[f32; 4]>::try_from(v).ok()?;
+    let p = |x: f32, y: f32| crate::ipc::types::NormPoint { x: x.clamp(0.0, 1.0), y: y.clamp(0.0, 1.0) };
+    Some(crate::ipc::types::UprightGuide { start: p(x0, y0), end: p(x1, y1) })
+}
+
+/// Edits for `transform` (part of [`encode`]).
+pub fn encode_transform(t: &TransformSettings) -> Vec<PropertyEdit> {
+    let crs = |name: &str, value: Option<String>| PropertyEdit { ns: CRS_NS, name: name.to_owned(), value };
+    let mut out = vec![crs(PERSPECTIVE_UPRIGHT, Some(t.upright.crs_value().to_string()))];
+    let values = [t.vertical, t.horizontal, t.rotate, t.aspect, t.scale, t.offset_x, t.offset_y];
+    for ((name, _, _, fmt), v) in TRANSFORM_SCALARS.iter().zip(values) {
+        out.push(crs(name, Some(format_num(v, *fmt))));
+    }
+    out.push(crs(CONSTRAIN_TO_WARP, Some(if t.constrain_crop { "1" } else { "0" }.into())));
+    if t.guides.is_empty() {
+        out.push(crs(GUIDE_COUNT, None));
+    } else {
+        out.push(crs(GUIDE_COUNT, Some(t.guides.len().to_string())));
+    }
+    for i in 0..TransformSettings::MAX_GUIDES {
+        out.push(crs(&format!("{GUIDE_PREFIX}{i}"), t.guides.get(i).map(format_guide)));
+    }
+    let keep = t.solution.as_ref().filter(|s| s.mode == t.upright && !s.crs.is_empty());
+    for key in UPRIGHT_SOLUTION_KEYS {
+        let v = keep.and_then(|s| s.crs.iter().find(|p| p.name == *key)).map(|p| p.value.clone());
+        out.push(crs(key, v));
+    }
+    // Verbatim properties outside the known list (newer Lightroom versions).
+    if let Some(s) = keep {
+        for p in s.crs.iter().filter(|p| !UPRIGHT_SOLUTION_KEYS.contains(&p.name.as_str())) {
+            out.push(crs(&p.name, Some(p.value.clone())));
+        }
+    }
+    out
+}
+
+/// Sets on `t` the Transform properties `src` carries (part of [`decode_onto`]). The solution
+/// is read only when the source has Lightroom's Upright state: `matrix` = the inverse of
+/// `UprightTransform_<mode>` (`develop::transform::from_lightroom`), `crs` = the state
+/// verbatim.
+pub fn decode_transform(src: &dyn CrsSource, t: &mut TransformSettings) -> Result<(), String> {
+    let crs = |name: &str| src.scalar(CRS_NS, name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    if let Some(raw) = crs(PERSPECTIVE_UPRIGHT) {
+        t.upright = UprightMode::from_crs(parse_num(PERSPECTIVE_UPRIGHT, &raw)?.round() as i64).unwrap_or_default();
+    }
+    let slots: [&mut f32; 7] = [
+        &mut t.vertical,
+        &mut t.horizontal,
+        &mut t.rotate,
+        &mut t.aspect,
+        &mut t.scale,
+        &mut t.offset_x,
+        &mut t.offset_y,
+    ];
+    for ((name, lo, hi, _), slot) in TRANSFORM_SCALARS.iter().zip(slots) {
+        if let Some(raw) = crs(name) {
+            *slot = parse_num(name, &raw)?.clamp(*lo, *hi);
+        }
+    }
+    if let Some(raw) = crs(CONSTRAIN_TO_WARP) {
+        t.constrain_crop = parse_bool(CONSTRAIN_TO_WARP, &raw)?;
+    }
+    if let Some(raw) = crs(GUIDE_COUNT) {
+        let n = (parse_num(GUIDE_COUNT, &raw)?.round().max(0.0) as usize).min(TransformSettings::MAX_GUIDES);
+        t.guides = (0..n).filter_map(|i| crs(&format!("{GUIDE_PREFIX}{i}")).and_then(|v| parse_guide(&v))).collect();
+    }
+    let state: Vec<CrsProperty> = UPRIGHT_SOLUTION_KEYS
+        .iter()
+        .filter_map(|k| src.scalar(CRS_NS, k).map(|v| CrsProperty { name: (*k).to_owned(), value: v }))
+        .collect();
+    if !state.is_empty() {
+        let mode = t.upright;
+        t.solution = Some(match crate::develop::transform::lightroom_solution(&state, mode) {
+            Some(sol) => sol,
+            // No matrix for the mode (or off): keep the state for the write-back only.
+            None => UprightSolution { mode, matrix: UprightSolution::IDENTITY.to_vec(), rotation_deg: 0.0, crs: state },
+        });
+    }
+    Ok(())
+}
+
 /// `crs:` features found in a packet that Sieve preserves but does not render, as
 /// `RawImageEntry.developWarnings` (stored at every XMP read).
 pub fn unsupported_warnings(src: &dyn CrsSource) -> Vec<DevelopWarning> {
@@ -864,21 +1032,7 @@ pub fn unsupported_warnings(src: &dyn CrsSource) -> Vec<DevelopWarning> {
     if lens {
         push(DevelopWarningCode::LensCorrectionsUnsupported, None);
     }
-    let transform = [
-        "PerspectiveUpright",
-        "PerspectiveVertical",
-        "PerspectiveHorizontal",
-        "PerspectiveRotate",
-        "PerspectiveAspect",
-        "PerspectiveX",
-        "PerspectiveY",
-    ]
-    .iter()
-    .any(|n| nonzero(n))
-        || crs("PerspectiveScale").and_then(|v| v.parse::<f32>().ok()).is_some_and(|v| v != 100.0);
-    if transform {
-        push(DevelopWarningCode::TransformUnsupported, None);
-    }
+    // Transform / Upright are rendered since v19 (no `TransformUnsupported`).
     let legacy_pv = crs("ProcessVersion").and_then(|v| v.parse::<f32>().ok()).is_some_and(|v| v < MIN_PROCESS_VERSION);
     if legacy_pv && (src.has(CRS_NS, "Exposure") || src.has(CRS_NS, "Exposure2012")) {
         push(DevelopWarningCode::LegacyProcessVersion, crs("ProcessVersion"));
@@ -1153,11 +1307,7 @@ mod tests {
             unsupported_warnings(&src).into_iter().map(|w| (w.code, w.detail)).collect();
         assert_eq!(
             codes,
-            [
-                (DevelopWarningCode::MasksUnsupported, Some("3".into())),
-                (DevelopWarningCode::RetouchUnsupported, None),
-                (DevelopWarningCode::TransformUnsupported, None),
-            ]
+            [(DevelopWarningCode::MasksUnsupported, Some("3".into())), (DevelopWarningCode::RetouchUnsupported, None),]
         );
     }
 
