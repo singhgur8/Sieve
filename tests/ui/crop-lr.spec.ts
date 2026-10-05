@@ -144,10 +144,9 @@ test.describe("crop like Lightroom", () => {
     expect((again.r - again.l) * (again.b - again.t)).toBeGreaterThan(0.8); // analytic 0.823 for 3:2 at 4 degrees
   });
 
-  test("angle tool: a line drawn along a tilted horizon levels it; Auto straighten is disabled with a reason", async ({ page }) => {
+  test("angle tool: a line drawn along a tilted horizon levels it; Auto straighten is enabled", async ({ page }) => {
     await openCrop(page);
-    await expect(page.getByTestId("crop-auto-straighten")).toBeDisabled();
-    await expect(page.getByTestId("crop-auto-straighten")).toHaveAttribute("title", /Upright/);
+    await expect(page.getByTestId("crop-auto-straighten")).toBeEnabled();
     await page.getByTestId("crop-angle-tool").click();
     await expect(page.getByTestId("crop-angle-tool")).toHaveAttribute("aria-pressed", "true");
     const f = (await page.getByTestId("crop-frame").boundingBox())!;

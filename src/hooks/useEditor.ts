@@ -55,6 +55,8 @@ export interface EditorOptions {
   format?: ImageFormat;
   /** Render the full, uncropped frame (crop tool active). */
   uncropped?: boolean;
+  /** Render without the Transform (Upright / manual): the Guided tool draws on the sensor frame. */
+  untransformed?: boolean;
 }
 
 export interface Editor {
@@ -150,7 +152,9 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     inflight.current.add(key);
     const cropOff = !!o.uncropped && slot !== "before";
     const base = slot === "before" ? neutralAdjustments(o.format) : adjRef.current;
-    const a: ParametricAdjustments = cropOff ? { ...base, crop: { ...base.crop, enabled: false } } : base;
+    const flat = !!o.untransformed && slot !== "before";
+    let a: ParametricAdjustments = cropOff || flat ? { ...base, crop: { ...base.crop, enabled: false } } : base;
+    if (flat) a = { ...a, transform: neutralAdjustments(o.format).transform };
     const full = Math.min(2048, Math.max(64, Math.round(o.maxEdge)));
     const edge = draft.current && slot === "main" ? Math.max(256, Math.min(1024, Math.round(o.maxEdge / 2))) : full;
     const options = { maxEdge: Math.min(edge, full), slot, region: slot === "detail" ? o.region : null };
@@ -166,7 +170,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
         nullStreak.current.delete(key);
         if (r.imageId !== idRef.current) return; // image changed
         const wasDraft = draft.current && r.slot === "main";
-        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing, uncropped: cropOff || !base.crop.enabled };
+        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing, uncropped: cropOff || flat || !base.crop.enabled };
         // Decode off the display path (not awaited: the next render may start meanwhile), then swap in.
         void decodeUrl(r.url).then(() => {
           if (r.imageId !== idRef.current) return;
@@ -288,9 +292,10 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (id != null && opts.wantBefore) schedule("before");
   }, [id, opts.wantBefore, schedule]);
   const uncropped = !!opts.uncropped;
+  const untransformed = !!opts.untransformed;
   useEffect(() => {
     if (id != null) schedule("main");
-  }, [id, uncropped, schedule]);
+  }, [id, uncropped, untransformed, schedule]);
   const regionKey = opts.region ? JSON.stringify(opts.region) : "";
   useEffect(() => {
     if (id != null && regionKey) schedule("detail");

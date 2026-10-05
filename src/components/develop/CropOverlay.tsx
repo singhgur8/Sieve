@@ -303,6 +303,7 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
         </svg>
       )}
       <div ref={box} className="pointer-events-none absolute" style={{ left, top, width: iw, height: ih }} data-testid="crop-frame">
+        {!tool.constrain && rot !== 0 && <PaperFill iw={iw} ih={ih} rot={rot} />}
         <div className={dim} style={{ left: 0, top: 0, width: "100%", height: pct(rect.t) }} />
         <div className={dim} style={{ left: 0, top: pct(rect.b), width: "100%", height: pct(1 - rect.b) }} />
         <div className={dim} style={{ left: 0, top: pct(rect.t), width: pct(rect.l), height: pct(rect.b - rect.t) }} />
@@ -359,6 +360,29 @@ function Guide({ id, orient, pa }: { id: OverlayId; orient: number; pa: number }
           <path key={i} d={d} vectorEffect="non-scaling-stroke" />
         ))}
       </g>
+    </svg>
+  );
+}
+
+/**
+ * "Constrain to image" off: the part of the frame the rotated photo does not cover is white, as in the render
+ * (the backend fills the gap white). Frame rectangle minus the rotated photo quad (even-odd).
+ */
+function PaperFill({ iw, ih, rot }: { iw: number; ih: number; rot: number }) {
+  const a = (rot * Math.PI) / 180;
+  const cos = Math.cos(a);
+  const sin = Math.sin(a);
+  const quad = [
+    [-iw / 2, -ih / 2],
+    [iw / 2, -ih / 2],
+    [iw / 2, ih / 2],
+    [-iw / 2, ih / 2],
+  ]
+    .map(([x, y]) => `${(iw / 2 + x * cos - y * sin).toFixed(2)},${(ih / 2 + x * sin + y * cos).toFixed(2)}`)
+    .join(" L");
+  return (
+    <svg className="pointer-events-none absolute inset-0 size-full" viewBox={`0 0 ${iw} ${ih}`} data-testid="crop-paper">
+      <path fillRule="evenodd" fill="white" d={`M0,0 H${iw} V${ih} H0 Z M${quad} Z`} />
     </svg>
   );
 }

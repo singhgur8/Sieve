@@ -290,6 +290,24 @@ export const HELP: HelpEntry[] = [
     ],
   },
   {
+    id: "upright",
+    title: "Crop, straighten and Upright",
+    keywords: "crop straighten angle horizon level vertical perspective keystone transform guided auto upright lines",
+    blocks: [
+      {
+        ul: [
+          "Press R to crop. Drag the corners, edges or the frame; drag outside the frame to rotate. A locks the aspect ratio, X swaps landscape / portrait, O cycles the guides. Enter applies, Esc cancels.",
+          "Auto (in the crop panel) straightens the photo: it finds the horizon or the vertical lines and sets the Angle for you. Shift+double-click the Angle slider does the same. If it finds no straight lines it tells you; draw the angle yourself with the Angle tool.",
+          "Constrain to image keeps the crop inside the straightened photo. Turn it off to crop past the edge: the empty corners are filled white, as in Lightroom.",
+          "Transform (right panel, below Detail) fixes perspective. Upright Level levels the horizon, Vertical also straightens converging verticals, Full corrects horizontal perspective too, and Auto picks a balanced correction. One click, one undo step.",
+          "Guided (Shift+T) lets you draw 2 to 4 lines along things that should be straight, such as door frames or walls. Sieve corrects the photo as soon as there are two. Drag a line's ends to adjust it, click the x to delete it, Esc to finish.",
+          "The sliders below (Vertical, Horizontal, Rotate, Aspect, Scale, Offset) adjust by hand. Constrain Crop keeps the crop inside the corrected image. The blue dot shows the transform was changed; hold it to see the photo without it.",
+          "Transform is written to the sidecar so Lightroom shows the same Upright mode and sliders. A photo you already straightened with Upright in Lightroom keeps Lightroom's own correction.",
+        ],
+      },
+    ],
+  },
+  {
     id: "shortcuts",
     title: "Keyboard shortcuts",
     keywords: "keys chords cheat sheet",

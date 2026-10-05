@@ -33,6 +33,9 @@ import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyField
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
 import { CropOverlay, constrainTool, newTool, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
+import { GuideOverlay } from "./GuideOverlay";
+import { useUpright } from "../../hooks/useUpright";
+import { cropAngleForRotation } from "../../lib/transform";
 import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, loadCropAspect, loadOverlay, nextOverlay, previewRotation, saveOverlay, toStored } from "../../lib/crop";
 import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
@@ -69,6 +72,8 @@ export interface DevelopHandle {
   cropOverlay: () => void;
   cropOverlayRotate: () => void;
   cropReset: () => void;
+  /** Shift+T: toggle the Guided Upright tool. */
+  toggleGuided: () => void;
   /** Time (ms) of the adjustment Cmd+Z would undo (0 = none) and whether an adjustment redo exists. */
   lastCommitAt: () => number;
   canRedo: () => boolean;
@@ -175,6 +180,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const [cropTool, setCropTool] = useState<CropTool | null>(null);
   const cropRef = useRef<CropTool | null>(null);
   cropRef.current = cropTool;
+  // Guided Upright tool (Shift+T): the photo is shown without its transform and guide lines are drawn on it.
+  const [guideOn, setGuideOn] = useState(false);
+  const guideRef = useRef(false);
+  guideRef.current = guideOn;
   const [browsing, setBrowsing] = useState(false);
   const [picking, setPicking] = useState(false);
   const pickerRef = useRef(false);
@@ -198,7 +207,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const beforeOn = (showBefore || split) && !compare;
   const editorA = useEditor(idA, {
     format: (idA != null ? lib.getEntry(idA) : undefined)?.format,
-    uncropped: cropTool !== null && !focusB,
+    uncropped: (cropTool !== null || guideOn) && !focusB,
+    untransformed: guideOn && !focusB,
     maxEdge,
     region,
     wantBefore: beforeOn && !focusB,
@@ -208,7 +218,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   });
   const editorB = useEditor(idB, {
     format: (idB != null ? lib.getEntry(idB) : undefined)?.format,
-    uncropped: cropTool !== null && focusB,
+    uncropped: (cropTool !== null || guideOn) && focusB,
+    untransformed: guideOn && focusB,
     maxEdge,
     region,
     wantBefore: false,
@@ -270,7 +281,16 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   // Zoom level and position persist while stepping through photos (Lightroom); the crop tool and Esc still go back to Fit.
 
   // ---- crop tool ----
-  useEffect(() => setCropTool(null), [id]);
+  useEffect(() => {
+    setCropTool(null);
+    setGuideOn(false);
+    setCropMsg(null);
+  }, [id]);
+  const upright = useUpright(editor, id, onError);
+  const [cropMsg, setCropMsg] = useState<string | null>(null);
+  const [cropBusy, setCropBusy] = useState(false);
+  const adjRef = useRef(editor.adj);
+  adjRef.current = editor.adj;
   const orientation = entry?.orientation ?? 1;
   const imageAspect = editor.main && editor.main.uncropped && editor.main.height > 0 ? editor.main.width / editor.main.height : 0;
   // Oriented, uncropped aspect (w / h) of the photo: what crop rectangles are fractions of.
@@ -285,6 +305,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     if (id == null) return;
     const c = editor.adj.crop;
     masksRef.current.endTool();
+    setGuideOn(false);
+    setCropMsg(null);
     setZoom({ on: false, cx: 0.5, cy: 0.5 });
     setShowBefore(false);
     setSplit(false);
@@ -309,7 +331,39 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, []);
   const imageAspectRef = useRef(imageAspect);
   imageAspectRef.current = imageAspect;
-  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: changeCrop, commit: commitCrop, cancel: cancelCrop };
+  /** Auto straighten (Lightroom): `auto_upright(level)` -> the crop angle (mirrored orientations flip it), re-fit by `changeCrop`. */
+  const autoStraighten = useCallback(async () => {
+    const forId = id;
+    if (forId == null || !cropRef.current) return;
+    setCropBusy(true);
+    setCropMsg(null);
+    try {
+      const r = await unwrap(commands.autoUpright(forId, "level", adjRef.current));
+      const t = cropRef.current;
+      if (!t || forId !== idRefDev.current) return;
+      if (!r.solution) return setCropMsg(r.message ?? "No straight lines found to level");
+      changeCrop({ ...t, angle: cropAngleForRotation(r.solution.rotationDeg, orientationRef.current), rotating: false });
+    } catch (e) {
+      onError(e);
+    } finally {
+      setCropBusy(false);
+    }
+  }, [id, changeCrop, onError]);
+  const idRefDev = useRef(id);
+  idRefDev.current = id;
+  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: changeCrop, commit: commitCrop, cancel: cancelCrop, autoStraighten: () => void autoStraighten(), autoBusy: cropBusy, autoMessage: cropMsg };
+  const toggleGuided = useCallback(() => {
+    if (guideRef.current) return setGuideOn(false);
+    if (idRefDev.current == null) return;
+    masksRef.current.endTool();
+    setCropTool(null);
+    setPicking(false);
+    setShowBefore(false);
+    setSplit(false);
+    setZoom({ on: false, cx: 0.5, cy: 0.5 });
+    setGuideOn(true);
+  }, []);
+  const guided = { active: guideOn, toggle: toggleGuided };
 
   // Zoom to a preset keeping the image point under `at` (viewer px; the viewer centre by default) fixed.
   const hoverRef = useRef<{ x: number; y: number } | null>(null);
@@ -699,6 +753,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const escape = useCallback(() => {
     if (pickerRef.current) return setPicking(false);
     if (browsingRef.current) return setBrowsing(false);
+    if (guideRef.current) return setGuideOn(false);
     if (cropRef.current) return setCropTool(null);
     const m = masksRef.current;
     if (m.tool) return m.endTool();
@@ -744,6 +799,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       },
       cropOverlayRotate: () => cropRef.current && changeCrop({ ...cropRef.current, overlayOrient: (cropRef.current.overlayOrient + 1) % 4 }),
       cropReset: () => cropRef.current && changeCrop(resetTool(cropRef.current)),
+      toggleGuided,
       cropLock: () => cropRef.current && changeCrop(toggleLockTool(cropRef.current, imageAspectRef.current || 1.5)),
       lastCommitAt: editor.lastCommitAt,
       canRedo: editor.canRedo,
@@ -755,7 +811,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);
@@ -837,6 +893,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         </div>
       )}
       {cropTool && <CropBar crop={cropApi} />}
+      {guideOn && imageAspect > 0 && !compare && (
+        <GuideOverlay guides={editor.adj.transform.guides ?? []} size={size} imageAspect={imageAspect} orientation={orientation} onChange={upright.setGuides} />
+      )}
       {picking && (
         <div
           className="absolute inset-0 z-20 cursor-crosshair"
@@ -1064,6 +1123,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                 imageId={id}
                 onError={onError}
                 crop={cropApi}
+                upright={upright}
+                guided={guided}
                 picker={{ active: picking, toggle: togglePicker }}
                 masks={{
                   open: masks.open,

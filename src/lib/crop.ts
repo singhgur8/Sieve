@@ -30,7 +30,7 @@ export const ASPECTS: { id: AspectId; label: string; ratio: number | null }[] = 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Display -> stored (un-oriented) point mapping for EXIF orientation 1..8. */
-function toStoredPoint(o: number, u: number, v: number): [number, number] {
+export function toStoredPoint(o: number, u: number, v: number): [number, number] {
   switch (o) {
     case 2: return [1 - u, v];
     case 3: return [1 - u, 1 - v];
@@ -42,7 +42,7 @@ function toStoredPoint(o: number, u: number, v: number): [number, number] {
     default: return [u, v];
   }
 }
-function fromStoredPoint(o: number, x: number, y: number): [number, number] {
+export function fromStoredPoint(o: number, x: number, y: number): [number, number] {
   switch (o) {
     case 2: return [1 - x, y];
     case 3: return [1 - x, 1 - y];

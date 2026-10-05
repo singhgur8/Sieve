@@ -1,5 +1,5 @@
 // Crop drawer of the adjust panel (right under the tool strip while the crop tool is active): start/finish the crop tool, aspect presets, straighten angle.
-import { Lock, LockOpen, Ruler, RectangleVertical, Wand2 } from "lucide-react";
+import { Loader2, Lock, LockOpen, Ruler, RectangleVertical, Wand2 } from "lucide-react";
 import { hint } from "../../lib/keymap";
 import { ASPECTS, OVERLAYS, saveOverlay, type AspectId, type OverlayId } from "../../lib/crop";
 import { resetTool, setAspectTool, setCustomRatio, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
@@ -12,9 +12,14 @@ export interface CropApi {
   change: (t: CropTool) => void;
   commit: () => void;
   cancel: () => void;
+  /** Auto straighten (Upright Level -> crop angle). */
+  autoStraighten: () => void;
+  autoBusy: boolean;
+  /** Inline note when no straight lines were found. */
+  autoMessage: string | null;
 }
 
-const AUTO_TIP = "Auto straighten: coming with Upright";
+const AUTO_TIP = "Auto straighten: level the horizon / verticals from the photo (Shift+double-click the Angle slider)";
 
 /** W : H inputs of the Custom aspect. */
 function CustomRatio({ tool, crop, testid }: { tool: CropTool; crop: CropApi; testid: string }) {
@@ -78,10 +83,15 @@ export function CropPanel({ crop }: { crop: CropApi }) {
         <button className={`${b} ${tool.angleTool ? "bg-sky-800 text-sky-100" : ""}`} onClick={() => crop.change({ ...tool, angleTool: !tool.angleTool })} title="Angle tool: drag a line along the horizon (or Cmd-drag)" aria-pressed={!!tool.angleTool} data-testid="crop-angle-tool">
           <Ruler className="inline size-3.5" /> Angle tool
         </button>
-        <button className={b} disabled title={AUTO_TIP} data-testid="crop-auto-straighten">
-          <Wand2 className="inline size-3.5" /> Auto
+        <button className={b} disabled={crop.autoBusy} onClick={crop.autoStraighten} title={AUTO_TIP} data-testid="crop-auto-straighten">
+          {crop.autoBusy ? <Loader2 className="inline size-3.5 animate-spin" /> : <Wand2 className="inline size-3.5" />} Auto
         </button>
       </div>
+      {crop.autoMessage && (
+        <p className="mb-2 rounded bg-amber-900/40 px-1.5 py-1 text-[11px] text-amber-200" role="status" data-testid="crop-auto-message">
+          {crop.autoMessage}
+        </p>
+      )}
       <label className="mb-2 flex items-center gap-1.5 text-xs text-neutral-300" title="Keep the crop inside the straightened image">
         <input type="checkbox" checked={tool.constrain} onChange={(e) => crop.change({ ...tool, constrain: e.target.checked })} data-testid="crop-constrain" />
         Constrain to image
@@ -117,6 +127,7 @@ export function CropPanel({ crop }: { crop: CropApi }) {
         onInput={(v) => crop.change({ ...tool, angle: v, rotating: true })}
         onCommit={() => crop.change({ ...tool, rotating: false })}
         onReset={() => crop.change({ ...tool, angle: 0, rotating: false })}
+        onAuto={crop.autoStraighten}
       />
       <div className="mt-2 flex gap-1">
         <button className={`${b} bg-sky-700 text-white hover:bg-sky-600`} onClick={crop.commit} data-testid="crop-done" title="Apply the crop (Enter)">
@@ -166,9 +177,14 @@ export function CropBar({ crop }: { crop: CropApi }) {
       <button className={`${ibtn} ${tool.angleTool ? "bg-sky-800" : ""}`} onClick={() => crop.change({ ...tool, angleTool: !tool.angleTool })} title="Angle tool: drag a line along the horizon (or Cmd-drag)" aria-pressed={!!tool.angleTool} data-testid="cropbar-angle-tool">
         <Ruler className="size-3.5" />
       </button>
-      <button className={`${ibtn} opacity-40`} disabled title={AUTO_TIP} data-testid="cropbar-auto-straighten">
-        <Wand2 className="size-3.5" />
+      <button className={`${ibtn} disabled:opacity-40`} disabled={crop.autoBusy} onClick={crop.autoStraighten} title={AUTO_TIP} data-testid="cropbar-auto-straighten">
+        {crop.autoBusy ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
       </button>
+      {crop.autoMessage && (
+        <span className="max-w-48 truncate text-amber-300" title={crop.autoMessage} role="status" data-testid="cropbar-auto-message">
+          {crop.autoMessage}
+        </span>
+      )}
       <label className="flex items-center gap-1" title="Keep the crop inside the straightened image">
         <input type="checkbox" checked={tool.constrain} onChange={(e) => crop.change({ ...tool, constrain: e.target.checked })} data-testid="cropbar-constrain" />
         Constrain
@@ -189,7 +205,7 @@ export function CropBar({ crop }: { crop: CropApi }) {
           onPointerUp={() => crop.change({ ...tool, rotating: false })}
           onBlur={() => tool.rotating && crop.change({ ...tool, rotating: false })}
           onKeyUp={() => crop.change({ ...tool, rotating: false })}
-          onDoubleClick={() => crop.change({ ...tool, angle: 0, rotating: false })}
+          onDoubleClick={(e) => (e.shiftKey ? crop.autoStraighten() : crop.change({ ...tool, angle: 0, rotating: false }))}
         />
         <span className="w-10 tabular-nums text-neutral-300" data-testid="cropbar-angle-value">
           {`${tool.angle > 0 ? "+" : ""}${tool.angle.toFixed(1)}°`}

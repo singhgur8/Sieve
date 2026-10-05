@@ -32,6 +32,8 @@ import { ToneCurvePanel } from "./ToneCurvePanel";
 import { ColorGradingPanel } from "./ColorGradingPanel";
 import { CalibrationPanel, DetailPanel, EffectsPanel } from "./DetailPanels";
 import { CropPanel, type CropApi } from "./CropPanel";
+import { TransformPanel, type GuidedApi } from "./TransformPanel";
+import type { UprightApi } from "../../hooks/useUpright";
 import { hint } from "../../lib/keymap";
 
 const BASIC_ALL: AdjustmentField[] = [...BASIC_FIELDS, ...PRESENCE_FIELDS, "profile", "black_and_white"];
@@ -72,6 +74,9 @@ interface Props {
   imageId: number | null;
   onError: (e: unknown) => void;
   crop: CropApi;
+  /** Transform section: Upright buttons / Guided tool. */
+  upright: UprightApi;
+  guided: GuidedApi;
   /** White balance eyedropper (W). */
   picker: { active: boolean; toggle: () => void };
   /** Masking tool: the strip button toggles the Masks panel, which replaces the section list while open. */
@@ -222,7 +227,7 @@ const WbRow = memo(function WbRow({ kind, value, def, other, asShot, disabled, o
   );
 });
 
-export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, hold, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
+export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, hold, auto, imageId, onError, crop, upright, guided, picker, masks, browser, exif, bar }: Props) {
   const syncing = useActivityRunning("paste_sync");
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
@@ -395,6 +400,10 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
 
               <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} onHold={holdOf("Detail", ["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
                 <DetailPanel editor={editor} />
+              </Section>
+
+              <Section id="transform" dirty={dirty(["transform"])} onHold={holdOf("Transform", ["transform"])} title="Transform" onReset={() => resetFields(["transform"], "Reset Transform")}>
+                <TransformPanel editor={editor} upright={upright} guided={guided} />
               </Section>
 
               <Section id="effects" dirty={dirty(["vignette", "grain"])} onHold={holdOf("Effects", ["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>

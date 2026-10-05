@@ -60,6 +60,7 @@ export type ActionId =
   | "split"
   | "crop"
   | "cropCommit"
+  | "guided"
   | "undoAdj"
   | "redoAdj"
   | "undoCull"
@@ -211,6 +212,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "split", group: "Develop", label: "Split view", chords: [c("y")], modes: ["develop"], display: ["Y"], where: "Develop" },
   { id: "crop", group: "Develop", label: "Crop tool (again: apply)", chords: [c("r")], modes: ["develop"], display: ["R"], where: "Develop" },
   { id: "cropCommit", group: "Develop", label: "Apply crop (Esc cancels it)", chords: [c("Enter")], modes: ["develop"], display: ["Enter"], where: "While cropping" },
+  { id: "guided", group: "Develop", label: "Guided Upright tool: draw up to 4 guide lines (Esc exits)", chords: [c("t", { shift: true })], modes: ["develop"], display: ["Shift+T"], where: "Develop" },
   { id: "undoAdj", group: "Develop", label: "Undo (culling or adjustment, newest first)", chords: [c("z", { mod: true })], modes: ["develop"], display: ["Cmd+Z"], where: "Develop" },
   { id: "redoAdj", group: "Develop", label: "Redo (culling or adjustment)", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
   { id: "bwToggle", group: "Develop", label: "Toggle Black & White", chords: [c("v")], modes: ["develop"], display: ["V"], where: "Develop" },

@@ -1316,6 +1316,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return loupe.current?.cycleInfo();
       case "crop":
         return develop.current?.toggleCrop();
+      case "guided":
+        return develop.current?.toggleGuided();
       case "cropCommit":
         return void develop.current?.commitCrop();
       case "before":
