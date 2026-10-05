@@ -187,3 +187,122 @@ in Develop and the Grid (Undo toast). Generic Auto behaviour. Reasons on disable
 
 Conflicts checked: X / A / O / Shift+O are scoped to crop (`needs: "crop"`), ahead of reject / auto-mask / mask overlay. K is the brush in Develop and keeper in Compare.
 Cmd+Alt+R crop reset vs Cmd+Shift+R reset all. Shift+T Guided vs Cmd+Shift+T capture time. Up / Down hover-nudge vs Compare swap. None of these is ambiguous today.
+
+---
+
+## Re-check 1 (2026-10-05, HEAD 96142fc, contract v19.2)
+
+Evidence: mock backend on `vite --port 1448` (`/?mock=201&keepers=not_rejected`, `/?mock=60&scope=all&twobodies=1&meta=1`, `/?mock=200&scope=all[&upright=none]`), throwaway Playwright drivers at 1280×800 and 1728×1117 (deleted). The existing suites `ux-8d-p1`, `ux-8d-p2`, `ux-8d-v192`, `upright`, `crop-lr` and `crop-geometry` pass against the same server (52/52).
+Kept screenshots (`test-data/ux-review-8d/`): `rc1-cull-1280.png`, `rc1-capture-sync-1280.png`, `rc1-autosync-1280.png`, `rc1-after-apply-1280.png`, `rc1-guided-1280.png`, `rc1-crop-auto-1728.png`.
+
+**Summary: open P0 0 · P1 4 (all new: R1-1 crop discarded on navigation, R1-2 typed crop angle ignored, R1-3 crop vs Upright mismatch [ARCH], R1-4 capture-time Apply below the fold at 1280) · P2 14.** All eight P1s from the first pass are resolved.
+
+### Status of the first-pass P1s
+
+| # | Status | Evidence |
+|---|---|---|
+| P1-1 Auto Sync | **Resolved** | `rc1-autosync-1280.png`: `Edit 5 selected` opens Develop with the `Auto Sync` switch on and the note in the right panel. A committed edit is one `sync_delta` (source + 4) with relative exposure / WB, and one Cmd+Z reverts all 5. Cmd+Alt+Shift+A flips the switch (suite `ux-8d-p1`). The notice copy contradicts the panel (R1-P2-1). |
+| P1-2 Selection bar reflow | **Resolved** | Cull step, 1280 and 1728: the bounding box of `cell-2` is identical before and after a Shift-click range (y = 173). In Cull with an empty clipboard, `selection-bar` has count 0. Elsewhere it floats bottom-centre. It covers the last row (R1-P2-3). |
+| P1-3 Sync two cameras defaults / scope | **Resolved** | One photo selected: both pickers read "Choose a frame…", Apply is disabled, and the Cmd-click tip shows. A one-per-camera pair opens on Sync with both thumbnails. Scope "This body … in this project (15)". A searchable list with no cap. With a filter hiding frames: "including N hidden by the current filters". At 1280×800 Apply sits below the fold (R1-4). |
+| P1-4 Two identical bodies | **Resolved** | `rc1-capture-sync-1280.png`: `Sony ILCE-7M4 (…8214)` vs `(…9876)`. "The selected photos only (2)" fallback sends `scope: "selected"`. The facet lists both bodies. The model-scope label is muddled (R1-P2-5). |
+| P1-5 Review / apply rejects only | **Resolved** | `rc1-cull-1280.png`: the `Review 8 suggested rejects` chip shows exactly 8 photos. The Apply dialog opens with only Rejects checked, `Apply to 8`, and sends `kinds {picks:false, rejects:true, stars:false}`. The choice is remembered per project. What happens after Apply needs work (R1-P2-6). |
+| P1-6 Strictness text | **Resolved** | The `strictness-explain` text and Help match the specified sentences for all three levels. |
+| P1-7 By you / Auto | **Resolved** | Segmented chips `Rejected 7 · By you 7 · Auto 0`. `Auto 0` opens "No photos were auto-rejected yet. Sieve suggests rejecting 8. Review them". Esc does not close it (R1-P2-4). |
+| P1-8 1280 layout | **Resolved** | 1280 and 1728: no element in the top 160 px has `right > innerWidth` in the Plan or in Develop. The Plan's Apply all reason sits under the button. The Navigator reads `Fit Fill 100% 200%` inside the panel. |
+
+### Transform / Upright and crop vs Lightroom Classic (first review)
+
+What matches Lightroom and needs no change:
+- **Upright buttons.** Same order and labels (Off / Auto / Guided, Level / Vertical / Full). One history entry each (`Upright: Vertical`). The section's blue changed dot shows.
+- **No usable lines.** An inline amber note appears, nothing is saved and the mode stays Off, as Lightroom does. The backend copy ("No vertical lines found", "The correction would be too extreme") is clear.
+- **Manual sliders.** Vertical / Horizontal / Rotate / Aspect / Scale / Offset X / Y have Lightroom's ranges and support typing, nudging and double-click reset.
+- **Constrain Crop.** Off by default, as in Lightroom.
+- **Guided tool.** Shift+T arms it. It shows the photo without its transform, solves live from 2 guides, allows at most 4, x deletes a guide and Esc exits.
+- **Auto straighten in the crop tool.** The `Auto` button and Shift+double-click on Angle both work. In `rc1-crop-auto-1728.png` it levels by +1.2° and the crop re-fits to the largest rectangle.
+- **The "over-cropped after Done" bug is fixed.** At 5° with Original 3:2 locked, the rectangle is 0.8874 of the frame on both axes. That equals the analytic maximum inscribed rectangle, min(1.5/(1.5 cos θ + sin θ), 1/(1.5 sin θ + cos θ)) = 0.8874. Rotating back to 0 grows it back (crop-lr suite). The stored crop round-trips: reopening R shows the same rectangle.
+- **Constrain to image off.** The rotated corners render as white paper, matching the export.
+- **Keymap.** R, Enter, Esc, A, X, O, Shift+O and Cmd+Alt+R all work while cropping. The crop-scoped X / A / O / Shift+O win over reject / auto-mask / mask overlay; these are the only duplicate chords in `keymap.ts` (scripted check over every mode).
+- **Crop bar.** It now appears only when the right panel is hidden.
+- **Accepted deviation.** Dragging inside the crop moves the rectangle, not the image (decisions.md).
+
+The user said: "when I manually straighten and click done, the image is cropped in way more than it should". The plain straighten case is fixed. Two paths still give a result the user did not see or intend (R1-1, R1-3), and typing an exact angle does not work (R1-2).
+
+### New P1
+
+#### R1-1 Leaving the crop tool any way except Done / Enter / R silently throws the crop away
+- **Where**: `develop/DevelopView.tsx`. The `useEffect(() => { setCropTool(null); … }, [id])` runs on photo change. `toggleGuided` calls `setCropTool(null)`, and so does leaving Develop (G / E / Grid / Loupe buttons, step switches, filmstrip click).
+- **Evidence**: driver at 1280. R, Angle +4.0°, then Right arrow: 0 `save_adjustments` with label "Crop", and the next photo opens with no crop tool. The same happens with G: 0 saves.
+- **Why**: in Lightroom, moving to another photo or module while the Crop Overlay is open **applies** the crop. The crop tool stays active on the next photo when you change photos within Develop. A photographer straightens, presses → to do the next frame, and loses the work without a word. This looks exactly like "the crop tool doesn't work like Lightroom".
+- **Fix**:
+  1. Every exit other than Esc / Cancel commits first. That covers photo change (arrows, filmstrip, N / Shift+N, Compare), G / E / D / C, step switches (Cmd+Alt+1/2/3), Shift+T (Guided), opening Masks (K / M / Shift+M …) and the toolbar view buttons. The commit is one "Crop" history entry on the photo being left. No entry if nothing changed (`commitCrop` already checks this).
+  2. Implementation: expose `commitPendingTool(): Promise<void>` on the Develop handle (it calls `commitCrop()` and awaits the editor flush). App's navigation paths `await` it before changing `active` / `mode` / `step`. Inside DevelopView, Shift+T and the mask keys call `commitCrop()` instead of `setCropTool(null)`.
+  3. Photo change within Develop (arrows, filmstrip): after committing, **re-open the crop tool on the new photo**. Call `startCrop()` once the new photo's `info` is loaded, with the same aspect lock and overlay. This matches Lightroom, where R stays on while you step through a series.
+  4. Esc and Cancel stay the only discard paths.
+- **Acceptance**: R, angle 4 (slider), Right arrow → exactly one `save_adjustments` with label "Crop" and `crop.angle = 4` for photo 1, and `crop-overlay` is visible on photo 2. R, angle 4, G → one Crop save. R, angle 4, Esc → none.
+
+#### R1-2 A typed crop angle is thrown away
+- **Where**: `develop/CropPanel.tsx`, the `Slider id="crop-angle"`: `onInput={(v) => crop.change({ ...tool, angle: v, rotating: true })}` followed by `onCommit={() => crop.change({ ...tool, rotating: false })}`. When a value is typed, both run in the same tick. `onCommit` spreads the stale `tool`, whose angle is still 0, so it overwrites the typed angle.
+- **Evidence**: click the Angle value, type `5`, then Tab or Enter → still `0.0°` with the rectangle unchanged. Dragging and hover + Up / Down work (+0.5° after 5 presses). Filling the range gives +5.0°.
+- **Why**: "Angle: type −1.3" is how Lightroom users straighten precisely. It is the sibling of the user's straighten complaint.
+- **Fix**: make `CropApi.change` accept an updater (`change(t => ({ ...t, rotating: false }))`), applied through `setCropTool(prev => constrainTool(f(prev), …))`. Use the updater for every `onCommit` / `onReset` / `onKeyUp` / `onBlur` / `onPointerUp` in `CropPanel` and `CropBar`.
+- **Acceptance**: type 5 + Enter in the Angle value → `+5.0°`. With Original 3:2 locked, `crop-rect` is `{l:0.0563, t:0.0563, r:0.9437, b:0.9437}`. The crop tool stays open, so Enter in the field does not also commit the crop. The same holds for −1.3 typed into `cropbar-angle`.
+
+#### R1-3 Crop after Upright / Transform: what you draw is not what you get **[ARCH, small]**
+- **Where**: `useEditor.ts`. In crop mode, `render` sends `crop.enabled = false` but keeps `transform`. Rust `develop::transform::Geometry::of` then calls `constrain_crop`, which turns a *disabled* crop into the largest frame inside the warp whenever `transform.constrainCrop` is on. `CropOverlay` (`constrainTool`, `insideRotated`, `PaperFill`) only knows the crop angle, not the Upright / manual warp.
+- **Evidence**: code reading. The mock does not warp, so this cannot be seen in screenshots. Confirm on the Mac with a Vertical-corrected hall frame.
+  - With Constrain Crop **on**, the "uncropped" frame under the crop tool is already auto-cropped, but the overlay treats it as the full frame. A rectangle drawn at 10 % insets is stored as 10 % of the *full* warped frame. After Done the photo shows more than the box did, or it is re-shrunk by `constrain_crop`.
+  - With Constrain Crop **off**, "Constrain to image" in the crop tool lets the rectangle take in the empty, white warp corners.
+- **Why**: this is the remaining "cropped differently than I set it" path, and Upright is exactly what the user asked for. In Lightroom, the Crop Overlay shows the whole warped image, and "Constrain to Image" keeps the rectangle inside the warped image area.
+- **Fix**:
+  1. Frontend, no contract change: while cropping, render with `transform: { ...a.transform, constrainCrop: false }` as well as `crop.enabled = false`. The tool then shows the full warped frame with its white corners.
+  2. Contract (architect): give the overlay the warped image outline in the corrected frame. Either `RenderResult.validQuad: [number, number][] | null` (4 points, fractions of the corrected frame, null without a warp) or a small `transform_bounds(id, adjustments) -> [number, number][]`. The backend already computes this outline in `region_planes`.
+  3. `CropOverlay`: "Constrain to image" keeps the rectangle inside the intersection of the rotated frame and `validQuad` (a convex polygon test replacing `insideRotated`; `fitInsideRotated` and `approach` use it). `PaperFill` paints the area outside `validQuad`.
+  4. Starting the tool on a photo with Constrain Crop on and no stored crop: begin from what `constrain_crop` would produce, so the first frame you see is the current result.
+- **Acceptance (real app)**: Vertical on a frame with converging verticals, Constrain Crop on, then R. The whole warped image is visible, and the rectangle starts at the auto-constrained frame. Dragging a corner outward stops at the warp edge. Done → the rendered result matches the rectangle (corner positions within 1 %).
+
+#### R1-4 Edit Capture Time: Apply is below the fold at 1280×800, and Enter does nothing
+- **Where**: `CaptureTimeDialog.tsx`. `<Dialog … className="flex max-h-[90vh] … overflow-y-auto">` is passed no `onConfirm`.
+- **Evidence**: `rc1-capture-sync-1280.png`. Opened on a pre-filled pair, the dialog body scrolls and `capture-apply` sits at y 772–804 in an 800 px window. The four-row preview is cut off. At 1728 it fits.
+- **Why**: on the most common laptop size, the last step of a 3-step task (select pair → Cmd+Shift+T → Apply) is hidden.
+- **Fix**:
+  - Make the footer (Cancel / Apply) `sticky bottom-0` with `bg-neutral-900` and a top border. Only the middle scrolls.
+  - Below 900 px height, use `h-24` frame lists (instead of `h-28`), 96 px thumbnails, and two preview rows plus "…and N more".
+  - Pass `onConfirm={apply}` with `canConfirm={!applyDisabled}`, so Enter applies when focus is not in the search field.
+  - Initial focus goes to the first tab (or the reference search box on Sync), not the `?` help icon. Today the help icon gets a visible focus ring on open.
+- **Acceptance**: at 1280×800, opened on a pair, `capture-apply` is fully inside the viewport without scrolling. Enter applies once. Esc cancels.
+
+### New P2
+
+- **R1-P2-1 Auto Sync copy contradicts itself.** The notice from `App.tsx` `editAllInScene` says "(exposure and white balance stay per photo for now)". The right panel says they "are applied as a change". The `SelectionBar` `sel-edit-all` tooltip still says "Cmd+Alt+S syncs". Notice: "Editing 5 photos. Auto Sync is on: every change goes to all 5; exposure and white balance move by the same amount on each. Turn Auto Sync off (Cmd+Alt+Shift+A) to edit one." Tooltip: "Open Develop with the whole selection, Auto Sync on".
+- **R1-P2-2 Right bar at 1280.** `Auto Sync · 5` wraps to two lines next to the switch, which is also labelled Auto Sync (`rc1-autosync-1280.png`). While Auto Sync is on, label the button `Sync…` (count in the tooltip) and add `whitespace-nowrap`. Put the count on the switch instead: `Auto Sync · 5`.
+- **R1-P2-3 Floating selection bar.** `5 selected` wraps onto two lines: add `whitespace-nowrap` to `selbar-count`. The bar covers the last grid row: while it is shown, add `padding-bottom: 56px` to the grid scroller so the last row can scroll clear of it.
+- **R1-P2-4 `Auto 0` popover.** Esc does not close it, and only the click-catcher does. Close it on Esc (and on a step / filter change).
+- **R1-P2-5 Capture dialog copy.** The model scope reads "every Sony ILCE-7M4 (…9876) photo from any body", which names one body and then says "any body". Change it to "This camera model: every Sony ILCE-7M4 photo, any body (45)".
+- **R1-P2-6 After `Apply to 8` from Review suggested rejects, the grid is empty** ("No photos match the current filters", chip `Review 0 suggested rejects` still pressed; `rc1-after-apply-1280.png`). When the apply ran under the `suggested: "reject"` filter, switch the view to Rejected · Auto (the `Auto` segment's filter) and toast "Rejected 8 photos, shown here. [Undo]". When the pending count is 0, render the chip as muted text "No reject suggestions" instead of a pressed button.
+- **R1-P2-7 Apply dialog counts.** "Rejects ( 8 )" has stray spaces because the flex `gap-1.5` applies between "(", the count span and ")". Wrap `({n})` in one span.
+- **R1-P2-8 Guided shows two pressed Upright buttons** (`rc1-guided-1280.png`: Guided and Vertical). While the Guided tool is armed, press only Guided and show the stored mode as a hint ("Current: Vertical, kept until 2 guides are drawn"). Also add an on-image badge top-left, like the WB picker's: "Guided Upright: drag 2–4 lines along straight edges · x deletes · Esc done". The instruction only lives in the panel today, which is often scrolled away.
+- **R1-P2-9 Grid while dragging Transform sliders** (Lightroom shows a grid overlay while any Transform slider is dragged). Show the crop tool's 10×10 fine grid over the image while a `tf-*` slider is being dragged or nudged, and hide it 300 ms after release.
+- **R1-P2-10 Crop handle modifiers** (Lightroom): Alt-drag on a handle resizes symmetrically about the centre, and Shift-drag on a free crop keeps the current ratio for that drag. `CropOverlay` `down` / `move` ignore modifiers today. Pass `e.altKey` / `e.shiftKey` into `resizeRect`.
+- **R1-P2-11 Cheat sheet / Cmd+Alt+R.** Add rows "Cmd-drag: draw a straighten line" and "Shift+double-click Angle: Auto straighten" (While cropping). In Lightroom, Cmd+Alt+R resets the crop from anywhere in Develop: drop `needs: "crop"` from `cropReset`, so outside the tool it resets `crop` only, as one "Reset Crop" history entry.
+
+### Remaining first-pass P2s
+
+Resolved: P2-1 (Space to the last preset), P2-2 (info card placement), P2-3 (camera names), P2-4 (sub-second offset), P2-5 (covered by P1-3), P2-7 (`Auto` / `Auto tone`), P2-8 (toast placement while cropping), P2-9 (crop bar only with the panel hidden), P2-10 (toast copy), P2-13 (cheat-sheet group "Copy & paste settings"), P2-14 (filmstrip scene badge).
+Still open:
+- **P2-6**: optional capture time on grid cells.
+- **P2-11**: Plan rows still show "To do: edit this photo" plus a truncated "Edit the represent… Open representative" (1280).
+- **P2-12**: the strictness row is still a second row at 1728.
+
+**Open P2 total: 14** (R1-P2-1 … R1-P2-11, P2-6, P2-11, P2-12).
+
+### Keyboard map changes from this re-check
+
+| Action | Today | Proposed | Lightroom Classic | Notes |
+|---|---|---|---|---|
+| Leave the crop tool by changing photo / view | discards | **commits** (and stays on for the next photo in Develop) | commits | R1-1 |
+| Reset crop | Cmd+Alt+R while cropping | Cmd+Alt+R anywhere in Develop | same | R1-P2-11. No conflict: Cmd+Shift+R resets all. |
+| Confirm Edit Capture Time | – | Enter (not in the search field) | – | R1-4 |
+| Close the `Auto 0` popover | click outside | + Esc | – | R1-P2-4 |
+| Crop handle Alt / Shift drag | – | Alt = from centre, Shift = keep ratio | same | R1-P2-10 |
+
+No new chord conflicts. The only duplicate chords in `keymap.ts` are the intentional crop-scoped ones: X / O / Shift+O / A while cropping, ahead of reject / mask overlay / overlay style / auto mask. The cheat sheet scrolls inside the modal and is filterable at 1280×800 (content 1,648 px in a 637 px viewport) without overflowing the window, so it needs no change.
