@@ -24,8 +24,10 @@ A 100% offline, local desktop application built with Tauri v2 (Rust + React/Type
 1. Import a project folder (a new folder per shoot; one catalog holds many).
 2. Auto-cull, then review/override: pass/fail flags + 0–5 stars.
 3. Culling results are written to XMP sidecars next to the RAWs (Lightroom/Bridge-readable):
-   reject = `xmp:Rating -1`; stars = `xmp:Rating 0–5`; pick = `xmp:Label "Pick"`;
-   auto tags = `lr:hierarchicalSubject` `Sieve|<tag>`. Never clobber unrelated XMP fields.
+   pick = `xmpDM:pick="1"` + `xmpDM:good="True"`; reject = `xmpDM:pick="-1"` + `xmpDM:good="False"`
+   (Lightroom Classic 13.2+); stars = `xmp:Rating 0–5`, kept on reject; color label = `xmp:Label`;
+   auto tags = `lr:hierarchicalSubject` `Sieve|<tag>`. Legacy Sieve sidecars (`xmp:Rating -1`,
+   `xmp:Label "Pick"`) are still read and migrated on write. Never clobber unrelated XMP fields.
 4. Edit keepers in-app (no export needed until culling + editing are done).
 5. Export client deliverables with Lightroom-style presets: JPEG (quality), TIFF 8/16, PNG, optional
    WebP/HEIC; resize; sRGB / Display P3 / Adobe RGB with ICC; output sharpening; filename template;
