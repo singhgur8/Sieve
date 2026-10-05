@@ -1257,9 +1257,11 @@ pub async fn list_xmp_failures(
 #[tauri::command]
 #[specta::specta]
 pub async fn refresh_sidecars(
+    app: AppHandle,
     catalog: State<'_, Catalog>,
     xmp: State<'_, XmpSync>,
     develop: State<'_, DevelopCache>,
+    analysis: State<'_, Analysis>,
     project_id: Option<ProjectId>,
 ) -> AppResult<Vec<ImageId>> {
     let folders: Vec<FolderId> = catalog
@@ -1279,6 +1281,10 @@ pub async fn refresh_sidecars(
     if !changed.is_empty() {
         // Like import's sidecar read: cached develop state of these images is stale.
         develop.forget_sources(Some(&changed));
+    }
+    if xmp.take_capture_time_changes() {
+        // Lightroom-corrected capture times: bursts and scenes regroup on the new order.
+        analysis.start(&app, AnalysisScope::Rescore)?;
     }
     Ok(changed)
 }

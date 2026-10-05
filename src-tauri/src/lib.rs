@@ -376,6 +376,9 @@ pub fn run() {
             app.state::<Ingest>().start(app.handle())?;
             if auto_analyze {
                 app.state::<Analysis>().start(app.handle(), AnalysisScope::Pending)?;
+            } else {
+                // Suggestions scored by older rules are refreshed once (never the user's flags).
+                app.state::<Analysis>().start_if_rules_changed(app.handle())?;
             }
             // Flush sidecar changes left dirty by a previous session (no-op unless auto-sync).
             app.state::<XmpSync>().notify(app.handle());
