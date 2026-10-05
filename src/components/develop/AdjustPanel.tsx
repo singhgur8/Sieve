@@ -431,25 +431,25 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
             role="switch"
             aria-checked={bar.autoSync}
             onClick={() => bar.onAutoSync(!bar.autoSync)}
-            className={`flex shrink-0 items-center gap-1.5 rounded px-2 text-xs ${bar.autoSync ? "bg-sky-800 text-sky-50" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-2 text-xs ${bar.autoSync ? "bg-sky-800 text-sky-50" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
             title={`Every change goes to all ${bar.count} selected photos${hint("autoSync")}. Exposure and white balance move by the same amount on each photo (relative); everything else is copied`}
             data-testid="auto-sync-switch"
           >
             <span className={`relative inline-block h-3 w-6 rounded-full ${bar.autoSync ? "bg-sky-300" : "bg-neutral-600"}`} aria-hidden>
               <span className={`absolute top-0.5 size-2 rounded-full bg-neutral-950 transition-all ${bar.autoSync ? "left-3.5" : "left-0.5"}`} />
             </span>
-            Auto Sync
+            {bar.autoSync ? `Auto Sync · ${bar.count}` : "Auto Sync"}
           </button>
         )}
         {bar.count > 1 ? (
           <button
-            className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
+            className="flex flex-1 items-center justify-center gap-1 whitespace-nowrap rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
             disabled={syncing}
             onClick={(e) => bar.onSync(e.altKey)}
-            title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
+            title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos${bar.autoSync ? " once (Auto Sync does it for every change)" : ""} (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
             data-testid="sync-settings"
           >
-            <RefreshCw className="size-3.5" /> {bar.autoSync ? `Auto Sync · ${bar.count}` : "Sync…"}
+            <RefreshCw className="size-3.5" /> Sync…
           </button>
         ) : (
           <button

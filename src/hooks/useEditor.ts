@@ -164,7 +164,8 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     const cropOff = !!o.uncropped && slot !== "before";
     const base = slot === "before" ? neutralAdjustments(o.format) : adjRef.current;
     const flat = !!o.untransformed && slot !== "before";
-    let a: ParametricAdjustments = cropOff || flat ? { ...base, crop: { ...base.crop, enabled: false } } : base;
+    // While cropping, show the whole warped frame: the crop is off and Constrain Crop (auto-crop inside the warp) too (R1-3).
+    let a: ParametricAdjustments = cropOff || flat ? { ...base, crop: { ...base.crop, enabled: false }, ...(cropOff ? { transform: { ...base.transform, constrainCrop: false } } : {}) } : base;
     if (flat) a = { ...a, transform: neutralAdjustments(o.format).transform };
     const full = Math.min(2048, Math.max(64, Math.round(o.maxEdge)));
     const edge = draft.current && slot === "main" ? Math.max(256, Math.min(1024, Math.round(o.maxEdge / 2))) : full;

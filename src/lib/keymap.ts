@@ -25,6 +25,8 @@ export type ActionId =
   | "cropOverlay"
   | "cropOverlayRotate"
   | "cropReset"
+  | "cropStraightenDrag"
+  | "cropAutoStraighten"
   | "panelsToggle"
   | "panelsHide"
   | "bwToggle"
@@ -148,7 +150,9 @@ export const KEYMAP: KeyDef[] = [
   { id: "cropSwap", group: "Develop", label: "Swap crop orientation (landscape / portrait)", chords: [c("x")], modes: ["develop"], display: ["X"], where: "While cropping", needs: "crop" },
   { id: "cropOverlay", group: "Develop", label: "Cycle the crop guide overlay (thirds, grid, golden ratio / spiral, diagonal, triangle, aspect ratios)", chords: [c("o")], modes: ["develop"], display: ["O"], where: "While cropping", needs: "crop" },
   { id: "cropOverlayRotate", group: "Develop", label: "Rotate the crop guide overlay", chords: [c("o", { shift: true })], modes: ["develop"], display: ["Shift+O"], where: "While cropping", needs: "crop" },
-  { id: "cropReset", group: "Develop", label: "Reset the crop", chords: [c("r", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+R"], where: "While cropping", needs: "crop" },
+  { id: "cropReset", group: "Develop", label: "Reset the crop", chords: [c("r", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+R"], where: "Develop (resets only the crop, one history entry)" },
+  { id: "cropStraightenDrag", group: "Develop", label: "Draw a straighten line on the photo", chords: [], modes: ["develop"], display: ["Cmd-drag"], where: "While cropping", needs: "crop" },
+  { id: "cropAutoStraighten", group: "Develop", label: "Auto straighten (level the horizon)", chords: [], modes: ["develop"], display: ["Shift+double-click Angle"], where: "While cropping", needs: "crop" },
   { id: "cropLock", group: "Develop", label: "Lock / unlock the crop aspect ratio", chords: [c("a")], modes: ["develop"], display: ["A"], where: "While cropping", needs: "crop" },
 
   // ---- culling ----

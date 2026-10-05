@@ -31,7 +31,7 @@ import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
 import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
-import { CropOverlay, constrainTool, newTool, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
+import { CropOverlay, constrainTool, newTool, refit, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { GuideOverlay } from "./GuideOverlay";
 import { useUpright } from "../../hooks/useUpright";
@@ -57,6 +57,8 @@ export interface DevelopHandle {
   toggleCrop: () => void;
   /** Enter: apply the crop (no-op when the tool is inactive). */
   commitCrop: () => void;
+  /** Leaving the crop tool any way but Esc / Cancel commits it (Lightroom); resolves after the saves landed. A photo change within Develop re-opens the tool on the next photo. */
+  commitPendingTool: () => Promise<void>;
   /** Esc: discard the crop tool; true when it was active (so the caller does not also leave Develop). */
   cancelCrop: () => boolean;
   undo: () => void;
@@ -297,10 +299,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   // Zoom level and position persist while stepping through photos (Lightroom); the crop tool and Esc still go back to Fit.
 
   // ---- crop tool ----
+  // The tool (aspect lock, overlay) that was committed by a photo change: it re-opens on the next photo once that is loaded.
+  const carryRef = useRef<CropTool | null>(null);
+  const [reopen, setReopen] = useState<CropTool | null>(null);
   useEffect(() => {
     setCropTool(null);
     setGuideOn(false);
     setCropMsg(null);
+    setReopen(carryRef.current);
+    carryRef.current = null;
   }, [id]);
   const upright = useUpright(editor, id, onError);
   const [cropMsg, setCropMsg] = useState<string | null>(null);
@@ -316,8 +323,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const orientationRef = useRef(orientation);
   orientationRef.current = orientation;
   /** Every crop tool change goes through here: the rectangle stays inside the straightened image. */
-  const changeCrop = useCallback((t: CropTool) => setCropTool(constrainTool(t, frameAspectRef.current, orientationRef.current)), []);
-  const startCrop = useCallback(() => {
+  const changeCrop = useCallback(
+    (t: CropTool | ((prev: CropTool) => CropTool)) =>
+      setCropTool((prev) => {
+        const next = typeof t === "function" ? (prev ? t(prev) : prev) : t;
+        return next ? constrainTool(next, frameAspectRef.current, orientationRef.current) : next;
+      }),
+    [],
+  );
+  const startCrop = useCallback((carry?: CropTool | null) => {
     if (id == null) return;
     const c = editor.adj.crop;
     masksRef.current.endTool();
@@ -327,8 +341,19 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setShowBefore(false);
     setSplit(false);
     setPicking(false);
-    setCropTool(newTool(c.enabled ? fromStored(c, orientation, frameAspect) : FULL, c.enabled ? c.angle : 0, loadCropAspect(), loadOverlay()));
+    let t = newTool(c.enabled ? fromStored(c, orientation, frameAspect) : FULL, c.enabled ? c.angle : 0, loadCropAspect(), loadOverlay());
+    if (carry) {
+      t = { ...t, overlay: carry.overlay, overlayOrient: carry.overlayOrient, constrain: carry.constrain };
+      if (!c.enabled) t = refit({ ...t, aspect: carry.aspect, flip: carry.flip, customRatio: carry.customRatio }, frameAspect);
+    }
+    setCropTool(constrainTool(t, frameAspect, orientation));
   }, [id, editor.adj.crop, orientation, frameAspect]);
+  // Re-open the crop tool on the next photo (R1-1) as soon as it is loaded.
+  useEffect(() => {
+    if (!reopen || id == null || editor.loading || !editor.info || editor.info.imageId !== id || !(frameAspect > 0)) return;
+    setReopen(null);
+    startCrop(reopen);
+  }, [reopen, id, editor.loading, editor.info, frameAspect, startCrop]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
     if (!t) {
@@ -367,12 +392,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [id, changeCrop, onError]);
   const idRefDev = useRef(id);
   idRefDev.current = id;
-  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: startCrop, change: changeCrop, commit: commitCrop, cancel: cancelCrop, autoStraighten: () => void autoStraighten(), autoBusy: cropBusy, autoMessage: cropMsg };
+  const cropApi: CropApi = { tool: cropTool, imageAspect: imageAspect || 1.5, start: () => startCrop(), change: changeCrop, commit: commitCrop, cancel: cancelCrop, autoStraighten: () => void autoStraighten(), autoBusy: cropBusy, autoMessage: cropMsg };
   const toggleGuided = useCallback(() => {
     if (guideRef.current) return setGuideOn(false);
     if (idRefDev.current == null) return;
     masksRef.current.endTool();
-    setCropTool(null);
+    commitCrop();
     setPicking(false);
     setShowBefore(false);
     setSplit(false);
@@ -380,6 +405,18 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setGuideOn(true);
   }, []);
   const guided = { active: guideOn, toggle: toggleGuided };
+  /** Every exit from the crop tool except Esc / Cancel commits it; `carry` re-opens it on the next photo. */
+  const commitPendingTool = useCallback(async () => {
+    const t = cropRef.current;
+    if (t) {
+      carryRef.current = t;
+      window.setTimeout(() => {
+        if (carryRef.current === t) carryRef.current = null; // the exit was not a photo change
+      }, 1500);
+      commitCrop();
+    }
+    await Promise.all([flushA(), flushB()]);
+  }, [commitCrop, flushA, flushB]);
 
   // Zoom to a preset keeping the image point under `at` (viewer px; the viewer centre by default) fixed.
   const hoverRef = useRef<{ x: number; y: number } | null>(null);
@@ -672,8 +709,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       if (tool) {
         // Lightroom: the tool key opens Masking and starts the tool in one go (a running crop is discarded first).
         if (cropRef.current) {
+          commitCrop(); // leaving the tool applies it (Lightroom)
           cropRef.current = null; // the checks below run before React re-renders
-          setCropTool(null);
         }
         setPicking(false);
         if (!m.open) m.setOpen(true);
@@ -811,6 +848,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       toggleSplit: () => setSplit((v) => !v),
       toggleCrop: () => (cropRef.current ? commitCrop() : startCrop()),
       commitCrop,
+      commitPendingTool,
       cancelCrop,
       undo: editor.undo,
       toggleAutoSync: () => {
@@ -835,7 +873,13 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         changeCrop({ ...t, overlay });
       },
       cropOverlayRotate: () => cropRef.current && changeCrop({ ...cropRef.current, overlayOrient: (cropRef.current.overlayOrient + 1) % 4 }),
-      cropReset: () => cropRef.current && changeCrop(resetTool(cropRef.current)),
+      cropReset: () => {
+        if (cropRef.current) return changeCrop(resetTool(cropRef.current));
+        // Outside the tool (Lightroom): only the crop goes back, as one history entry (none when it is already neutral).
+        const d = editorRef.current;
+        if (JSON.stringify(d.adj.crop) === JSON.stringify(d.defaults.crop)) return;
+        d.change((a) => ({ ...a, crop: { ...d.defaults.crop } }), "Reset Crop");
+      },
       toggleGuided,
       cropLock: () => cropRef.current && changeCrop(toggleLockTool(cropRef.current, imageAspectRef.current || 1.5)),
       lastCommitAt: editor.lastCommitAt,
@@ -848,11 +892,51 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);
   const frame: Frame | null = useMemo(() => (fw > 0 && fh > 0 ? { orientation, crop: editor.adj.crop, w: fw, h: fh } : null), [orientation, editor.adj.crop, fw, fh]);
+  // Lightroom shows a fine grid while a Transform slider is dragged or nudged; it goes 300 ms after the last change (R1-P2-9).
+  const [tfGrid, setTfGrid] = useState(false);
+  const tfHold = useRef(false);
+  const tfTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const tfBump = useCallback(() => {
+    setTfGrid(true);
+    clearTimeout(tfTimer.current);
+    if (!tfHold.current) tfTimer.current = setTimeout(() => setTfGrid(false), 300);
+  }, []);
+  useEffect(() => {
+    const isTf = (t: EventTarget | null) => t instanceof Element && !!t.closest('[data-testid^="slider-tf-"], [data-testid^="slider-row-tf-"]');
+    const down = (e: PointerEvent) => {
+      if (!isTf(e.target)) return;
+      tfHold.current = true;
+      tfBump();
+    };
+    const up = () => {
+      if (!tfHold.current) return;
+      tfHold.current = false;
+      tfBump();
+    };
+    document.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      document.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+      clearTimeout(tfTimer.current);
+    };
+  }, [tfBump]);
+  const tfKey = (({ vertical, horizontal, rotate, aspect, scale, offsetX, offsetY }) => JSON.stringify([vertical, horizontal, rotate, aspect, scale, offsetX, offsetY]))(editor.adj.transform);
+  const tfPrev = useRef({ id, tfKey });
+  useEffect(() => {
+    const p = tfPrev.current;
+    tfPrev.current = { id, tfKey };
+    if (p.id !== id || p.tfKey === tfKey) return;
+    // Only when the change comes from a Transform slider (drag, hover nudge, typing), not from Upright / undo / paste.
+    if (document.querySelector('[data-testid^="slider-row-tf-"]:hover, [data-testid^="slider-tf-"]:focus, [data-testid^="slider-edit-tf-"]')) tfBump();
+  }, [tfKey, id, tfBump]);
   const boxRef = useRef(box);
   boxRef.current = box;
   const frameRef = useRef(frame);
@@ -931,6 +1015,21 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       )}
       {/* The right panel is the home of the crop controls (Lightroom); the floating bar only stands in while that panel is hidden (Tab). */}
       {cropTool && (panels.right || masks.open) && <CropBar crop={cropApi} />}
+      {guideOn && !compare && (
+        <span className="pointer-events-none absolute left-2 top-2 z-20 rounded bg-black/70 px-1.5 text-xs text-white" data-testid="guided-badge">
+          Guided Upright: drag 2 to 4 lines along straight edges. x deletes, Esc done
+        </span>
+      )}
+      {tfGrid && box && !cropTool && (
+        <div className="pointer-events-none absolute z-10" style={{ left: box.x, top: box.y, width: box.w, height: box.h }} data-testid="transform-grid">
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => (
+            <div key={i}>
+              <div className="absolute inset-y-0 w-px bg-white/45" style={{ left: `${i * 10}%` }} />
+              <div className="absolute inset-x-0 h-px bg-white/45" style={{ top: `${i * 10}%` }} />
+            </div>
+          ))}
+        </div>
+      )}
       {guideOn && imageAspect > 0 && !compare && (
         <GuideOverlay guides={editor.adj.transform.guides ?? []} size={size} imageAspect={imageAspect} orientation={orientation} onChange={upright.setGuides} />
       )}
@@ -1222,7 +1321,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
             activeId={compare ? compare.b : id}
             selected={compare ? new Set([compare.a]) : sel.selected}
             marked={compare ? new Set([compare.b]) : undefined}
-            onPick={(fid, ev) => (compare ? onCandidate?.(fid) : sel.click(fid, { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey }))}
+            onPick={(fid, ev) => {
+              const mods = { shift: ev.shiftKey, meta: ev.metaKey || ev.ctrlKey };
+              void commitPendingTool().then(() => (compare ? onCandidate?.(fid) : sel.click(fid, mods)));
+            }}
             onRate={onRate}
             badge={compare ? (fid) => <CompareTag id={fid} a={compare.a} b={compare.b} /> : filmBadge}
             cellW={filmCell}

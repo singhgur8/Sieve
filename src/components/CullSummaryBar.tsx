@@ -1,10 +1,11 @@
 // Cull step readout: picked / unflagged / rejected (by you vs. auto) and how the keepers add up, every number a filter.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Sparkles } from "lucide-react";
 import type { CullSummary, KeeperRule, PickOrigin, RejectStrictness } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { keeperEquation } from "../lib/cull";
 import { KeeperRuleMenu } from "./KeeperRule";
+import { useWide } from "./edit/bits";
 
 interface Props {
   summary: CullSummary;
@@ -54,6 +55,20 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
   const suggestions = suggestionParts(s);
   const reviewRejects = () => setQuery((q) => (q.suggested === "reject" ? { ...q, suggested: null } : { ...q, keepersOnly: false, picks: [], pickOrigin: null, suggested: "reject" }));
   const [autoNote, setAutoNote] = useState<{ x: number; y: number } | null>(null);
+  // The `Auto 0` popover closes on Esc and when the filter changes (R1-P2-4).
+  useEffect(() => {
+    if (!autoNote) return;
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      setAutoNote(null);
+    };
+    window.addEventListener("keydown", esc, true);
+    return () => window.removeEventListener("keydown", esc, true);
+  }, [autoNote]);
+  const filterKey = JSON.stringify([query.picks, query.pickOrigin, query.suggested, query.keepersOnly]);
+  useEffect(() => setAutoNote(null), [filterKey]);
+  const wide = useWide("(min-width: 1440px)");
   const seg = (active: boolean) => `whitespace-nowrap px-1.5 py-0.5 text-xs transition-colors ${active ? on : idle}`;
   const splitPart = (n: number, o: PickOrigin, label: string) => {
     const testid = `cull-sum-${o === "user" ? "by-you" : "auto"}`;
@@ -82,6 +97,48 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
       </button>
     );
   };
+  const strictRow = (inline: boolean) => (
+    <div
+      className={inline ? "flex shrink-0 items-center gap-2 whitespace-nowrap text-[11px] text-neutral-400" : "flex shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-0.5 text-[11px] text-neutral-400"}
+      data-testid="strictness-row"
+      data-inline={inline}
+    >
+      <label className="flex items-center gap-1.5" title={STRICT_TEXT[strictness!]}>
+        <span className="text-neutral-300">Reject strictness</span>
+        <select
+          value={strictness}
+          onChange={(e) => onStrictness!(e.target.value as RejectStrictness)}
+          className="rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs text-neutral-100"
+          data-testid="reject-strictness"
+          title={`${STRICT_TEXT[strictness!]} Changing it re-evaluates the suggestions; nothing is rejected until you apply them`}
+          aria-label="Reject strictness"
+        >
+          <option value="conservative">Conservative</option>
+          <option value="balanced">Balanced</option>
+          <option value="aggressive">Aggressive</option>
+        </select>
+      </label>
+      <span className={inline ? "sr-only" : "min-w-0 truncate"} data-testid="strictness-explain">
+        {STRICT_TEXT[strictness!]}
+      </span>
+      {s.suggestedRejectPending > 0 || query.suggested === "reject" ? (
+        <button
+          className={`${inline ? "" : "ml-auto "}${base} ${query.suggested === "reject" ? on : idle}`}
+          data-testid="strictness-count"
+          data-rejects={s.suggestedRejectPending}
+          aria-pressed={query.suggested === "reject"}
+          title="Show exactly the photos you have not flagged or rated that Sieve would reject, each with the reason. Nothing is rejected until you press Apply suggestions"
+          onClick={reviewRejects}
+        >
+          Review {s.suggestedRejectPending} suggested {s.suggestedRejectPending === 1 ? "reject" : "rejects"}
+        </button>
+      ) : (
+        <span className={`${inline ? "" : "ml-auto "}text-neutral-400`} data-testid="strictness-count" data-rejects={s.suggestedRejectPending}>
+          No reject suggestions
+        </span>
+      )}
+    </div>
+  );
   return (
     <>
     <div className="flex shrink-0 flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="cull-summary" data-keepers={s.keepers} data-total={s.total}>
@@ -125,9 +182,10 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
         {formula}
       </span>
       <KeeperRuleMenu current={s.keeperRule} onPick={onKeeperRule} testid="cull-sum-rule" />
+      {strictness && onStrictness && wide && <span className="ml-auto flex shrink-0">{strictRow(true)}</span>}
       {suggestions && (
         <button
-          className="ml-auto flex items-center gap-1 whitespace-nowrap rounded bg-neutral-800 px-1.5 py-0.5 text-sky-200 hover:bg-neutral-700"
+          className={`${strictness && onStrictness && wide ? "" : "ml-auto "}flex items-center gap-1 whitespace-nowrap rounded bg-neutral-800 px-1.5 py-0.5 text-sky-200 hover:bg-neutral-700`}
           data-testid="cull-sum-suggest"
           title="Sieve has an opinion on photos you have not flagged. Apply suggestions copies it to their flags and stars (you review the result in the Rejected view and can undo it)"
           onClick={onApplySuggestions}
@@ -161,42 +219,7 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
         </div>
       </>
     )}
-    {strictness && onStrictness && (
-      <div className="flex shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap border-b border-neutral-800 px-3 py-0.5 text-[11px] text-neutral-400" data-testid="strictness-row">
-        <label className="flex items-center gap-1.5">
-          <span className="text-neutral-300">Reject strictness</span>
-          <select
-            value={strictness}
-            onChange={(e) => onStrictness(e.target.value as RejectStrictness)}
-            className="rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs text-neutral-100"
-            data-testid="reject-strictness"
-            title="How readily Sieve suggests rejecting a photo. Changing it re-evaluates the suggestions; nothing is rejected until you apply them"
-            aria-label="Reject strictness"
-          >
-            <option value="conservative">Conservative</option>
-            <option value="balanced">Balanced</option>
-            <option value="aggressive">Aggressive</option>
-          </select>
-        </label>
-        <span className="min-w-0 truncate" data-testid="strictness-explain">{STRICT_TEXT[strictness]}</span>
-        {s.suggestedRejectPending > 0 || query.suggested === "reject" ? (
-          <button
-            className={`ml-auto ${base} ${query.suggested === "reject" ? on : idle}`}
-            data-testid="strictness-count"
-            data-rejects={s.suggestedRejectPending}
-            aria-pressed={query.suggested === "reject"}
-            title="Show exactly the photos you have not flagged or rated that Sieve would reject, each with the reason. Nothing is rejected until you press Apply suggestions"
-            onClick={reviewRejects}
-          >
-            Review {s.suggestedRejectPending} suggested {s.suggestedRejectPending === 1 ? "reject" : "rejects"}
-          </button>
-        ) : (
-          <span className="ml-auto text-neutral-300" data-testid="strictness-count" data-rejects={s.suggestedRejectPending}>
-            0 reject suggestions
-          </span>
-        )}
-      </div>
-    )}
+    {strictness && onStrictness && !wide && strictRow(false)}
     </>
   );
 }

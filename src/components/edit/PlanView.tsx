@@ -421,10 +421,21 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           {plural(e.imageIds.length, "keeper")}
         </p>
         <p className={`text-xs ${line.cls}`} data-testid={`plan-status-${id}`}>
-          {busyHere ? (wf.busy!.total > 0 ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : "Applying…") : line.text}
+          {busyHere ? (
+            wf.busy!.total > 0 ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : "Applying…"
+          ) : r.ui === "todo" && !r.skipped ? (
+            <>
+              To do:{" "}
+              <button className="text-sky-300 underline-offset-2 hover:underline" data-testid={`plan-todo-edit-${id}`} onClick={(ev) => (ev.stopPropagation(), p.onEdit(id))}>
+                edit this photo
+              </button>
+            </>
+          ) : (
+            line.text
+          )}
           {!busyHere && line.extra && <span className="text-amber-300">{line.extra}</span>}
         </p>
-        {!busyHere && (
+        {!busyHere && !(r.ui === "todo" && !r.skipped) && (
           <ApplyWhy
             block={applyBlock(r)}
             testid={`plan-apply-why-${id}`}

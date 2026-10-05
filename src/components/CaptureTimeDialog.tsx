@@ -33,7 +33,7 @@ const field = "w-16 rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1
 const sel = "w-full rounded border border-neutral-700 bg-neutral-950 px-1.5 py-1 text-neutral-100";
 
 /** Searchable, virtualized list of one camera's frames (no cap) with the chosen frame's thumbnail and time underneath. */
-function FramePicker({ frames, value, onChange, testid, entries }: { frames: RawImageEntry[]; value: number | null; onChange: (id: number) => void; testid: string; entries: Map<number, RawImageEntry> }) {
+function FramePicker({ frames, value, onChange, testid, entries, compact }: { frames: RawImageEntry[]; value: number | null; onChange: (id: number) => void; testid: string; entries: Map<number, RawImageEntry>; compact: boolean }) {
   const [q, setQ] = useState("");
   const box = useRef<HTMLDivElement>(null);
   const list = useMemo(() => {
@@ -45,7 +45,7 @@ function FramePicker({ frames, value, onChange, testid, entries }: { frames: Raw
   return (
     <div className="flex flex-col gap-1" data-testid={testid}>
       <input className={sel} placeholder={`Search ${frames.length.toLocaleString()} frames by name or time…`} value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search frames" data-testid={`${testid}-search`} />
-      <div ref={box} className="h-28 overflow-y-auto rounded border border-neutral-700 bg-neutral-950" role="listbox" aria-label="Frames" data-testid={`${testid}-list`} data-count={list.length}>
+      <div ref={box} className={`${compact ? "h-24" : "h-28"} overflow-y-auto rounded border border-neutral-700 bg-neutral-950`} role="listbox" aria-label="Frames" data-testid={`${testid}-list`} data-count={list.length}>
         <div className="relative w-full" style={{ height: v.getTotalSize() }}>
           {v.getVirtualItems().map((r) => {
             const e = list[r.index];
@@ -70,7 +70,7 @@ function FramePicker({ frames, value, onChange, testid, entries }: { frames: Raw
       </div>
       {chosen ? (
         <div className="flex items-center gap-2" data-testid={`${testid}-chosen`} data-id={chosen.id}>
-          <Thumb entry={chosen} className="h-20 w-[120px] shrink-0 rounded" />
+          <Thumb entry={chosen} className={`${compact ? "h-16 w-24" : "h-20 w-[120px]"} shrink-0 rounded`} />
           <div className="min-w-0 text-neutral-300">
             <div className="truncate font-medium">{chosen.fileName}</div>
             <div className="tabular-nums text-neutral-400" data-testid={`${testid}-time`}>
@@ -104,6 +104,13 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
   const [refFrame, setRefFrame] = useState<number | null>(null);
   const [tgtFrame, setTgtFrame] = useState<number | null>(null);
   const [scope, setScope] = useState<CameraSyncScope>("body");
+  // Short windows (a 13" laptop is 800 px): smaller lists and thumbnails, two preview rows.
+  const compact = typeof window !== "undefined" && window.innerHeight < 900;
+  // Initial focus: the active tab (not the help icon); on a pre-filled Sync pair, the reference search box.
+  const tabsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    tabsRef.current?.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
+  }, []);
 
   const loadIds = useMemo(() => [...new Set([...targetIds, ...viewIds])], [targetIds, viewIds]);
   useEffect(() => {
@@ -159,6 +166,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
     if (!pair || openedOnSync.current) return;
     openedOnSync.current = true;
     setTab("sync");
+    window.setTimeout(() => document.querySelector<HTMLElement>('[data-testid="capture-ref-frame-search"]')?.focus(), 0);
     setTgtCam(camName(pair.fix));
     setRefCam(camName(pair.ref));
     setTgtFrame(pair.fix.id);
@@ -236,7 +244,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
   const preview = previewIds
     .map((id) => entries?.get(id))
     .filter((e): e is RawImageEntry => !!e && e.capture.capturedAtMs != null)
-    .slice(0, 4)
+    .slice(0, compact ? 2 : 4)
     .map((e) => {
       const before = e.capture.capturedAtMs as number;
       const after = tab === "revert" ? (e.capture.originalCapturedAtMs ?? before) : plan.offset != null ? before + plan.offset : before;
@@ -244,8 +252,9 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
     });
   const changeCount = tab === "revert" ? plan.ids.filter((id) => (entries?.get(id)?.capture.captureTimeSource ?? "exif") !== "exif").length : plan.offset === 0 || plan.offset == null ? 0 : tab === "sync" ? syncCount : plan.ids.length;
 
+  const applyDisabled = !entries || busy || !plan.mode || (tab === "sync" && (camNames.length < 2 || sameCamera)) || (tab !== "revert" && changeCount === 0);
   const apply = async () => {
-    if (!plan.mode || busy) return;
+    if (applyDisabled || !plan.mode) return;
     setBusy(true);
     try {
       await onApply(plan.ids, plan.mode, plan.label);
@@ -273,14 +282,22 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
     </label>
   );
   return (
-    <Dialog label="Edit capture time" testid="capture-time-dialog" className="flex max-h-[90vh] w-[560px] flex-col gap-3 overflow-y-auto rounded-lg border border-neutral-700 bg-neutral-900 p-5 text-sm" onCancel={onCancel}>
+    <Dialog
+      label="Edit capture time"
+      testid="capture-time-dialog"
+      className="flex max-h-[90vh] w-[560px] flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 text-sm"
+      onCancel={onCancel}
+      onConfirm={() => void apply()}
+      canConfirm={() => !applyDisabled && !document.activeElement?.matches('[data-testid$="-search"]')}
+    >
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5" data-testid="capture-body">
       <h2 className="text-base font-semibold text-neutral-100">
         Edit capture time <HelpLink id="capture-time" title="How does this work?" />
       </h2>
       <p className="text-xs text-neutral-400">
         Fixes a camera clock that was off (wrong time zone, daylight saving, two cameras out of step). Sorting, bursts and scenes use the corrected time. The original files are never changed; the correction is saved in the XMP sidecars and can be reverted.
       </p>
-      <div role="tablist" className="flex flex-wrap gap-1 text-xs">
+      <div ref={tabsRef} role="tablist" className="flex flex-wrap gap-1 text-xs">
         {tabBtn("shift", "Shift by hours / minutes")}
         {tabBtn("set", "Set exact time")}
         {tabBtn("sync", "Sync two cameras")}
@@ -333,7 +350,7 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
                       </option>
                     ))}
                   </select>
-                  {entries && <FramePicker frames={framesOf(refCam)} value={refId} onChange={setRefFrame} testid="capture-ref-frame" entries={entries} />}
+                  {entries && <FramePicker compact={compact} frames={framesOf(refCam)} value={refId} onChange={setRefFrame} testid="capture-ref-frame" entries={entries} />}
                 </div>
                 <div className="flex flex-col gap-1">
                   <span className="font-medium text-neutral-300">Clock to fix (these photos move)</span>
@@ -344,14 +361,14 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
                       </option>
                     ))}
                   </select>
-                  {entries && <FramePicker frames={framesOf(tgtCam)} value={tgtId} onChange={setTgtFrame} testid="capture-tgt-frame" entries={entries} />}
+                  {entries && <FramePicker compact={compact} frames={framesOf(tgtCam)} value={tgtId} onChange={setTgtFrame} testid="capture-tgt-frame" entries={entries} />}
                 </div>
               </div>
               <fieldset className="flex flex-col gap-1" data-testid="capture-scope-group">
                 <legend className="font-medium text-neutral-300">Which photos move</legend>
                 {([
                   ["body", `This body: every ${tgtCam ? camLabel(tgtCam) : ""} photo in this project (${(scopeCounts?.body ?? viewTargets.length).toLocaleString()})`],
-                  ["model", `This camera model: every ${scopeNoun} photo from any body (${(scopeCounts?.model ?? viewTargets.length).toLocaleString()})`],
+                  ["model", `This camera model: every ${scopeNoun} photo, any body (${(scopeCounts?.model ?? viewTargets.length).toLocaleString()})`],
                   ["selected", `The selected photos only (${targetIds.length.toLocaleString()})`],
                 ] as [CameraSyncScope, string][]).map(([k, label]) => (
                   <label key={k} className="flex items-center gap-1.5 text-neutral-300">
@@ -402,13 +419,14 @@ export function CaptureTimeDialog({ targetIds, activeId, viewIds, projectId = nu
         </div>
       )}
 
-      <div className="flex justify-end gap-2">
+      </div>
+      <div className="flex shrink-0 justify-end gap-2 border-t border-neutral-700 bg-neutral-900 px-5 py-3" data-testid="capture-footer">
         <button onClick={onCancel} className="rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700" data-testid="capture-cancel">
           Cancel
         </button>
         <button
           onClick={() => void apply()}
-          disabled={!entries || busy || !plan.mode || (tab === "sync" && (camNames.length < 2 || sameCamera)) || (tab !== "revert" && changeCount === 0)}
+          disabled={applyDisabled}
           className="rounded bg-emerald-700 px-3 py-1.5 font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
           data-testid="capture-apply"
         >

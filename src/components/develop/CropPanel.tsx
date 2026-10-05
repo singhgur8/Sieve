@@ -9,7 +9,7 @@ export interface CropApi {
   tool: CropTool | null;
   imageAspect: number;
   start: () => void;
-  change: (t: CropTool) => void;
+  change: (t: CropTool | ((prev: CropTool) => CropTool)) => void;
   commit: () => void;
   cancel: () => void;
   /** Auto straighten (Upright Level -> crop angle). */
@@ -124,9 +124,9 @@ export function CropPanel({ crop }: { crop: CropApi }) {
         step={0.1}
         digits={1}
         display={(v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}°`}
-        onInput={(v) => crop.change({ ...tool, angle: v, rotating: true })}
-        onCommit={() => crop.change({ ...tool, rotating: false })}
-        onReset={() => crop.change({ ...tool, angle: 0, rotating: false })}
+        onInput={(v) => crop.change((t) => ({ ...t, angle: v, rotating: true }))}
+        onCommit={() => crop.change((t) => ({ ...t, rotating: false }))}
+        onReset={() => crop.change((t) => ({ ...t, angle: 0, rotating: false }))}
         onAuto={crop.autoStraighten}
       />
       <div className="mt-2 flex gap-1">
@@ -201,11 +201,11 @@ export function CropBar({ crop }: { crop: CropApi }) {
           value={tool.angle}
           aria-label="Crop angle"
           data-testid="cropbar-angle"
-          onChange={(e) => crop.change({ ...tool, angle: Number(e.target.value), rotating: true })}
-          onPointerUp={() => crop.change({ ...tool, rotating: false })}
-          onBlur={() => tool.rotating && crop.change({ ...tool, rotating: false })}
-          onKeyUp={() => crop.change({ ...tool, rotating: false })}
-          onDoubleClick={(e) => (e.shiftKey ? crop.autoStraighten() : crop.change({ ...tool, angle: 0, rotating: false }))}
+          onChange={(e) => crop.change((t) => ({ ...t, angle: Number(e.target.value), rotating: true }))}
+          onPointerUp={() => crop.change((t) => ({ ...t, rotating: false }))}
+          onBlur={() => crop.change((t) => (t.rotating ? { ...t, rotating: false } : t))}
+          onKeyUp={() => crop.change((t) => ({ ...t, rotating: false }))}
+          onDoubleClick={(e) => (e.shiftKey ? crop.autoStraighten() : crop.change((t) => ({ ...t, angle: 0, rotating: false })))}
         />
         <span className="w-10 tabular-nums text-neutral-300" data-testid="cropbar-angle-value">
           {`${tool.angle > 0 ? "+" : ""}${tool.angle.toFixed(1)}°`}

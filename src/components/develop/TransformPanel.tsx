@@ -4,7 +4,7 @@ import type { CompleteAdjustments, TransformSettings } from "../../ipc";
 import type { Editor } from "../../hooks/useEditor";
 import type { UprightApi } from "../../hooks/useUpright";
 import { hint } from "../../lib/keymap";
-import { UPRIGHT_BUTTONS } from "../../lib/transform";
+import { UPRIGHT_BUTTONS, uprightLabel } from "../../lib/transform";
 import { NumField, seg } from "./fields";
 
 export interface GuidedApi {
@@ -28,7 +28,7 @@ export function TransformPanel({ editor, upright, guided }: { editor: Editor; up
       </div>
       <div className="mb-1 grid grid-cols-3 gap-1" data-testid="upright-buttons">
         {UPRIGHT_BUTTONS.map((b) => {
-          const on = b.mode === t.upright || (b.mode === "guided" && guided.active);
+          const on = guided.active ? b.mode === "guided" : b.mode === t.upright; // while the Guided tool is armed only it is pressed
           return (
             <button
               key={b.mode}
@@ -46,6 +46,11 @@ export function TransformPanel({ editor, upright, guided }: { editor: Editor; up
       {guided.active && (
         <p className="mb-1 text-[11px] text-sky-300" data-testid="upright-guided-help">
           Guided: drag on the photo to draw up to 4 lines along things that should be straight. Drag an end to adjust, x deletes, Esc exits.
+          {t.upright !== "off" && t.upright !== "guided" && (
+            <span className="block text-neutral-400" data-testid="upright-guided-current">
+              Current: {uprightLabel(t.upright)}, kept until 2 guides are drawn
+            </span>
+          )}
         </p>
       )}
       {upright.message && (

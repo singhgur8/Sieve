@@ -145,6 +145,11 @@ interface Props {
   /** EXIF orientation of the photo (a mirrored one flips the sense of the straighten rotation). */
   orientation?: number;
   onChange: (t: CropTool) => void;
+  /**
+   * Seam for the Upright / Transform warp outline (v19.3, R1-3): the valid image area as 4 points, fractions of the corrected
+   * frame (clockwise), or null / undefined = the rotated frame only. "Constrain to image" and the paper fill will use it.
+   */
+  validQuad?: [number, number][] | null;
 }
 
 const HANDLE_POS: Record<Handle, { x: number; y: number; cursor: string }> = {
@@ -162,13 +167,28 @@ const ROTATE_CURSOR = `url("data:image/svg+xml;utf8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="black" stroke-width="4" d="M20 12a8 8 0 1 1-2.5-5.8M20 3v4.5h-4.5"/><path stroke="white" stroke-width="2" d="M20 12a8 8 0 1 1-2.5-5.8M20 3v4.5h-4.5"/></svg>',
 )}") 12 12, crosshair`;
 
+/** Alt-drag on a handle: the opposite side mirrors the dragged one about the centre. */
+function resizeCentred(rect: Rect, handle: Handle, px: number, py: number, fr: number | null): Rect {
+  const cx = (rect.l + rect.r) / 2;
+  const cy = (rect.t + rect.b) / 2;
+  const hx = handle.includes("w") ? -1 : handle.includes("e") ? 1 : 0;
+  const hy = handle.includes("n") ? -1 : handle.includes("s") ? 1 : 0;
+  const ax = hx < 0 ? rect.r : hx > 0 ? rect.l : cx;
+  const ay = hy < 0 ? rect.b : hy > 0 ? rect.t : cy;
+  const n = resizeRect(rect, handle, hx ? ax + 2 * (px - cx) : px, hy ? ay + 2 * (py - cy) : py, fr);
+  const w = n.r - n.l;
+  const h = n.b - n.t;
+  const s = Math.min(1, (2 * Math.min(cx, 1 - cx)) / w, (2 * Math.min(cy, 1 - cy)) / h);
+  return { l: cx - (w * s) / 2, r: cx + (w * s) / 2, t: cy - (h * s) / 2, b: cy + (h * s) / 2 };
+}
+
 const deg = (rad: number) => (rad * 180) / Math.PI;
 /** Folds an angle difference into (-180, 180]. */
 const wrap = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 
 type P = { x: number; y: number };
 
-export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange }: Props) {
+export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange, validQuad = null }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const layer = useRef<HTMLDivElement>(null);
   const drag = useRef<{ kind: Handle | "move"; x: number; y: number; rect: Rect } | null>(null);
@@ -215,7 +235,9 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     const d = drag.current;
     if (!d) return;
     const [x, y] = frac(e);
-    const next = d.kind === "move" ? moveRect(d.rect, x - d.x, y - d.y) : resizeRect(d.rect, d.kind, x, y, fr);
+    // Lightroom modifiers: Alt resizes about the centre, Shift keeps the current ratio of a free crop for this drag.
+    const keep = e.shiftKey && fr == null ? ((d.rect.r - d.rect.l) / Math.max(1e-6, d.rect.b - d.rect.t)) : fr;
+    const next = d.kind === "move" ? moveRect(d.rect, x - d.x, y - d.y) : e.altKey ? resizeCentred(d.rect, d.kind, x, y, keep) : resizeRect(d.rect, d.kind, x, y, keep);
     onChange(withBase(tool, approach(d.rect, next, imageAspect, tool.constrain ? rot : 0)));
   };
   const up = () => {
@@ -284,7 +306,7 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
   const dim = "pointer-events-none absolute bg-black/60";
   const grid = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => i / 10);
   return (
-    <div className="pointer-events-none absolute inset-0 z-10" data-testid="crop-overlay" data-rotation={rot.toFixed(2)}>
+    <div className="pointer-events-none absolute inset-0 z-10" data-testid="crop-overlay" data-rotation={rot.toFixed(2)} data-valid-quad={validQuad ? JSON.stringify(validQuad) : undefined}>
       <div
         ref={layer}
         className="pointer-events-auto absolute -inset-6 touch-none"

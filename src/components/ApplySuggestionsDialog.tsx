@@ -140,7 +140,9 @@ export function ApplySuggestionsDialog({ selected, all, onCancel, onConfirm, pro
         {([["rejects", "Rejects", c.allRejects], ["picks", "Picks", c.allPicks], ["stars", "Stars", c.allStars]] as const).map(([k, label, n]) => (
           <label key={k} className="flex items-center gap-1.5">
             <input type="checkbox" checked={kinds[k]} onChange={(e) => setKind(k, e.target.checked)} data-testid={`apply-kind-${k}`} />
-            {label} (<span data-testid={`apply-kind-${k}-count`}>{rows == null ? "…" : n}</span>)
+            <span>
+              {label} (<span data-testid={`apply-kind-${k}-count`}>{rows == null ? "…" : n}</span>)
+            </span>
           </label>
         ))}
       </fieldset>

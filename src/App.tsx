@@ -343,7 +343,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (!cmp) setCmp(null);
   }, [sel, ids, cmp]);
 
-  const changeMode = useCallback(
+  /** Run `fn` after a running crop tool was applied (clicks that leave the photo / view). */
+  const leave = useCallback(
+    (fn: () => void) => {
+      const d = develop.current;
+      if (mode === "develop" && d?.isCropping()) void d.commitPendingTool().then(fn);
+      else fn();
+    },
+    [mode],
+  );
+  const changeModeNow = useCallback(
     (m: Mode) => {
       setPlanOpen(false);
       if (m === "grid") {
@@ -356,6 +365,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     },
     [openLoupe, openDevelop, enterCompare, mode, cmp],
   );
+  const changeMode = useCallback((m: Mode) => leave(() => changeModeNow(m)), [leave, changeModeNow]);
 
   // ---- culling actions (batch over targets), all undoable ----
   const onRestored = useCallback(
@@ -741,7 +751,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [rowOfScene],
   );
 
-  const goStep = useCallback(
+  const goStepNow = useCallback(
     (s: WorkflowStep) => {
       if (projectId == null) return;
       if (s === "cull") {
@@ -762,6 +772,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [projectId, step, setStep, openPlan, wf.loadPlan],
   );
+  const goStep = useCallback((s: WorkflowStep) => leave(() => goStepNow(s)), [leave, goStepNow]);
 
   /** G / Esc: back to the overview of the step (the Plan in the Edit step, the Grid otherwise). */
   const goOverview = useCallback(() => {
@@ -923,7 +934,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     setApplyOpen({ selected: [...sel.selected], all: ids, onlyRejects: query.suggested === "reject" });
   };
 
-  const applySuggestions = (t: number[], onlyUnset: boolean, kinds: SuggestionKinds) =>
+  const applySuggestions = (t: number[], onlyUnset: boolean, kinds: SuggestionKinds) => {
+    const reviewing = query.suggested === "reject";
     void run(async () => {
       const before = await unwrap(commands.getCullSnapshot(t));
       const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, kinds.picks && kinds.rejects && kinds.stars ? null : kinds));
@@ -935,10 +947,17 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return;
       }
       const entry = cull.record(`Apply suggestions to ${plural(applied, "photo")}`, before);
+      if (reviewing && kinds.rejects && !kinds.picks && !kinds.stars) {
+        // The review filter just emptied itself: show what was rejected instead (Rejected, by Auto).
+        setQuery((q) => ({ ...q, suggested: null, keepersOnly: false, picks: ["reject"], pickOrigin: "auto" }));
+        push(`Rejected ${plural(applied, "photo")}, shown here`, { action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) } });
+        return;
+      }
       push(`Applied suggestions to ${applied} of ${t.length} photos${skipped ? ` (${skipped} skipped)` : ""}. Review the result in the Rejected view`, {
         action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) },
       });
     });
+  };
 
   /** Keeper rule changed from the Cull summary / Export dialog (the Edit plan has its own path through `wf`). */
   /** Edit Capture Time: apply, refresh order / entries / panel, and offer Undo (restore_capture_times). */
@@ -1101,7 +1120,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [sel],
   );
 
-  /** "Edit all in scene": the whole scene selected, Develop on `startId`. Reset / presets apply to all, Cmd+Alt+S syncs the rest. */
+  /** "Edit all in scene": the whole scene selected, Develop on `startId`. Auto Sync is on. */
   const editAllInScene = useCallback(
     (sceneIds: number[], startId: number) => {
       if (sceneIds.length === 0) return;
@@ -1111,7 +1130,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       setMode("develop");
       if (sceneIds.length > 1) {
         setAutoSync(true);
-        setNotice(`Editing ${sceneIds.length} photos. Auto Sync is on: changes go to all ${sceneIds.length} (exposure and white balance stay per photo for now). Turn it off to edit one`);
+        setNotice(`Editing ${sceneIds.length} photos. Auto Sync is on: every change goes to all ${sceneIds.length}; exposure and white balance move by the same amount on each. Turn Auto Sync off (Cmd+Alt+Shift+A) to edit one`);
       }
     },
     [sel, setNotice],
@@ -1141,6 +1160,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   }, [scenesOpen]);
 
   // ---- keyboard: one handler driven by the shared keymap ----
+  const LEAVES_CROP = ["stepCull", "stepEdit", "stepExport", "nextScene", "prevScene", "navH", "navV", "gridJump", "toggleLoupe", "devToLoupe", "toGrid", "escape", "develop", "compare", "filterBar", "gridLoupe", "export", "import"];
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
     const inPlan = planOpen && projectId != null && step === "edit";
@@ -1173,6 +1193,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste", "copyAll", "pasteAll"];
     if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
+    // Leaving the crop tool any way but Esc / Cancel applies it first (Lightroom), then the key does its job.
+    if (mode === "develop" && LEAVES_CROP.includes(def.id) && develop.current?.isCropping()) {
+      const d = def;
+      const ev = e;
+      void develop.current.commitPendingTool().then(() => runKey(d, ev));
+      return;
+    }
+    return runKey(def, e);
+  });
+  const runKey = (def: NonNullable<ReturnType<typeof matchKey>>, e: KeyboardEvent) => {
     const k = e.key;
     switch (def.id) {
       case "stepCull":
@@ -1400,7 +1430,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "help":
         return openHelp();
     }
-  });
+  };
 
   const importActive = status.progress !== null && status.progress.done < status.progress.total;
   const analysisBarShown = !!status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total);
@@ -1687,7 +1717,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       />
       )}
 
-      <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
+      <div className="relative flex min-h-0 flex-1 flex-col has-[[data-testid=selection-bar]]:[&_[data-testid=grid-scroll]]:pb-14" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid {...gridProps} />
         </ErrorBoundary>
@@ -1776,14 +1806,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   rows={wf.rows}
                   activeId={active ?? null}
                   fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
-                  onJump={(id) => openScene(id)}
-                  onStepScene={(dir) => stepScene(dir, dir === 1)}
-                  onPlan={openPlan}
+                  onJump={(id) => leave(() => openScene(id))}
+                  onStepScene={(dir) => leave(() => stepScene(dir, dir === 1))}
+                  onPlan={() => leave(openPlan)}
                   onMakeRep={makeRepresentative}
                   onApplyOptions={(id) => setMatchOpen(id)}
                   onShowIds={showIds}
                   onReview={reviewFrames}
-                  onNextReview={nextReview}
+                  onNextReview={() => leave(nextReview)}
                 />
               ) : undefined
             }

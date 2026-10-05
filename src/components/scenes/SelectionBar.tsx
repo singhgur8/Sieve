@@ -31,7 +31,7 @@ export function SelectionBar({ selected, sceneCount, hasActive, onSelectAll, onC
   const editWhy = selected === 0 && sceneCount == null ? "Select photos first" : null;
   return (
     <div className="absolute bottom-3 left-1/2 z-20 flex h-9 max-w-[calc(100%-24px)] -translate-x-1/2 items-center gap-2 overflow-x-auto rounded-lg border border-neutral-700 bg-neutral-900/95 px-3 text-xs text-neutral-300 shadow-xl" data-testid="selection-bar">
-      <span className="font-medium" data-testid="selbar-count">
+      <span className="whitespace-nowrap font-medium" data-testid="selbar-count">
         {selected} selected
       </span>
       {sceneCount != null && (
@@ -50,7 +50,7 @@ export function SelectionBar({ selected, sceneCount, hasActive, onSelectAll, onC
         <RefreshCw className="size-3.5" /> Sync from active
       </button>
       {why("sel-sync-why", syncWhy)}
-      <button className={btn} onClick={onEditAll} disabled={!!editWhy} data-testid="sel-edit-all" title="Open Develop with the whole selection (the whole scene when nothing is selected). Cmd+Alt+S syncs, reset and presets apply to all">
+      <button className={btn} onClick={onEditAll} disabled={!!editWhy} data-testid="sel-edit-all" title="Open Develop with the whole selection, Auto Sync on (the whole scene when nothing is selected)">
         <SlidersHorizontal className="size-3.5" /> {sceneCount != null && selected < 2 ? "Edit all in scene" : `Edit ${selected} selected`}
       </button>
       {why("sel-edit-why", editWhy)}

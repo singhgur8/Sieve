@@ -116,7 +116,7 @@ test.describe("P1-1 Auto Sync (frontend)", () => {
   test("Edit N selected turns Auto Sync on; a committed change is ONE sync_delta (source + 2 targets), one Cmd+Z reverts the whole batch", async ({ page }) => {
     await editThree(page);
     await expect(page.getByTestId("auto-sync-switch")).toHaveAttribute("aria-checked", "true");
-    await expect(page.getByTestId("sync-settings")).toContainText("Auto Sync · 3");
+    await expect(page.getByTestId("sync-settings")).toContainText("Sync…");
     await clearCalls(page);
     await setSlider(page, "contrast", 25);
     await expect.poll(async () => (await calls(page, "sync_delta")).length).toBe(1);
