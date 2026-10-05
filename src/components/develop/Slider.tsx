@@ -103,6 +103,7 @@ export const Slider = memo(function Slider({
     const v = nudgeValue(sign, e);
     if (v == null) return;
     valRef.current = v;
+    gesture.current = true;
     setLive(v);
     onInput(v);
   };
@@ -208,9 +209,9 @@ export const Slider = memo(function Slider({
             onInput(v);
           }}
           onPointerDown={() => (gesture.current = true)}
-          onKeyDown={() => (gesture.current = true)}
           onPointerUp={commit}
           onKeyDown={(e) => {
+            gesture.current = true;
             // Focused slider: all four arrows step (Shift x10, Alt fine); Home / End / Page keys stay native.
             if (e.metaKey || e.ctrlKey || !e.key.startsWith("Arrow")) return;
             e.preventDefault();

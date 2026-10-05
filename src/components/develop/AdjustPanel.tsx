@@ -295,7 +295,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                   >
                     {auto.busy ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} Auto
                   </button>
-                  <span className="min-w-0 truncate text-[11px] text-neutral-500">tone and white balance from this photo</span>
+                  <span className="min-w-0 truncate text-[11px] text-neutral-400">tone and white balance from this photo</span>
                 </div>
                 <div className="flex h-7 items-center gap-2" data-testid="bw-mode">
                   <span className="w-[72px] shrink-0 text-xs text-neutral-300">Treatment</span>

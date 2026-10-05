@@ -271,14 +271,18 @@ export const HELP: HelpEntry[] = [
   {
     id: "editing",
     title: "Editing basics",
-    keywords: "develop sliders exposure scene apply copy paste sync auto edit export",
+    keywords: "develop sliders exposure scene apply copy paste sync auto edit export type value arrow keys blue dot preset preview highlight",
     blocks: [
       {
         ul: [
           "Press D to open Develop. Sliders (Exposure, Contrast, Highlights, Shadows, White balance, ...) are non-destructive and saved to the sidecar. Double-click a slider's name to reset it.",
           "In the Edit step, keepers are grouped into scenes by lighting. Edit one photo per scene, then Apply to scene copies that edit to the others, matched for exposure and white balance.",
           "Auto edit (my style) edits a scene's photo with your learned style. Review it, then apply.",
-          "Copy, Paste and Sync move settings between photos. Cmd+Shift+C copies, Cmd+Shift+V pastes.",
+          "Copy, Paste and Sync move settings between photos. Cmd+C (or Ctrl+C) copies every setting, Cmd+V (Ctrl+V) pastes them as one undoable step. Cmd+Shift+C picks which settings to copy.",
+          "Type a slider value: click the number, type, Enter applies, Esc cancels, Tab moves to the next slider. Hover a slider and press Up / Down to nudge it (Shift = x10, Alt = fine). Left / Right still move between photos unless a slider has focus.",
+          "Auto (top of Basic) sets tone and white balance from the photo itself, on any photo. It is not Auto edit (my style), which applies your learned style to a scene.",
+          "A blue dot next to a panel's name (Basic, Detail, Effects, ...) means it was changed. Press and hold the dot to see the photo without those changes; release to come back. Nothing is saved.",
+          "The preset the photo carries is highlighted in the Presets list. Hover a preset to preview it on the photo; click to apply it.",
           "Backslash shows before / after. Cmd+Shift+R resets all adjustments.",
           "Export (Cmd+Shift+E) renders JPEG, TIFF or PNG with your preset. The originals stay untouched.",
         ],

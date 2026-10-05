@@ -91,7 +91,7 @@ interface Props {
   /** Toast with an Undo action (multi-photo reset / preset). */
   onUndoToast: (msg: string, undo: () => void) => void;
   /** Paste / sync result (v19 `EditBatchResult`): the workflow refreshes and shows the one-step Undo toast. */
-  onBatch: (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number) => Promise<boolean>;
+  onBatch: (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number, soft?: boolean) => Promise<boolean>;
   /** Photos whose history was just written by the user (commit, undo, batch edit): scene batch Undo offers must not outlive it. */
   onCommitted?: (ids: number[]) => void;
   onBack: () => void;
@@ -406,7 +406,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       // v19: one undoable batch (`EditBatchResult`); the workflow reports it with an Undo toast.
       const r = await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
       await afterBatch(t);
-      await onBatchRef.current(r, "Pasted settings", t.length);
+      await onBatchRef.current(r, "Pasted settings", t.length, true);
     });
   }, [targets, run, editor, afterBatch, onNotice]);
 
@@ -427,7 +427,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         await editor.flush();
         const r = await unwrap(commands.syncSettings(id, t, fields));
         await afterBatch(t);
-        await onBatchRef.current(r, `Synchronized ${fields.length} settings`, t.length);
+        await onBatchRef.current(r, `Synchronized ${fields.length} settings`, t.length, true);
       });
     },
     [id, run, editor, afterBatch, syncTargets],
@@ -470,7 +470,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         await editor.flush();
         const r = await unwrap(commands.pastePrevious(t, from, null));
         await afterBatch(t);
-        await onBatchRef.current(r, `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`, t.length);
+        await onBatchRef.current(r, `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`, t.length, true);
       }),
     [run, targets, editor, afterBatch, lib, onNotice],
   );
