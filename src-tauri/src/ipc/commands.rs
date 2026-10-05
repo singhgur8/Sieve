@@ -2527,10 +2527,16 @@ pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> App
 /// `transform.upright` + `transform.solution` and commits one history entry. `off` returns no
 /// solution. Body: stub (no solution, `message` says Upright is not available yet) until
 /// vision-ml-dev (line detection) / rust-engine-dev (solver) implement it.
+// Implemented (vision-ml-dev, `ml::upright`): LSD-style line detection on a ~1024 px render,
+// vanishing points, Level / Vertical / Full / Auto / Guided solve. "Auto straighten" for the
+// crop tool = `level`, crop angle = `ml::upright::crop_angle_for_rotation(rotationDeg, o)`.
+// A plain comment so `bindings.ts` is unchanged.
 #[tauri::command]
 #[specta::specta]
 pub async fn auto_upright(
     catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
     id: ImageId,
     mode: UprightMode,
     adjustments: Option<ParametricAdjustments>,
@@ -2538,10 +2544,49 @@ pub async fn auto_upright(
     if let Some(a) = &adjustments {
         a.validate().map_err(AppError::invalid)?;
     }
-    // Validates the id (not_found) the way the real implementation will.
-    catalog.run(move |c| repo::image_format(c, id).map(|_| ())).await?;
-    let message = (mode != UprightMode::Off).then(|| "Upright is not available yet".to_owned());
-    Ok(UprightResult { mode, solution: None, message })
+    // Line detection + solve: `ml::upright` (vision-ml-dev). Detection runs on a ~1024 px
+    // render of the live colour settings without crop / transform / masks / LUT.
+    let (adjustments, entry) = catalog
+        .run(move |c| {
+            let e = repo::get_image(c, id)?;
+            let a = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            Ok((a, e))
+        })
+        .await?;
+    if mode == UprightMode::Off {
+        return Ok(UprightResult { mode, solution: None, message: None });
+    }
+    let f35 = ml::upright::focal_35mm_estimate(
+        entry.camera.make,
+        entry.camera.model.as_deref(),
+        entry.capture.focal_length_mm,
+    );
+    let orientation = entry.orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1);
+    let guides = adjustments.transform.guides.clone();
+    let outcome = if mode == UprightMode::Guided {
+        // Guides only: no render needed.
+        let (w, h) = match (entry.width, entry.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => develop::source::oriented_size(w, h, orientation),
+            _ => (3, 2),
+        };
+        ml::upright::solve_rgb8(&[], w, h, orientation, mode, &guides, f35)
+    } else {
+        let src = develop_source(&catalog, &develop, id).await?;
+        let cache = develop.inner().clone();
+        let luts = luts.inner().clone();
+        let r = blocking(move || {
+            let a = ml::upright::detection_adjustments(&adjustments);
+            let px = cache.render_image(&src, &a, None, ml::upright::DETECT_EDGE, &luts)?;
+            let img = px.image;
+            Ok(ml::upright::solve_rgb8(&img.rgb, img.width, img.height, orientation, mode, &guides, f35))
+        })
+        .await;
+        note_if_missing(&catalog, id, r).await?
+    };
+    Ok(UprightResult { mode, solution: outcome.solution, message: outcome.message })
 }
 
 /// Renders a temporary variation of the live `adjustments` (no save, no history entry): a
