@@ -77,7 +77,14 @@ test("the Navigator image stays frozen while a slider is dragged and follows the
   await openDevelop(page);
   const nav = page.getByTestId("navigator-img");
   await expect(nav).toBeVisible();
-  const before = await nav.getAttribute("src");
+  // The initial load schedules a few renders (viewport / crop effects); let the last one settle before the baseline.
+  let before = await nav.getAttribute("src");
+  for (let stable = 0; stable < 6; ) {
+    await page.waitForTimeout(100);
+    const now = await nav.getAttribute("src");
+    stable = now === before ? stable + 1 : 0;
+    before = now;
+  }
   const box = (await page.getByTestId("slider-exposure").boundingBox())!;
   const y = box.y + box.height / 2;
   await page.mouse.move(box.x + box.width * 0.5, y);
