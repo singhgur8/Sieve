@@ -1,5 +1,5 @@
 // Develop module: filmstrip + viewer (before/after, split, 100% detail) + presets/history + adjustment sliders.
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
 import { usePrefetchNeighbours } from "../../hooks/usePrefetch";
 import { applyAutoTone, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset, type SyncDeltaResult } from "../../ipc";
