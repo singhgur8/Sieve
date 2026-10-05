@@ -65,7 +65,7 @@ test.describe("R1-4 Edit Capture Time at 1280x800", () => {
     const b = (await page.getByTestId("capture-apply").boundingBox())!;
     expect(b.y + b.height).toBeLessThanOrEqual(800);
     expect(b.y).toBeGreaterThan(0);
-    expect(await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))).toBe("capture-ref-frame-search");
+    expect(await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))).toBe("capture-tab-sync"); // R2-P2-2: a pre-filled pair focuses the Sync tab, so Enter applies at once
     await page.getByTestId("capture-tab-sync").focus();
     await clearCalls(page);
     await page.keyboard.press("Enter");
