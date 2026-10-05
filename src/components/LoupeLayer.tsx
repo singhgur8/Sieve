@@ -9,7 +9,8 @@ import { Filmstrip } from "./Filmstrip";
 import { CompareBar, CompareTag } from "./CompareBar";
 import { usePanels } from "../lib/panels";
 import { usePrefetchNeighbours } from "../hooks/usePrefetch";
-import { FIT, ZoomPane, type Metrics, type View } from "./ZoomPane";
+import { FIT, ZoomPane, fillScale, scaleForPct, zoomAt, type Metrics, type View } from "./ZoomPane";
+import { ZOOM_PRESETS, type ZoomPreset } from "../lib/zoom";
 
 /** Compare pair: `a` is the Select (the keeper so far), `b` the Candidate. `focus` is the active pane. */
 export interface CompareState {
@@ -19,7 +20,9 @@ export interface CompareState {
 }
 
 export interface LoupeHandle {
+  /** Space: Fit <-> 100% at the point under the cursor. */
   toggleZoom: () => void;
+  setPreset: (p: ZoomPreset) => void;
   cycleFace: (dir: 1 | -1) => void;
   resetView: () => void;
   cycleInfo: () => void;
@@ -57,14 +60,8 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
   const viewRef = useRef(view);
   viewRef.current = view;
 
-  // Single loupe: navigating resets to fit (compare keeps the shared zoom while stepping). Done during render
-  // (not in an effect) so the new photo never paints one frame at the previous photo's zoom.
+  // Zoom level and relative position persist while stepping through photos (Lightroom): only face stepping resets.
   const navKey = `${mode}:${activeId}`;
-  const [seenNav, setSeenNav] = useState(navKey);
-  if (seenNav !== navKey) {
-    setSeenNav(navKey);
-    if (mode === "loupe") setView(FIT);
-  }
   useEffect(() => {
     faceIdx.current = -1;
   }, [navKey]);
@@ -82,16 +79,37 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
     };
   }, [activeId]);
 
+  /** Fit <-> 100%, anchored at the cursor (pane centre when the pointer is outside the pane). */
+  const toggle = (at?: { x: number; y: number }) => {
+    const m = metrics.current;
+    if (!m) return;
+    const v = viewRef.current;
+    if (v.scale > 1.001) return setView(FIT);
+    const a = at ?? m.hover ?? { x: m.cw / 2, y: m.ch / 2 };
+    setView(zoomAt(m, Math.max(1.5, scaleForPct(m, 100)), a.x, a.y, 100));
+  };
+  const setPreset = (p: ZoomPreset) => {
+    const m = metrics.current;
+    if (!m) return;
+    if (p === "fit") return setView(FIT);
+    const pct = typeof p === "number" ? p : undefined;
+    const scale = typeof p === "number" ? scaleForPct(m, p) : fillScale(m);
+    // Buttons keep the centre of what is on screen in place.
+    setView(zoomAt(m, scale, m.cw / 2, m.ch / 2, pct));
+  };
+  const presetActive = (p: ZoomPreset) => {
+    const m = metrics.current;
+    if (p === "fit") return view.scale <= 1.001;
+    if (!m || view.scale <= 1.001) return false;
+    if (p === "fill") return Math.abs(view.scale - fillScale(m)) < 0.01;
+    return Math.abs((m.fitW / m.natW) * view.scale * 100 - p) < 1;
+  };
+
   useImperativeHandle(
     ref,
     () => ({
-      toggleZoom: () => {
-        const m = metrics.current;
-        if (!m) return;
-        const v = viewRef.current;
-        if (v.scale > 1.01) setView(FIT);
-        else setView({ scale: Math.max(1.5, m.natW / m.fitW), cx: v.cx, cy: v.cy, actual: true });
-      },
+      toggleZoom: () => toggle(),
+      setPreset,
       cycleFace: (dir) => {
         const m = metrics.current;
         if (!m || faces.length === 0) return;
@@ -141,7 +159,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
                   data-testid={`compare-pane-${k}`}
                   data-image-id={id}
                 >
-                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} testId={`zoom-${k}`} rescaleActual={k === "b"} />
+                  <ZoomPane entry={lib.getEntry(id)} version={lib.version(id)} view={view} onView={setView} metricsRef={metrics} onFocus={() => onFocusPane(k)} onClickZoom={(x, y) => toggle({ x, y })} testId={`zoom-${k}`} rescaleActual={k === "b"} />
                   <InfoOverlay entry={lib.getEntry(id)} level={info} showKeeper={mode === "compare"} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
                 </div>
               );
@@ -149,7 +167,7 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
           </>
         ) : activeId != null ? (
           <div className="relative min-w-0 flex-1">
-            <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} testId="zoom-a" />
+            <ZoomPane entry={lib.getEntry(activeId)} version={lib.version(activeId)} view={view} onView={setView} metricsRef={metrics} onClickZoom={(x, y) => toggle({ x, y })} testId="zoom-a" />
             <InfoOverlay entry={lib.getEntry(activeId)} level={info} showKeeper={false} onLocate={onLocate} onRate={onRate} burstSizes={burstSizes} />
           </div>
         ) : null}
@@ -163,13 +181,32 @@ export const LoupeLayer = forwardRef<LoupeHandle, Props>(function LoupeLayer({ m
             {posIdx + 1} of {lib.ids.length}
           </div>
         )}
-        <div
-          className="absolute bottom-2 right-3 rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
-          title={`Zoom level${faces.length > 0 ? `, ${faces.length} face${faces.length > 1 ? "s" : ""} found (F steps through them)` : ""}. Space toggles Fit and 100%`}
-          data-testid="zoom-label"
-        >
-          {zoomLabel}
-          {faces.length > 0 ? ` · ${faces.length} face${faces.length > 1 ? "s" : ""}` : ""}
+        <div className="absolute bottom-2 right-3 flex items-center gap-2">
+          <div className="flex gap-px" role="group" aria-label="Zoom presets" data-testid="zoom-presets">
+            {ZOOM_PRESETS.map((z) => (
+              <button
+                key={String(z.id)}
+                type="button"
+                tabIndex={-1}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setPreset(z.id)}
+                aria-pressed={presetActive(z.id)}
+                data-testid={`zoom-preset-${z.id}`}
+                title={`${z.title}${z.id === "fit" ? ". Space toggles Fit and 100% at the cursor" : ""}`}
+                className={`rounded bg-black/70 px-1.5 py-0.5 text-xs ${presetActive(z.id) ? "text-white ring-1 ring-sky-500" : "text-neutral-400 hover:text-neutral-100"}`}
+              >
+                {z.label}
+              </button>
+            ))}
+          </div>
+          <div
+            className="rounded bg-black/70 px-2 py-0.5 text-xs text-neutral-200"
+            title={`Zoom level${faces.length > 0 ? `, ${faces.length} face${faces.length > 1 ? "s" : ""} found (F steps through them)` : ""}. Space or a click zooms to 100% at the cursor and back to Fit; zoom and position stay while you step through photos`}
+            data-testid="zoom-label"
+          >
+            {zoomLabel}
+            {faces.length > 0 ? ` · ${faces.length} face${faces.length > 1 ? "s" : ""}` : ""}
+          </div>
         </div>
       </div>
       {mode === "compare" && compare && (
