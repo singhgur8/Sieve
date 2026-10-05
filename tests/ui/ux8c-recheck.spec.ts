@@ -76,7 +76,7 @@ test("N2 / N5: with the origin chip at 1280 the filter bar does not overflow and
   await openProject(page, 2000);
   await page.getByTestId("cull-sum-suggest").click();
   await page.getByTestId("apply-confirm").click();
-  await expect(page.getByTestId("cull-sum-auto")).not.toHaveText(/^0 auto/);
+  await expect(page.getByTestId("cull-sum-auto")).not.toHaveText(/^Auto 0/);
   await page.getByTestId("cull-sum-auto").click();
   const chip = page.getByTestId("filter-origin");
   await expect(chip).toHaveText(/^Auto/);
@@ -93,13 +93,23 @@ test("N2 / N5: with the origin chip at 1280 the filter bar does not overflow and
   await expect(page.getByTestId("pick-reject")).toHaveAttribute("title", /auto only — clear "Auto ×" to see all/);
 });
 
-test("N4: a zero part of the reject split is plain text without padding spaces", async ({ page }) => {
+test("N4 / P1-7: the reject split is a chip group; a zero Auto chip stays a button and explains itself", async ({ page }) => {
   await openProject(page);
   const auto = page.getByTestId("cull-sum-auto");
-  await expect(auto).toHaveText(/^0 auto/);
-  expect(await auto.evaluate((e) => e.tagName)).toBe("SPAN");
+  await expect(auto).toHaveText(/^Auto 0/);
+  expect(await auto.evaluate((e) => e.tagName)).toBe("BUTTON");
   expect(await page.getByTestId("cull-sum-by-you").evaluate((e) => e.tagName)).toBe("BUTTON");
-  await expect(page.getByTestId("cull-sum-reject-split")).toHaveText(/^\(\d+ by you, 0 auto\)$/);
+  await expect(page.getByTestId("cull-sum-reject-split")).toHaveText(/^Rejected \d+By you \d+Auto 0$/);
+  for (const t of ["cull-sum-by-you", "cull-sum-auto"]) {
+    const bg = await page.getByTestId(t).evaluate((e) => getComputedStyle(e).backgroundColor);
+    const bgPicked = await page.getByTestId("cull-sum-picked").evaluate((e) => getComputedStyle(e).backgroundColor);
+    expect(bg).toBe(bgPicked);
+  }
+  await auto.click();
+  await expect(page.getByTestId("auto-zero-note")).toContainText("No photos were auto-rejected yet");
+  await expect(page.getByTestId("auto-zero-note")).toContainText("Sieve suggests rejecting");
+  await page.getByTestId("auto-zero-apply").click();
+  await expect(page.getByTestId("apply-dialog")).toBeVisible();
 });
 
 test("N3: Help legend strips are bars without text", async ({ page }) => {

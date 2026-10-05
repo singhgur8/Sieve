@@ -20,6 +20,7 @@ export function formatOffset(ms: number): string {
   if (ms === 0) return "no change";
   const sign = ms < 0 ? "-" : "+";
   let a = Math.abs(ms);
+  if (a < SEC) return `${sign}${(a / SEC).toFixed(1)} s`;
   const d = Math.floor(a / (24 * HOUR));
   a -= d * 24 * HOUR;
   const h = Math.floor(a / HOUR);

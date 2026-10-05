@@ -58,9 +58,9 @@ test.describe("cull summary: suggestions and flag origin (v18.1)", () => {
     await applyWithDefaults(page); // creates auto-rejects next to the user's own
     const byYou = page.getByTestId("cull-sum-by-you");
     const auto = page.getByTestId("cull-sum-auto");
-    await expect(auto).not.toHaveText(/^0 auto/);
-    const nAuto = Number((await auto.textContent())!.match(/^(\d+)/)![1]);
-    const nYou = Number((await byYou.textContent())!.match(/^(\d+)/)![1]);
+    await expect(auto).not.toHaveText(/^Auto 0/);
+    const nAuto = Number((await auto.textContent())!.match(/(\d+)$/)![1]);
+    const nYou = Number((await byYou.textContent())!.match(/(\d+)$/)![1]);
     const nRejected = Number(await page.getByTestId("cull-sum-rejected").locator("b").textContent());
     expect(nAuto + nYou).toBe(nRejected);
     const readout = page.getByTestId("selection-count");

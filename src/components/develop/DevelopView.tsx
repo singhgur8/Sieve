@@ -29,7 +29,7 @@ import { useHoverPreview, useStyleLibrary } from "../../hooks/useDevelopV14";
 import { Dialog } from "../Dialog";
 import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
-import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
+import { AUTO_SYNC_HELD_BACK, COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
 import { CropOverlay, constrainTool, newTool, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
@@ -49,6 +49,10 @@ export interface DevelopHandle {
   paste: () => void;
   /** Sync… dialog, or (quiet) sync with the remembered fields straight away. */
   sync: (quiet?: boolean) => void;
+  /** Cmd+Alt+Shift+A: Auto Sync on / off. */
+  toggleAutoSync: () => void;
+  /** Cmd+Z right after an auto-synced edit: undo the active photo's entry too (the caller undoes the batch). False when the last edit was not auto-synced. */
+  undoAutoSyncedEdit: () => boolean;
   reset: () => void;
   toggleSplit: () => void;
   /** R: start the crop tool, or apply it when already active. */
@@ -90,6 +94,9 @@ export interface DevelopHandle {
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
 
 interface Props {
+  /** Auto Sync (Lightroom): while on, every committed edit goes to the other selected photos (state lives in App, session-long). */
+  autoSync?: boolean;
+  onAutoSync?: (on: boolean) => void;
   lib: Library;
   sel: SelectionApi;
   onError: (e: unknown) => void;
@@ -164,7 +171,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ autoSync = false, onAutoSync, onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -205,7 +212,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const idB = compare ? compare.b : null;
   const maxEdge = Math.ceil(Math.max(size.w, size.h) * dpr);
   const beforeOn = (showBefore || split) && !compare;
+  // Auto Sync hook of editor A (filled in below, once the selection helpers exist).
+  const savedRef = useRef<(id: number, changed: AdjustmentField[]) => Promise<void>>(async () => {});
   const editorA = useEditor(idA, {
+    onSaved: (i, c) => savedRef.current(i, c),
     format: (idA != null ? lib.getEntry(idA) : undefined)?.format,
     uncropped: (cropTool !== null || guideOn) && !focusB,
     untransformed: guideOn && !focusB,
@@ -418,6 +428,11 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   }, [id, sel.selected]);
 
   const syncTargets = useMemo(() => [...sel.selected].filter((x) => x !== id), [sel.selected, id]);
+  const syncTargetsRef = useRef(syncTargets);
+  syncTargetsRef.current = syncTargets;
+  const autoOn = autoSync && !compare && syncTargets.length > 0;
+  const autoOnRef = useRef(autoOn);
+  autoOnRef.current = autoOn;
 
   const afterBatch = useCallback(
     async (t: number[]) => {
@@ -487,6 +502,33 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     },
     [id, run, editor, afterBatch, syncTargets],
   );
+
+  // ---- Auto Sync: each committed edit's changed setting groups go to the other selected photos as one batch ----
+  // SEAM (IPC v19.2): exposure and white balance are held back (AUTO_SYNC_HELD_BACK) until `sync_settings` has a relative
+  // (delta) mode. Then: send `{ relative: held-back changed fields }` here instead of dropping them.
+  const lastAuto = useRef<{ id: number; targets: number[] } | null>(null);
+  const idRef2 = useRef(id);
+  idRef2.current = id;
+  const afterBatchRef = useRef(afterBatch);
+  afterBatchRef.current = afterBatch;
+  savedRef.current = async (savedId, changed) => {
+    lastAuto.current = null;
+    if (!autoOnRef.current || savedId !== idRef2.current || changed.length === 0) return;
+    const fields = changed.filter((f) => !AUTO_SYNC_HELD_BACK.includes(f));
+    if (fields.length < changed.length) onNotice("Exposure and white balance are not synced by Auto Sync yet: they stay per photo. Use Sync… (Cmd+Alt+S) to copy them");
+    const t = syncTargetsRef.current.filter((x) => x !== savedId);
+    if (fields.length === 0 || t.length === 0) return;
+    try {
+      const r = await unwrap(commands.syncSettings(savedId, t, fields));
+      await afterBatchRef.current(t);
+      if (r.batchId != null && r.changedIds.length > 0) {
+        lastAuto.current = { id: savedId, targets: t };
+        await onBatchRef.current(r, "Auto Sync", t.length, true);
+      }
+    } catch (e) {
+      onError(e);
+    }
+  };
 
   const doReset = useCallback(
     () =>
@@ -779,7 +821,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       toggleCrop: () => (cropRef.current ? commitCrop() : startCrop()),
       commitCrop,
       cancelCrop,
-      undo: editor.undo,
+      undo: () => {
+        lastAuto.current = null;
+        editor.undo();
+      },
+      undoAutoSyncedEdit: () => {
+        // The batch Undo (App) reverts the synced photos; this reverts the active photo's own entry of the same edit.
+        const l = lastAuto.current;
+        lastAuto.current = null;
+        if (!l || l.id !== idRef2.current) return false;
+        editor.undo();
+        return true;
+      },
+      toggleAutoSync: () => {
+        if (syncTargetsRef.current.length === 0) return onNotice("Auto Sync needs 2 or more selected photos (Cmd / Shift-click in the filmstrip)");
+        onAutoSync?.(!autoOnRef.current);
+      },
       redo: editor.redo,
       maskKey: (action, e) => maskKey(action, e),
       cancelMaskTool: () => {
@@ -1141,6 +1198,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                   count: nTargets,
                   hasPrevious: prevId != null && prevId !== id,
                   onPrevious: pastePrevious,
+                  autoSync: autoOn,
+                  onAutoSync: (v) => onAutoSync?.(v),
                   onSync: (alt) => (alt ? syncTo(rememberedCopyFields()) : setDialog({ kind: "sync" })),
                   onReset: doReset,
                 }}

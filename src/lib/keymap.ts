@@ -71,6 +71,7 @@ export type ActionId =
   | "paste"
   | "sync"
   | "syncQuiet"
+  | "autoSync"
   | "autoTone"
   | "autoWb"
   | "reset"
@@ -217,16 +218,17 @@ export const KEYMAP: KeyDef[] = [
   { id: "redoAdj", group: "Develop", label: "Redo (culling or adjustment)", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
   { id: "bwToggle", group: "Develop", label: "Toggle Black & White", chords: [c("v")], modes: ["develop"], display: ["V"], where: "Develop" },
   { id: "wbPicker", group: "Develop", label: "White balance picker (click a neutral grey)", chords: [c("w")], modes: ["develop"], display: ["W"], where: "Develop" },
-  { id: "pastePrev", group: "Develop", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
+  { id: "pastePrev", group: "Copy & paste settings", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
   { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
-  { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
-  { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
+  { id: "copy", group: "Copy & paste settings", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
+  { id: "paste", group: "Copy & paste settings", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
   // Plain Cmd+C / Cmd+V: copy EVERY setting of the active photo (not crop / masks) and paste to every selected photo, one undoable
-  // batch. Library only for now; Develop reuses these ids by adding "develop" to `modes` and handling the action there.
-  { id: "copyAll", group: "Scenes", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: ALL, display: ["Cmd+C"], where: "Everywhere (not while typing)" },
-  { id: "pasteAll", group: "Scenes", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: ALL, display: ["Cmd+V"], where: "Everywhere (not while typing)" },
-  { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
-  { id: "syncQuiet", group: "Develop", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
+  // batch. Work in the Library and in Develop.
+  { id: "copyAll", group: "Copy & paste settings", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: ALL, display: ["Cmd+C"], where: "Everywhere (not while typing)" },
+  { id: "pasteAll", group: "Copy & paste settings", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: ALL, display: ["Cmd+V"], where: "Everywhere (not while typing)" },
+  { id: "sync", group: "Copy & paste settings", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
+  { id: "syncQuiet", group: "Copy & paste settings", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
+  { id: "autoSync", group: "Copy & paste settings", label: "Auto Sync on / off (2+ photos selected: every change goes to all of them)", chords: [c("a", { mod: true, alt: true, shift: true })], modes: ["develop"], display: ["Cmd+Alt+Shift+A"], where: "Develop" },
   { id: "autoTone", group: "Develop", label: "Auto tone (Basic: Tone > Auto)", chords: [c("u", { mod: true })], modes: ["develop"], display: ["Cmd+U"], where: "Develop" },
   { id: "autoWb", group: "Develop", label: "Auto white balance", chords: [c("u", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+U"], where: "Develop" },
   { id: "reset", group: "Develop", label: "Reset all adjustments", chords: [c("r", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+R"], where: "Develop" },

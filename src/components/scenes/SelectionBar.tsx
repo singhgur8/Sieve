@@ -30,7 +30,7 @@ export function SelectionBar({ selected, sceneCount, hasActive, onSelectAll, onC
   const syncWhy = !hasActive ? "Select a source photo" : selected < 2 ? "Shift / Cmd-click more photos" : null;
   const editWhy = selected === 0 && sceneCount == null ? "Select photos first" : null;
   return (
-    <div className="flex h-8 shrink-0 items-center gap-2 overflow-x-auto border-b border-neutral-800 bg-neutral-950 px-3 text-xs text-neutral-300" data-testid="selection-bar">
+    <div className="absolute bottom-3 left-1/2 z-20 flex h-9 max-w-[calc(100%-24px)] -translate-x-1/2 items-center gap-2 overflow-x-auto rounded-lg border border-neutral-700 bg-neutral-900/95 px-3 text-xs text-neutral-300 shadow-xl" data-testid="selection-bar">
       <span className="font-medium" data-testid="selbar-count">
         {selected} selected
       </span>

@@ -6,6 +6,7 @@ import { formatTime, formatShutter, trimNum } from "../lib/format";
 import { sourceLabel } from "../lib/captureTime";
 import { usePhotoMetadata } from "../hooks/usePhotoMetadata";
 import { hint } from "../lib/keymap";
+import { cameraLabel } from "../lib/metaFilter";
 
 function Row({ label, children, testid }: { label: string; children: ReactNode; testid?: string }) {
   return (
@@ -83,7 +84,7 @@ export function PhotoInfoPanel({ imageId, refetchKey, onClose, onEditTime, onRev
             </div>
             <div className="my-1 border-t border-neutral-800" />
             <Row label="Camera" testid="info-camera">
-              {[m.camera.make, m.camera.model].filter(Boolean).join(" ") || dash}
+              {m.camera.make === "other" && !m.camera.model ? dash : cameraLabel(m.camera)}
               {m.cameraSerial && <span className="text-neutral-500"> · #{m.cameraSerial}</span>}
             </Row>
             <Row label="Lens" testid="info-lens">

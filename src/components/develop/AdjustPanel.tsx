@@ -43,6 +43,9 @@ export interface BottomBar {
   count: number;
   hasPrevious: boolean;
   onPrevious: () => void;
+  /** Auto Sync (Lightroom): every committed edit also goes to the other selected photos. */
+  autoSync: boolean;
+  onAutoSync: (on: boolean) => void;
   /** Sync… (Alt held: no dialog). */
   onSync: (alt: boolean) => void;
   onReset: () => void;
@@ -418,7 +421,27 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
         </div>
       )}
 
+      {bar.count > 1 && bar.autoSync && (
+        <p className="shrink-0 border-t border-neutral-800 px-3 py-1 text-[11px] leading-tight text-neutral-400" data-testid="auto-sync-note">
+          Auto Sync is on: changes go to all {bar.count} photos. Exposure and white balance are not synced yet and stay per photo.
+        </p>
+      )}
       <div className="flex h-9 shrink-0 gap-2 border-t border-neutral-800 px-3 py-1" data-testid="right-bar">
+        {bar.count > 1 && (
+          <button
+            role="switch"
+            aria-checked={bar.autoSync}
+            onClick={() => bar.onAutoSync(!bar.autoSync)}
+            className={`flex shrink-0 items-center gap-1.5 rounded px-2 text-xs ${bar.autoSync ? "bg-sky-800 text-sky-50" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+            title={`Every change goes to all ${bar.count} selected photos${hint("autoSync")}. Exposure and white balance are not synced yet (they stay per photo; Sync… copies them)`}
+            data-testid="auto-sync-switch"
+          >
+            <span className={`relative inline-block h-3 w-6 rounded-full ${bar.autoSync ? "bg-sky-300" : "bg-neutral-600"}`} aria-hidden>
+              <span className={`absolute top-0.5 size-2 rounded-full bg-neutral-950 transition-all ${bar.autoSync ? "left-3.5" : "left-0.5"}`} />
+            </span>
+            Auto Sync
+          </button>
+        )}
         {bar.count > 1 ? (
           <button
             className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
@@ -427,7 +450,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
             title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
             data-testid="sync-settings"
           >
-            <RefreshCw className="size-3.5" /> Sync…
+            <RefreshCw className="size-3.5" /> {bar.autoSync ? `Auto Sync · ${bar.count}` : "Sync…"}
           </button>
         ) : (
           <button

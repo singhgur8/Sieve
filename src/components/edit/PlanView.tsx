@@ -180,12 +180,12 @@ export function PlanView(p: Props) {
               </Menu>
             )}
             {rows.length > 0 && (
-              <div className="flex shrink-0 items-center gap-2 text-xs text-neutral-300" data-testid="plan-progress">
+              <div className="flex min-w-0 shrink items-center gap-2 text-xs text-neutral-300" data-testid="plan-progress">
                 <span className="flex h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-neutral-800 min-[1600px]:w-[200px]" aria-hidden>
                   <span className="h-full bg-emerald-500" style={{ width: `${((counts?.applied ?? 0) / rows.length) * 100}%` }} />
                   <span className="h-full bg-sky-500" style={{ width: `${(((counts?.edited ?? 0) + (counts?.outdated ?? 0)) / rows.length) * 100}%` }} />
                 </span>
-                <span className="whitespace-nowrap" data-testid="plan-counts">
+                <span className="min-w-0 truncate whitespace-nowrap" data-testid="plan-counts">
                   {(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · {counts?.applied ?? 0} applied · {counts?.toEdit ?? 0} to do{(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}
                 </span>
               </div>
@@ -215,7 +215,7 @@ export function PlanView(p: Props) {
               Continue to Export <ArrowRight className="size-3.5" /> {keeperCount}
             </button>
           ) : (pending.length === 0 && (counts?.toEdit ?? 0) === 0) || (pending.length === 0 && rows.some((r) => r.ui === "applied" || r.ui === "reset")) ? null : (
-            <>
+            <div className="flex shrink-0 items-center gap-2 max-[1439px]:flex-col-reverse max-[1439px]:items-end max-[1439px]:gap-0.5" data-testid="plan-apply-block">
             {pending.length === 0 && busy == null && !applying && (
               <ApplyWhy
                 block={{ reason: "Edit a scene's representative first", fix: todo.length > 0 ? "open" : undefined }}
@@ -233,9 +233,9 @@ export function PlanView(p: Props) {
               Apply {plural(pending.length, "edited scene")} ({pendingTargets})
               <ArrowRight className="size-3.5" />
             </button>
-            </>
+            </div>
           )}
-          <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-2 hover:bg-neutral-700" triggerTestId="plan-more" title="More" align="right">
+          <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 shrink-0 items-center rounded-md bg-neutral-800 px-2 hover:bg-neutral-700" triggerTestId="plan-more" title="More" align="right">
             {(close) => (
               <div className="w-72 py-1">
                 <button
@@ -491,7 +491,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         {!r.skipped && (r.ui === "todo" || r.ui === "reset" || r.ui === "edited") && (
           <AutoEditButton style={wf.style} testid={`plan-auto-${id}`} label="Auto edit" disabled={anyBusy} onClick={() => wf.requestAutoEdit([id])} className="px-2" />
         )}
-        <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
+        <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 shrink-0 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
           {(close) => {
             const item = (testid: string, label: string, fn: () => void, disabled = false, why?: string) => (
               <button

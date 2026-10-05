@@ -61,7 +61,7 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   const [open, setOpen] = useState(defaultOpen);
   return (
     <section className="border-b border-neutral-800 px-3 py-2" data-testid={`section-${id}`} data-open={open}>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <button className="flex items-center gap-1 font-semibold uppercase tracking-wide text-neutral-300" aria-expanded={open} onClick={() => setOpen(!open)} data-testid={`section-toggle-${id}`}>
           {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
           {title}
@@ -107,8 +107,8 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           id="navigator"
           title="Navigator"
           action={
-            <span className="flex gap-1.5 text-[11px]" role="group" aria-label="Zoom presets">
-              {ZOOM_PRESETS.map((z) => (
+            <span className="flex shrink-0 gap-1.5 text-[11px]" role="group" aria-label="Zoom presets">
+              {ZOOM_PRESETS.filter((z) => z.id !== 50 && z.id !== 400).map((z) => (
                 <button
                   key={String(z.id)}
                   className={activePreset === z.id ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"}
@@ -119,7 +119,7 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
                   data-testid={z.id === "fit" ? "nav-fit" : `nav-${z.id}`}
                   aria-pressed={activePreset === z.id}
                 >
-                  {z.id === "fit" ? "FIT" : z.label}
+                  {z.label}
                 </button>
               ))}
             </span>
