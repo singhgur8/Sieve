@@ -65,6 +65,8 @@ export type ActionId =
   | "undoCull"
   | "redoCull"
   | "copy"
+  | "copyAll"
+  | "pasteAll"
   | "paste"
   | "sync"
   | "syncQuiet"
@@ -215,6 +217,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "wbPicker", group: "Develop", label: "White balance picker (click a neutral grey)", chords: [c("w")], modes: ["develop"], display: ["W"], where: "Develop" },
   { id: "pastePrev", group: "Develop", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
   { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
+  { id: "copyAll", group: "Develop", label: "Copy all settings of this photo (Cmd+Shift+C picks which)", chords: [c("c", { mod: true })], modes: ["develop"], display: ["Cmd+C"], where: "Develop (not while typing)" },
+  { id: "pasteAll", group: "Develop", label: "Paste the copied settings (one undo step; Cmd+Shift+V is the same)", chords: [c("v", { mod: true })], modes: ["develop"], display: ["Cmd+V"], where: "Develop (not while typing)" },
   { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
   { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },

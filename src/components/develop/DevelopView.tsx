@@ -78,6 +78,9 @@ export interface DevelopHandle {
   /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
   autoTone: () => void;
   autoWb: () => void;
+  /** Cmd+C / Cmd+V: copy every setting / paste them (one undoable step). */
+  copyAll: () => void;
+  pasteAll: () => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -213,6 +216,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     onCommitted: noteCommitted,
   });
   const editor = focusB ? editorB : editorA;
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
   const { info } = editor;
   const health = useEntryHealth(entry);
   // The original became reachable again (relocated folder): load the image that failed to open.
@@ -387,7 +392,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   const doPaste = useCallback(() => {
     const c = getClipboard();
-    if (!c) return onNotice("Nothing copied yet (Cmd+Shift+C)");
+    if (!c) return onNotice("Nothing copied yet (Cmd+C copies this photo's settings)");
     const t = targets();
     if (!t.length) return;
     void run(async () => {
@@ -395,7 +400,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       const before = await heads(t);
       await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
       await afterBatch(t);
-      const msg = `Pasted ${c.fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`;
+      const msg = `Pasted settings${t.length === 1 ? "" : ` to ${t.length} photos`}`;
       if (!before) return onNotice(msg);
       // Undo only the photos the paste changed (an unchanged photo has no new history entry).
       const after = await heads(t);
@@ -478,13 +483,21 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
 
   // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
   const runAuto = useCallback(
-    async (what: "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+    async (what: "all" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
       if (id == null || autoBusy) return;
       setAutoBusy(true);
       try {
         await editor.flush();
         const cur = editor.adj;
-        if (what === "tone" || what === "key") {
+        if (what === "all") {
+          // Generic Auto (works without a learned style): tone and white balance from this photo, one history entry.
+          const [v, w] = await Promise.all([unwrap(commands.autoTone(id, cur, null)), unwrap(commands.autoWhiteBalance(id, cur))]);
+          editor.change((a) => {
+            const t = applyAutoTone(a, v);
+            return { ...t, whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } };
+          }, "Auto");
+          setAutoWb({ id, t: w.temperatureK, tint: w.tint });
+        } else if (what === "tone" || what === "key") {
           const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
           editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
         } else {
@@ -511,6 +524,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const wbNow = editor.adj.whiteBalance;
   const auto: AutoApi = {
     busy: autoBusy,
+    all: () => void runAuto("all"),
     tone: () => void runAuto("tone"),
     wb: () => void runAuto("wb"),
     slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
@@ -530,14 +544,31 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const edgeFor = useCallback((to: "navigator" | "viewer") => (to === "navigator" ? 480 : maxEdge), [maxEdge]);
   const hover = useHoverPreview(id, edgeFor);
   // Any edit (commit, slider, auto, paste) replaces a hover preview with the real render.
-  const { stop: stopHover } = hover;
+  const { stop: stopHover, startVariant } = hover;
   useEffect(() => stopHover(), [editor.adj, stopHover]);
   const hoverPreset = useCallback(
     (p: StylePreset | null) => {
-      if (!p || id == null) return hover.stop();
-      hover.start(p.name, "navigator", async () => unwrap(commands.resolvePreset(id, p.id, editor.adj)));
+      if (!p || id == null) return stopHover();
+      // 120 ms dwell, then one `renderPreviewVariant` (slot `preview`) shown on the main image and the Navigator;
+      // latest wins, nothing is applied or saved until the click.
+      startVariant(p.name, "preset", { kind: "preset", presetId: p.id }, () => editor.adj, 120);
     },
-    [hover, id, editor.adj],
+    [stopHover, startVariant, id, editor.adj],
+  );
+  // Press-and-hold a panel's "changed" dot: the photo without that panel's changes while held.
+  const holdingRef = useRef(false);
+  const holdApi = useMemo(
+    () => ({
+      start: (title: string, fields: AdjustmentField[]) => {
+        holdingRef.current = true;
+        startVariant(`Without ${title} changes`, "hold", { kind: "without_fields", fields }, () => editorRef.current.adj, 0);
+      },
+      stop: () => {
+        holdingRef.current = false;
+        stopHover();
+      },
+    }),
+    [startVariant, stopHover],
   );
   const profileHover = useMemo(
     () => ({
@@ -728,8 +759,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       savePreset: () => setDialog({ kind: "preset" }),
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
+      copyAll: () => copyWith(rememberedCopyFields()),
+      pasteAll: doPaste,
     }),
-    [toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [copyWith, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);
@@ -950,7 +983,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               onImport={() => void importStyles()}
               onRemoveGroup={(g: StyleGroup) => void styles.removeGroup(g.id)}
               onHoverPreset={hoverPreset}
-              navPreview={hover.preview?.to === "navigator" ? hover.preview : null}
+              navPreview={hover.preview?.to === "navigator" || hover.preview?.source === "preset" ? hover.preview : null}
+              appliedPresetId={editor.history?.appliedPresetId ?? null}
               history={editor.history}
               imageId={id}
               onApplyPreset={doApplyPreset}
@@ -1018,7 +1052,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           {viewerToolbar}
         </div>
         {!panels.right && (
-          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside" onMouseLeave={hover.stop}>
+          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside" onMouseLeave={() => !holdingRef.current && hover.stop()}>
             {compare && (
               <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
                 Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}
@@ -1031,6 +1065,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                 importing={styles.importing}
                 onImportStyles={() => void importStyles()}
                 hover={profileHover}
+                hold={holdApi}
                 auto={auto}
                 imageId={id}
                 onError={onError}

@@ -2,7 +2,7 @@
 // (150 ms dwell -> `resolvePreset` / `renderPreview` on the `navigator` slot) and snapshots (no backend command yet).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ImportStyleReport, type ParametricAdjustments, type StyleGroup } from "../ipc";
+import { commands, unwrap, type ImportStyleReport, type ParametricAdjustments, type PreviewVariant, type StyleGroup } from "../ipc";
 
 export interface StyleLibraryApi {
   /** Every style group (User Presets, imported folders, LUTs), library order. */
@@ -67,6 +67,8 @@ export interface HoverPreview {
   label: string;
   /** Where it is shown: the Navigator (presets) or the main viewer (profiles). */
   to: "navigator" | "viewer";
+  /** Set when rendered by `renderPreviewVariant`: a hovered preset or a held "without this panel" view (main image). */
+  source?: "preset" | "hold";
 }
 
 /**
@@ -101,6 +103,32 @@ export function useHoverPreview(imageId: number | null, maxEdgeFor: (to: "naviga
     },
     [imageId, maxEdgeFor],
   );
+  /**
+   * `renderPreviewVariant` preview (slot `preview`, no history, nothing saved): a preset after a short dwell, or a
+   * "without these fields" view at once while a panel's changed dot is held. Latest wins (`token`).
+   */
+  const startVariant = useCallback(
+    (label: string, source: "preset" | "hold", variant: PreviewVariant, getAdjustments: () => ParametricAdjustments, delay: number) => {
+      if (imageId == null) return;
+      clearTimeout(timer.current);
+      const t = ++token.current;
+      const run = async () => {
+        try {
+          const r = await unwrap(commands.renderPreviewVariant(imageId, getAdjustments(), variant, { maxEdge: Math.max(64, Math.min(2048, maxEdgeFor("viewer"))), slot: "preview", region: null }));
+          if (!r || t !== token.current) return;
+          const img = new Image();
+          img.src = r.url;
+          await Promise.race([img.decode().catch(() => undefined), new Promise<void>((res) => setTimeout(res, 400))]);
+          if (t === token.current) setPreview({ url: r.url, label, to: "viewer", source });
+        } catch {
+          /* a failed preview is silent: the normal view stays */
+        }
+      };
+      if (delay <= 0) void run();
+      else timer.current = setTimeout(() => void run(), delay);
+    },
+    [imageId, maxEdgeFor],
+  );
   useEffect(() => stop, [imageId, stop]);
   // A hover preview is transient: Esc, losing window focus or hiding the page always drops it.
   useEffect(() => {
@@ -115,7 +143,7 @@ export function useHoverPreview(imageId: number | null, maxEdgeFor: (to: "naviga
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [stop]);
-  return { preview, start, stop };
+  return { preview, start, startVariant, stop };
 }
 
 export interface SnapshotView {

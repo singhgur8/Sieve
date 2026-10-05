@@ -69,6 +69,75 @@ export const Slider = memo(function Slider({
   const hi = Math.max(def, value);
   const color = accent ?? "#7dd3fc";
 
+  // Latest value for nudging (keys repeat faster than the parent re-renders).
+  const valRef = useRef(value);
+  valRef.current = value;
+  const hovered = useRef(false);
+  const nudgeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** Step of a key press: Shift x10, Alt x0.1 (only where the display can show the finer step). */
+  const stepFor = (e: { shiftKey: boolean; altKey: boolean }) => {
+    const base = textStep ?? step;
+    // Fine only where the display can show it (Temp in 5 K steps, a 0.1-step slider with 2 digits...).
+    const fine = textStep != null || base * 0.1 >= 10 ** -digits - 1e-9;
+    return base * (e.shiftKey ? 10 : e.altKey && fine ? 0.1 : 1);
+  };
+  /** The slider position `sign` steps away (Kelvin-like sliders step in their typed unit); null = unchanged. */
+  const nudgeValue = (sign: 1 | -1, e: { shiftKey: boolean; altKey: boolean }): number | null => {
+    const cur = parse && editText ? Number.parseFloat(editText(valRef.current)) : valRef.current;
+    if (!Number.isFinite(cur)) return null;
+    const next = Math.round((cur + sign * stepFor(e)) * 1e6) / 1e6;
+    const v = parse ? parse(String(next)) : next;
+    if (v == null || !Number.isFinite(v)) return null;
+    const out = clamp(v, min, max);
+    return out === valRef.current ? null : out;
+  };
+  const nudge = (sign: 1 | -1, e: { shiftKey: boolean; altKey: boolean }) => {
+    const v = nudgeValue(sign, e);
+    if (v == null) return;
+    valRef.current = v;
+    setLive(v);
+    onInput(v);
+  };
+  const nudgeRef = useRef(nudge);
+  nudgeRef.current = nudge;
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
+  // Lightroom: hover a slider and press Up / Down. Only Up / Down (Left / Right keep moving between photos);
+  // a focused text field or slider keeps its own keys.
+  useEffect(() => {
+    if (disabled) return;
+    const down = (e: KeyboardEvent) => {
+      if (!hovered.current || (e.key !== "ArrowUp" && e.key !== "ArrowDown") || e.metaKey || e.ctrlKey) return;
+      const t = e.target;
+      if (t instanceof HTMLElement && t.closest("input, textarea, select")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      nudgeRef.current(e.key === "ArrowUp" ? 1 : -1, e);
+      clearTimeout(nudgeTimer.current);
+      nudgeTimer.current = setTimeout(() => {
+        nudgeTimer.current = undefined;
+        commitRef.current();
+      }, 300);
+    };
+    window.addEventListener("keydown", down, true);
+    return () => {
+      window.removeEventListener("keydown", down, true);
+      if (nudgeTimer.current) {
+        clearTimeout(nudgeTimer.current);
+        nudgeTimer.current = undefined;
+        commitRef.current();
+      }
+    };
+  }, [disabled]);
+  const leave = () => {
+    hovered.current = false;
+    if (nudgeTimer.current) {
+      clearTimeout(nudgeTimer.current);
+      nudgeTimer.current = undefined;
+      commit();
+    }
+  };
+
   const [editing, setEditing] = useState<string | null>(null);
   const editRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -99,7 +168,7 @@ export const Slider = memo(function Slider({
   };
 
   return (
-    <div className="flex h-6 items-center gap-2" data-testid={`slider-row-${id}`} data-changed={changed}>
+    <div className="flex h-6 items-center gap-2" data-testid={`slider-row-${id}`} data-changed={changed} onMouseEnter={() => (hovered.current = true)} onMouseLeave={leave}>
       <span
         className={`w-[72px] shrink-0 cursor-default select-none truncate text-xs ${changed ? "text-neutral-100" : "text-neutral-300"}`}
         onDoubleClick={dbl}
@@ -131,6 +200,12 @@ export const Slider = memo(function Slider({
             onInput(v);
           }}
           onPointerUp={commit}
+          onKeyDown={(e) => {
+            // Focused slider: all four arrows step (Shift x10, Alt fine); Home / End / Page keys stay native.
+            if (e.metaKey || e.ctrlKey || !e.key.startsWith("Arrow")) return;
+            e.preventDefault();
+            nudge(e.key === "ArrowUp" || e.key === "ArrowRight" ? 1 : -1, e);
+          }}
           onKeyUp={(e) => (e.key.startsWith("Arrow") || ["Home", "End", "PageUp", "PageDown"].includes(e.key)) && commit()}
           onBlur={commit}
           onDoubleClick={disabled ? undefined : dbl}
@@ -156,11 +231,19 @@ export const Slider = memo(function Slider({
             } else if (e.key === "Escape") {
               e.preventDefault();
               finish(null);
+            } else if (e.key === "Tab") {
+              // Commit and type into the next (previous with Shift) slider's value.
+              e.preventDefault();
+              finish(editing);
+              const all = [...document.querySelectorAll<HTMLButtonElement>('[data-testid^="slider-value-"]:not(:disabled)')];
+              const at = all.findIndex((b) => b.dataset.testid === `slider-value-${id}`);
+              const next = all[at + (e.shiftKey ? -1 : 1)];
+              if (next) setTimeout(() => next.click(), 0);
             } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
               e.preventDefault();
               const cur = Number.parseFloat(editing);
               if (!Number.isFinite(cur)) return;
-              const d = (textStep ?? step) * (e.shiftKey ? 10 : 1) * (e.key === "ArrowUp" ? 1 : -1);
+              const d = stepFor(e) * (e.key === "ArrowUp" ? 1 : -1);
               const next = Math.round((cur + d) * 1e6) / 1e6;
               const v = toValue(String(next));
               setEditing(v == null ? editing : editText ? editText(v) : v.toFixed(digits));
@@ -173,7 +256,7 @@ export const Slider = memo(function Slider({
           className={`w-12 shrink-0 cursor-text whitespace-nowrap text-right text-xs tabular-nums ${changed ? "font-medium text-neutral-100" : "text-neutral-400"} disabled:cursor-default`}
           onClick={startEdit}
           disabled={disabled}
-          title="Click to type a value"
+          title="Click to type a value (Enter applies, Esc cancels, Tab: next slider). Hover the slider and press Up / Down to nudge (Shift x10, Alt fine)"
           data-testid={`slider-value-${id}`}
         >
           {shown}

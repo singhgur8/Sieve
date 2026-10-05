@@ -1281,6 +1281,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       }
       case "copy":
         return develop.current?.copy();
+      case "copyAll":
+        return develop.current?.copyAll();
+      case "pasteAll":
+        return develop.current?.pasteAll();
       case "paste":
         if (mode === "develop") develop.current?.paste();
         else void pasteToSelection();

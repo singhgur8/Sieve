@@ -1,5 +1,5 @@
 // Develop left panel: Navigator, Presets, Snapshots, History and the sticky Copy… / Paste bar (docs/ux-spec-8b.md 5.3).
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Loader2, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
 import { hint } from "../../lib/keymap";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
@@ -31,6 +31,8 @@ interface Props {
   onHoverPreset: (p: StylePreset | null) => void;
   /** Hover preview shown in the Navigator instead of the photo (label `Preview: <name>`). */
   navPreview: { url: string; label: string } | null;
+  /** The preset the photo currently carries (`AdjustmentHistory.appliedPresetId`); highlighted in the list. */
+  appliedPresetId?: number | null;
   history: AdjustmentHistory | null;
   imageId: number | null;
   onApplyPreset: (p: StylePreset) => void;
@@ -71,7 +73,7 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   );
 }
 
-export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onPreset, activePreset, onCopy, onPaste, copied }: Props) {
+export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, appliedPresetId = null, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onPreset, activePreset, onCopy, onPaste, copied }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>(loadGroups);
   const [removingGroup, setRemovingGroup] = useState<number | null>(null);
@@ -88,6 +90,11 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
       /* not remembered */
     }
   };
+  // Bring the applied preset into view (its group is shown open above) when it changes.
+  const appliedRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    appliedRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [appliedPresetId, groups]);
   const pasting = useActivityRunning("paste_sync");
   const pasteTitle = pasting ? BUSY_WHY.paste_sync : copied
     ? `Paste ${copied.fields.length} settings${copied.fromName ? ` from ${copied.fromName.replace(/\.[^.]+$/, "")}` : ""} to ${targetCount} photo${targetCount === 1 ? "" : "s"}${hint("paste")}`
@@ -173,7 +180,7 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           )}
           <div data-testid="preset-list">
             {shown.map((g) => {
-              const open = groupOpen[g.id] ?? g.kind === "user";
+              const open = groupOpen[g.id] ?? (g.kind === "user" || (appliedPresetId != null && g.presets.some((x) => x.id === appliedPresetId)));
               return (
                 <div key={g.id} data-testid={`preset-group-${g.id}`} data-open={open} data-kind={g.kind}>
                   <div className="group/g flex h-6 items-center">
@@ -212,8 +219,14 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
                   {open && (
                     <ul>
                       {g.presets.map((p) => (
-                        <li key={p.id} className="group flex h-6 items-center justify-between rounded pl-5 pr-1 hover:bg-neutral-800" onMouseEnter={() => onHoverPreset(p)} onMouseLeave={() => onHoverPreset(null)}>
-                          <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
+                        <li
+                          key={p.id}
+                          ref={p.id === appliedPresetId ? appliedRef : undefined}
+                          data-applied={p.id === appliedPresetId}
+                          aria-current={p.id === appliedPresetId ? "true" : undefined}
+                          className={`group flex h-6 items-center justify-between rounded pl-5 pr-1 ${p.id === appliedPresetId ? "bg-sky-900/60 text-sky-100 hover:bg-sky-900/80" : "hover:bg-neutral-800"}`}
+                          onMouseEnter={() => onHoverPreset(p)} onMouseLeave={() => onHoverPreset(null)}>
+                          <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name} (hover to preview it on the photo)`}>
                             {p.name}
                           </button>
                           {p.warnings.length > 0 && (

@@ -1,7 +1,7 @@
 // Develop right panel, Lightroom order (docs/ux-spec-8b.md 5.4): Histogram, tool strip (Crop, Masking), Basic (Treatment,
 // Profile, WB, Tone with Auto, Presence), Tone Curve, HSL / Color, Color Grading, Detail, Effects, Calibration, bottom bar.
 import { memo, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
-import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History } from "lucide-react";
+import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History, Wand2 } from "lucide-react";
 import type { AdjustmentField } from "../../ipc";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import type { Editor } from "../../hooks/useEditor";
@@ -49,6 +49,8 @@ export interface BottomBar {
 /** Lightroom's Auto buttons (Tone, WB, Shift+double-click on a slider), driven by DevelopView (v14 `auto_tone` / `auto_white_balance`). */
 export interface AutoApi {
   busy: boolean;
+  /** Generic Auto: tone + white balance from the photo (no learned style needed), one history entry. */
+  all: () => void;
   tone: () => void;
   wb: () => void;
   /** Shift+double-click: auto for one slider (temp / tint use the white balance, the rest `auto_tone` with that key). */
@@ -65,6 +67,8 @@ interface Props {
   onImportStyles: () => void;
   hover: ProfileHover;
   auto: AutoApi;
+  /** Press-and-hold of a section's changed dot: the photo without that section's changes (renderPreviewVariant). */
+  hold: { start: (title: string, fields: AdjustmentField[]) => void; stop: () => void };
   imageId: number | null;
   onError: (e: unknown) => void;
   crop: CropApi;
@@ -218,7 +222,7 @@ const WbRow = memo(function WbRow({ kind, value, def, other, asShot, disabled, o
   );
 });
 
-export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
+export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, hold, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
   const syncing = useActivityRunning("paste_sync");
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
@@ -232,6 +236,8 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
     if (v === undefined) dirtyCache.set(k, (v = !sameAdjustments(copyFields(adj, editor.defaults, fields), adj)));
     return v;
   };
+
+  const holdOf = (title: string, fields: AdjustmentField[]) => (down: boolean) => (down ? hold.start(title, fields) : hold.stop());
 
   const autoRef = useRef(auto);
   autoRef.current = auto;
@@ -278,7 +284,19 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
             <ProfileBrowser editor={editor} catalog={catalog} importing={importing} onImport={onImportStyles} hover={hover} onClose={() => browser.setOpen(false)} />
           ) : (
             <>
-              <Section id="basic" dirty={dirty(BASIC_ALL)} title="Basic" onReset={() => resetFields(BASIC_ALL, "Reset Basic")}>
+              <Section id="basic" dirty={dirty(BASIC_ALL)} onHold={holdOf("Basic", BASIC_ALL)} title="Basic" onReset={() => resetFields(BASIC_ALL, "Reset Basic")}>
+                <div className="flex h-7 items-center gap-2" data-testid="auto-row">
+                  <button
+                    className="flex h-6 items-center gap-1 rounded bg-sky-800 px-3 text-xs font-medium text-sky-50 hover:bg-sky-700 disabled:opacity-60"
+                    disabled={auto.busy}
+                    onClick={auto.all}
+                    title={`Auto: set exposure, contrast, highlights, shadows and white balance from this photo's analysis. Works on any photo, no learned style needed. Not the same as "Auto edit (my style)", which applies your own editing style to a whole scene.`}
+                    data-testid="auto-all"
+                  >
+                    {auto.busy ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} Auto
+                  </button>
+                  <span className="min-w-0 truncate text-[11px] text-neutral-500">tone and white balance from this photo</span>
+                </div>
                 <div className="flex h-7 items-center gap-2" data-testid="bw-mode">
                   <span className="w-[72px] shrink-0 text-xs text-neutral-300">Treatment</span>
                   <div className="flex flex-1 gap-1">
@@ -327,7 +345,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                       className="flex h-5 items-center gap-1 rounded bg-neutral-800 px-2 text-[11px] hover:bg-neutral-700 disabled:opacity-40"
                       disabled={auto.busy}
                       onClick={auto.tone}
-                      title={`Auto${hint("autoTone")}`}
+                      title={`Auto tone only: exposure, contrast, highlights, shadows, whites, blacks (white balance is untouched)${hint("autoTone")}`}
                       data-testid="auto-tone"
                     >
                       {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto
@@ -341,11 +359,11 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                 {PRESENCE.map(simple)}
               </Section>
 
-              <Section id="tone-curve" dirty={dirty(["tone_curve"])} title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
+              <Section id="tone-curve" dirty={dirty(["tone_curve"])} onHold={holdOf("Tone Curve", ["tone_curve"])} title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
                 <ToneCurvePanel editor={editor} />
               </Section>
 
-              <Section id="hsl" dirty={dirty(HSL_BW_FIELDS)} title={adj.blackAndWhite.enabled ? "B&W" : "HSL / Color"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
+              <Section id="hsl" dirty={dirty(HSL_BW_FIELDS)} onHold={holdOf("Color", HSL_BW_FIELDS)} title={adj.blackAndWhite.enabled ? "B&W" : "HSL / Color"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
                 {adj.blackAndWhite.enabled ? (
                   <div data-testid="bw-mixer">
                     {BANDS.map((b) => (
@@ -371,19 +389,19 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                 )}
               </Section>
 
-              <Section id="color-grading" dirty={dirty(["color_grading"])} title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
+              <Section id="color-grading" dirty={dirty(["color_grading"])} onHold={holdOf("Color Grading", ["color_grading"])} title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
                 <ColorGradingPanel editor={editor} />
               </Section>
 
-              <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
+              <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} onHold={holdOf("Detail", ["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
                 <DetailPanel editor={editor} />
               </Section>
 
-              <Section id="effects" dirty={dirty(["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
+              <Section id="effects" dirty={dirty(["vignette", "grain"])} onHold={holdOf("Effects", ["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
                 <EffectsPanel editor={editor} />
               </Section>
 
-              <Section id="calibration" dirty={dirty(["calibration"])} title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
+              <Section id="calibration" dirty={dirty(["calibration"])} onHold={holdOf("Calibration", ["calibration"])} title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
                 <CalibrationPanel editor={editor} />
               </Section>
             </>
