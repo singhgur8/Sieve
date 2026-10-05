@@ -2,11 +2,12 @@
 import { memo, useCallback, useEffect, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Flag, X } from "lucide-react";
-import { convertFileSrc, type RawImageEntry } from "../ipc";
+import { type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { LABEL_COLOR } from "../lib/format";
 import { SceneBadge, Stars } from "./Cell";
 import { flagTitle } from "../lib/cull";
+import { thumbSrc } from "../lib/entryImage";
 
 interface Props {
   lib: Library;
@@ -109,7 +110,7 @@ const FilmCell = memo(FilmCellImpl, cellPropsEqual);
 function entrySig(e: RawImageEntry | undefined): string {
   if (!e) return "";
   const t = e.thumbnail;
-  return `${e.id}|${e.pick}|${e.pickOrigin}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}`;
+  return `${e.id}|${e.pick}|${e.pickOrigin}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}|${e.editedPreview?.thumbUrl ?? ""}`;
 }
 function cellPropsEqual(a: CellProps, b: CellProps): boolean {
   for (const k of Object.keys(a) as (keyof CellProps)[]) if (k !== "e" && a[k] !== b[k]) return false;
@@ -130,7 +131,7 @@ function FilmCellImpl({ fid, e, v, active, isSel, isMarked, left, top, cellW, ce
     className={`absolute cursor-pointer overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${isMarked ? "ring-2 ring-amber-400" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
     style={{ left, top, width: cellW, height: cellH }}
   >
-    {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${v}`} alt="" draggable={false} className="size-full object-cover" />}
+    {t?.status === "ready" && <img src={thumbSrc(e, v)!} alt="" draggable={false} className="size-full object-cover" />}
     {e && (e.pick !== "unflagged" || e.colorLabel) && (
       <span className="absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
         {e.pick === "pick" && (

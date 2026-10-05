@@ -649,6 +649,23 @@ pub struct RawImageEntry {
     /// extraction or re-import; `null` = present (or not checked since). Cleared by the next
     /// successful access, a re-import that finds it, or `relocate_folder` (IPC v13).
     pub missing_since_ms: Option<i64>,
+    /// Rendered previews of the photo's develop settings (IPC v19.1): what Library grid,
+    /// Loupe, filmstrip and scenes show for an edited photo instead of the embedded
+    /// thumbnail. `null` when unedited (`hasEdits = false`) or not rendered yet (the
+    /// `editedPreviewChanged` event follows once it is). May briefly lag the newest edit.
+    pub edited_preview: Option<EditedPreview>,
+}
+
+/// Cached renders of one photo's develop settings (IPC v19.1), served by the `sieve://`
+/// scheme from the app cache dir (never next to the photos). URLs are content-addressed
+/// (image id + settings hash): a new edit gives new URLs, so they may be cached forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditedPreview {
+    /// Grid thumbnail, long edge 512 px, orientation and crop applied.
+    pub thumb_url: String,
+    /// Loupe / Develop placeholder, long edge 2048 px, orientation and crop applied.
+    pub preview_url: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ImageOff } from "lucide-react";
-import { convertFileSrc, type RawImageEntry } from "../ipc";
+import { type RawImageEntry } from "../ipc";
+import { embeddedPreviewSrc, embeddedThumbSrc, previewSrc, thumbSrc } from "../lib/entryImage";
 
 /** Zoom relative to "fit" (1 = fit), centre of the viewport in normalised image coordinates. */
 export interface View {
@@ -78,8 +79,13 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
   const [decoded, setDecoded] = useState<{ url: string; w: number; h: number } | null>(null);
   const [broken, setBroken] = useState<string | null>(null);
   const t = entry?.thumbnail;
-  const previewPath = t?.status === "ready" ? (t.previewPath ?? t.path) : null;
-  const thumbPath = t?.status === "ready" ? t.path : null;
+  // An edited photo shows its edited render (IPC v19.1), otherwise the embedded preview / thumbnail. If the edited
+  // render cannot be loaded (cache cleaned), the embedded one is the fallback.
+  const ready = t?.status === "ready";
+  const editedUrl = ready && entry?.hasEdits && entry.editedPreview ? entry.editedPreview.previewUrl : null;
+  const edited = !!editedUrl && broken !== editedUrl;
+  const previewUrl = !ready ? null : edited ? previewSrc(entry, version) : embeddedPreviewSrc(entry, version);
+  const thumbUrl = !ready ? null : edited ? thumbSrc(entry, version) : embeddedThumbSrc(entry, version);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -91,8 +97,6 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
     return () => ro.disconnect();
   }, []);
 
-  const previewUrl = previewPath ? `${convertFileSrc(previewPath)}?v=${version}` : null;
-  const thumbUrl = thumbPath ? `${convertFileSrc(thumbPath)}?v=${version}` : null;
   useEffect(() => {
     if (!previewUrl) return;
     let stale = false;
@@ -100,7 +104,7 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
     im.src = previewUrl;
     im.decode().then(
       () => !stale && setDecoded({ url: previewUrl, w: im.naturalWidth, h: im.naturalHeight }),
-      () => !stale && setBroken(previewPath),
+      () => !stale && setBroken(previewUrl),
     );
     return () => {
       stale = true;
@@ -220,14 +224,14 @@ export function ZoomPane({ entry, version, view, onView, metricsRef, testId, onF
       onPointerCancel={() => (drag.current = null)}
       onPointerLeave={onPointerLeave}
     >
-      {thumbUrl && <img key={thumbUrl} src={thumbUrl} alt="" draggable={false} className={imgClass} style={style} data-testid="zoom-thumb" />}
+      {thumbUrl && <img key={thumbUrl} src={thumbUrl} alt="" draggable={false} className={`${imgClass}${edited && !nat ? " object-contain" : ""}`} style={style} data-testid="zoom-thumb" />}
       {t?.status === "failed" && (
         <Unavailable title="No preview for this photo" detail={t.reason} />
       )}
-      {previewPath && broken === previewPath && (
+      {previewUrl && broken === previewUrl && (
         <Unavailable title="Preview unavailable" detail="The cached preview could not be loaded (cache folder cleaned or drive offline). Use More > Regenerate previews, or re-import the folder." />
       )}
-      {previewUrl && nat && <img key={previewUrl} src={previewUrl} alt={entry?.fileName} draggable={false} className={imgClass} style={style} onError={() => setBroken(previewPath)} />}
+      {previewUrl && nat && <img key={previewUrl} src={previewUrl} alt={entry?.fileName} draggable={false} className={imgClass} style={style} onError={() => setBroken(previewUrl)} />}
     </div>
   );
 }

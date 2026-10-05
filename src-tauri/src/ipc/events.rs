@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
 
-use super::types::{string_enum, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase};
+use super::types::{
+    string_enum, EditedPreview, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase,
+};
 
 string_enum! {
     /// What a background activity is doing (v18, [`ActivityEvent`]).
@@ -87,6 +89,17 @@ pub struct ThumbnailReady {
     pub preview_path: Option<String>,
     pub width: u32,
     pub height: u32,
+}
+
+/// The edited preview of an image was rendered (or dropped) in the background (IPC v19.1):
+/// mirrors `RawImageEntry.editedPreview`. `preview = null`: the photo is unedited again (show
+/// the embedded thumbnail). Emitted after edits, batches (paste / sync / presets / scene
+/// apply / undo) and for neighbours prerendered by `prepareDevelop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct EditedPreviewChanged {
+    pub image_id: ImageId,
+    pub preview: Option<EditedPreview>,
 }
 
 /// Extraction failed for an image. Mirrors `ThumbnailState::Failed`.

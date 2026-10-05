@@ -54,6 +54,13 @@ async function routeImages(page: Page) {
     const m = /\/mock\/(thumb|preview)\/(\d+)\.jpg/.exec(route.request().url())!;
     return route.fulfill({ contentType: "image/svg+xml", headers: { "cache-control": "max-age=3600" }, body: svg(m[1] as "thumb" | "preview", Number(m[2])) });
   });
+  // IPC v19.1 edited previews: a lighter, labelled variant of the photo ("<id> edited").
+  await page.route(/\/mock\/edited\/\d+\//, (route) => {
+    const m = /edited\/(\d+)\/\w+\/(thumb|preview)\.jpg/.exec(route.request().url())!;
+    const kind = m[2] as "thumb" | "preview";
+    const body = svg(kind, Number(m[1])).replace(/hsl\((\d+),(\d+)%,(\d+)%\)/g, (_s, hh, ss, ll) => `hsl(${hh},${ss}%,${Math.min(90, Number(ll) + 30)}%)`).replace(/>(\d+)<\/text>/, ">$1 edited</text>");
+    return route.fulfill({ contentType: "image/svg+xml", headers: { "cache-control": "max-age=31536000, immutable" }, body });
+  });
   await page.route(/\/mock\/render\//, (route) => {
     const u = new URL(route.request().url());
     const m = /render\/(\d+)\/(\w+)/.exec(u.pathname)!;
