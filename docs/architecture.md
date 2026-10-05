@@ -63,6 +63,7 @@ src-tauri/
     xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
     xmp/masks.rs               crs:MaskGroupBasedCorrections <-> masks (mapping tables, Lightroom mattes) (v10)
     develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
+    develop/edited.rs          edited-preview disk cache + low-priority regeneration worker (IPC v19.1)
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
@@ -405,6 +406,29 @@ Error kinds (`AppError.kind`; the `message` is always user-facing): `not_found` 
 4. On slider release (or debounced): `saveAdjustments(id, adj, "Exposure")` -> history entry + XMP dirty.
 - Histogram (256 bins R/G/B/luma of the 8-bit output) and `renderMs` come back with every render.
 - Slots are independent streams: `before` (before/after view), `detail` (region renders for 1:1 zoom).
+
+### Edited previews (IPC v19.1, `develop::edited`)
+- Purpose: edits visible outside Develop (grid, Loupe, filmstrip, scenes) and no flash of the unedited embedded
+  preview when switching between edited photos. `RawImageEntry.editedPreview {thumbUrl, previewUrl}` +
+  `editedPreviewChanged` event; frontend picks images through `src/lib/entryImage.ts`.
+- Files: `<cacheDir>/edited/<id>_<hash>_{p,t}.jpg` (2048 / 512 px, q82 4:2:0, orientation + crop applied), `hash` =
+  FNV-1a of an engine version + the settings JSON. One hash per image; in-memory index rebuilt by a directory scan
+  at startup; LRU by bytes (1024 MB, `SIEVE_EDITED_CACHE_MB`) evicts whole images; `DevelopCache::forget_images`
+  (remove_project) deletes files. Served by the `sieve` handler (`/edited/<id>/<hash>/{thumb,preview}.jpg`,
+  immutable caching; a miss = 404 + queued render).
+- Triggers: `repo::save_adjustments` -> `edited::notify_saved(conn, id, updated_at)` (catalog found by the
+  connection's path in a process registry), so every write path (sliders, paste / sync, presets, scene apply,
+  undo / redo / batch undo, XMP read) regenerates; the job waits (200 ms retries, up to 10 s) until
+  `adjustments.updated_at` shows the write is committed. `repo::get_image(s)` attach the cached URLs and queue a
+  render for edited photos whose preview is missing or older than their `updated_at` (self-healing after restarts,
+  evictions, pre-v19.1 edits). `prepareDevelop` neighbours are queued first (urgent).
+- Worker: one thread + a rayon pool of cores/4 (min 2), both macOS QoS utility; waits until no interactive render
+  for 250 ms. Renders via `DevelopCache::render_detached` (cached source if present, else a temporary decode not
+  inserted into the LRU; prepared inputs not cached) or reuses the last settled `main` render (full quality, whole
+  frame, >= 1536 px) whose settings hash matches. Memory: one job at a time; 2 settled frames kept (~8 MB each).
+- Measured (one 25 MB ARW, release, Apple Silicon): first edited pixels on switch, hit 3.4 ms (read + JPEG decode)
+  vs miss 375 ms (cold decode + 2048 render + decode); regeneration after a commit 465 ms cold source, 113 ms with
+  a settled render; files 157 KB + 17 KB.
 
 ### Develop source + cache
 - LibRaw `half_size` decode (camera RGB, no WB, linear, 16-bit; ~3000 px long edge for 24 MP) + as-shot multipliers,

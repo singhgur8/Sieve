@@ -235,6 +235,8 @@ declare global {
     __ipcLog: MockCall[];
     /** Test hook: delay (ms) before a `render_preview` call with this per-slot sequence number resolves. */
     __mockRenderDelay?: (seq: number, slot: string) => number;
+    /** Test hook (IPC v19.1): delay (ms) before the mock's edited preview of a changed photo is ready. */
+    __mockEditedDelay?: number;
     /** Render concurrency observed by the mock (max renders awaiting a result at once). */
     __mockRenderStats?: { inflight: number; maxInflight: number };
     /** Test hook: when true, export jobs only advance through `__mockExportStep`. */
@@ -418,6 +420,7 @@ export function installMockBackend(count: number) {
         reasons: [],
       },
       hasEdits: false,
+      editedPreview: null,
       // v18: every 4th frame came with a sidecar.
       xmp: { dirty: false, syncedAtMs: null, error: null, hasSidecar: id % 4 === 0 },
       pickOrigin: null,
@@ -910,6 +913,25 @@ export function installMockBackend(count: number) {
     if (label === "Paste Settings" || label === "Sync Settings" || label === "Paste from Previous") return "pasted";
     return "user";
   };
+  /**
+   * IPC v19.1 edited previews: like the backend's background worker, renders the photo's edited preview after a
+   * delay (`window.__mockEditedDelay`, default 120 ms) unless the settings changed meanwhile, then emits
+   * `editedPreviewChanged`. URLs are content-addressed: `/mock/edited/<id>/<hash>/{thumb,preview}.jpg`.
+   */
+  function renderEdited(id: number) {
+    const key = JSON.stringify(adjs.get(id) ?? null);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0;
+    const hash = h.toString(16).padStart(8, "0").repeat(2);
+    setTimeout(() => {
+      const r = byId.get(id);
+      if (!r || JSON.stringify(adjs.get(id) ?? null) !== key) return;
+      const preview = r.hasEdits ? { thumbUrl: `/mock/edited/${id}/${hash}/thumb.jpg`, previewUrl: `/mock/edited/${id}/${hash}/preview.jpg` } : null;
+      if (JSON.stringify(preview) === JSON.stringify(r.editedPreview ?? null)) return;
+      r.editedPreview = preview;
+      void emit("edited-preview-changed", { imageId: id, preview });
+    }, window.__mockEditedDelay ?? 120);
+  }
   function commit(id: number, next0: ParametricAdjustments, label: string, coalesce = true) {
     const next = completeAdjustments(next0);
     const cur = getAdj(id);
@@ -932,6 +954,7 @@ export function installMockBackend(count: number) {
     adjs.set(id, next);
     const r = byId.get(id);
     if (r) r.hasEdits = !isNeutral(next);
+    renderEdited(id);
   }
   function jump(id: number, cursor: number) {
     const h = histOf(id);
@@ -942,6 +965,7 @@ export function installMockBackend(count: number) {
     adjs.set(id, snap);
     const r = byId.get(id);
     if (r) r.hasEdits = !isNeutral(snap);
+    renderEdited(id);
     return { adjustments: snap, history: historyDto(id) };
   }
   function histogram(a: ParametricAdjustments) {

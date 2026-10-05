@@ -1,9 +1,10 @@
 import { memo, useState } from "react";
 import { AlertTriangle, Anchor, CloudUpload, FileCheck, Flag, ImageOff, Layers, Loader2, Star, Unplug, X } from "lucide-react";
-import { convertFileSrc, type RawImageEntry } from "../ipc";
+import { type RawImageEntry } from "../ipc";
 import { useEntryHealth } from "../lib/errors";
 import { formatTime, LABEL_COLOR, TAG_SHORT, TAG_STYLE } from "../lib/format";
 import { flagTitle, rejectInfo, sidecarName, suggestedReject, tagTitle } from "../lib/cull";
+import { thumbSrc } from "../lib/entryImage";
 
 interface Props {
   id: number;
@@ -200,7 +201,7 @@ export const Cell = memo(function Cell({ id, entry, version, size, selected, act
       style={{ contain: "strict" }}
     >
       {t?.status === "ready" ? (
-        <Thumb src={`${convertFileSrc(t.path)}?v=${version}`} name={entry?.fileName} dim={dim} />
+        <Thumb src={thumbSrc(entry, version)!} name={entry?.fileName} dim={dim} />
       ) : t?.status === "failed" ? (
         <div className={`flex size-full flex-col items-center justify-center gap-1 px-1 text-center ${dim ? "opacity-40" : ""}`} title={t.reason} data-testid={`thumb-failed-${id}`}>
           <ImageOff className="size-5 text-red-500" />

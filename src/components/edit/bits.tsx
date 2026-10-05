@@ -1,8 +1,9 @@
 // Small shared pieces of the Edit step: scene status icons and copy, the style-aware "Auto edit (my style)" button, a thumbnail.
 import { useEffect, useState } from "react";
 import { CheckCircle2, Circle, CircleDot, Loader2, RefreshCw, Sparkles, Wand2 } from "lucide-react";
-import { convertFileSrc, type RawImageEntry, type StyleModelStatus } from "../../ipc";
+import { type RawImageEntry, type StyleModelStatus } from "../../ipc";
 import { styleGate, type SceneRow, type SceneUi } from "../../hooks/useWorkflow";
+import { thumbSrc } from "../../lib/entryImage";
 
 export const STATUS_ICON: Record<SceneUi, { icon: typeof Circle; cls: string }> = {
   todo: { icon: Circle, cls: "text-neutral-400" },
@@ -113,7 +114,7 @@ export function Thumb({ entry, version = 0, className = "" }: { entry: RawImageE
   const t = entry?.thumbnail;
   return (
     <div className={`overflow-hidden bg-neutral-800 ${className}`}>
-      {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${version}`} alt="" draggable={false} className="size-full object-cover" />}
+      {t?.status === "ready" && <img src={thumbSrc(entry, version)!} alt="" draggable={false} className="size-full object-cover" />}
     </div>
   );
 }

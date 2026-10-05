@@ -37,6 +37,7 @@ import { WarningsChip } from "./WarningsChip";
 import { FULL, fromStored, isFull, loadCropAspect, loadOverlay, nextOverlay, previewRotation, saveOverlay, toStored } from "../../lib/crop";
 import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
+import { developPlaceholder } from "../../lib/entryImage";
 
 export interface DevelopHandle {
   toggleBefore: () => void;
@@ -766,11 +767,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const thumb = entry?.thumbnail;
   const thumbUrl = thumb?.status === "ready" ? `${convertFileSrc(thumb.path)}?v=${id != null ? lib.version(id) : 0}` : null;
 
-  /** Embedded preview of a photo: shown (fit view) until its first render arrives, so switching photos never goes blank. */
-  const placeholderFor = (pid: number | null): string | null => {
-    const t = pid != null ? lib.getEntry(pid)?.thumbnail : undefined;
-    return t?.status === "ready" ? `${convertFileSrc(t.previewPath ?? t.path)}?v=${lib.version(pid!)}` : null;
-  };
+  /**
+   * Shown (fit view) until a photo's first render arrives, so switching photos never goes blank: its cached edited
+   * render (IPC v19.1), or the embedded preview of an unedited photo - never the embedded (unedited) preview of an
+   * edited photo, which would flash it without its edits.
+   */
+  const placeholderFor = (pid: number | null): string | null => (pid != null ? developPlaceholder(lib.getEntry(pid), lib.version(pid)) : null);
   usePrefetchNeighbours(lib, id);
 
   const mkViewer = (ed: Editor, active: boolean) => {

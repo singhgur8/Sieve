@@ -6,7 +6,6 @@ import {
   ALL_ADJUSTMENT_FIELDS,
   DEFAULT_SYNC_FIELDS,
   commands,
-  convertFileSrc,
   DEFAULT_MATCH_OPTIONS,
   DEFAULT_SCENE_APPLY_OPTIONS,
   lerpAdjustments,
@@ -24,6 +23,7 @@ import { SettingsFieldsDialog } from "../develop/SettingsFieldsDialog";
 import { Dialog } from "../Dialog";
 import { formatError } from "../../lib/format";
 import { flushEdits } from "../../lib/editFlush";
+import { thumbSrc } from "../../lib/entryImage";
 
 interface Props {
   scene: Scene;
@@ -206,7 +206,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
               return (
                 <div key={id} className="flex items-center gap-1.5" data-testid={`match-anchor-${id}`}>
                   <span className="block size-16 shrink-0 overflow-hidden rounded bg-neutral-800">
-                    {t?.status === "ready" && <img src={convertFileSrc(t.path)} alt="" className="size-full object-cover" draggable={false} />}
+                    {t?.status === "ready" && <img src={thumbSrc(rows.get(id))!} alt="" className="size-full object-cover" draggable={false} />}
                   </span>
                   <span className="max-w-28 truncate text-xs text-neutral-300">{fileName(id)}</span>
                 </div>

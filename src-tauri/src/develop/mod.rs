@@ -27,6 +27,7 @@ pub mod auto;
 pub mod batches;
 pub mod camera;
 pub mod cancel;
+pub mod edited;
 pub mod fastmath;
 pub mod highlights;
 pub mod history;
@@ -318,6 +319,20 @@ fn decode_source(path: &std::path::Path) -> AppResult<(LinearImage, SourceMeta)>
     })
 }
 
+/// Decodes `src` into a fresh (uncached) entry.
+fn load_entry(src: &SourceImage) -> AppResult<Entry> {
+    let (image, meta) = decode_source(&src.path)?;
+    Ok(Entry {
+        path: src.path.clone(),
+        image,
+        meta,
+        prepared: Mutex::new(Vec::new()),
+        profile: Mutex::new(None),
+        tone_src: Mutex::new(None),
+        tone_ctx: Mutex::new(Vec::new()),
+    })
+}
+
 /// Rayon pool of interactive preview renders: leaves two cores to the UI (WebView main thread, compositor), so a
 /// slider drag does not starve the page it is dragged in. Min 2 threads.
 fn preview_pool() -> &'static rayon::ThreadPool {
@@ -382,6 +397,8 @@ struct Inner {
     prefetch: Mutex<Prefetch>,
     /// Evaluated mask weights of recent renders (Phase 7c).
     weights: masks::render::WeightCache,
+    /// Edited-preview cache (IPC v19.1), once enabled by the app.
+    edited: OnceLock<edited::EditedPreviews>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -436,6 +453,7 @@ impl DevelopCache {
                 encoded: Mutex::new((HashMap::new(), VecDeque::new())),
                 prefetch: Mutex::new(Prefetch::default()),
                 weights: masks::render::WeightCache::default(),
+                edited: OnceLock::new(),
             }),
             auto_faces: None,
         }
@@ -454,6 +472,23 @@ impl DevelopCache {
     /// The on-demand face detector, if enabled.
     pub fn auto_faces(&self) -> Option<&crate::ml::auto_faces::AutoFaces> {
         self.auto_faces.as_ref()
+    }
+
+    /// Starts the edited-preview cache (IPC v19.1; files in `config.dir`, renders through this
+    /// cache with `luts`, changes reported to `emit`). Idempotent: later calls return the
+    /// first instance.
+    pub fn enable_edited_previews(
+        &self,
+        config: edited::EditedConfig,
+        luts: LutLibrary,
+        emit: edited::Emitter,
+    ) -> edited::EditedPreviews {
+        self.inner.edited.get_or_init(|| edited::EditedPreviews::start(config, luts, emit, self.clone())).clone()
+    }
+
+    /// The edited-preview cache, if enabled.
+    pub fn edited(&self) -> Option<&edited::EditedPreviews> {
+        self.inner.edited.get()
     }
 
     /// The remembered catalog facts of image `id` (see [`Self::remember_source`]).
@@ -510,6 +545,9 @@ impl DevelopCache {
         if let Some(m) = &self.config.mask_cache {
             m.forget_images(ids);
         }
+        if let Some(e) = self.edited() {
+            e.forget(ids);
+        }
     }
 
     /// Issues the next ticket for (image, slot). Call on the async side, before any
@@ -553,23 +591,13 @@ impl DevelopCache {
         if let Some(e) = self.cached(src) {
             return Ok(e);
         }
-        let decoded = decode_source(&src.path);
-        let (image, meta) = match decoded {
-            Ok(d) => d,
+        let entry = match load_entry(src) {
+            Ok(e) => Arc::new(e),
             Err(e) => {
                 lock(&self.inner.decoding).remove(&src.id);
                 return Err(e);
             }
         };
-        let entry = Arc::new(Entry {
-            path: src.path.clone(),
-            image,
-            meta,
-            prepared: Mutex::new(Vec::new()),
-            profile: Mutex::new(None),
-            tone_src: Mutex::new(None),
-            tone_ctx: Mutex::new(Vec::new()),
-        });
         {
             let mut lru = lock(&self.inner.lru);
             lru.clock += 1;
@@ -615,6 +643,9 @@ impl DevelopCache {
         let started = Instant::now();
         if !self.is_current(ticket) {
             return Ok(None);
+        }
+        if let Some(e) = self.edited() {
+            e.note_interactive();
         }
         let key = (ticket.image_id, ticket.slot);
         let render_lock = lock(&self.inner.rendering).entry(key).or_default().clone();
@@ -663,7 +694,19 @@ impl DevelopCache {
             crate::raw::turbo::encode_rgb_444(&img.rgb, img.width, img.height, JPEG_QUALITY)
         }
         .map_err(AppError::internal)?;
-        drop(img.rgb);
+        // A settled full-quality render of the whole frame becomes the edited preview if these
+        // are the stored settings (edited cache, IPC v19.1); otherwise it is dropped here.
+        let settled = ticket.slot == RenderSlot::Main
+            && options.region.is_none()
+            && quality_for(options.max_edge) == pipeline::Quality::Preview;
+        match self.edited() {
+            Some(e) if settled => e.note_settled(
+                ticket.image_id,
+                adjustments,
+                crate::raw::preview::Rgb { width: img.width, height: img.height, pixels: img.rgb },
+            ),
+            _ => drop(img.rgb),
+        }
         if !self.is_current(ticket) {
             return Ok(None);
         }
@@ -743,6 +786,10 @@ impl DevelopCache {
                     Ok(Ok(_)) => {}
                 }
             }
+            // Prerender the neighbour's edited preview (no-op when unedited or current).
+            if let Some(e) = this.edited() {
+                e.ensure(&[next.id], true);
+            }
         });
         if spawned.is_err() {
             lock(&self.inner.prefetch).running = false;
@@ -797,6 +844,33 @@ impl DevelopCache {
         }
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
+    }
+
+    /// Blocking. Full-quality render of the whole (cropped) frame for the edited-preview cache:
+    /// uses the cached source if there is one, else decodes a temporary one that is *not*
+    /// inserted into the LRU (a batch of hundreds must not evict what the user is editing);
+    /// never touches the cached prepared inputs. A missing LUT renders without it.
+    pub fn render_detached(
+        &self,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+        max_edge: u32,
+        luts: &LutLibrary,
+    ) -> AppResult<pipeline::RenderedImage> {
+        let entry = match self.cached(src) {
+            Some(e) => e,
+            None => Arc::new(load_entry(src)?),
+        };
+        let prepared = source::prepare(&entry.image, src.orientation(), &adjustments.crop, None, max_edge);
+        let lut = match &adjustments.lut {
+            Some(l) => luts.load(&l.id).ok().flatten(),
+            None => None,
+        };
+        let profile = entry.profile(&adjustments.profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let input = entry.input(&prepared, &profile, src.id, pipeline::Quality::Preview, tone.as_ref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &input, None);
+        Ok(pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref()))
     }
 }
 
@@ -985,6 +1059,20 @@ fn parse_render_path(path: &str, query: Option<&str>) -> Option<(ImageId, Render
 /// dedicated thread per request (see `lib.rs`); must not panic.
 pub fn handle_protocol(cache: &DevelopCache, request: &http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
     let uri = request.uri();
+    if let Some((id, hash, thumb)) = edited::parse_path(uri.path()) {
+        return match cache.edited().and_then(|e| e.read(id, hash, thumb)) {
+            Some(bytes) => {
+                let mut resp = respond(http::StatusCode::OK, "image/jpeg", bytes);
+                // Content-addressed (image id + settings hash): never changes.
+                resp.headers_mut().insert(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+                );
+                resp
+            }
+            None => respond(http::StatusCode::NOT_FOUND, "text/plain", b"edited preview not available".to_vec()),
+        };
+    }
     match parse_render_path(uri.path(), uri.query()) {
         None => respond(http::StatusCode::BAD_REQUEST, "text/plain", b"bad render path".to_vec()),
         Some((id, slot, seq)) => match cache.encoded(id, slot, seq) {

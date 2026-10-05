@@ -1,19 +1,19 @@
 import { useEffect, useRef } from "react";
-import { convertFileSrc } from "../ipc";
+import { previewSrc, thumbSrc } from "../lib/entryImage";
 import type { Library } from "./useLibrary";
 
 const AHEAD = 4;
 const BEHIND = 2;
 const KEEP = 24;
 
-/** URLs a viewer paints for an entry: the small thumbnail first, then the 2048px preview. */
+/** URLs a viewer paints for an entry: the small thumbnail first, then the 2048px preview (edited renders for edited photos). */
 export function entryUrls(lib: Library, id: number): string[] {
-  const t = lib.getEntry(id)?.thumbnail;
-  if (!t || t.status !== "ready") return [];
+  const e = lib.getEntry(id);
+  if (!e || e.thumbnail.status !== "ready") return [];
   const v = lib.version(id);
-  const out = [`${convertFileSrc(t.path)}?v=${v}`];
-  if (t.previewPath && t.previewPath !== t.path) out.push(`${convertFileSrc(t.previewPath)}?v=${v}`);
-  return out;
+  const thumb = thumbSrc(e, v);
+  const preview = previewSrc(e, v);
+  return [thumb, preview].filter((u, i, all): u is string => !!u && all.indexOf(u) === i);
 }
 
 /**

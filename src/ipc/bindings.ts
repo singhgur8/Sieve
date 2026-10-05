@@ -1001,6 +1001,7 @@ export const events = {
 	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
 	analysisReady: makeEvent<AnalysisReady>("analysis-ready"),
+	editedPreviewChanged: makeEvent<EditedPreviewChanged>("edited-preview-changed"),
 	exportFinished: makeEvent<ExportFinished>("export-finished"),
 	exportProgress: makeEvent<ExportProgress>("export-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
@@ -2154,6 +2155,29 @@ export type EditSource =
 export type EditState = {
 	adjustments: ParametricAdjustments,
 	history: AdjustmentHistory,
+};
+
+/**
+ *  Cached renders of one photo's develop settings (IPC v19.1), served by the `sieve://`
+ *  scheme from the app cache dir (never next to the photos). URLs are content-addressed
+ *  (image id + settings hash): a new edit gives new URLs, so they may be cached forever.
+ */
+export type EditedPreview = {
+	/**  Grid thumbnail, long edge 512 px, orientation and crop applied. */
+	thumbUrl: string,
+	/**  Loupe / Develop placeholder, long edge 2048 px, orientation and crop applied. */
+	previewUrl: string,
+};
+
+/**
+ *  The edited preview of an image was rendered (or dropped) in the background (IPC v19.1):
+ *  mirrors `RawImageEntry.editedPreview`. `preview = null`: the photo is unedited again (show
+ *  the embedded thumbnail). Emitted after edits, batches (paste / sync / presets / scene
+ *  apply / undo) and for neighbours prerendered by `prepareDevelop`.
+ */
+export type EditedPreviewChanged = {
+	imageId: number,
+	preview: EditedPreview | null,
 };
 
 export type EffectsAdjustments = {
@@ -3902,6 +3926,13 @@ export type RawImageEntry = {
 	 *  successful access, a re-import that finds it, or `relocate_folder` (IPC v13).
 	 */
 	missingSinceMs: number | null,
+	/**
+	 *  Rendered previews of the photo's develop settings (IPC v19.1): what Library grid,
+	 *  Loupe, filmstrip and scenes show for an edited photo instead of the embedded
+	 *  thumbnail. `null` when unedited (`hasEdits = false`) or not rendered yet (the
+	 *  `editedPreviewChanged` event follows once it is). May briefly lag the newest edit.
+	 */
+	editedPreview: EditedPreview | null,
 };
 
 /**

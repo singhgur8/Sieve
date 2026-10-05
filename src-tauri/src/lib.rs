@@ -23,9 +23,9 @@ use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
-    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress,
-    ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress, StyleModelFinished,
-    StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, EditedPreviewChanged,
+    ExportFinished, ExportProgress, ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress,
+    StyleModelFinished, StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -208,7 +208,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             ModelDownloadFinished,
             StyleModelProgress,
             StyleModelFinished,
-            ActivityEvent
+            ActivityEvent,
+            // IPC v19.1
+            EditedPreviewChanged
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -303,6 +305,7 @@ pub fn run() {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DevelopConfig::DEFAULT_CACHE_MB);
             let export_memory_mb = std::env::var(EXPORT_MEMORY_ENV).ok().and_then(|v| v.parse::<u64>().ok());
+            let config_cache_dir = cache_dir.clone();
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
@@ -340,6 +343,17 @@ pub fn run() {
             // Adobe DCPs / looks installed on this Mac, read in place (never copied).
             app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
             let luts = LutLibrary::new(luts_dir);
+            // Edited previews (IPC v19.1): `<cacheDir>/edited/`, regenerated in the background.
+            {
+                let handle = app.handle().clone();
+                app.state::<DevelopCache>().enable_edited_previews(
+                    develop::edited::EditedConfig::new(&config_cache_dir, path.clone()),
+                    luts.clone(),
+                    std::sync::Arc::new(move |ev: EditedPreviewChanged| {
+                        let _ = ev.emit(&handle);
+                    }),
+                );
+            }
             let exporter = Exporter::new(
                 ExportConfig { catalog_path: path.clone(), memory_budget_mb: export_memory_mb },
                 luts.clone(),

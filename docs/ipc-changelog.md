@@ -1293,3 +1293,32 @@ Who updates what
 - rust-engine-dev / vision-ml-dev: nothing required. New multi-image write paths that should count as an apply or
   auto edit must go through `develop::batches::commit_recorded` (it stamps the history entries); labels decide the
   source of everything else (`history::source_for_label`).
+
+## v19.1 — 2026-10-05 (Phase 8d: edited previews; additive, no schema change)
+
+Types
+- `RawImageEntry.editedPreview: EditedPreview | null` — cached renders of the photo's current develop settings
+  (`null` when `hasEdits = false` or not rendered yet; may briefly lag the newest edit).
+- New `EditedPreview { thumbUrl, previewUrl }`: 512 px / 2048 px JPEGs, orientation + crop applied, served by the
+  `sieve` scheme at `sieve://localhost/edited/<id>/<hash>/{thumb,preview}.jpg` (`http://sieve.localhost/...` on
+  Windows). Content-addressed (image id + settings hash): a new edit = new URLs; responses are
+  `Cache-Control: public, max-age=31536000, immutable`; a missing file answers 404 and queues a render.
+
+Events
+- New `editedPreviewChanged { imageId, preview: EditedPreview | null }` (`edited-preview-changed`): a background
+  render finished (after edits, paste / sync / presets / scene apply / undo batches, XMP reads, `prepareDevelop`
+  neighbours, or a listed photo whose preview was missing / stale); `null` = the photo is unedited again.
+
+Behaviour (rust-engine-dev, `develop::edited`)
+- Files live in `<cacheDir>/edited/` only (never next to the photos), one settings hash per image, LRU-bounded by
+  bytes (default 1024 MB, `SIEVE_EDITED_CACHE_MB`); `remove_project` deletes the removed images' files.
+- Every committed adjustments write (`repo::save_adjustments`) queues a regeneration (350 ms debounce, waits for the
+  transaction to commit; rolled-back writes render nothing); a low-priority worker (QoS utility, own pool, yields
+  while interactive renders run) renders it, reusing Develop's settled full-quality render when it matches.
+
+Frontend
+- Use `src/lib/entryImage.ts` (`thumbSrc`, `previewSrc`, `developPlaceholder`) for any image of a photo; listen to
+  `editedPreviewChanged` (done in `useLibrary`). Develop never uses the embedded preview of an edited photo as the
+  placeholder (spinner until its render lands when no edited preview exists yet).
+- Mock: entries carry `editedPreview`; edits emit the event after `window.__mockEditedDelay` ms (default 120);
+  URLs `/mock/edited/<id>/<hash>/{thumb,preview}.jpg` (routed in `tests/ui/helpers.ts`).

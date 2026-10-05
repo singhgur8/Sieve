@@ -233,6 +233,7 @@ mod tests {
             companion_path: None,
             develop_warnings: Vec::new(),
             missing_since_ms: None,
+            edited_preview: None,
             tags: Vec::new(),
             quality: None,
             has_edits: false,

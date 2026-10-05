@@ -170,6 +170,11 @@ export function useLibrary(query: Query, onError: (e: unknown) => void): Library
         eventThumbs.current.set(ev.payload.imageId, thumbnail);
         patch([ev.payload.imageId], (e) => ({ ...e, thumbnail }));
       }),
+      // IPC v19.1: an edited render finished (or was dropped after a reset): grid / loupe / filmstrip follow live.
+      events.editedPreviewChanged.listen((ev) => {
+        const { imageId, preview } = ev.payload;
+        patch([imageId], (e) => ({ ...e, editedPreview: preview, hasEdits: preview ? true : e.hasEdits }));
+      }),
       events.analysisReady.listen((ev) => refreshLoaded([ev.payload.imageId])),
       events.xmpSynced.listen((ev) => refreshLoaded([...ev.payload.written, ...ev.payload.read])),
       events.xmpWriteFailed.listen((ev) => refreshLoaded([ev.payload.imageId])),

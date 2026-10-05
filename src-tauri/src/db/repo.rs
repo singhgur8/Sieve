@@ -461,6 +461,7 @@ fn entry_from_row(r: &Row) -> rusqlite::Result<RawImageEntry> {
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
         missing_since_ms: r.get(50)?,
+        edited_preview: None,
     })
 }
 
@@ -504,6 +505,7 @@ pub fn get_image(conn: &Connection, id: ImageId) -> AppResult<RawImageEntry> {
         .ok_or_else(|| AppError::not_found(format!("image {id}")))?;
     let mut entries = [entry];
     attach_tags(conn, &mut entries)?;
+    crate::develop::edited::attach(conn, &mut entries)?;
     let [entry] = entries;
     Ok(entry)
 }
@@ -534,6 +536,7 @@ fn load_entries(conn: &Connection, ids: &[ImageId], strict: bool) -> AppResult<V
         }
     }
     attach_tags(conn, &mut out)?;
+    crate::develop::edited::attach(conn, &mut out)?;
     Ok(out)
 }
 
@@ -1495,6 +1498,7 @@ pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustme
     adj.validate().map_err(AppError::invalid)?;
     let neutral = adj.is_neutral_for(image_format(conn, id)?);
     let json = serde_json::to_string(adj)?;
+    let updated_at = now_ms();
     let changed = conn.execute(
         "INSERT INTO adjustments (image_id, params_json, process_version, updated_at, neutral)
          SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1)
@@ -1503,11 +1507,13 @@ pub fn save_adjustments(conn: &Connection, id: ImageId, adj: &ParametricAdjustme
              process_version = excluded.process_version,
              updated_at = excluded.updated_at,
              neutral = excluded.neutral",
-        params![id, json, adj.process_version, now_ms(), neutral],
+        params![id, json, adj.process_version, updated_at, neutral],
     )?;
     if changed == 0 {
         return Err(AppError::not_found(format!("image {id}")));
     }
+    // Regenerates the edited preview once this write is committed (IPC v19.1).
+    crate::develop::edited::notify_saved(conn, id, updated_at);
     Ok(())
 }
 
