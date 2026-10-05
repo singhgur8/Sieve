@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ActivityKind, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -27,6 +27,7 @@ import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
 import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
+import { SelectionBar } from "./components/scenes/SelectionBar";
 import { StepBar } from "./components/StepBar";
 import { AnalyzeSplit, ShootSelect } from "./components/AnalyzeControls";
 import { PlanView } from "./components/edit/PlanView";
@@ -47,7 +48,8 @@ import { ChevronRight } from "lucide-react";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount, useModalCount } from "./lib/modal";
-import { getClipboard } from "./lib/clipboard";
+import { getClipboard, setClipboard } from "./lib/clipboard";
+import { flushEdits } from "./lib/editFlush";
 import { clearFileHealth, describeReason, noteFailure } from "./lib/errors";
 import { HealthBanner, RestoreBackupDialog } from "./components/CatalogHealth";
 import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
@@ -981,19 +983,76 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const revealInFinder = (path: string) => void run(() => unwrap(commands.revealInFinder(path)));
 
+  /** Cmd+V / Cmd+Shift+V in the Library: the copied settings go to every selected photo as one undoable batch. */
   const pasteToSelection = useCallback(async () => {
     const c = getClipboard();
-    if (!c) return setNotice("Nothing copied yet (Cmd+Shift+C in Develop)");
+    if (!c) return setNotice("Nothing copied yet. Cmd+C copies all settings of the active photo");
     const t = targets();
     if (t.length === 0) return;
     try {
-      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
-      setNotice(`Pasted ${plural(c.fields.length, "setting group")} to ${plural(t.length, "photo")}`);
-      await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
+      await flushEdits();
+      const r = await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      await wf.reportBatch(r, `Pasted ${plural(c.fields.length, "setting group")}${c.fromName ? ` from ${c.fromName}` : ""}`, t.length);
     } catch (e) {
       reportError(e);
     }
-  }, [targets, lib, reportError, setNotice]);
+  }, [targets, wf, reportError, setNotice]);
+
+  /** Cmd+C in the Library: every setting of the active photo (not crop / masks) onto the clipboard. */
+  const copyActive = useCallback(async () => {
+    const id = active;
+    if (id == null) return setNotice("Select a photo first");
+    try {
+      await flushEdits();
+      const adjustments = await unwrap(commands.getAdjustments(id));
+      const fromName = lib.getEntry(id)?.fileName;
+      setClipboard({ adjustments, fields: [...DEFAULT_SYNC_FIELDS], fromName });
+      const n = Math.max(0, targets().filter((t) => t !== id).length);
+      setNotice(`Copied all settings of ${fromName ?? "the photo"} (not crop / masks). ${n > 0 ? `Cmd+V pastes to the ${plural(n, "other selected photo")}` : "Select photos and press Cmd+V to paste"}`);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [active, lib, targets, reportError, setNotice]);
+
+  /** Sync: the active photo's settings onto the rest of the selection (one undoable batch). */
+  const syncSelection = useCallback(async () => {
+    const id = active;
+    const t = targets().filter((x) => x !== id);
+    if (id == null || t.length === 0) return setNotice("Select the photos to sync to (Shift / Cmd-click), the active photo is the source");
+    try {
+      await flushEdits();
+      const r = await unwrap(commands.syncSettings(id, t, [...DEFAULT_SYNC_FIELDS]));
+      await wf.reportBatch(r, `Synchronized settings of ${lib.getEntry(id)?.fileName ?? "the photo"}`, t.length);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [active, targets, wf, lib, reportError, setNotice]);
+
+  /** "Show" on an apply toast: leave the Plan and list exactly these photos, selected. */
+  const showIds = useCallback(
+    (list: number[], label: string) => {
+      if (list.length === 0) return;
+      setPlanOpen(false);
+      setCmp(null);
+      setMode("grid");
+      setIdFilter({ ids: new Set(list), label });
+      sel.set(list, list[0]);
+    },
+    [sel],
+  );
+
+  /** "Edit all in scene": the whole scene selected, Develop on `startId`. Reset / presets apply to all, Cmd+Alt+S syncs the rest. */
+  const editAllInScene = useCallback(
+    (sceneIds: number[], startId: number) => {
+      if (sceneIds.length === 0) return;
+      sel.set(sceneIds, startId);
+      setCmp(null);
+      setPlanOpen(false);
+      setMode("develop");
+      setNotice(`Editing 1 of ${sceneIds.length}: Cmd+Alt+S syncs this photo's settings to the other ${sceneIds.length - 1}; reset and presets apply to all ${sceneIds.length}`);
+    },
+    [sel, setNotice],
+  );
 
   const selectBurst = useCallback(async () => {
     const id = active;
@@ -1048,7 +1107,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     }
     const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
-    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste"];
+    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste", "copyAll", "pasteAll"];
     if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
     const k = e.key;
@@ -1070,7 +1129,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
         if (!row || row.ui === "todo" || row.ui === "reset" || row.targets === 0) return setNotice("Edit this scene's representative first");
         if (row.skipped) return setNotice("This scene is skipped. Include it first (S in the Plan)");
-        return void wf.applyScene(row.entry.sceneId, "match", reviewFrames);
+        return void wf.applyScene(row.entry.sceneId, "match", reviewFrames, showIds);
       }
       case "autoEdit": {
         if (step !== "edit") return;
@@ -1223,6 +1282,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         if (mode === "develop") develop.current?.paste();
         else void pasteToSelection();
         return;
+      case "copyAll":
+        return void copyActive();
+      case "pasteAll":
+        return void pasteToSelection();
       case "sync":
         return develop.current?.sync();
       case "syncQuiet":
@@ -1525,6 +1588,22 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       />
       )}
 
+      {mode === "grid" && !planOpen && (query.sceneId != null || sel.selected.size > 1) && (
+        <SelectionBar
+          selected={sel.selected.size}
+          sceneCount={query.sceneId != null ? ids.length : null}
+          hasActive={active != null}
+          onSelectAll={sel.selectAll}
+          onCopy={() => void copyActive()}
+          onPaste={() => void pasteToSelection()}
+          onSync={() => void syncSelection()}
+          onEditAll={() => {
+            const list = sel.selected.size > 1 ? ids.filter((i) => sel.selected.has(i)) : ids;
+            if (list.length > 0) editAllInScene(list, active != null && list.includes(active) ? active : list[0]);
+          }}
+        />
+      )}
+
       <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid {...gridProps} />
@@ -1551,6 +1630,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 setNotice("Press Shift+A on the photo you want as the representative");
               }}
               onApplyOptions={(id) => setMatchOpen(id)}
+              onShowIds={showIds}
               onBackToCull={() => goStep("cull")}
               onContinueExport={() => goStep("export")}
               onRegroup={() => void wf.regroup()}
@@ -1599,6 +1679,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   onPlan={openPlan}
                   onMakeRep={makeRepresentative}
                   onApplyOptions={(id) => setMatchOpen(id)}
+                  onShowIds={showIds}
                   onReview={reviewFrames}
                   onNextReview={nextReview}
                 />
@@ -1697,7 +1778,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           onApply={(options) => {
             const id = matchScene.id;
             setMatchOpen(null);
-            void wf.applyScene(id, options, reviewFrames).then(() => {
+            void wf.applyScene(id, options, reviewFrames, showIds).then(() => {
               setDevEpoch((n) => n + 1);
             });
           }}
