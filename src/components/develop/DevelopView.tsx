@@ -90,6 +90,8 @@ interface Props {
   onNotice: (s: string) => void;
   /** Toast with an Undo action (multi-photo reset / preset). */
   onUndoToast: (msg: string, undo: () => void) => void;
+  /** Paste / sync result (v19 `EditBatchResult`): the workflow refreshes and shows the one-step Undo toast. */
+  onBatch: (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number, soft?: boolean) => Promise<boolean>;
   /** Photos whose history was just written by the user (commit, undo, batch edit): scene batch Undo offers must not outlive it. */
   onCommitted?: (ids: number[]) => void;
   onBack: () => void;
@@ -156,7 +158,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -214,6 +216,10 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     onCommitted: noteCommitted,
   });
   const editor = focusB ? editorB : editorA;
+  const onBatchRef = useRef(onBatch);
+  onBatchRef.current = onBatch;
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
   const { info } = editor;
   // Apply to scene / Match scene read the stored settings: they wait for these saves (lib/editFlush).
   const flushA = editorA.flush;
@@ -389,33 +395,20 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     [run, afterBatch, onNotice],
   );
 
-  /** Current history entry of every photo (cap: bigger batches skip the Undo toast). */
-  const heads = useCallback(async (t: number[]): Promise<Map<number, number | null> | null> => {
-    if (t.length > 200) return null;
-    const m = new Map<number, number | null>();
-    for (const x of t) m.set(x, (await unwrap(commands.getHistory(x))).currentEntryId);
-    return m;
-  }, []);
 
   const doPaste = useCallback(() => {
     const c = getClipboard();
-    if (!c) return onNotice("Nothing copied yet (Cmd+Shift+C)");
+    if (!c) return onNotice("Nothing copied yet (Cmd+C copies this photo's settings)");
     const t = targets();
     if (!t.length) return;
     void run(async () => {
       await editor.flush();
-      const before = await heads(t);
-      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      // v19: one undoable batch (`EditBatchResult`); the workflow reports it with an Undo toast.
+      const r = await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
       await afterBatch(t);
-      const msg = `Pasted ${c.fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`;
-      if (!before) return onNotice(msg);
-      // Undo only the photos the paste changed (an unchanged photo has no new history entry).
-      const after = await heads(t);
-      const changed = t.filter((x) => after?.get(x) !== before.get(x));
-      if (changed.length === 0) return onNotice(`${msg} (no change)`);
-      onUndoToast(msg, undoBatch(changed, "paste"));
+      await onBatchRef.current(r, "Pasted settings", t.length, true);
     });
-  }, [targets, run, editor, afterBatch, onNotice, onUndoToast, heads, undoBatch]);
+  }, [targets, run, editor, afterBatch, onNotice]);
 
   /** Copy with `fields` (dialog confirm, or Alt-click with the remembered ones). */
   const copyWith = useCallback(
@@ -432,12 +425,12 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       const t = syncTargets;
       void run(async () => {
         await editor.flush();
-        await unwrap(commands.syncSettings(id, t, fields));
-        onNotice(`Synchronized ${fields.length} settings to ${t.length} photo${t.length === 1 ? "" : "s"}`);
+        const r = await unwrap(commands.syncSettings(id, t, fields));
         await afterBatch(t);
+        await onBatchRef.current(r, `Synchronized ${fields.length} settings`, t.length, true);
       });
     },
-    [id, run, editor, afterBatch, onNotice, syncTargets],
+    [id, run, editor, afterBatch, syncTargets],
   );
 
   const doReset = useCallback(
@@ -475,28 +468,30 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         const t = targets();
         if (from == null || t.every((x) => x === from)) return onNotice("No previous photo to paste from");
         await editor.flush();
-        const before = await heads(t);
-        await unwrap(commands.pastePrevious(t, from, null));
+        const r = await unwrap(commands.pastePrevious(t, from, null));
         await afterBatch(t);
-        const msg = `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`;
-        if (!before) return onNotice(msg);
-        const after = await heads(t);
-        const changed = t.filter((x) => x !== from && after?.get(x) !== before.get(x));
-        if (changed.length === 0) return onNotice(`${msg} (no change)`);
-        onUndoToast(msg, undoBatch(changed, "paste from previous"));
+        await onBatchRef.current(r, `Pasted settings from ${stem(lib.getEntry(from)?.fileName) || "the previous photo"}`, t.length, true);
       }),
-    [run, targets, editor, heads, afterBatch, lib, onNotice, onUndoToast, undoBatch],
+    [run, targets, editor, afterBatch, lib, onNotice],
   );
 
   // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
   const runAuto = useCallback(
-    async (what: "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+    async (what: "all" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
       if (id == null || autoBusy) return;
       setAutoBusy(true);
       try {
         await editor.flush();
         const cur = editor.adj;
-        if (what === "tone" || what === "key") {
+        if (what === "all") {
+          // Generic Auto (works without a learned style): tone and white balance from this photo, one history entry.
+          const [v, w] = await Promise.all([unwrap(commands.autoTone(id, cur, null)), unwrap(commands.autoWhiteBalance(id, cur))]);
+          editor.change((a) => {
+            const t = applyAutoTone(a, v);
+            return { ...t, whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } };
+          }, "Auto");
+          setAutoWb({ id, t: w.temperatureK, tint: w.tint });
+        } else if (what === "tone" || what === "key") {
           const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
           editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
         } else {
@@ -523,6 +518,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const wbNow = editor.adj.whiteBalance;
   const auto: AutoApi = {
     busy: autoBusy,
+    all: () => void runAuto("all"),
     tone: () => void runAuto("tone"),
     wb: () => void runAuto("wb"),
     slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
@@ -542,14 +538,31 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const edgeFor = useCallback((to: "navigator" | "viewer") => (to === "navigator" ? 480 : maxEdge), [maxEdge]);
   const hover = useHoverPreview(id, edgeFor);
   // Any edit (commit, slider, auto, paste) replaces a hover preview with the real render.
-  const { stop: stopHover } = hover;
+  const { stop: stopHover, startVariant } = hover;
   useEffect(() => stopHover(), [editor.adj, stopHover]);
   const hoverPreset = useCallback(
     (p: StylePreset | null) => {
-      if (!p || id == null) return hover.stop();
-      hover.start(p.name, "navigator", async () => unwrap(commands.resolvePreset(id, p.id, editor.adj)));
+      if (!p || id == null) return stopHover();
+      // 120 ms dwell, then one `renderPreviewVariant` (slot `preview`) shown on the main image and the Navigator;
+      // latest wins, nothing is applied or saved until the click.
+      startVariant(p.name, "preset", { kind: "preset", presetId: p.id }, () => editor.adj, 120);
     },
-    [hover, id, editor.adj],
+    [stopHover, startVariant, id, editor.adj],
+  );
+  // Press-and-hold a panel's "changed" dot: the photo without that panel's changes while held.
+  const holdingRef = useRef(false);
+  const holdApi = useMemo(
+    () => ({
+      start: (title: string, fields: AdjustmentField[]) => {
+        holdingRef.current = true;
+        startVariant(`Without ${title} changes`, "hold", { kind: "without_fields", fields }, () => editorRef.current.adj, 0);
+      },
+      stop: () => {
+        holdingRef.current = false;
+        stopHover();
+      },
+    }),
+    [startVariant, stopHover],
   );
   const profileHover = useMemo(
     () => ({
@@ -962,7 +975,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
               onImport={() => void importStyles()}
               onRemoveGroup={(g: StyleGroup) => void styles.removeGroup(g.id)}
               onHoverPreset={hoverPreset}
-              navPreview={hover.preview?.to === "navigator" ? hover.preview : null}
+              navPreview={hover.preview?.to === "navigator" || hover.preview?.source === "preset" ? hover.preview : null}
+              appliedPresetId={editor.history?.appliedPresetId ?? null}
               history={editor.history}
               imageId={id}
               onApplyPreset={doApplyPreset}
@@ -1030,7 +1044,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           {viewerToolbar}
         </div>
         {!panels.right && (
-          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside" onMouseLeave={hover.stop}>
+          <aside className="flex w-72 shrink-0 flex-col border-l border-neutral-800 min-[1600px]:w-80" data-testid="right-aside" onMouseLeave={() => !holdingRef.current && hover.stop()}>
             {compare && (
               <div className="truncate border-b border-neutral-800 px-3 py-1 text-[11px] text-sky-300" data-testid="compare-editing">
                 Editing the {compare.focus === "a" ? "Select" : "Candidate"}: {entry?.fileName}
@@ -1043,6 +1057,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
                 importing={styles.importing}
                 onImportStyles={() => void importStyles()}
                 hover={profileHover}
+                hold={holdApi}
                 auto={auto}
                 imageId={id}
                 onError={onError}

@@ -422,20 +422,22 @@ export function useWorkflow(d: Deps) {
    * Returns false when nothing changed.
    */
   const reportBatch = useCallback(
-    async (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number): Promise<boolean> => {
+    async (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number, soft = false): Promise<boolean> => {
       if (r.batchId == null || r.changedIds.length === 0) {
         toasts.push(`${text}: no change (${plural(attempted, "photo")} already matched)`);
         return false;
       }
       const b = remember(r.batchId, r.label, [], r.changedIds);
-      await afterChange(r.changedIds);
+      // `soft`: the caller (Develop) already refreshed its own photos; a full `onChanged` would remount the Develop view.
+      if (soft) await fetchPlan().catch(() => {});
+      else await afterChange(r.changedIds);
       const tid = toasts.push(`${text} to ${plural(r.changedIds.length, "photo")}${attempted > r.changedIds.length ? ` (${attempted - r.changedIds.length} already matched)` : ""}`, {
         action: b ? { label: "Undo", testid: "paste-undo-batch", onClick: () => void undoBatch(b) } : undefined,
       });
       bindToast(b, tid);
       return true;
     },
-    [afterChange, toasts, undoBatch],
+    [afterChange, fetchPlan, toasts, undoBatch],
   );
 
   // ---- apply ----

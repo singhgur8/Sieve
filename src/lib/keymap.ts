@@ -65,9 +65,9 @@ export type ActionId =
   | "undoCull"
   | "redoCull"
   | "copy"
-  | "paste"
   | "copyAll"
   | "pasteAll"
+  | "paste"
   | "sync"
   | "syncQuiet"
   | "autoTone"
@@ -221,8 +221,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
   // Plain Cmd+C / Cmd+V: copy EVERY setting of the active photo (not crop / masks) and paste to every selected photo, one undoable
   // batch. Library only for now; Develop reuses these ids by adding "develop" to `modes` and handling the action there.
-  { id: "copyAll", group: "Scenes", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: LIB, display: ["Cmd+C"], where: "Grid, Loupe, Compare" },
-  { id: "pasteAll", group: "Scenes", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: LIB, display: ["Cmd+V"], where: "Grid, Loupe, Compare" },
+  { id: "copyAll", group: "Scenes", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: ALL, display: ["Cmd+C"], where: "Everywhere (not while typing)" },
+  { id: "pasteAll", group: "Scenes", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: ALL, display: ["Cmd+V"], where: "Everywhere (not while typing)" },
   { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
   { id: "syncQuiet", group: "Develop", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
   { id: "autoTone", group: "Develop", label: "Auto tone (Basic: Tone > Auto)", chords: [c("u", { mod: true })], modes: ["develop"], display: ["Cmd+U"], where: "Develop" },

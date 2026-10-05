@@ -2535,8 +2535,8 @@ export function installMockBackend(count: number) {
           let resolved: ParametricAdjustments;
           if (v.kind === "preset") {
             const p = presets.find((x) => x.id === v.presetId);
-            if (!p) throw { kind: "not_found", message: `preset ${v.presetId}` };
-            resolved = copyFields(live, p.adjustments, p.fields);
+            // Imported style presets are not stored in the mock (like `resolve_preset`): they preview as the live settings.
+            resolved = p ? copyFields(live, p.adjustments, p.fields) : live;
           } else {
             if (!v.fields.length) throw { kind: "invalid_argument", message: "fields must not be empty" };
             resolved = copyFields(live, neutral(), v.fields);

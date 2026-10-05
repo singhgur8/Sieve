@@ -266,9 +266,9 @@ test.describe("copy / paste / previous / sync shortcuts", () => {
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("+1.25");
     const [paste] = await calls(page, "paste_settings");
     expect(paste.args.ids).toEqual([2]);
-    await expect(page.getByTestId("notice").last()).toContainText("settings to 1 photo");
-    await expect(page.getByTestId("batch-undo")).toBeVisible();
-    await page.getByTestId("batch-undo").click();
+    await expect(page.getByTestId("notice").last()).toContainText("Pasted settings");
+    await expect(page.getByTestId("paste-undo-batch")).toBeVisible();
+    await page.getByTestId("paste-undo-batch").click();
     await expect(page.getByTestId("slider-value-exposure")).toHaveText("0.00");
   });
 
@@ -366,7 +366,7 @@ for (const vp of [
 }
 
 test.describe("style library and auto (IPC v14)", () => {
-  test("Presets panel: folder import makes a group, apply calls apply_preset, hover previews in the Navigator, group removal", async ({ page }) => {
+  test("Presets panel: folder import makes a group, apply calls apply_preset, hover previews on the main image and Navigator, group removal", async ({ page }) => {
     await openDevelop(page);
     await expect(page.getByTestId("preset-empty")).toContainText("No presets yet. Save one with + or import a Lightroom presets folder.");
     await clearCalls(page);
@@ -387,8 +387,8 @@ test.describe("style library and auto (IPC v14)", () => {
     await clearCalls(page);
     await first.hover();
     await expect(page.getByTestId("navigator-preview-label")).toContainText("Preview: Smith Wedding 01");
-    expect((await calls(page, "resolve_preset")).length).toBeGreaterThan(0);
-    expect((await calls(page, "render_preview")).some((c) => (c.args.options as { slot: string }).slot === "navigator" && (c.args.options as { maxEdge: number }).maxEdge === 480)).toBe(true);
+    await expect(page.getByTestId("hover-preview-label")).toHaveText("Preview: Smith Wedding 01");
+    expect((await calls(page, "render_preview_variant")).some((c) => (c.args.options as { slot: string }).slot === "preview" && (c.args.variant as { kind: string }).kind === "preset")).toBe(true);
     await page.mouse.move(700, 400);
     await expect(page.getByTestId("navigator-preview-label")).toHaveCount(0);
     // A quick pass over the row does not render anything.
@@ -396,7 +396,7 @@ test.describe("style library and auto (IPC v14)", () => {
     await first.hover();
     await page.mouse.move(700, 400);
     await page.waitForTimeout(300);
-    expect((await calls(page, "resolve_preset")).length).toBe(0);
+    expect((await calls(page, "render_preview_variant")).length).toBe(0);
 
     await clearCalls(page);
     await first.click();
