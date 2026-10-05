@@ -2577,6 +2577,14 @@ pub async fn auto_upright(
     if mode == UprightMode::Off {
         return Ok(UprightResult { mode, solution: None, message: None });
     }
+    // A photo Lightroom already solved stores every mode's matrix: switching modes reuses
+    // Lightroom's own solve (matches what Lightroom shows) instead of detecting lines again.
+    if mode != UprightMode::Guided {
+        let lightroom = adjustments.transform.solution.as_ref().filter(|s| !s.crs.is_empty());
+        if let Some(solution) = lightroom.and_then(|s| develop::transform::lightroom_solution(&s.crs, mode)) {
+            return Ok(UprightResult { mode, solution: Some(solution), message: None });
+        }
+    }
     let f35 = ml::upright::focal_35mm_estimate(
         entry.camera.make,
         entry.camera.model.as_deref(),
