@@ -839,6 +839,51 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
+
+Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.
+
+- `get_transform_bounds(id, adjustments: ParametricAdjustments) -> TransformBounds` (TS
+  `commands.getTransformBounds`). Pure geometry of the live settings, no render, no save (decodes the source on first
+  use like `get_develop_info`; instant while the photo is open in Develop). Unknown id -> `not_found`, missing
+  original -> `file_missing`.
+- `TransformBounds { validQuad: [number, number][] | null, constrainedCrop: CropSettings | null }`, both `null` when
+  the transform is neutral (no Upright solution for the current mode, neutral sliders):
+  - `validQuad`: the warped image outline, 4 points = the source corners mapped into the corrected frame, as
+    **fractions of the uncropped corrected frame as displayed** (EXIF orientation applied; the same frame as a render
+    with `crop.enabled = false` and the crop tool's displayed rects in `src/lib/crop.ts`). Clockwise on screen (y
+    down). Not clipped: points may lie outside 0..1. Image pixels = quad ∩ frame; the rest renders white.
+  - `constrainedCrop`: what Constrain Crop makes of `adjustments.crop` (`develop::transform::constrain_crop`), in the
+    **stored** convention (un-oriented fractions + angle; convert with `fromStored(c, orientation, aspect)`). The crop
+    unchanged when it fits; else the largest frame of the same aspect / angle that fits; a disabled crop becomes the
+    largest frame of the photo's aspect (`enabled: true`), or stays disabled when the warp covers the whole frame
+    (e.g. Scale > 100). Computed regardless of `transform.constrainCrop`; equals the crop a render uses when that is on.
+- Confirmed (no change): a render with `crop.enabled = false` and `transform.constrainCrop = false` keeps the full
+  warped frame (same output size as the uncropped photo) with white outside `validQuad`
+  (`Geometry::of` leaves a disabled crop alone unless `constrainCrop`; tests `bounds_identity_is_null`,
+  `develop::source` `keystone_warp_straightens_converging_lines`). With `constrainCrop = true` a disabled crop
+  renders as the auto-constrained frame, which is why the crop tool must turn it off while cropping.
+
+Mock backend (`src/testing/mockBackend.ts`): no pixel warp; with `transform.upright != "off"` or a non-zero
+`vertical`, `validQuad = [[0,0],[1,0],[1-d,1],[d,1]]` (d = 0.06 with Upright + |vertical|/100 * 0.2, max 0.3) and
+`constrainedCrop` = the stored form of the displayed rect `{l: d, t: 2d, r: 1-d, b: 1}` for a disabled crop (an enabled
+crop is returned as is). Otherwise both `null`. Contract check: `tests/ui/ipc-v19-3-mock.spec.ts`.
+
+Who updates what
+- architect (done): type, `develop::transform::bounds`, `DevelopCache::transform_bounds`, command + registration,
+  Rust tests (`develop::transform::tests::bounds_*`), bindings, mock.
+- frontend-dev (R1-3):
+  1. While cropping, render with `crop: {...a.crop, enabled: false}` **and** `transform: {...a.transform,
+     constrainCrop: false}`.
+  2. On crop-tool start and whenever `transform` changes while it is open, call
+     `getTransformBounds(id, liveAdjustments)` (debounce slider drags). "Constrain to image" keeps the rectangle inside
+     the rotated frame ∩ `validQuad` (convex polygon test replacing `insideRotated`; `fitInsideRotated` / `approach`
+     use it); `PaperFill` paints outside `validQuad`. `validQuad = null` -> today's behaviour.
+  3. Starting the tool with `transform.constrainCrop` on and `validQuad != null`: initial rect =
+     `fromStored(constrainedCrop, orientation, aspect)` when `constrainedCrop.enabled` (for a stored crop too: that is
+     what the photo currently shows).
+- rust-engine-dev, vision-ml-dev: nothing.
+
 ## v19.2 — 2026-10-05 (Phase 8d feedback: camera bodies, project-wide camera sync, suggestion filter, Auto Sync)
 
 Driven by `docs/ux-review-8d.md` P1-1, P1-3, P1-4, P1-5 ([ARCH] items). Additive on the wire except one TS call

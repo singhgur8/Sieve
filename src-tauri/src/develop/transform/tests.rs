@@ -176,3 +176,90 @@ fn constrain_keeps_max_inscribed_rect() {
     let c = Geometry::of(&adj, 6000, 4000).crop;
     assert!(c.right - c.left < 0.4 && c.left > 0.0 && c.top > 0.0 && c.right < 0.45, "{c:?}");
 }
+
+/// v19.3 `get_transform_bounds`: no warp -> no quad / constrained crop; a crop-tool render
+/// (crop disabled, Constrain Crop off) keeps the whole warped frame (R1-3 step 1).
+#[test]
+fn bounds_identity_is_null() {
+    let adj = ParametricAdjustments::default();
+    assert_eq!(bounds(&adj, 6000, 4000, 1), TransformBounds { valid_quad: None, constrained_crop: None });
+    let t = TransformSettings { vertical: -40.0, constrain_crop: false, ..settings() };
+    let adj = ParametricAdjustments { transform: t, ..Default::default() };
+    let g = Geometry::of(&adj, 6000, 4000);
+    assert!(g.warp.is_some());
+    assert!(!g.crop.enabled, "crop tool frame is the full warped frame: {:?}", g.crop);
+}
+
+/// Inside test for a clockwise (y down) convex quad.
+fn inside_quad(q: &[(f64, f64)], p: (f64, f64)) -> bool {
+    (0..q.len()).all(|i| {
+        let (a, b) = (q[i], q[(i + 1) % q.len()]);
+        // Tolerance: the crop is stored as f32.
+        (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0) >= -1e-6
+    })
+}
+
+/// Keystone: the quad is the frame corners forwarded through the slider warp, clockwise;
+/// widening the top (Vertical < 0) pulls the bottom corners inwards.
+#[test]
+fn bounds_keystone_quad_forwards_frame_corners() {
+    let t = TransformSettings { vertical: -50.0, ..settings() };
+    let adj = ParametricAdjustments { transform: t.clone(), ..Default::default() };
+    let q = bounds(&adj, 6000, 4000, 1).valid_quad.expect("warp has an outline");
+    let fwd = sliders_forward(&t, ASPECT);
+    let expected: Vec<(f64, f64)> =
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].iter().map(|&(x, y)| apply(&fwd, x, y).unwrap()).collect();
+    assert_eq!(q.len(), 4);
+    for (a, b) in q.iter().zip(&expected) {
+        assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9, "{q:?} vs {expected:?}");
+    }
+    assert!(q[3].0 > 0.01 && q[2].0 < 0.99, "bottom corners pulled in: {q:?}");
+    assert!(inside_quad(&q, (0.5, 0.5)), "clockwise: {q:?}");
+    // Orientation 6 (90 CW for display): the same outline, displayed: un-oriented (x, y) ->
+    // display (1 - y, x).
+    let q6 = bounds(&adj, 6000, 4000, 6).valid_quad.unwrap();
+    assert!(inside_quad(&q6, (0.5, 0.5)), "clockwise after orientation: {q6:?}");
+    for p in &expected {
+        let d = (1.0 - p.1, p.0);
+        assert!(q6.iter().any(|r| (r.0 - d.0).abs() < 1e-9 && (r.1 - d.1).abs() < 1e-9), "{d:?} in {q6:?}");
+    }
+}
+
+/// The constrained crop lies inside the quad (and the frame), for a disabled crop, a user
+/// crop leaving the warped image, and a straightened crop.
+#[test]
+fn bounds_constrained_crop_inside_quad() {
+    let crops = [
+        CropSettings::default(),
+        CropSettings { enabled: true, left: 0.0, top: 0.3, right: 0.5, bottom: 1.0, angle: 0.0 },
+        CropSettings { enabled: true, left: 0.05, top: 0.05, right: 0.95, bottom: 0.95, angle: 3.0 },
+    ];
+    let transforms = [
+        TransformSettings { vertical: -50.0, ..settings() },
+        TransformSettings { horizontal: 30.0, rotate: 4.0, ..settings() },
+        TransformSettings {
+            upright: UprightMode::Level,
+            solution: Some(lr_solution(LR_LEVEL, UprightMode::Level)),
+            ..settings()
+        },
+    ];
+    for t in &transforms {
+        for crop in &crops {
+            let adj = ParametricAdjustments { transform: t.clone(), crop: *crop, ..Default::default() };
+            let b = bounds(&adj, 6000, 4000, 1);
+            let (q, c) = (b.valid_quad.unwrap(), b.constrained_crop.unwrap());
+            // Unchanged (possibly disabled) when the frame already lies inside the warped image.
+            assert!(c.enabled || c == *crop);
+            for p in crop_corners(&c, ASPECT) {
+                assert!(inside_quad(&q, p), "{p:?} outside {q:?} ({t:?}, {crop:?})");
+                assert!((-1e-6..=1.0 + 1e-6).contains(&p.0) && (-1e-6..=1.0 + 1e-6).contains(&p.1));
+            }
+            // Same as what a render with Constrain Crop on uses.
+            let on = ParametricAdjustments {
+                transform: TransformSettings { constrain_crop: true, ..t.clone() },
+                ..adj.clone()
+            };
+            assert_eq!(Geometry::of(&on, 6000, 4000).crop, c);
+        }
+    }
+}
