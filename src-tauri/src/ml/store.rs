@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+use super::scoring::SCORING_RULES_VERSION;
 use super::{AutoTag, ImageMetrics, Scored, MODEL_VERSION};
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
@@ -211,6 +212,28 @@ pub fn set_auto_tags(tx: &Transaction, id: ImageId, tags: &[AutoTag], keep: &[Cu
             delete.execute(params![id, tag])?;
         }
     }
+    Ok(())
+}
+
+/// `catalog_meta` key holding the [`SCORING_RULES_VERSION`] the stored suggestions were
+/// computed with (written by every full rescore).
+pub const RULES_VERSION_KEY: &str = "scoring_rules_version";
+
+/// Whether the stored suggestions come from other scoring rules than this build's (missing
+/// = scored before the version was recorded).
+pub fn rules_version_stale(conn: &Connection) -> AppResult<bool> {
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM catalog_meta WHERE key = ?1", [RULES_VERSION_KEY], |r| r.get(0))
+        .optional()?;
+    Ok(v.and_then(|v| v.parse::<u32>().ok()) != Some(SCORING_RULES_VERSION))
+}
+
+/// Records that the stored suggestions follow this build's rules.
+pub fn set_rules_version(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO catalog_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![RULES_VERSION_KEY, SCORING_RULES_VERSION.to_string()],
+    )?;
     Ok(())
 }
 

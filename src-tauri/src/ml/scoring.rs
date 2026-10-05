@@ -40,6 +40,12 @@ use crate::ipc::types::{
     CullTag, CullThresholds, FaceInfo, PickFlag, QualityScore, ShootType, SuggestionReason, SuggestionReasonKind,
 };
 
+/// Version of the scoring / suggestion rules (no new measurements: those are
+/// `MODEL_VERSION`). Bump when the rules change what existing analyses suggest; catalogs
+/// scored with another version are rescored once by the next analysis run (or at startup
+/// via `Analysis::start_if_rules_changed`). 1 = before Phase 8d, 2 = reject strictness.
+pub const SCORING_RULES_VERSION: u32 = 2;
+
 /// Minimum detector confidence for a face to be judged.
 pub const MIN_CONSIDER_SCORE: f32 = 0.6;
 /// Subjects are at least this share of the largest considered face's height.

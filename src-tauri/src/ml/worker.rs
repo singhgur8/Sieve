@@ -265,7 +265,8 @@ fn run_queue(
                 std::thread::sleep(INGEST_POLL);
                 continue;
             }
-            if dirty || flags.rescore.swap(false, Ordering::SeqCst) {
+            // Suggestions from older scoring rules are refreshed once (rules version).
+            if flags.rescore.swap(false, Ordering::SeqCst) || dirty || store::rules_version_stale(conn)? {
                 stats.burst_groups = rescore_all(conn)?;
                 dirty = false;
             }
@@ -283,6 +284,10 @@ fn run_queue(
             // stay pending and are picked up once `scripts/fetch-models.sh` has run.
             if let Err(e) = measurer.check() {
                 eprintln!("[analysis] models unavailable, analysis stopped: {e}");
+                // Already analysed photos still get this build's suggestions (no models needed).
+                if store::rules_version_stale(conn)? {
+                    stats.burst_groups = rescore_all(conn)?;
+                }
                 stats.cancelled = true;
                 return Ok(End::ModelsMissing);
             }
@@ -438,6 +443,7 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
         store::write_scored(&tx, a.id, s, now)?;
     }
     let n = store::write_bursts(&tx, &rows)?;
+    store::set_rules_version(&tx)?;
     tx.commit()?;
     Ok(n)
 }
@@ -617,6 +623,80 @@ mod tests {
             params![id, MODEL_VERSION, m.phash as i64, serde_json::to_string(m).unwrap()],
         )
         .unwrap();
+    }
+
+    /// Runs a startup-style `Pending` pass to completion.
+    fn run_pending(config: &AnalysisConfig) {
+        let rec = Arc::new(Recorder::default());
+        let flags = WorkerFlags::default();
+        kick(config, &flags, AnalysisScope::Pending, rec.clone()).unwrap();
+        let t = Instant::now();
+        while rec.finished.lock().unwrap().is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while flags.running.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn older_scoring_rules_are_rescored_once_without_touching_user_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 3, &[]);
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        repo::set_shoot_type(&conn, ShootType::Wedding).unwrap();
+        // Analysed under the pre-8d rules: the stored suggestion is stale ("pick" on a frame
+        // whose whole frame is soft, which balanced now rejects), and no rules version.
+        let mut soft = metrics(vec![]);
+        soft.global_sharpness = 0.3;
+        soft.phash = 0;
+        let mut m2 = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m2.phash = !0;
+        let mut m3 = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m3.phash = 0x0F0F_0F0F_0F0F_0F0F;
+        for (id, m) in [(1, &soft), (2, &m2), (3, &m3)] {
+            store_metrics(&conn, id, m);
+        }
+        rescore_all(&mut conn).unwrap();
+        conn.execute("UPDATE quality_scores SET suggested_pick = 'pick' WHERE image_id = 1", []).unwrap();
+        conn.execute("DELETE FROM catalog_meta WHERE key = ?1", [store::RULES_VERSION_KEY]).unwrap();
+        // The user's own decisions (catalog() sets 2 stars + pick; make 3 a user reject).
+        conn.execute("UPDATE images SET pick = 'reject', rating = 4 WHERE id = 3", []).unwrap();
+        let user = |conn: &Connection| -> Vec<(String, i64, String)> {
+            conn.prepare("SELECT pick, rating, pick_origin FROM images ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = user(&conn);
+        let sugg = |conn: &Connection| -> String {
+            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = 1", [], |r| r.get(0)).unwrap()
+        };
+        assert!(store::rules_version_stale(&conn).unwrap());
+
+        // First start: nothing to analyse, but the old suggestions are refreshed.
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "reject");
+        assert!(!store::rules_version_stale(&conn).unwrap());
+        let v: String = conn
+            .query_row("SELECT value FROM catalog_meta WHERE key = ?1", [store::RULES_VERSION_KEY], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, crate::ml::scoring::SCORING_RULES_VERSION.to_string());
+        assert_eq!(user(&conn), before, "user flags, stars and origins are never touched");
+
+        // Second start: no rescore (a marker written into the stored suggestion survives).
+        conn.execute("UPDATE quality_scores SET suggested_pick = 'unflagged' WHERE image_id = 1", []).unwrap();
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "unflagged");
+
+        // An older stored version (e.g. "1") is stale again.
+        conn.execute("UPDATE catalog_meta SET value = '1' WHERE key = ?1", [store::RULES_VERSION_KEY]).unwrap();
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "reject");
+        assert_eq!(user(&conn), before);
     }
 
     #[test]
@@ -816,6 +896,22 @@ mod tests {
         let s = store::analysis_status(&conn, false).unwrap();
         assert_eq!((s.pending, s.failed, s.analyzed), (2, 0, 0));
         assert!(rec.finished.lock().unwrap()[0].cancelled);
+    }
+
+    #[test]
+    fn missing_models_still_refresh_stale_suggestions_of_analysed_photos() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 2, &[]);
+        let conn = db::open(&config.catalog_path).unwrap();
+        // 1 is analysed (no suggestion yet, rules version missing); 2 still needs the models.
+        store_metrics(&conn, 1, &metrics(vec![face(0.4, 0.15, 0.7, 0.28)]));
+        let stats = run_blocking(&config, &Recorder::default()).unwrap();
+        assert!(stats.cancelled);
+        let n: u32 =
+            conn.query_row("SELECT COUNT(*) FROM quality_scores WHERE image_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        assert!(!store::rules_version_stale(&conn).unwrap());
+        assert_eq!(store::count_needs(&conn).unwrap(), 1, "the other photo stays pending");
     }
 
     /// Stub measurer: the first `measure` call runs `removal` (every other call waits for
