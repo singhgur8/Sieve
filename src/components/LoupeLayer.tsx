@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import { Flag, X } from "lucide-react";
 import { commands, unwrap, type FaceInfo, type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
-import { formatShutter, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
+import { formatShutter, formatTime, LABEL_COLOR, tagName, TAG_STYLE, trimNum } from "../lib/format";
 import { BurstBadge, CompanionBadge, HealthBadge, Stars, XmpBadge } from "./Cell";
 import { flagTitle, rejectInfo, tagTitle } from "../lib/cull";
 import { Filmstrip } from "./Filmstrip";
@@ -322,6 +322,12 @@ function InfoOverlay({
         <div className="text-sky-300" data-testid="suggested-line" title="What Apply suggestions would set. Nothing changes until you apply it">
           {suggested}
           {!reject && entry.quality?.suggestedPick === "reject" && reasons.length > 0 ? `: ${reasons.map((r) => r.text).join("; ")}` : ""}
+        </div>
+      )}
+      {c.capturedAtMs != null && (
+        <div className="text-neutral-300" data-testid="info-capture-time" data-source={c.captureTimeSource ?? "exif"} title={c.captureTimeSource && c.captureTimeSource !== "exif" ? `Corrected capture time (the file says ${c.originalCapturedAtMs != null ? formatTime(c.originalCapturedAtMs) : "nothing"})` : "Capture time from the file"}>
+          {formatTime(c.capturedAtMs)}
+          {c.captureTimeSource && c.captureTimeSource !== "exif" ? " (corrected)" : ""}
         </div>
       )}
       <div className="text-neutral-400" title="Capture settings, Sieve's quality score (0-100) and burst membership">

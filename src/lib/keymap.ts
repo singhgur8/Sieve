@@ -42,6 +42,8 @@ export type ActionId =
   | "zoomDevelop"
   | "face"
   | "info"
+  | "photoInfo"
+  | "captureTime"
   | "keeper"
   | "keeperSet"
   | "anchor"
@@ -198,6 +200,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100% at the cursor (stays while you step with the arrows)", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
   { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
+  { id: "photoInfo", group: "View", label: "Show / hide the photo info panel (time, camera, exposure, file)", chords: [c("i", { mod: true })], modes: ALL, display: ["Cmd+I"], where: "Library, Develop" },
+  { id: "captureTime", group: "Library", label: "Edit capture time: shift, set or sync two cameras", chords: [c("t", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+T"], where: "Library, Develop" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },
 
   // ---- develop ----
