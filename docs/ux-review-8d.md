@@ -306,3 +306,74 @@ Still open:
 | Crop handle Alt / Shift drag | – | Alt = from centre, Shift = keep ratio | same | R1-P2-10 |
 
 No new chord conflicts. The only duplicate chords in `keymap.ts` are the intentional crop-scoped ones: X / O / Shift+O / A while cropping, ahead of reject / mask overlay / overlay style / auto mask. The cheat sheet scrolls inside the modal and is filterable at 1280×800 (content 1,648 px in a 637 px viewport) without overflowing the window, so it needs no change.
+
+---
+
+## Re-check 2 (2026-10-05, HEAD 2c5dff6, contract v19.3)
+
+Evidence: mock backend on `vite --port 1452` (`/?mock=200&scope=all`, `/?mock=60&scope=all&twocams=1`), a throwaway Playwright driver at 1280×800 and 1728×1117 (deleted). It covered 16 exit keys from an open crop tool, plus undo, Reset all and a History click while cropping, plus stepping through an Upright photo. The suites `ux-8d-r1`, `ux-8d-r1b`, `ipc-v19-3-mock`, `crop-lr`, `crop-geometry`, `upright`, `ux-8d-p1`, `ux-8d-p2`, `ux-8d-v192` and `apply-scene-8d` pass on their own server (78/78).
+Kept screenshots (`test-data/ux-review-8d/`): `rc2-crop-stale-after-undo-1280.png`, `rc2-capture-1280.png`, `rc2-crop-upright-1280.png`.
+
+**Summary: open P0 0 · P1 2 (both new, both side effects of R1-1's commit-on-exit: R2-1 undo / reset / history while cropping is re-applied on exit, R2-2 stepping through Upright photos with the tool open writes a crop to each) · P2 3 new + P2-6 = 4.** R1-1 … R1-4 are resolved. R1-P2-1 … 11, P2-11 and P2-12 are resolved.
+
+### Status of the re-check 1 P1s
+
+| # | Status | Evidence |
+|---|---|---|
+| R1-1 Crop commits on exit | **Resolved** (two side effects: R2-1, R2-2) | Angle typed 2.5 / 4, then each exit key. **Commit, one `Crop` save on the photo being left:** → (and the tool re-opens on photo 2 at 0.0° with the same lock and overlay), G, E, C (Compare in Develop), Shift+T, Cmd+Alt+1 / 2, K, Cmd+Shift+E, filmstrip click. Three quick → presses give exactly one save. **No commit, tool stays open:** Esc, then Esc again on the re-opened tool. **No navigation, tool stays open (correct):** `\`, Tab, Shift+Tab, Y, D, Cmd+Shift+V, Cmd+Shift+C, Cmd+S. Clicking a filmstrip frame within 1.5 s of C does not re-open the tool inside Compare, so the carry does not leak. 1280 and 1728 behave identically. |
+| R1-2 Typed angle | **Resolved** | Typing 5 + Enter gives `+5.0°`, and the rect is the analytic 0.0563 inset (suite). On an Upright photo, typing −1.3 gives `-1.3°` with the tool still open. The angle stored on Done is −1.3. |
+| R1-3 Crop vs Upright | **Resolved** (mock; confirm the real warp on the Mac) | While cropping, `render_preview` sends `crop.enabled=false, transform.constrainCrop=false`. With Vertical + Constrain Crop on, R starts at the constrained crop `{l .06, t .12, r .94, b 1}` with the mock trapezoid `validQuad`. Dragging the SW handle to the frame corner stops at the warp edge (`l` stays .06). `PaperFill` does not paint outside `validQuad`, but the real render already shows the white warp wedges, so this needs no change. See P2 R2-P2-1 for the panel position. |
+| R1-4 Capture dialog | **Resolved** | `rc2-capture-1280.png`: on a pre-filled pair at 1280×800, Apply sits at y 715–747 with a sticky footer (Shift tab 569, Set tab 570). Enter on a focused tab applies once, and Esc cancels (suite). Initial focus is the reference search box, so Enter straight after Cmd+Shift+T does nothing (R2-P2-2). |
+
+### P2 status
+
+Resolved, checked by suite and spot check: R1-P2-1 notice / tooltip copy, R1-P2-2 `Auto Sync · 3` on one line with `Sync…`, R1-P2-3 one-line count and 56 px grid padding, R1-P2-4 Esc closes `Auto 0`, R1-P2-5 "This camera model: every Canon EOS R5 photo, any body (20)" (`rc2-capture-1280.png`), R1-P2-6 Apply lands on Rejected · Auto with "Rejected N photos, shown here" and "No reject suggestions", R1-P2-7 `Rejects (8)`, R1-P2-8 only Guided pressed plus the hint and the on-image badge, R1-P2-9 transform grid, R1-P2-10 Alt / Shift handle drags, R1-P2-11 cheat-sheet rows and Cmd+Alt+R outside the tool ("Reset Crop", one entry), P2-11 Plan to-do row, P2-12 strictness inline at ≥1440.
+Still open: P2-6 (optional capture time on grid cells). No regressions found in these areas.
+
+### New P1
+
+#### R2-1 Undo / Reset all / a History click while the crop tool is open is silently re-applied on exit
+- **Where**: `develop/DevelopView.tsx`. `cropTool` is seeded once in `startCrop` from `editor.adj.crop`. `editor.undo` / `redo`, `doReset` (Cmd+Shift+R), the History panel, paste (Cmd+Shift+V), presets and Previous all change `editor.adj.crop` underneath without touching the tool. `commitCrop` then compares the stale tool to the new `adj.crop`, sees a difference and saves the old crop again.
+- **Evidence**: `rc2-crop-stale-after-undo-1280.png`. Commit a 4° crop, press R, then click History "Original". The history shows Original selected and the filmstrip cell has lost its "edited" mark, but the tool still shows `+4.0°` with the rotated frame. Press → and you get `save_adjustments` `Crop` with angle 4 on photo 1: the undo is gone. Cmd+Z and Cmd+Shift+R give the same result, at 1280 and 1728.
+- **Why**: this got worse with R1-1. Before, → discarded the stale tool, so the undo survived. Now every exit re-commits the stale tool. Undoing a bad straighten is precisely what someone does while the crop tool is open, and the result is the opposite of what History says.
+- **Fix**:
+  1. Seed the tool from the stored crop whenever `editor.adj.crop` or `editor.adj.transform` changes from **outside** the tool while it is open: undo / redo, History click, Reset all, Reset Crop, paste, preset, Previous, sync, Auto Sync from another photo. Re-run `startCrop(carry = current tool)` so the aspect lock, overlay and Constrain to image are kept. Implementation: keep `toolBaseline = JSON(editor.adj.crop)` when the tool is seeded. In an effect on `editor.adj.crop`, if the tool is open and `JSON(adj.crop) !== toolBaseline`, re-seed and update the baseline. `commitCrop` sets the baseline to what it saves before calling `editor.change`, so its own commit does not trigger a re-seed.
+  2. Cmd+Z with uncommitted tool changes (the tool differs from its seed): the first Cmd+Z reverts the tool to its seed without touching history, and the toast reads "Crop changes undone". The next Cmd+Z is a normal undo, and the tool re-seeds from it (step 1). This matches Lightroom, where the overlay always shows the current history state.
+- **Acceptance**:
+  - Commit 4°, R, Cmd+Z: the tool shows `0.0°` and the full frame, and → saves no `Crop` on photo 1.
+  - The same holds with a History click on "Original" and with Cmd+Shift+R.
+  - R, angle 3 (uncommitted), Cmd+Z: the tool goes back to its opening state and there is no history change.
+
+#### R2-2 Stepping through Upright-corrected photos with the crop tool open writes a crop to every photo passed
+- **Where**: `DevelopView.tsx` re-open effect (`reopen` → `startCrop(carry)`) together with the `get_transform_bounds` effect, which re-fits the rectangle to `validQuad` 150 ms later (`changeCrop((t) => t)`), and `commitPendingTool`, which commits any difference from the stored crop.
+- **Evidence**:
+  - Photo 2 has Upright Vertical with Constrain Crop off. On photo 1, press R, then →. The re-opened tool on photo 2 shows the full frame `{0,0,1,1}` at 100 ms, then jumps to `{.0566 …}` at 1 s. Press → again and you get `save_adjustments` `Crop` on photo 2, although the crop tool was never touched there.
+  - The same happens on any Upright photo with R then → (`1:Crop:0`).
+  - On the Mac, an Upright Auto synced across a scene means that holding → through it with the tool open crops all of them, and the frame visibly jumps on each.
+- **Why**: navigation must not edit photos the user only looked at. It also adds a "Crop" history entry and an XMP write per frame. In Lightroom, Constrain to Image is stored per photo, so browsing never changes a crop.
+- **Fix**:
+  1. Distinguish **explicit** from **implicit** commits. Done, Enter and R commit what is on screen (today's behaviour). Implicit exits (photo change, G / E / C, step switch, Shift+T, mask keys, Export, toolbar view buttons) commit only when the user changed the tool since it was seeded: handles, move, angle, aspect / lock / swap, Reset, Auto, straighten line. Add `dirty: boolean` to `CropTool`. `changeCrop` sets it when the change is user-initiated. `startCrop`, the quad re-fit and the R2-1 re-seed do not set it. `commitPendingTool` skips `commitCrop` when `!dirty` and just closes the tool, which is still carried to the next photo.
+  2. No jump: when the photo has a non-neutral transform, `startCrop` awaits `get_transform_bounds` before showing the tool, as it already does with Constrain Crop on. The first frame you see is the fitted one.
+- **Acceptance**:
+  - The two-photo scenario above gives 0 `save_adjustments` on photo 2.
+  - The `crop-rect` on photo 2 is never `{0,0,1,1}` once the overlay is visible.
+  - R, then Enter on the same Upright photo still saves one `Crop`, because Enter is explicit.
+  - R, angle 2, → still saves one `Crop` (R1-1).
+
+### New P2
+
+- **R2-P2-1 The crop panel can be scrolled out of view when R opens it** (`rc2-crop-upright-1280.png`: Transform open, so the Angle field, Constrain to image and Done are above the fold at 1280 and 1728). This is exactly the Upright → R path. When the tool opens, scroll the right panel so `crop-panel` is in view (`scrollIntoView({ block: "nearest" })`). Restore the previous scroll position when the tool closes.
+- **R2-P2-2 Enter right after Cmd+Shift+T does nothing on a pre-filled pair**, because focus starts in the reference search box. When both frames are already chosen (a one-per-camera selection), put the initial focus on the `Sync two cameras` tab, so Enter applies. Keep the search box as the initial focus when a frame still has to be picked. Also: Enter in the search box with an empty query applies (when `canConfirm`).
+- **R2-P2-3 Cmd+S and Copy (Cmd+Shift+C) while cropping act on the stored crop, not the one on screen.** Lightroom applies the overlay first. Add `"saveXmp"` and `"copy"` to `LEAVES_CROP` in `App.tsx`, so they call `commitPendingTool()` first. After R2-2 this is a no-op when the tool is untouched.
+
+### Keyboard map changes from this re-check
+
+| Action | Today | Proposed | Lightroom Classic | Notes |
+|---|---|---|---|---|
+| Cmd+Z / Cmd+Shift+Z while cropping | undoes underneath the tool; the stale tool re-applies on exit | 1st Cmd+Z reverts uncommitted tool changes; then normal undo and the tool re-seeds | overlay follows history | R2-1 |
+| Navigate with the crop tool open, untouched | commits a re-fitted crop | closes and re-opens without saving | no change to the photo | R2-2 |
+| Cmd+S / Cmd+Shift+C while cropping | ignore the on-screen crop | commit first (if dirty) | applies the overlay | R2-P2-3 |
+
+No new chord conflicts. Cmd+Alt+R (Reset Crop, now Develop-wide) vs Cmd+Shift+R (Reset all) vs R (crop tool) are distinct. `cropStraightenDrag` / `cropAutoStraighten` are display-only rows with no chords.
+
+**Open P0 0 · P1 2 (R2-1, R2-2) · P2 4 (R2-P2-1 … 3, P2-6).** Neither P1 needs a contract change.
