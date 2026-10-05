@@ -216,7 +216,8 @@ const PROJECT_SQL: &str = "
            COALESCE(SUM(i.pick = 'pick'), 0),
            COALESCE(SUM(i.pick = 'reject'), 0),
            COALESCE(SUM(i.missing_since_ms IS NOT NULL), 0),
-           MIN(i.captured_at_ms), MAX(i.captured_at_ms)
+           MIN(i.captured_at_ms), MAX(i.captured_at_ms),
+           p.reject_strictness
       FROM projects p
       LEFT JOIN folders f ON f.project_id = p.id
       LEFT JOIN images i ON i.folder_id = f.id
@@ -239,6 +240,7 @@ fn query_projects(conn: &Connection, id: Option<ProjectId>) -> AppResult<Vec<Pro
                 cover_chosen: cover.is_some(),
                 cover_thumbnail_path: None,
                 shoot_type: ShootType::parse(&r.get::<_, String>(3)?).unwrap_or(ShootType::General),
+                reject_strictness: RejectStrictness::parse(&r.get::<_, String>(15)?).unwrap_or_default(),
                 workflow_step: WorkflowStep::parse(&r.get::<_, String>(4)?).unwrap_or(WorkflowStep::Cull),
                 created_at_ms: r.get(5)?,
                 last_opened_at_ms: r.get(6)?,
@@ -325,6 +327,24 @@ pub fn set_project_cover(conn: &Connection, id: ProjectId, image: Option<ImageId
 
 pub fn set_project_shoot_type(conn: &Connection, id: ProjectId, shoot_type: ShootType) -> AppResult<()> {
     update(conn, id, "UPDATE projects SET shoot_type = ?2 WHERE id = ?1", shoot_type.as_str())
+}
+
+/// `set_project_reject_strictness` (v19). Unknown project -> `not_found`.
+pub fn set_project_reject_strictness(conn: &Connection, id: ProjectId, strictness: RejectStrictness) -> AppResult<()> {
+    update(conn, id, "UPDATE projects SET reject_strictness = ?2 WHERE id = ?1", strictness.as_str())
+}
+
+/// Reject strictness culling uses for image `image` (its project's; `balanced` for an image
+/// without one). For the analysis worker (vision-ml-dev).
+pub fn reject_strictness_of_image(conn: &Connection, image: ImageId) -> AppResult<RejectStrictness> {
+    let v: Option<String> = conn
+        .prepare_cached(
+            "SELECT p.reject_strictness FROM images i JOIN folders f ON f.id = i.folder_id
+             JOIN projects p ON p.id = f.project_id WHERE i.id = ?1",
+        )?
+        .query_row([image], |r| r.get(0))
+        .optional()?;
+    Ok(v.as_deref().and_then(RejectStrictness::parse).unwrap_or_default())
 }
 
 /// Shoot type culling uses for image `image` (its project's; the catalog default for an

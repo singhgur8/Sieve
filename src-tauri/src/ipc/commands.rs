@@ -583,7 +583,9 @@ pub async fn goto_history(
 }
 
 /// Pastes the `fields` groups of `adjustments` (the frontend's copied settings) onto
-/// every image in `ids`; one "Paste Settings" history entry per changed image. Atomic.
+/// every image in `ids` (any selection; duplicates ignored); one "Paste Settings" history
+/// entry per changed image. Atomic. v19: recorded as one undoable edit batch (kind `paste`,
+/// `undo_edit_batch(result.batchId)`; `batchId = null` when nothing changed).
 #[tauri::command]
 #[specta::specta]
 pub async fn paste_settings(
@@ -593,18 +595,22 @@ pub async fn paste_settings(
     ids: Vec<ImageId>,
     adjustments: ParametricAdjustments,
     fields: Vec<AdjustmentField>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     require_fields(&fields)?;
     adjustments.validate().map_err(AppError::invalid)?;
     let n = ids.len() as u32;
     let activity = start_multi_activity(&app, n, "Pasting settings to");
     let result = catalog
-        .run(move |c| develop::history::apply_fields(c, &ids, &adjustments, &fields, develop::history::LABEL_PASTE))
+        .run(move |c| {
+            develop::batches::apply_fields_recorded(c, &ids, &adjustments, &fields, develop::history::LABEL_PASTE)
+        })
         .await;
     end_activity(activity, &result, |_| format!("Pasted settings to {}", super::activity::photos(n)));
-    result?;
-    xmp.notify(&app);
-    Ok(())
+    let r = result?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// A `paste_sync` activity (IPC v18) for writes to more than one photo ("Pasting settings to
@@ -632,7 +638,8 @@ fn end_activity<T>(
 }
 
 /// Copies the `fields` groups of `sourceId`'s stored adjustments onto `targetIds`
-/// ("Sync Settings"). Atomic.
+/// ("Sync Settings"; any selection, duplicates ignored). Atomic. v19: one undoable edit batch
+/// (kind `paste`), like `paste_settings`.
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_settings(
@@ -642,20 +649,22 @@ pub async fn sync_settings(
     source_id: ImageId,
     target_ids: Vec<ImageId>,
     fields: Vec<AdjustmentField>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     require_fields(&fields)?;
     let n = target_ids.len() as u32;
     let activity = start_multi_activity(&app, n, "Syncing settings to");
     let result = catalog
         .run(move |c| {
             let src = repo::get_adjustments(c, source_id)?;
-            develop::history::apply_fields(c, &target_ids, &src, &fields, develop::history::LABEL_SYNC)
+            develop::batches::apply_fields_recorded(c, &target_ids, &src, &fields, develop::history::LABEL_SYNC)
         })
         .await;
     end_activity(activity, &result, |_| format!("Synced settings to {}", super::activity::photos(n)));
-    result?;
-    xmp.notify(&app);
-    Ok(())
+    let r = result?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// Resets `ids` to neutral adjustments ("Reset" history entry). Atomic.
@@ -2187,6 +2196,7 @@ pub async fn undo_edit_batch(
 /// `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
 /// `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
 /// `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+/// v19: one undoable edit batch (kind `paste`), like `paste_settings`.
 #[tauri::command]
 #[specta::specta]
 pub async fn paste_previous(
@@ -2196,18 +2206,20 @@ pub async fn paste_previous(
     target_ids: Vec<ImageId>,
     previous_id: ImageId,
     fields: Option<Vec<AdjustmentField>>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     let fields = fields.unwrap_or_else(|| AdjustmentField::PASTE_PREVIOUS.to_vec());
     require_fields(&fields)?;
     let targets: Vec<ImageId> = target_ids.into_iter().filter(|&id| id != previous_id).collect();
-    catalog
+    let r = catalog
         .run(move |c| {
             let src = repo::get_adjustments(c, previous_id)?;
-            develop::history::apply_fields(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
+            develop::batches::apply_fields_recorded(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
         })
         .await?;
-    xmp.notify(&app);
-    Ok(())
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// State of the personal style model ("Auto edit (my style)").
@@ -2445,4 +2457,144 @@ pub async fn remove_project(
     })
     .await?;
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// IPC v19 (Phase 8d): capture time, per-photo metadata, Upright, preview variants, reject
+// strictness. Paste / Sync / Paste from Previous return `EditBatchResult` (see above).
+// ---------------------------------------------------------------------------
+
+/// Lightroom's "Edit Capture Time" for `ids` (any selection): shift by an offset, set the
+/// active photo to an exact time (the others follow by the same offset), sync two cameras
+/// from a reference pair, or revert to the files' own time (see [`CaptureTimeEdit`]). The
+/// original EXIF time is kept (`CaptureMeta.originalCapturedAtMs`); the corrected time is
+/// what sorting, bursts, scenes, filters and export naming use, and is written to the
+/// sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated`; marks them dirty, notifies
+/// auto-sync). Kicks a rescore so bursts regroup. Atomic; undo with
+/// `restore_capture_times(result.previous)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_capture_time(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    analysis: State<'_, Analysis>,
+    ids: Vec<ImageId>,
+    mode: CaptureTimeEdit,
+) -> AppResult<CaptureTimeEditResult> {
+    let r = catalog.run(move |c| db::capture_time::edit(c, &ids, &mode)).await?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+        analysis.start(&app, AnalysisScope::Rescore)?;
+    }
+    Ok(r)
+}
+
+/// Puts corrected capture times back (undo / redo of `edit_capture_time`: pass its
+/// `previous`, or snapshots taken before). Atomic (unknown id -> `not_found`). Returns the ids
+/// whose time changed (refetch them). Marks sidecars dirty and kicks a rescore like
+/// `edit_capture_time`.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_capture_times(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    analysis: State<'_, Analysis>,
+    snapshots: Vec<CaptureTimeSnapshot>,
+) -> AppResult<Vec<ImageId>> {
+    let changed = catalog.run(move |c| db::capture_time::restore(c, &snapshots)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+        analysis.start(&app, AnalysisScope::Rescore)?;
+    }
+    Ok(changed)
+}
+
+/// Everything the Library Metadata panel shows for photo `id`: file facts, original and
+/// corrected capture time, camera, lens, exposure, size, GPS, sidecar. Unknown id ->
+/// `not_found`. Body: architect (catalog values); rust-engine-dev adds the values read from
+/// the file (`gps`, `focalLength35mm`, `exposureCompensationEv`, `flashFired`,
+/// `cameraSerial`), which are `null` until then.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<ImageMetadata> {
+    catalog.run(move |c| db::capture_time::image_metadata(c, id)).await
+}
+
+/// Solves Upright `mode` for photo `id` from the live `adjustments` (`null` = stored; Guided
+/// uses `adjustments.transform.guides`, the crop is ignored). Nothing is saved: the UI sets
+/// `transform.upright` + `transform.solution` and commits one history entry. `off` returns no
+/// solution. Body: stub (no solution, `message` says Upright is not available yet) until
+/// vision-ml-dev (line detection) / rust-engine-dev (solver) implement it.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_upright(
+    catalog: State<'_, Catalog>,
+    id: ImageId,
+    mode: UprightMode,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<UprightResult> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    // Validates the id (not_found) the way the real implementation will.
+    catalog.run(move |c| repo::image_format(c, id).map(|_| ())).await?;
+    let message = (mode != UprightMode::Off).then(|| "Upright is not available yet".to_owned());
+    Ok(UprightResult { mode, solution: None, message })
+}
+
+/// Renders a temporary variation of the live `adjustments` (no save, no history entry): a
+/// preset applied on top (hover preview on the main image) or some groups reset to the
+/// format defaults (press-and-hold "without this panel"). Same render path as
+/// `render_preview` (latest-wins per (id, slot), `sieve://` URL); use slot `preview` so the
+/// edit's `main` render stays valid. Unknown preset / image -> `not_found`; empty
+/// `withoutFields.fields` -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn render_preview_variant(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+    variant: PreviewVariant,
+    options: RenderOptions,
+) -> AppResult<Option<RenderedPreview>> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    options.validate().map_err(AppError::invalid)?;
+    if let PreviewVariant::WithoutFields { fields } = &variant {
+        require_fields(fields)?;
+    }
+    // Ticket first: arrival order decides latest-wins, as in `render_preview`.
+    let ticket = develop.ticket(id, options.slot);
+    let resolved = catalog.run(move |c| styles::resolve_preview_variant(c, id, &adjustments, &variant)).await?;
+    resolved.validate().map_err(AppError::invalid)?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let luts = luts.inner().clone();
+    let rendered = blocking(move || {
+        if !cache.is_current(ticket) {
+            return Ok(None);
+        }
+        cache.render(ticket, &src, &resolved, &options, &luts)
+    })
+    .await;
+    note_if_missing(&catalog, id, rendered).await
+}
+
+/// Sets how readily culling suggests reject for the project's photos (conservative /
+/// balanced / aggressive) and rescores. Unknown project -> `not_found`. The scorer reads it
+/// per image with `db::projects::reject_strictness_of_image` (vision-ml-dev).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_reject_strictness(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    project_id: ProjectId,
+    strictness: RejectStrictness,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_project_reject_strictness(c, project_id, strictness)).await?;
+    analysis.start(&app, AnalysisScope::Rescore)
 }

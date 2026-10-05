@@ -22,3 +22,8 @@ src-tauri/models/*
 !src-tauri/models/README.md
 !src-tauri/models/checksums.sha256
 .claude/worktrees/
+
+# tsc -b artifacts
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js

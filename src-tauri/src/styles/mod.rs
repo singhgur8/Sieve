@@ -441,6 +441,29 @@ pub fn resolve_preset(
     Ok(out)
 }
 
+/// The settings `render_preview_variant` renders for image `id` (IPC v19): `base` with the
+/// preset applied (as [`resolve_preset`]) or with `fields` back at the image's format
+/// defaults. Nothing is saved. Unknown preset / image -> `not_found`.
+pub fn resolve_preview_variant(
+    conn: &Connection,
+    id: ImageId,
+    base: &ParametricAdjustments,
+    variant: &PreviewVariant,
+) -> AppResult<ParametricAdjustments> {
+    match variant {
+        PreviewVariant::Preset { preset_id } => {
+            crate::db::repo::image_format(conn, id)?;
+            resolve_preset(conn, *preset_id, base)
+        }
+        PreviewVariant::WithoutFields { fields } => {
+            let defaults = ParametricAdjustments::defaults_for(crate::db::repo::image_format(conn, id)?);
+            let mut out = base.clone();
+            out.copy_fields(&defaults, fields);
+            Ok(out)
+        }
+    }
+}
+
 /// Applies preset `preset_id` to `ids` ("Preset: <name>" history entry per changed image).
 /// Atomic. Used by the `apply_preset` command.
 pub fn apply_preset(conn: &mut Connection, ids: &[ImageId], preset_id: PresetId) -> AppResult<Vec<ImageId>> {
@@ -451,7 +474,11 @@ pub fn apply_preset(conn: &mut Connection, ids: &[ImageId], preset_id: PresetId)
         let base = crate::db::repo::get_adjustments(conn, id)?;
         items.push((id, resolve_preset(conn, preset_id, &base)?));
     }
-    crate::develop::history::commit_batch(conn, &items, &label)
+    let tx = conn.savepoint()?;
+    let changed = crate::develop::history::commit_batch_in(&tx, &items, &label)?;
+    crate::develop::history::record_applied_preset(&tx, ids, preset_id)?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 /// Registers LUT-library files (`<app_data>/luts`, pre-v14 `import_lut`) that no style profile
