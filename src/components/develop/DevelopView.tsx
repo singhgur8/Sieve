@@ -30,10 +30,10 @@ import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
 import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
-import { CropOverlay, constrainTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
+import { CropOverlay, constrainTool, newTool, resetTool, swapTool, toggleLockTool, type CropTool } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { WarningsChip } from "./WarningsChip";
-import { FULL, fromStored, isFull, loadCropAspect, previewRotation, toStored } from "../../lib/crop";
+import { FULL, fromStored, isFull, loadCropAspect, loadOverlay, nextOverlay, previewRotation, saveOverlay, toStored } from "../../lib/crop";
 import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 import { Viewer, frameBox, visibleRegion, type Size, type Zoom } from "./Viewer";
 
@@ -63,6 +63,10 @@ export interface DevelopHandle {
   isCropping: () => boolean;
   cropSwap: () => void;
   cropLock: () => void;
+  /** O: next crop guide overlay; Shift+O: rotate it; Cmd+Alt+R: reset the crop tool. */
+  cropOverlay: () => void;
+  cropOverlayRotate: () => void;
+  cropReset: () => void;
   /** Time (ms) of the adjustment Cmd+Z would undo (0 = none) and whether an adjustment redo exists. */
   lastCommitAt: () => number;
   canRedo: () => boolean;
@@ -266,7 +270,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setShowBefore(false);
     setSplit(false);
     setPicking(false);
-    setCropTool({ rect: c.enabled ? fromStored(c, orientation, frameAspect) : FULL, angle: c.enabled ? c.angle : 0, aspect: loadCropAspect(), flip: false });
+    setCropTool(newTool(c.enabled ? fromStored(c, orientation, frameAspect) : FULL, c.enabled ? c.angle : 0, loadCropAspect(), loadOverlay()));
   }, [id, editor.adj.crop, orientation, frameAspect]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
@@ -705,6 +709,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       escape,
       isCropping: () => cropRef.current !== null,
       cropSwap: () => cropRef.current && changeCrop(swapTool(cropRef.current, imageAspectRef.current || 1.5)),
+      cropOverlay: () => {
+        const t = cropRef.current;
+        if (!t) return;
+        const overlay = nextOverlay(t.overlay);
+        saveOverlay(overlay);
+        changeCrop({ ...t, overlay });
+      },
+      cropOverlayRotate: () => cropRef.current && changeCrop({ ...cropRef.current, overlayOrient: (cropRef.current.overlayOrient + 1) % 4 }),
+      cropReset: () => cropRef.current && changeCrop(resetTool(cropRef.current)),
       cropLock: () => cropRef.current && changeCrop(toggleLockTool(cropRef.current, imageAspectRef.current || 1.5)),
       lastCommitAt: editor.lastCommitAt,
       canRedo: editor.canRedo,
