@@ -861,16 +861,21 @@ impl DevelopCache {
             Some(e) => e,
             None => Arc::new(load_entry(src)?),
         };
-        let prepared = source::prepare(&entry.image, src.orientation(), &adjustments.crop, None, max_edge);
+        let geo = entry.geometry(adjustments);
+        let prepared = source::prepare_geo(&entry.image, src.orientation(), &geo, None, max_edge);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id).ok().flatten(),
             None => None,
         };
         let profile = entry.profile(&adjustments.profile);
-        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
         let input = entry.input(&prepared, &profile, src.id, pipeline::Quality::Preview, tone.as_ref());
-        let (local, _) = self.local_planes(&entry, src, adjustments, &input, None);
-        Ok(pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref()))
+        let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, None);
+        let mut image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        if let Some(c) = &prepared.coverage {
+            source::fill_outside_rgb8(&mut image.rgb, c);
+        }
+        Ok(image)
     }
 }
 
