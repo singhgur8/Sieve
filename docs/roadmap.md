@@ -253,6 +253,87 @@ under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origi
 
 ---
 
+## Phase 8d — User feedback round 3: review, editing feel, crop/upright, capture time (user request 2026-10-05)
+Runs on the user's Mac (CoreML available). **Test photos rule (user, 2026-10-05):** tests use only the provided
+sample sets — `Pictures/test RAWS` and `Pictures/Jasmit Natalie Proposal`, read-only, copied into `test-data/` before
+anything writes XMP or exports. Never point `SIEVE_CATALOG` at the live catalog, never open the user's live projects,
+never touch any other photo folder. Diagnosis of the live catalog was done on a read-only DB copy only.
+- [ ] **Contract v19** (architect): (a) per-photo capture time: catalog keeps original EXIF time + corrected time;
+  `edit_capture_time(ids, mode)` with modes shift-by-offset / set-exact / "sync cameras" (offset from a reference
+  pair) and undo; corrected time read from Lightroom sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated` in
+  XMP) and written back the same way; grid sort / bursts / scenes use the corrected time. (b) `get_image_metadata(id)`
+  for a per-photo info panel (file, capture time original + corrected, camera, lens, exposure, dims, size, GPS if
+  any, sidecar path). (c) Transform / Upright: `ParametricAdjustments` gains Lightroom Transform (Upright mode
+  off/auto/level/vertical/full/guided + guides, Vertical, Horizontal, Rotate, Aspect, Scale, Offset X/Y, Constrain
+  crop) with `crs:` mapping (`PerspectiveUpright`, `UprightVersion`, `UprightTransform_*`, `Perspective*`,
+  `UprightFocal*`, `UprightGuidedDependentDigest`…) and `auto_upright(id, mode)` returning the solved values.
+  (d) applied-preset tracking per photo (last applied preset id, cleared when a preset-owned key changes) so the
+  browser can highlight it; preview render with a temporary preset / with one panel group reset (no history entry).
+  (e) batch edit commands for an arbitrary selection: paste copied settings / sync to N ids as one undoable batch.
+  (f) reject strictness setting (conservative / balanced / aggressive) on the cull thresholds / project.
+  Migration; bindings; ipc-changelog.
+- [ ] **Auto-reject logic** (vision-ml-dev): on the user's 2,824-photo wedding shoot the engine suggested reject for
+  10 photos while the user rejected 1,025 (418 of those suggested *pick*); missed_focus / blink / burst duplicate tags
+  exist but don't become reject suggestions — the Phase 7b keeper calibration (keeper false-reject 0%) over-corrected.
+  Make tags with sufficient confidence suggest reject (burst non-keepers, closed eyes on the main subject, missed
+  focus, motion blur, badly under/over exposed), shoot-type aware; expose one "reject strictness" setting
+  (conservative / balanced / aggressive, default balanced). Calibrate only on the test sets (labels.json + the Jasmit
+  set's edited/starred keepers). Acceptance on held-out test frames: balanced suggests reject for ≥ 25% of non-keepers
+  with keeper false-reject ≤ 5%; numbers per strictness level in the Status Log; every reject has a reason.
+- [ ] **Capture time + per-photo info** (rust-engine-dev + frontend-dev, after contract): Library Metadata panel shows
+  the selected photo's date/time and EXIF (not only gallery facts); Edit Capture Time dialog (shift selection by
+  ±h/m/s, set exact, sync two cameras by picking one frame from each that happened at the same moment) — Lightroom's
+  "Edit Capture Time" equivalent; Lightroom-corrected times picked up from sidecars. Acceptance: fixture sidecar with
+  Lightroom-shifted DateTimeOriginal imports with the corrected time; shifting one camera by −1 h reorders a mixed
+  two-camera test set; exiftool shows the written time; undo restores; originals byte-identical.
+- [ ] **Loupe zoom like Lightroom** (frontend-dev): zoom level and relative position persist while moving with the
+  arrow keys (Loupe, Develop, Compare); Space / click zooms to the point under the cursor (not the centre); zoom
+  presets (Fit, Fill, 50/100/200/400%) in the toolbar + Navigator; drag to pan, smooth; low-res instantly then sharp
+  tile with no jump. Acceptance: Playwright — zoom at a corner, press Right 5×, still 100% at the same relative point;
+  Space at a cursor position zooms there.
+- [ ] **Develop editing feel** (frontend-dev; rust-engine-dev for render side): (1) slider value editable — click the
+  number to type, Up/Down ±1 step (Shift ×10, Alt fine) while a slider or value is focused/hovered, Enter commits,
+  Esc cancels, double-click label resets; (2) Cmd+C / Cmd+V (and Ctrl+C / Ctrl+V; Cmd+Shift+C keeps the dialog)
+  copy/paste all settings in Develop and in the Library/scenes selection (paste to every selected photo as one batch);
+  (3) generic **Auto** (photo analysis, `auto_tone` + Auto WB) always available in Basic, separate from "Auto (my
+  style)"; (4) press-and-hold the blue "changed" dot on a panel (Basic, Effects, Detail, …) shows the photo without
+  that panel's changes until released; (5) slider drag never stutters: input handled independently of rendering
+  (thumb follows pointer every frame), latest-wins progressive renders (small draft continuously during drag, full on
+  release), research how Lightroom does it and record in decisions.md. Acceptance: Playwright for each; drag test on a
+  real 33 MP ARW from the test set: pointer-to-thumb latency p95 < 20 ms, ≥ 15 renders shown per second of dragging,
+  measured before/after.
+- [ ] **Smooth switching between edited photos** (frontend-dev + rust-engine-dev): no flash of the unedited photo when
+  moving between photos in Develop / scenes — show the last rendered edited preview (cached per photo + edit hash)
+  until the new render lands, prerender neighbours; edited renders also used for Library grid / loupe / scenes
+  thumbnails so edits are visible outside Develop. Acceptance: Playwright on a slow mock: no frame shows the unedited
+  preview of an edited photo; Rust test: edited thumbnail regenerated after an edit.
+- [ ] **Presets: highlight + hover preview on the main image** (frontend-dev, after contract): the applied preset is
+  highlighted in the browser; hovering a preset previews it on the main image (not only the Navigator), reverting on
+  hover-out; nothing applied until click. Acceptance: Playwright — hover shows preview render, mouse-out restores,
+  click applies + highlights, changing a preset-owned slider clears the highlight.
+- [ ] **Apply to Scene / batch editing fixes** (vision-ml-dev + frontend-dev): Apply to Scene must carry every
+  setting of the representative (Effects — grain, clarity, vignette, dehaze — Detail, HSL, curves, colour grading,
+  calibration, profile, LUT, masks where meaningful) with only exposure / WB normalised per frame; today grain /
+  clarity etc. are dropped. Disabled Apply buttons say why in place (e.g. "Edit the representative first",
+  "No keepers in this scene") with a one-click fix; scenes view supports multi-select + Paste / Sync / "Edit all in
+  scene". Acceptance: Rust test — every non-normalised field of the representative equals the target after apply;
+  Playwright — every disabled Apply has a visible reason; paste to a selection of 5 in scenes edits all 5, one undo.
+- [ ] **Crop like Lightroom + Upright** (rust-engine-dev + frontend-dev + vision-ml-dev for line detection): fix
+  straighten over-cropping (crop after rotation must be the largest rectangle of the chosen aspect inside the rotated
+  frame, as Lightroom); Lightroom crop behaviour — drag corners/edges, drag inside to move image, drag outside to
+  rotate, aspect presets + lock (A), X swaps orientation; Lightroom keymap (R enter, Enter/R commit, Esc cancel, O cycles overlays, Shift+O rotates overlay), angle tool (draw along a horizon), Auto straighten,
+  Constrain to image, reset; Transform panel with Upright Auto / Level / Vertical / Full / Guided (vision line
+  detection) and manual sliders, rendered in preview + export, written to `crs:` so Lightroom matches. Acceptance:
+  Rust tests — rotation by θ keeps the max inscribed rect (area within 0.5% of the analytic value), Upright Level on a
+  synthetic tilted horizon ≤ 0.3°, Vertical corrects converging verticals on a synthetic building; vs Camera Raw on
+  ≥ 3 test frames with Lightroom Upright (if available in Jasmit XMPs) the angle within 0.5°; Playwright for crop
+  interactions + keys.
+- [ ] **UX review** (ux-designer): review the above in cull → edit (presets, scenes, crop, sliders, zoom); no open P0/P1.
+- [ ] **QA gate**: baseline + every acceptance above, on test-set copies only; live catalog untouched (mtime/size of
+  `~/Library/Application Support/com.sieve.app/catalog.sqlite` unchanged by the QA run).
+
+---
+
 ## Future phases (notes to revisit — not part of the autonomous run)
 
 ### Phase 9 — Reference-match grading ("make photo A look like photo B")
