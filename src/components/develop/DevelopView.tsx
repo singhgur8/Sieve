@@ -31,7 +31,7 @@ import { LeftPanel } from "./LeftPanel";
 import { SettingsFieldsDialog } from "./SettingsFieldsDialog";
 import { COPY_FIELDS_KEY, modifiedFields, PRESET_FIELDS_KEY, rememberedCopyFields } from "../../lib/fieldGroups";
 import { setPreviousPhoto, getPreviousPhoto, usePreviousPhoto } from "../../lib/previousPhoto";
-import { CropOverlay, constrainTool, newTool, refit, resetTool, swapTool, toggleLockTool, type CropTool, type Quad } from "./CropOverlay";
+import { CropOverlay, cropChanged, constrainTool, newTool, refit, resetTool, swapTool, toggleLockTool, type CropTool, type Quad } from "./CropOverlay";
 import { CropBar, type CropApi } from "./CropPanel";
 import { GuideOverlay } from "./GuideOverlay";
 import { useUpright } from "../../hooks/useUpright";
@@ -70,6 +70,8 @@ export interface DevelopHandle {
   /** Esc in Develop: cancel crop / picker, end the mask tool, deselect the mask, close the Masks panel; never leaves Develop. */
   escape: () => void;
   isCropping: () => boolean;
+  /** First Cmd+Z with uncommitted crop tool changes reverts the tool; true when it did. */
+  revertTool: () => boolean;
   cropSwap: () => void;
   cropLock: () => void;
   /** O: next crop guide overlay; Shift+O: rotate it; Cmd+Alt+R: reset the crop tool. */
@@ -327,7 +329,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     (t: CropTool | ((prev: CropTool) => CropTool)) =>
       setCropTool((prev) => {
         const next = typeof t === "function" ? (prev ? t(prev) : prev) : t;
-        return next ? constrainTool(next, frameAspectRef.current, orientationRef.current, quadRef.current) : next;
+        if (!next) return next;
+        const dirty = !!(prev?.dirty || (prev && cropChanged(prev, next)) || next.dirty);
+        return { ...constrainTool(next, frameAspectRef.current, orientationRef.current, quadRef.current), dirty };
       }),
     [],
   );
@@ -360,16 +364,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       clearTimeout(timer);
     };
   }, [cropOpen, id, transformKey, changeCrop]);
+  /** JSON of the stored crop the open tool was seeded from: a different stored crop means a change from outside the tool (R2-1). */
+  const toolBaseline = useRef("");
   const startCrop = useCallback(async (carry?: CropTool | null) => {
     if (id == null) return;
     let c = editor.adj.crop;
     let q: Quad | null = null;
-    if (editor.adj.transform.constrainCrop) {
+    const tf = editor.adj.transform;
+    const nonNeutral = tf.upright !== "off" || tf.vertical !== 0 || tf.horizontal !== 0 || tf.rotate !== 0 || tf.scale !== 100 || tf.offsetX !== 0 || tf.offsetY !== 0 || tf.aspect !== 0;
+    toolBaseline.current = JSON.stringify(editor.adj.crop);
+    if (tf.constrainCrop || nonNeutral) {
+      // Await the outline so the first visible frame is the fitted one (R1-3, R2-2).
       // The photo currently shows the auto-constrained crop: start from that rectangle (R1-3).
       try {
         const b = await unwrap(commands.getTransformBounds(id, editor.adj));
         q = b.validQuad;
-        if (q && b.constrainedCrop?.enabled) c = b.constrainedCrop;
+        if (q && tf.constrainCrop && b.constrainedCrop?.enabled) c = b.constrainedCrop;
       } catch {
         /* no outline: today's behaviour */
       }
@@ -397,6 +407,22 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setReopen(null);
     startCrop(reopen);
   }, [reopen, id, editor.loading, editor.info, frameAspect, startCrop]);
+  // R2-1: the stored crop changed from outside the tool (undo, History, reset, paste, preset, sync): re-seed it.
+  const storedCropKey = JSON.stringify(editor.adj.crop);
+  useEffect(() => {
+    const t = cropRef.current;
+    if (!t || editor.loading || storedCropKey === toolBaseline.current) return;
+    toolBaseline.current = storedCropKey;
+    void startCrop({ ...t, dirty: false });
+  }, [storedCropKey, editor.loading, startCrop]);
+  /** First Cmd+Z with uncommitted tool changes: back to the seed, history untouched (R2-1). */
+  const revertTool = useCallback(() => {
+    const t = cropRef.current;
+    if (!t?.dirty) return false;
+    void startCrop({ ...t, dirty: false });
+    onNotice("Crop changes undone");
+    return true;
+  }, [startCrop, onNotice]);
   const commitCrop = useCallback(() => {
     const t = cropRef.current;
     if (!t) {
@@ -406,6 +432,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     setCropTool(null);
     const next = isFull(t.rect) && t.angle === 0 ? { ...editor.defaults.crop } : toStored(t.rect, orientation, t.angle, frameAspect);
     if (JSON.stringify(next) === JSON.stringify(editor.adj.crop)) return; // nothing changed: no history entry
+    toolBaseline.current = JSON.stringify(next); // our own commit must not re-seed a tool
     editor.change((a) => ({ ...a, crop: next }), "Crop");
   }, [editor, orientation, frameAspect]);
   const cancelCrop = useCallback(() => {
@@ -456,7 +483,8 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       window.setTimeout(() => {
         if (carryRef.current === t) carryRef.current = null; // the exit was not a photo change
       }, 1500);
-      commitCrop();
+      if (t.dirty) commitCrop();
+      else setCropTool(null); // untouched (R2-2): navigating never edits the photo; the tool is still carried
     }
     await Promise.all([flushA(), flushB()]);
   }, [commitCrop, flushA, flushB]);
@@ -907,6 +935,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       },
       escape,
       isCropping: () => cropRef.current !== null,
+      revertTool,
       cropSwap: () => cropRef.current && changeCrop(swapTool(cropRef.current, imageAspectRef.current || 1.5)),
       cropOverlay: () => {
         const t = cropRef.current;
@@ -935,7 +964,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
     }),
-    [commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
+    [revertTool, commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );
 
   const box = frameBox(zoom, size, fw * zs, fh * zs, editor.main);

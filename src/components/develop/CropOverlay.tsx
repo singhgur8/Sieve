@@ -47,7 +47,13 @@ export interface CropTool {
   customRatio?: number;
   /** True while the angle is being dragged (slider, rotate-by-drag): the fine grid shows. */
   rotating?: boolean;
+  /** The user changed the crop since the tool was seeded (R2-2): only then does an implicit exit commit it. */
+  dirty?: boolean;
 }
+
+/** Did the user-meaningful crop state change (rect, angle, aspect, lock, constrain), ignoring transient flags and the overlay? */
+export const cropChanged = (a: CropTool, b: CropTool): boolean =>
+  JSON.stringify([a.rect, a.base, a.angle, a.aspect, a.flip, a.customRatio, a.constrain]) !== JSON.stringify([b.rect, b.base, b.angle, b.aspect, b.flip, b.customRatio, b.constrain]);
 
 /** Warped image outline (v19.3 `validQuad`): 4 points, fractions of the corrected frame, clockwise on screen. */
 export type Quad = [number, number][];

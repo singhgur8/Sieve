@@ -1160,7 +1160,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   }, [scenesOpen]);
 
   // ---- keyboard: one handler driven by the shared keymap ----
-  const LEAVES_CROP = ["stepCull", "stepEdit", "stepExport", "nextScene", "prevScene", "navH", "navV", "gridJump", "toggleLoupe", "devToLoupe", "toGrid", "escape", "develop", "compare", "filterBar", "gridLoupe", "export", "import"];
+  const LEAVES_CROP = ["stepCull", "stepEdit", "stepExport", "nextScene", "prevScene", "navH", "navV", "gridJump", "toggleLoupe", "devToLoupe", "toGrid", "escape", "develop", "compare", "filterBar", "gridLoupe", "export", "import", "saveXmp", "copy"];
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
     const inPlan = planOpen && projectId != null && step === "edit";
@@ -1365,6 +1365,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "undoAdj": {
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
+        if (d?.revertTool()) return; // uncommitted crop tool changes go first (R2-1)
         if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) {
           return wf.undoLast();
         }
