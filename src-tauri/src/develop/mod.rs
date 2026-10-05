@@ -39,6 +39,7 @@ pub mod parity;
 pub mod pipeline;
 pub mod presets;
 pub mod source;
+pub mod sync_delta;
 pub mod tone;
 mod tone_data;
 pub mod transform;

@@ -15,8 +15,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db::{now_ms, repo};
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    CaptureTimeEdit, CaptureTimeEditResult, CaptureTimeSnapshot, CaptureTimeSource, ImageId, ImageMetadata,
-    MAX_CAPTURE_TIME_MS, MIN_CAPTURE_TIME_MS,
+    CameraSyncScope, CaptureTimeEdit, CaptureTimeEditResult, CaptureTimeSnapshot, CaptureTimeSource, ImageId,
+    ImageMetadata, MAX_CAPTURE_TIME_MS, MIN_CAPTURE_TIME_MS,
 };
 
 /// `(captured_at_ms, exif_captured_at_ms, capture_time_source)` of image `id`; unknown ->
@@ -64,10 +64,56 @@ fn refresh_scene_bounds(conn: &Connection, ids: &[ImageId]) -> AppResult<()> {
     Ok(())
 }
 
+/// Every photo of image `target`'s project taken with its camera (v19.2 `CameraSyncScope`):
+/// `body` = same make + model + serial (blank = unknown, an unknown serial matches unknown
+/// serials only), `model` = same make + model. Capture order. `selected` -> `None`.
+pub fn camera_scope_ids(conn: &Connection, target: ImageId, scope: CameraSyncScope) -> AppResult<Option<Vec<ImageId>>> {
+    if scope == CameraSyncScope::Selected {
+        return Ok(None);
+    }
+    let serial = if scope == CameraSyncScope::Body {
+        "AND NULLIF(TRIM(i.camera_serial), '') IS NULLIF(TRIM(t.camera_serial), '')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT i.id FROM images t
+           JOIN folders tf ON tf.id = t.folder_id
+           JOIN images i ON i.folder_id IN (SELECT id FROM folders WHERE project_id IS tf.project_id)
+         WHERE t.id = ?1 AND i.camera_make = t.camera_make
+           AND NULLIF(TRIM(i.camera_model), '') IS NULLIF(TRIM(t.camera_model), '') {serial}
+         ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id"
+    );
+    let ids: Vec<ImageId> = conn.prepare(&sql)?.query_map([target], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        return Err(AppError::not_found(format!("image {target}")));
+    }
+    Ok(Some(ids))
+}
+
 /// `edit_capture_time`. Atomic: unknown id -> `not_found`; a duplicate id, a `set_exact`
-/// reference outside `ids`, a `sync_cameras` frame without a capture time, or a result outside
+/// reference outside `ids`, a `sync_cameras` frame without a capture time, a `body` / `model`
+/// sync whose reference is in the moved set, or a result outside
 /// [`MIN_CAPTURE_TIME_MS`]..=[`MAX_CAPTURE_TIME_MS`] -> `invalid_argument`; nothing written.
+/// `sync_cameras` with scope `body` / `model` ignores `ids` and moves
+/// [`camera_scope_ids`] instead.
 pub fn edit(conn: &mut Connection, ids: &[ImageId], mode: &CaptureTimeEdit) -> AppResult<CaptureTimeEditResult> {
+    if let CaptureTimeEdit::SyncCameras { reference_id, target_id, scope } = mode {
+        if let Some(scoped) = camera_scope_ids(conn, *target_id, *scope)? {
+            times_of(conn, *reference_id)?;
+            if scoped.contains(reference_id) {
+                return Err(AppError::invalid(
+                    "the reference photo is from the camera being moved; pick a frame from the other camera",
+                ));
+            }
+            let mode = CaptureTimeEdit::SyncCameras {
+                reference_id: *reference_id,
+                target_id: *target_id,
+                scope: CameraSyncScope::Selected,
+            };
+            return edit(conn, &scoped, &mode);
+        }
+    }
     for (i, id) in ids.iter().enumerate() {
         if ids[..i].contains(id) {
             return Err(AppError::invalid(format!("image {id} listed twice")));
@@ -89,7 +135,7 @@ pub fn edit(conn: &mut Connection, ids: &[ImageId], mode: &CaptureTimeEdit) -> A
                 .ok_or_else(|| AppError::invalid("the reference photo must be one of the selected photos"))?;
             cur.map(|c| captured_at_ms - c)
         }
-        CaptureTimeEdit::SyncCameras { reference_id, target_id } => {
+        CaptureTimeEdit::SyncCameras { reference_id, target_id, .. } => {
             let (r, _, _) = times_of(&tx, *reference_id)?;
             let (t, _, _) = times_of(&tx, *target_id)?;
             match (r, t) {
@@ -171,8 +217,9 @@ pub fn apply_sidecar_time(conn: &Connection, id: ImageId, sidecar_ms: Option<i64
 }
 
 /// The catalog part of `get_image_metadata`: everything except the values read from the file
-/// (`focalLength35mm`, `exposureCompensationEv`, `flashFired`, `cameraSerial`, `gps`), which
-/// stay `null` here (rust-engine-dev fills them from the file in the command).
+/// (`focalLength35mm`, `exposureCompensationEv`, `flashFired`, `gps`), which stay `null` here
+/// (the command fills them from the file). `cameraSerial` is the catalog's (v19.2), `null`
+/// until read; the command falls back to the file's.
 pub fn image_metadata(conn: &Connection, id: ImageId) -> AppResult<ImageMetadata> {
     let e = repo::get_image(conn, id)?;
     let path = Path::new(&e.path);
@@ -187,7 +234,7 @@ pub fn image_metadata(conn: &Connection, id: ImageId) -> AppResult<ImageMetadata
         captured_at_ms: e.capture.captured_at_ms,
         original_captured_at_ms: e.capture.original_captured_at_ms,
         capture_time_source: e.capture.capture_time_source,
-        camera: e.camera,
+        camera: e.camera.clone(),
         lens: e.capture.lens,
         iso: e.capture.iso,
         shutter_seconds: e.capture.shutter_seconds,
@@ -196,7 +243,7 @@ pub fn image_metadata(conn: &Connection, id: ImageId) -> AppResult<ImageMetadata
         focal_length_35mm: None,
         exposure_compensation_ev: None,
         flash_fired: None,
-        camera_serial: None,
+        camera_serial: e.camera.serial.clone(),
         width: e.width,
         height: e.height,
         orientation: e.orientation,
@@ -267,10 +314,19 @@ mod tests {
         assert_eq!(err.unwrap_err().kind, ErrorKind::InvalidArgument);
 
         // Sync cameras: the Canon (4) was 1 h ahead of the Sony frame 1 shot at the same moment.
-        let r = edit(&mut conn, &[4], &CaptureTimeEdit::SyncCameras { reference_id: 1, target_id: 4 }).unwrap();
+        let r = edit(
+            &mut conn,
+            &[4],
+            &CaptureTimeEdit::SyncCameras { reference_id: 1, target_id: 4, scope: CameraSyncScope::Selected },
+        )
+        .unwrap();
         assert_eq!(r.offset_ms, Some(15000 - 3615000));
         assert_eq!(time(&conn, 4).0, Some(15000));
-        let err = edit(&mut conn, &[4], &CaptureTimeEdit::SyncCameras { reference_id: 99, target_id: 4 });
+        let err = edit(
+            &mut conn,
+            &[4],
+            &CaptureTimeEdit::SyncCameras { reference_id: 99, target_id: 4, scope: CameraSyncScope::Selected },
+        );
         assert_eq!(err.unwrap_err().kind, ErrorKind::NotFound);
 
         // Revert goes back to the file's time.
@@ -369,5 +425,44 @@ mod tests {
         let e =
             crate::db::projects::set_project_reject_strictness(&conn, 9, crate::ipc::types::RejectStrictness::Balanced);
         assert_eq!(e.unwrap_err().kind, ErrorKind::NotFound);
+    }
+
+    /// v19.2 (UX P1-3 / P1-4): sync two bodies of the same model over the whole project.
+    #[test]
+    fn sync_cameras_by_body_or_model_moves_the_whole_project() {
+        let mut conn = setup();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, created_at) VALUES (1, 'a', 0), (2, 'b', 0);
+             UPDATE folders SET project_id = 1;
+             INSERT INTO folders (id, path, added_at, project_id) VALUES (2, '/g', 0, 2);
+             INSERT INTO images (id, folder_id, path, file_name, format, camera_make, sensor_layout,
+                                 file_size, file_mtime_ms, imported_at, captured_at_ms, exif_captured_at_ms)
+             VALUES (5, 1, '/f/e.ARW', 'e.ARW', 'arw', 'sony', 'bayer', 1, 0, 0, 3640000, 3640000),
+                    (6, 2, '/g/f.ARW', 'f.ARW', 'arw', 'sony', 'bayer', 1, 0, 0, 3650000, 3650000);
+             UPDATE images SET camera_model = 'ILCE-7M4' WHERE camera_make = 'sony';
+             UPDATE images SET camera_serial = 'A' WHERE id IN (1, 3);
+             UPDATE images SET camera_serial = 'B' WHERE id IN (2, 5, 6);",
+        )
+        .unwrap();
+        let sync = |reference_id, target_id, scope| CaptureTimeEdit::SyncCameras { reference_id, target_id, scope };
+        assert_eq!(camera_scope_ids(&conn, 2, CameraSyncScope::Body).unwrap(), Some(vec![2, 5]), "not project 2's");
+        assert_eq!(camera_scope_ids(&conn, 2, CameraSyncScope::Model).unwrap(), Some(vec![1, 2, 5, 3]));
+        assert_eq!(camera_scope_ids(&conn, 2, CameraSyncScope::Selected).unwrap(), None);
+        assert_eq!(camera_scope_ids(&conn, 99, CameraSyncScope::Body).unwrap_err().kind, ErrorKind::NotFound);
+
+        // Body B (2, 5) is 10 s behind body A: frame 2 and frame 1 were the same moment.
+        let r = edit(&mut conn, &[], &sync(1, 2, CameraSyncScope::Body)).unwrap();
+        assert_eq!((r.offset_ms, r.changed_ids.clone()), (Some(-10000), vec![2, 5]));
+        assert_eq!((time(&conn, 2).0, time(&conn, 5).0, time(&conn, 6).0), (Some(10000), Some(3630000), Some(3650000)));
+        assert_eq!(time(&conn, 1).0, Some(10000), "the reference body is untouched");
+        restore(&mut conn, &r.previous).unwrap();
+
+        // Model scope containing the reference: refused, nothing written.
+        let err = edit(&mut conn, &[], &sync(1, 2, CameraSyncScope::Model)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
+        assert_eq!(time(&conn, 2).0, Some(20000));
+        // Model scope for the Canon: every Canon frame of the project, `ids` ignored.
+        let r = edit(&mut conn, &[1, 2], &sync(1, 4, CameraSyncScope::Model)).unwrap();
+        assert_eq!((r.changed_ids, r.offset_ms), (vec![4], Some(10000 - 3615000)));
     }
 }

@@ -102,10 +102,16 @@ export const commands = {
 	 *  Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
 	 *  `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
 	 *  With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
-	 *  photos. Atomic; unknown ids -> `not_found`.
+	 *  photos. v19.2 `kinds` (`null` = all): copy only suggested picks / rejects / stars (see
+	 *  [`SuggestionKinds`]), e.g. `{picks: false, rejects: true, stars: false}` flags only the
+	 *  suggested rejects. Atomic; unknown ids -> `not_found`.
 	 *  For undo, take `get_cull_snapshot(ids)` first.
 	 */
-	applySuggestions: (ids: number[], onlyUnset: boolean) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset })),
+	applySuggestions: (ids: number[], onlyUnset: boolean, kinds: {
+	picks: boolean,
+	rejects: boolean,
+	stars: boolean,
+} | null) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset, kinds })),
 	/**
 	 *  Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
 	 *  edits). Atomic: an unknown id fails with `not_found`.
@@ -135,6 +141,12 @@ export const commands = {
 	extensions?: string[],
 	/**  Camera body (make + model) is one of these. */
 	cameras?: CameraFilter[],
+	/**
+	 *  v19.2: camera body (make + model + serial, `CameraBody`) is one of these; the per-body
+	 *  refinement of `cameras` (two ILCE-7M4 bodies are two entries). Values come from
+	 *  `MetadataFilterOptions.bodies`.
+	 */
+	bodies?: CameraBody[],
 	/**  Lens is one of these; `null` = lens unknown. */
 	lenses?: (string | null)[],
 	iso?: NumberRange | null,
@@ -239,6 +251,39 @@ export const commands = {
 	 *  (kind `paste`), like `paste_settings`.
 	 */
 	syncSettings: (sourceId: number, targetIds: number[], fields: AdjustmentField[]) => typedError<EditBatchResult, AppError>(__TAURI_INVOKE("sync_settings", { sourceId, targetIds, fields })),
+	/**
+	 *  Auto Sync (v19.2): commits the active photo's edit `before` -> `after` to `sourceId` (its
+	 *  stored settings become `after`) and the same change to every photo in `targetIds`, as one
+	 *  undoable batch of kind `sync` (`undo_edit_batch(result.batch.batchId)` reverts the source
+	 *  and all targets). Only the groups that differ between `before` and `after` are touched
+	 *  (never crop / masks / transform); `options.relative` groups (default exposure + white
+	 *  balance) are applied relatively, the others copied (see [`SyncDeltaOptions`]). In Auto
+	 *  Sync mode the UI commits through this command **instead of** `save_adjustments` (one
+	 *  call per committed edit). Duplicates and the source in `targetIds` are ignored. Resolving
+	 *  an `as_shot` white balance decodes that photo (cached by the develop cache). Atomic;
+	 *  unknown image -> `not_found`; invalid settings / options -> `invalid_argument`.
+	 */
+	syncDelta: (sourceId: number, before: ParametricAdjustments, after: ParametricAdjustments, targetIds: number[], options: {
+	/**
+	 *  Changed groups applied **relatively** (the source's change is added to each target's
+	 *  own value) instead of copied. Only `exposure` (EV added, clamped to -5..=5) and
+	 *  `white_balance` (temperature shifted in mireds, tint added, clamped to the slider
+	 *  ranges; an `as_shot` target is resolved to its camera as-shot values first) can be
+	 *  relative; anything else -> `invalid_argument`. Default both. `[]` = copy everything
+	 *  (Lightroom's Auto Sync).
+	 */
+	relative?: AdjustmentField[],
+	/**
+	 *  Only consider these groups (`null` = every group except the per-frame ones). Groups in
+	 *  [`SyncDeltaOptions::NEVER_SYNCED`] are never synced even when listed.
+	 */
+	fields?: AdjustmentField[] | null,
+	/**
+	 *  History label of the source's and the targets' entries (`null` = "Auto Sync"; 1..=100
+	 *  chars). The UI passes what it would pass to `save_adjustments` (e.g. "Exposure").
+	 */
+	label?: string | null,
+} | null) => typedError<SyncDeltaResult, AppError>(__TAURI_INVOKE("sync_delta", { sourceId, before, after, targetIds, options })),
 	/**  Resets `ids` to neutral adjustments ("Reset" history entry). Atomic. */
 	resetAdjustments: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("reset_adjustments", { ids })),
 	/**
@@ -891,7 +936,8 @@ export const commands = {
 	/**
 	 *  Lightroom's "Edit Capture Time" for `ids` (any selection): shift by an offset, set the
 	 *  active photo to an exact time (the others follow by the same offset), sync two cameras
-	 *  from a reference pair, or revert to the files' own time (see [`CaptureTimeEdit`]). The
+	 *  from a reference pair (v19.2: the selected photos, or every photo of the target's body /
+	 *  model in its project), or revert to the files' own time (see [`CaptureTimeEdit`]). The
 	 *  original EXIF time is kept (`CaptureMeta.originalCapturedAtMs`); the corrected time is
 	 *  what sorting, bursts, scenes, filters and export naming use, and is written to the
 	 *  sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated`; marks them dirty, notifies
@@ -909,9 +955,9 @@ export const commands = {
 	/**
 	 *  Everything the Library Metadata panel shows for photo `id`: file facts, original and
 	 *  corrected capture time, camera, lens, exposure, size, GPS, sidecar. Unknown id ->
-	 *  `not_found`. Body: architect (catalog values); rust-engine-dev adds the values read from
-	 *  the file (`gps`, `focalLength35mm`, `exposureCompensationEv`, `flashFired`,
-	 *  `cameraSerial`), which are `null` until then.
+	 *  `not_found`. Catalog values plus a few read from the file (`gps`, `focalLength35mm`,
+	 *  `exposureCompensationEv`, `flashFired`; `cameraSerial` from the catalog since v19.2, else
+	 *  the file).
 	 */
 	getImageMetadata: (id: number) => typedError<ImageMetadata, AppError>(__TAURI_INVOKE("get_image_metadata", { id })),
 	/**
@@ -1483,6 +1529,23 @@ export type BurstGroup = {
 };
 
 /**
+ *  One camera body (v19.2): make + model + body serial. `model = null` = model unknown,
+ *  `serial = null` = serial unknown (not read yet, or the file has none). Matches exactly
+ *  (a `null` field matches only photos where that value is unknown).
+ */
+export type CameraBody = {
+	make: CameraMake,
+	model: string | null,
+	serial: string | null,
+};
+
+/**  v19.2 `MetadataFilterOptions.bodies` entry. */
+export type CameraBodyCount = {
+	body: CameraBody,
+	count: number,
+};
+
+/**
  *  Calibration panel (`crs:RedHue` ... `crs:ShadowTint`), all -100..=100. Applied to the
  *  camera -> working-space matrix (primaries), before every other colour operation.
  */
@@ -1509,6 +1572,13 @@ export type CameraInfo = {
 	make: CameraMake,
 	model: string | null,
 	sensorLayout: SensorLayout,
+	/**
+	 *  v19.2: body serial number from EXIF (`BodySerialNumber`, else DNG `CameraSerialNumber`),
+	 *  read at import / thumbnail re-extraction and backfilled in the background for photos
+	 *  imported before v19.2 (`null` until then, or when the file has none). Tells two bodies
+	 *  of the same model apart (`CameraBody`, Edit Capture Time > sync cameras).
+	 */
+	serial?: string | null,
 };
 
 export type CameraMake = "sony" | "fujifilm" | "canon" | "other";
@@ -1528,6 +1598,18 @@ export type CameraProfileInfo = {
 	 */
 	styleId: number | null,
 };
+
+/**  Which photos `CaptureTimeEdit::SyncCameras` moves (v19.2). */
+export type CameraSyncScope = 
+/**  The `ids` passed to `edit_capture_time` (v19 behaviour; "The selected photos"). */
+"selected" | 
+/**
+ *  Every photo in the target's project from the target's body (make + model + serial;
+ *  an unknown serial matches photos of that model with an unknown serial).
+ */
+"body" | 
+/**  Every photo in the target's project from the target's make + model (any serial). */
+"model";
 
 /**
  *  EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
@@ -1576,11 +1658,15 @@ export type CaptureTimeEdit =
 { kind: "set_exact"; referenceId: number; capturedAtMs: number } | 
 /**
  *  Sync two cameras: `referenceId` (a frame of the camera with the right clock) and
- *  `targetId` (a frame of the other camera taken at the same moment); every photo in
- *  `ids` (the other camera's frames, normally including `targetId`) shifts by
- *  `reference - target`. Both need a capture time; they may be outside `ids`.
+ *  `targetId` (a frame of the other camera taken at the same moment); the photos of
+ *  `scope` shift by `reference - target`. Both need a capture time; they may be outside
+ *  `ids`. v19.2 `scope` (optional, default `selected` = the v19 behaviour): `selected`
+ *  moves `ids`; `body` / `model` move **every** photo of the target's project taken with
+ *  the target's body (make + model + serial) / model (make + model), whatever the grid
+ *  shows, and ignore `ids` (pass `[]`). With `body` / `model` the reference must not be
+ *  in that set (`invalid_argument`: same camera).
  */
-{ kind: "sync_cameras"; referenceId: number; targetId: number } | 
+{ kind: "sync_cameras"; referenceId: number; targetId: number; scope?: CameraSyncScope } | 
 /**
  *  "Revert capture time to original": back to the file's EXIF time
  *  (`originalCapturedAtMs`, source `exif`).
@@ -2062,7 +2148,12 @@ export type EditBatchKind =
  *  `paste_settings` / `sync_settings` / `paste_previous` (v19): Copy / Paste / Sync to
  *  an arbitrary selection.
  */
-"paste";
+"paste" | 
+/**
+ *  `sync_delta` (v19.2): one Auto Sync commit, the source photo's edit plus the same
+ *  change on every target.
+ */
+"sync";
 
 /**  An undoable multi-image edit (`undo_edit_batch`). */
 export type EditBatchResult = {
@@ -2461,6 +2552,14 @@ export type FilterCounts = {
 	burstNonKeepers: number,
 	/**  Images whose original is missing (`ImageQuery.missingOnly`; IPC v13). */
 	missing: number,
+	/**
+	 *  v19.2: pending suggestions (`ImageQuery.suggested`) in the counted images: reject /
+	 *  pick / stars only. Over a project without other constraints they equal
+	 *  `CullSummary.suggestedRejectPending` / `suggestedPickPending` / `suggestedRatingPending`.
+	 */
+	suggestedReject?: number,
+	suggestedPick?: number,
+	suggestedRating?: number,
 };
 
 export type FolderEntry = {
@@ -2690,6 +2789,14 @@ export type ImageQuery = {
 	keepersOnly?: boolean,
 	/**  Lightroom-style Library Filter "Metadata" constraints (v18; default: none). */
 	metadata?: MetadataFilter,
+	/**
+	 *  v19.2: only photos with a **pending** suggestion of this kind (`null` = no constraint):
+	 *  analysed, unflagged and 0 stars (what `apply_suggestions(onlyUnset = true)` would change),
+	 *  with `suggestedPick = reject` (`reject`), `pick` (`pick`), or no flag but
+	 *  `suggestedRating > 0` (`rating`). Counts: `CullSummary.suggested*Pending`,
+	 *  `FilterCounts.suggested*`.
+	 */
+	suggested?: PendingSuggestion | null,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -3338,6 +3445,12 @@ export type MetadataFilter = {
 	extensions?: string[],
 	/**  Camera body (make + model) is one of these. */
 	cameras?: CameraFilter[],
+	/**
+	 *  v19.2: camera body (make + model + serial, `CameraBody`) is one of these; the per-body
+	 *  refinement of `cameras` (two ILCE-7M4 bodies are two entries). Values come from
+	 *  `MetadataFilterOptions.bodies`.
+	 */
+	bodies?: CameraBody[],
 	/**  Lens is one of these; `null` = lens unknown. */
 	lenses?: (string | null)[],
 	iso?: NumberRange | null,
@@ -3368,6 +3481,12 @@ export type MetadataFilterOptions = {
 	formats: FormatCount[],
 	extensions: ExtensionCount[],
 	cameras: CameraCount[],
+	/**
+	 *  v19.2: per body (make + model + serial), ignoring `metadata.bodies`; ordered like
+	 *  `cameras`, then by serial (unknown serial last). Label a body with its serial's last
+	 *  digits when two entries share make + model.
+	 */
+	bodies?: CameraBodyCount[],
 	lenses: LensCount[],
 	isos: NumberCount[],
 	/**  Rounded to 0.1 mm. */
@@ -3610,6 +3729,15 @@ export type ParametricCurve = {
 	midtoneSplit: number,
 	highlightSplit: number,
 };
+
+/**  Kind of a pending culling suggestion (v19.2, `ImageQuery.suggested`). */
+export type PendingSuggestion = 
+/**  Sieve suggests reject. */
+"reject" | 
+/**  Sieve suggests pick. */
+"pick" | 
+/**  No flag suggested, but stars (`suggestedRating > 0`). */
+"rating";
 
 /**  Body parts of an AI "People" selection (Lightroom's list; empty = entire person). */
 export type PersonPart = "face_skin" | "body_skin" | "eyebrows" | "eye_sclera" | "iris_pupil" | "lips" | "teeth" | "hair" | "clothes";
@@ -4569,6 +4697,18 @@ export type StyleValidation = {
 };
 
 /**
+ *  Which suggestions `apply_suggestions` copies (v19.2; `null` = all). A suggested `pick` flag
+ *  is copied with `picks`, a suggested `reject` with `rejects`, a suggested "no flag" (which
+ *  clears a flag, only possible with `onlyUnset = false`) only with both; `suggestedRating`
+ *  is copied with `stars`. Anything not selected stays as it is.
+ */
+export type SuggestionKinds = {
+	picks: boolean,
+	rejects: boolean,
+	stars: boolean,
+};
+
+/**
  *  One human-readable reason behind a suggestion (v18), e.g.
  *  `{kind: "blink", text: "Eyes closed"}` or
  *  `{kind: "duplicate_burst", text: "Duplicate in burst (keeper DSC0123)", relatedImageId: 42}`.
@@ -4598,6 +4738,52 @@ export type SuggestionReasonKind =
 "low_score" | 
 /**  Anything else (the text says what). */
 "other";
+
+/**  Options of `sync_delta` (v19.2; `null` = defaults). */
+export type SyncDeltaOptions = {
+	/**
+	 *  Changed groups applied **relatively** (the source's change is added to each target's
+	 *  own value) instead of copied. Only `exposure` (EV added, clamped to -5..=5) and
+	 *  `white_balance` (temperature shifted in mireds, tint added, clamped to the slider
+	 *  ranges; an `as_shot` target is resolved to its camera as-shot values first) can be
+	 *  relative; anything else -> `invalid_argument`. Default both. `[]` = copy everything
+	 *  (Lightroom's Auto Sync).
+	 */
+	relative?: AdjustmentField[],
+	/**
+	 *  Only consider these groups (`null` = every group except the per-frame ones). Groups in
+	 *  [`SyncDeltaOptions::NEVER_SYNCED`] are never synced even when listed.
+	 */
+	fields?: AdjustmentField[] | null,
+	/**
+	 *  History label of the source's and the targets' entries (`null` = "Auto Sync"; 1..=100
+	 *  chars). The UI passes what it would pass to `save_adjustments` (e.g. "Exposure").
+	 */
+	label?: string | null,
+};
+
+/**  Result of `sync_delta` (v19.2). */
+export type SyncDeltaResult = {
+	/**
+	 *  One batch (kind `sync`) holding the source's edit and every changed target; `batchId =
+	 *  null` when nothing changed. `undo_edit_batch(batch.batchId)` reverts all of them.
+	 */
+	batch: EditBatchResult,
+	/**
+	 *  The groups that differed between `before` and `after` and were synced (in
+	 *  `AdjustmentField` order); empty = nothing to sync.
+	 */
+	fields: AdjustmentField[],
+	/**  Of `fields`, those applied relatively. */
+	relativeFields: AdjustmentField[],
+	/**
+	 *  Targets whose white balance was copied absolutely because their (or the source's)
+	 *  as-shot white balance could not be resolved (file missing / unreadable).
+	 */
+	absoluteWbIds: number[],
+	/**  The source's history after the commit (as `save_adjustments` returns it). */
+	history: AdjustmentHistory,
+};
 
 export type TagCount = {
 	tag: CullTag,

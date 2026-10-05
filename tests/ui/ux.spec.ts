@@ -195,7 +195,7 @@ test.describe("P0-2 apply suggestions", () => {
     await page.keyboard.press("Enter"); // Enter confirms
     await expect(dlg).toHaveCount(0);
     const [call] = await calls(page, "apply_suggestions");
-    expect(call.args).toEqual({ ids: [2, 3, 4, 5, 6], onlyUnset: true });
+    expect(call.args).toEqual({ ids: [2, 3, 4, 5, 6], onlyUnset: true, kinds: null });
     await expect(page.getByTestId("notice")).toContainText("Applied suggestions to 4 of 5 photos (1 skipped)");
     expect(await rating(page, 6)).toBe("1"); // the manual rating survived
     const after = await page.evaluate(() =>

@@ -193,4 +193,23 @@ mod tests {
         eprintln!("{arw:?}\n{raf:?}\n{cr3:?}");
         assert!(cr3.focal_length_35mm.is_some() || cr3.camera_serial.is_some());
     }
+
+    /// v19.2: the ingest path (`raw::extract` -> `ImageMeta.serial`) finds the same serials
+    /// (read-only, the user's sample RAWs when present).
+    #[test]
+    #[ignore = "needs ~/Pictures/Jasmit Natalie Proposal"]
+    fn extraction_serial_matches_real_files() {
+        let dir =
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Pictures/Jasmit Natalie Proposal/10060918");
+        let mut buf = Vec::new();
+        let serial = |name: &str, buf: &mut Vec<u8>| {
+            let p = dir.join(name);
+            let f = crate::raw::format_from_extension(&p).unwrap();
+            crate::raw::extract(&p, f, buf).unwrap().meta.serial
+        };
+        assert_eq!(serial("AZA06414.ARW", &mut buf).as_deref(), Some("06258214"));
+        assert_eq!(serial("DSCF5910.RAF", &mut buf).as_deref(), Some("61000657"));
+        let cr3 = serial("IMG_5592.CR3", &mut buf);
+        assert_eq!(cr3, read(&dir.join("IMG_5592.CR3")).camera_serial, "CR3: {cr3:?}");
+    }
 }

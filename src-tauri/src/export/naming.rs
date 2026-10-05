@@ -214,6 +214,7 @@ mod tests {
                 make: CameraMake::Sony,
                 model: Some("ILCE-7M4".into()),
                 sensor_layout: SensorLayout::Bayer,
+                serial: None,
             },
             capture: CaptureMeta { captured_at_ms: Some(1_718_461_353_450), ..Default::default() },
             width: None,
