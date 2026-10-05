@@ -16,9 +16,12 @@ use rusqlite::{Connection, TransactionBehavior};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_specta::Event;
 
-use super::bursts::{add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts};
+use super::bursts::{
+    add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts, reject_if_clearly_worse,
+};
+use super::scoring::score_with;
 use super::store::{self, BurstRow};
-use super::{score, AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
+use super::{AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
 use crate::db::{self, now_ms, projects, repo};
 use crate::ingest::Ingest;
 use crate::ipc::error::{AppError, AppResult};
@@ -289,6 +292,7 @@ fn run_queue(
 
         // Each image is scored with its project's shoot type (IPC v14).
         let mut shoot = ShootTypes::default();
+        let strictness = store::reject_strictness(conn)?;
         for (id, _) in &batch {
             shoot.of_image(conn, *id)?;
         }
@@ -312,7 +316,7 @@ fn run_queue(
                 let recorded = match out.result {
                     Ok(metrics) => {
                         let (shoot_type, thresholds) = shoot.of_image(conn, out.id)?;
-                        let scored = score(&metrics, &thresholds, shoot_type);
+                        let scored = score_with(&metrics, &thresholds, shoot_type, strictness);
                         let recorded = store::record_measured(conn, out.id, &metrics, &scored)?;
                         if recorded {
                             stats.analyzed += 1;
@@ -367,6 +371,8 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let conn: &Connection = &tx;
     let mut shoot = ShootTypes::default();
+    let strictness = store::reject_strictness(conn)?;
+    let burst_rule = strictness.rules().burst;
     let window: u32 = conn
         .query_row("SELECT value FROM catalog_meta WHERE key = 'burst_window_ms'", [], |r| r.get::<_, String>(0))?
         .parse()
@@ -375,7 +381,7 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let mut scored = Vec::with_capacity(analyzed.len());
     for a in &analyzed {
         let (shoot_type, thresholds) = shoot.of_folder(conn, a.folder_id, a.id)?;
-        scored.push(score(&a.metrics, &thresholds, shoot_type));
+        scored.push(score_with(&a.metrics, &thresholds, shoot_type, strictness));
     }
 
     let mut by_folder: BTreeMap<i64, Vec<(BurstFrame, usize)>> = BTreeMap::new();
@@ -407,8 +413,14 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
                 annotate_soft_face(q, best_face);
                 if m != b.keeper {
                     demote(q, keeper.suggested_rating);
+                    let rejected = reject_if_clearly_worse(q, &keeper, burst_rule);
                     let reason = duplicate_reason(q, &keeper, b.keeper, &keeper_name, pinned);
-                    add_reason(q, reason);
+                    if rejected {
+                        // What made it a reject comes first.
+                        q.reasons.insert(0, reason);
+                    } else {
+                        add_reason(q, reason);
+                    }
                 }
             }
             rows.push(BurstRow {
@@ -494,7 +506,7 @@ mod tests {
     use super::*;
     use crate::ipc::types::{ShootType, SuggestionReason, SuggestionReasonKind};
     use crate::ml::scoring::tests::{face, metrics};
-    use crate::ml::MODEL_VERSION;
+    use crate::ml::{score, MODEL_VERSION};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -634,6 +646,48 @@ mod tests {
             .unwrap();
         rescore_all(&mut db::open(&config.catalog_path).unwrap()).unwrap();
         assert!((overall(3) - wedding).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rescore_rejects_clearly_worse_burst_frames_per_strictness() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 3, &[]);
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        repo::set_shoot_type(&conn, ShootType::Wedding).unwrap();
+        // One burst: 2 is the sharp keeper, 1 has a clearly softer face (still above the
+        // missed-focus threshold), 3 is nearly as good as the keeper.
+        let mut m1 = metrics(vec![face(0.4, 0.15, 0.55, 0.28)]);
+        m1.phash = 0xFFFF_0000;
+        let mut m2 = metrics(vec![face(0.4, 0.15, 0.8, 0.28)]);
+        m2.phash = 0xFFFF_0001;
+        let mut m3 = metrics(vec![face(0.4, 0.15, 0.78, 0.28)]);
+        m3.phash = 0xFFFF_0003;
+        for (id, m) in [(1, &m1), (2, &m2), (3, &m3)] {
+            store_metrics(&conn, id, m);
+        }
+        let pick = |conn: &Connection, id: i64| -> String {
+            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        // Default (balanced): the clearly softer frame is a reject, its burst reason first.
+        assert_eq!(store::reject_strictness(&conn).unwrap(), crate::ml::scoring::RejectStrictness::Balanced);
+        rescore_all(&mut conn).unwrap();
+        assert_eq!(repo::list_burst_groups(&conn, None).unwrap()[0].keeper_image_id, Some(2));
+        assert_eq!(pick(&conn, 1), "reject");
+        let r = reasons_of(&conn, 1);
+        assert_eq!((r[0].kind, r[0].related_image_id), (SuggestionReasonKind::DuplicateBurst, Some(2)));
+        assert_eq!(r[0].text, "Similar to 2 in this burst \u{2014} that one is sharper");
+        assert_eq!(pick(&conn, 3), "unflagged", "a near-equal frame stays a candidate");
+        assert_eq!(pick(&conn, 2), "pick");
+        // Conservative: burst frames are never rejected for being worse duplicates.
+        conn.execute(
+            "INSERT INTO catalog_meta (key, value) VALUES (?1, 'conservative')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [store::REJECT_STRICTNESS_KEY],
+        )
+        .unwrap();
+        rescore_all(&mut conn).unwrap();
+        assert_eq!(pick(&conn, 1), "unflagged");
+        assert_eq!(reasons_of(&conn, 1)[0].kind, SuggestionReasonKind::DuplicateBurst);
     }
 
     #[test]

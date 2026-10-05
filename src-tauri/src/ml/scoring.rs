@@ -26,10 +26,14 @@
 //!   at the clip point), never merely a bright scene or white sky.
 //!
 //! Suggestions (validated against a photographer's own cull with
-//! `examples/keeper_eval.rs`): reject only for hard, trustworthy defects (missed focus
-//! with nothing sharp in the frame, exposure beyond recovery, stacked defects); other
-//! defects lower the stars and withhold `pick`. Burst non-keepers are capped below the
-//! keeper by `bursts::demote`, never rejected for being duplicates.
+//! `examples/keeper_eval.rs`): which defects reject depends on [`RejectStrictness`]
+//! (`Conservative` = only defects beyond recovery; `Balanced`, the default, adds clear
+//! missed focus / motion blur, closed eyes on the main subject, badly exposed frames;
+//! `Aggressive` every focus / motion / blink defect); other defects lower the stars and
+//! withhold `pick`. Burst non-keepers are capped below the keeper by `bursts::demote` and
+//! rejected only when the burst's best frame is clearly better
+//! (`bursts::reject_if_clearly_worse`, not `Conservative`). Every reject leads with the
+//! reason that made it one.
 
 use super::{AutoTag, FaceMetrics, ImageMetrics, Scored, MODEL_VERSION};
 use crate::ipc::types::{
@@ -95,6 +99,116 @@ pub const GROSS_DARK_LUMA: f32 = 0.04;
 /// detail elsewhere may be deliberate (ring shots, foreground focus) or still a moment
 /// the photographer keeps: tag + lowest stars, never an automatic reject.
 pub const SEVERE_GLOBAL_MARGIN: f32 = 0.05;
+
+/// How readily confident defects become a suggested reject (Phase 8d). `Conservative` is
+/// the Phase 7b behaviour (only defects beyond recovery); `Balanced` (default) also rejects
+/// clear missed focus / motion blur, closed eyes on the main subject, badly exposed frames
+/// and burst frames whose best frame is clearly better; `Aggressive` rejects every
+/// focus / motion / blink defect and smaller burst gaps. Calibration: `docs/decisions.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RejectStrictness {
+    Conservative,
+    #[default]
+    Balanced,
+    Aggressive,
+}
+
+/// Burst non-keepers are rejected when the burst's best frame is clearly better in one of
+/// these (and has no focus / blink defect itself): eyes more open, primary face sharper,
+/// or a higher overall score, each by at least the given gap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BurstReject {
+    pub eyes_gap: f32,
+    pub face_sharpness_gap: f32,
+    pub overall_gap: f32,
+}
+
+/// Which closed-eye frames are rejected (only where eyes matter: not Landscape / Sports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlinkReject {
+    Never,
+    /// Closed eyes without a laughing mouth (candid laughs are often keepers).
+    NotLaughing,
+    Any,
+}
+
+/// Reject thresholds of one strictness level. Sharpness limits are relative to the shoot
+/// type's `globalSharpnessMin` / `faceSharpnessMin`, so Sports / Landscape scale with them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RejectRules {
+    /// `missed_focus` rejects when global sharpness < `globalSharpnessMin` + this
+    /// (`f32::INFINITY` = always).
+    pub focus_global_margin: f32,
+    /// ... or the primary face's sharpness < `faceSharpnessMin` + this.
+    pub focus_face_margin: f32,
+    /// `motion_blur` rejects when global sharpness < `globalSharpnessMin` + this (not in
+    /// Sports below `Aggressive`: panning blur is often deliberate there).
+    pub motion_global_margin: f32,
+    pub blink: BlinkReject,
+    /// Mean luma below this rejects (too dark to rescue).
+    pub dark_luma: f32,
+    /// Share of a subject face's skin blown at or above which the frame is rejected.
+    pub face_blown: f32,
+    /// Share of the frame blown at or above which the frame is rejected.
+    pub frame_blown: f32,
+    /// `overall` below max(this, `rejectMaxOverall`) rejects (stacked weaknesses).
+    pub low_overall: f32,
+    pub burst: Option<BurstReject>,
+}
+
+impl RejectStrictness {
+    pub const ALL: [RejectStrictness; 3] = [Self::Conservative, Self::Balanced, Self::Aggressive];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Balanced => "balanced",
+            Self::Aggressive => "aggressive",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+
+    pub fn rules(self) -> RejectRules {
+        match self {
+            Self::Conservative => RejectRules {
+                focus_global_margin: -SEVERE_GLOBAL_MARGIN,
+                focus_face_margin: f32::NEG_INFINITY,
+                motion_global_margin: f32::NEG_INFINITY,
+                blink: BlinkReject::Never,
+                dark_luma: GROSS_DARK_LUMA,
+                face_blown: GROSS_FACE_BLOWN,
+                frame_blown: GROSS_FRAME_BLOWN,
+                low_overall: 0.0,
+                burst: None,
+            },
+            Self::Balanced => RejectRules {
+                focus_global_margin: 0.0,
+                focus_face_margin: -0.28,
+                motion_global_margin: 0.05,
+                blink: BlinkReject::NotLaughing,
+                dark_luma: 0.08,
+                face_blown: 0.35,
+                frame_blown: 0.7,
+                low_overall: 0.2,
+                burst: Some(BurstReject { eyes_gap: 0.3, face_sharpness_gap: 0.15, overall_gap: 0.2 }),
+            },
+            Self::Aggressive => RejectRules {
+                focus_global_margin: f32::INFINITY,
+                focus_face_margin: f32::INFINITY,
+                motion_global_margin: f32::INFINITY,
+                blink: BlinkReject::Any,
+                dark_luma: 0.1,
+                face_blown: 0.25,
+                frame_blown: OVER_FRAME_BLOWN,
+                low_overall: 0.3,
+                burst: Some(BurstReject { eyes_gap: 0.15, face_sharpness_gap: 0.08, overall_gap: 0.1 }),
+            },
+        }
+    }
+}
 
 /// Eye openness 0..=1 from the EAR of the more-open eye: 0.45 at the blink threshold,
 /// 1.0 at 1.6x the threshold.
@@ -227,7 +341,13 @@ pub fn ev_text(mean_luma: f32) -> String {
     }
 }
 
+/// [`score_with`] at the default strictness.
 pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Scored {
+    score_with(m, t, shoot_type, RejectStrictness::default())
+}
+
+pub fn score_with(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType, strictness: RejectStrictness) -> Scored {
+    let rules = strictness.rules();
     let n = m.faces.len();
     let considered: Vec<bool> =
         m.faces.iter().map(|f| f.bbox.height >= t.min_face_size && f.detection_score >= MIN_CONSIDER_SCORE).collect();
@@ -423,17 +543,39 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
     // Suggestions. Exposure problems (often intentional low key) only withhold `pick`.
     let badly_exposed = tags.iter().any(|t| matches!(t.tag, CullTag::Underexposed | CullTag::Overexposed));
     let defect = missed_focus.is_some() || (!blinking.is_empty() && eyes_matter);
-    // Suggested reject only on strong, trustworthy signals (see `docs/decisions.md`):
-    // - missed focus with nothing sharp in the frame (soft faces in an otherwise crisp
-    //   frame may be deliberate, and photographers keep soft moments: lowest stars instead);
-    // - exposure beyond recovery.
-    // A blink lowers the stars but never rejects on its own: closed eyes cannot be told
-    // apart from a lowered, smiling gaze with certainty in a single still.
+    // Suggested reject on confident defects, as far as the strictness allows (see
+    // `RejectStrictness` and `docs/decisions.md`):
+    // - missed focus with the whole frame soft (soft faces in an otherwise crisp frame may
+    //   be deliberate, e.g. ring shots), or a very soft primary face;
+    // - motion blur on a soft frame (not in Sports below `Aggressive`);
+    // - closed eyes on the main subject where eyes matter (laughing blinks only `Aggressive`);
+    // - too dark / blown out;
+    // - stacked weaknesses (low `overall`).
+    // Burst non-keepers are handled in `bursts::reject_if_clearly_worse`.
     let severe_focus = missed_focus.is_some() && m.global_sharpness < t.global_sharpness_min - SEVERE_GLOBAL_MARGIN;
-    let gross_exposure =
-        e.mean_luma < GROSS_DARK_LUMA || m.highlights.blown >= GROSS_FRAME_BLOWN || face_blown >= GROSS_FACE_BLOWN;
-    let hard_reject = severe_focus || gross_exposure;
-    let suggested_pick = if hard_reject || overall < t.reject_max_overall {
+    let focus_reject = missed_focus.is_some()
+        && (m.global_sharpness < t.global_sharpness_min + rules.focus_global_margin
+            || (face_focus && face_sharpness.is_some_and(|s| s < t.face_sharpness_min + rules.focus_face_margin)));
+    let motion_ok_here = !matches!(shoot_type, ShootType::Sports) || strictness == RejectStrictness::Aggressive;
+    let motion_reject =
+        motion && motion_ok_here && m.global_sharpness < t.global_sharpness_min + rules.motion_global_margin;
+    let blink_matters = eyes_matter && !matches!(shoot_type, ShootType::Sports);
+    let blink_reject = blink_matters
+        && !blinking.is_empty()
+        && match rules.blink {
+            BlinkReject::Never => false,
+            BlinkReject::NotLaughing => !laughing,
+            BlinkReject::Any => true,
+        };
+    let gross_dark = e.mean_luma < GROSS_DARK_LUMA;
+    let gross_exposure = gross_dark || m.highlights.blown >= GROSS_FRAME_BLOWN || face_blown >= GROSS_FACE_BLOWN;
+    let dark_reject = e.mean_luma < rules.dark_luma.max(GROSS_DARK_LUMA);
+    let face_blown_reject = face_blown >= rules.face_blown.min(GROSS_FACE_BLOWN);
+    let frame_blown_reject = m.highlights.blown >= rules.frame_blown.min(GROSS_FRAME_BLOWN);
+    let exposure_reject = gross_exposure || dark_reject || face_blown_reject || frame_blown_reject;
+    let low_reject = overall < t.reject_max_overall.max(rules.low_overall);
+    let hard_reject = severe_focus || focus_reject || motion_reject || blink_reject || exposure_reject;
+    let suggested_pick = if hard_reject || low_reject {
         PickFlag::Reject
     } else if !defect && !badly_exposed && overall >= t.pick_min_overall {
         PickFlag::Pick
@@ -460,15 +602,18 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         rs.push((rank, SuggestionReason { kind, text, related_image_id: None }))
     };
     if missed_focus.is_some() {
-        let text = match (face_focus, severe_focus) {
+        // "Nothing sharp" when the soft whole frame is what rejects it.
+        let frame_soft =
+            severe_focus || (focus_reject && m.global_sharpness < t.global_sharpness_min + rules.focus_global_margin);
+        let text = match (face_focus, frame_soft) {
             (true, false) => FACE_SOFT.to_string(),
             (true, true) => format!("{FACE_SOFT} and nothing else in the frame is sharp"),
             (false, false) => "Whole frame is soft".to_string(),
             (false, true) => "Out of focus: nothing in the frame is sharp".to_string(),
         };
-        push(if severe_focus { 0 } else { 1 }, SuggestionReasonKind::MissedFocus, text);
+        push(if severe_focus || focus_reject { 0 } else { 1 }, SuggestionReasonKind::MissedFocus, text);
         if motion {
-            push(2, SuggestionReasonKind::MotionBlur, "Motion blur".to_string());
+            push(if motion_reject { 0 } else { 2 }, SuggestionReasonKind::MotionBlur, "Motion blur".to_string());
         }
     }
     if !blinking.is_empty() {
@@ -480,10 +625,16 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         if laughing {
             text.push_str(" (laughing)");
         }
-        push(if eyes_matter { 3 } else { 7 }, SuggestionReasonKind::Blink, text);
+        let rank = if blink_reject {
+            0
+        } else if eyes_matter {
+            3
+        } else {
+            7
+        };
+        push(rank, SuggestionReasonKind::Blink, text);
     }
     let tagged = |tag: CullTag| tags.iter().any(|a| a.tag == tag);
-    let gross_dark = e.mean_luma < GROSS_DARK_LUMA;
     if tagged(CullTag::Underexposed) || gross_dark {
         let text = if gross_dark {
             format!("Far too dark to recover ({})", ev_text(e.mean_luma))
@@ -492,7 +643,7 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         } else {
             format!("Underexposed ({}% of the frame is pure black)", pct(e.clipped_shadows_pct))
         };
-        push(if gross_dark { 0 } else { 4 }, SuggestionReasonKind::Underexposed, text);
+        push(if dark_reject { 0 } else { 4 }, SuggestionReasonKind::Underexposed, text);
     }
     let gross_face = face_blown >= GROSS_FACE_BLOWN;
     let gross_frame = m.highlights.blown >= GROSS_FRAME_BLOWN;
@@ -506,6 +657,7 @@ pub fn score(m: &ImageMetrics, t: &CullThresholds, shoot_type: ShootType) -> Sco
         } else {
             (4, format!("Overexposed ({}% of the frame is blown out)", pct(m.highlights.blown)))
         };
+        let rank = if face_blown_reject || frame_blown_reject { 0 } else { rank };
         push(rank, SuggestionReasonKind::Overexposed, text);
     }
     let explained = defect || badly_exposed || gross_exposure;
@@ -632,15 +784,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn blink_lowers_stars_but_never_rejects() {
+    fn conservative_blink_lowers_stars_but_never_rejects() {
         let t = default_thresholds(W);
-        let s = score(&metrics(vec![face(0.4, 0.15, 0.7, 0.05)]), &t, W);
+        let c = RejectStrictness::Conservative;
+        let s = score_with(&metrics(vec![face(0.4, 0.15, 0.7, 0.05)]), &t, W, c);
         assert!(has(&s, CullTag::Blink));
         assert_eq!(s.quality.suggested_pick, PickFlag::Unflagged);
         assert!(s.quality.suggested_rating <= BLINK_MAX_STARS);
         let mut laughing = face(0.4, 0.15, 0.7, 0.05);
         laughing.mouth_open = Some(0.4);
-        let s = score(&metrics(vec![laughing]), &t, W);
+        let s = score_with(&metrics(vec![laughing]), &t, W, c);
         assert!(has(&s, CullTag::Blink));
         assert_ne!(s.quality.suggested_pick, PickFlag::Reject);
         assert!((1..=LAUGH_BLINK_MAX_STARS).contains(&s.quality.suggested_rating));
@@ -756,13 +909,144 @@ pub(crate) mod tests {
     fn exposure_tags() {
         let t = default_thresholds(W);
         let mut m = metrics(vec![]);
-        m.exposure.mean_luma = 0.05;
+        m.exposure.mean_luma = 0.1;
         let s = score(&m, &t, W);
         assert!(has(&s, CullTag::Underexposed));
         assert!(!s.quality.overall.is_nan());
         assert_ne!(s.quality.suggested_pick, PickFlag::Reject, "dark is often intentional");
         m.exposure.mean_luma = GROSS_DARK_LUMA / 2.0;
         assert_eq!(score(&m, &t, W).quality.suggested_pick, PickFlag::Reject);
+    }
+
+    #[test]
+    fn dark_and_blown_rejects_follow_strictness() {
+        let t = default_thresholds(W);
+        let pick = |m: &ImageMetrics, s: RejectStrictness| score_with(m, &t, W, s).quality.suggested_pick;
+        use RejectStrictness::*;
+        let mut m = metrics(vec![]);
+        m.exposure.mean_luma = 0.07; // about -4.5 EV
+        assert_ne!(pick(&m, Conservative), PickFlag::Reject);
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+        let s = score_with(&m, &t, W, Balanced);
+        assert_eq!(s.quality.reasons[0].kind, SuggestionReasonKind::Underexposed);
+        m.exposure.mean_luma = 0.09;
+        assert_ne!(pick(&m, Balanced), PickFlag::Reject);
+        assert_eq!(pick(&m, Aggressive), PickFlag::Reject);
+        // Blown skin: 40% rejects from balanced, 30% only when aggressive.
+        let mut blown = face(0.4, 0.15, 0.7, 0.28);
+        blown.blown = 0.4;
+        let m = metrics(vec![blown.clone()]);
+        assert_ne!(pick(&m, Conservative), PickFlag::Reject);
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+        assert_eq!(score_with(&m, &t, W, Balanced).quality.reasons[0].kind, SuggestionReasonKind::Overexposed);
+        blown.blown = 0.3;
+        let m = metrics(vec![blown]);
+        assert_ne!(pick(&m, Balanced), PickFlag::Reject);
+        assert_eq!(pick(&m, Aggressive), PickFlag::Reject);
+    }
+
+    #[test]
+    fn focus_and_motion_rejects_follow_strictness() {
+        let t = default_thresholds(W);
+        use RejectStrictness::*;
+        let pick = |m: &ImageMetrics, s: RejectStrictness| score_with(m, &t, W, s).quality.suggested_pick;
+        // Soft face, whole frame just below the sharp-frame threshold: balanced rejects.
+        let mut m = metrics(vec![face(0.4, 0.15, 0.3, 0.28)]);
+        m.global_sharpness = t.global_sharpness_min - 0.02;
+        assert_ne!(pick(&m, Conservative), PickFlag::Reject);
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+        let s = score_with(&m, &t, W, Balanced);
+        assert_eq!(s.quality.reasons[0].text, "Face is soft and nothing else in the frame is sharp");
+        // Soft face in a crisp frame (ring shot, foreground focus): only aggressive.
+        let m = metrics(vec![face(0.4, 0.15, 0.3, 0.28)]);
+        assert_ne!(pick(&m, Balanced), PickFlag::Reject);
+        assert_eq!(pick(&m, Aggressive), PickFlag::Reject);
+        // ... unless the face is hopelessly soft.
+        let m = metrics(vec![face(0.4, 0.15, t.face_sharpness_min - 0.3, 0.28)]);
+        assert_eq!(pick(&m, Balanced), PickFlag::Reject);
+        assert_eq!(score_with(&m, &t, W, Balanced).quality.reasons[0].text, FACE_SOFT);
+        // Motion blur on a soft-ish frame: balanced rejects, motion reason first.
+        let mut moving = face(0.4, 0.15, 0.3, 0.28);
+        moving.anisotropy = 0.5;
+        let mut m = metrics(vec![moving]);
+        m.global_sharpness = t.global_sharpness_min + 0.03;
+        let s = score_with(&m, &t, W, Balanced);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(s.quality.reasons[0].kind, SuggestionReasonKind::MotionBlur);
+        assert_ne!(pick(&m, Conservative), PickFlag::Reject);
+        // Sports: panning blur is often deliberate; only aggressive rejects it.
+        let sp = ShootType::Sports;
+        let ts = default_thresholds(sp);
+        let mut moving = face(0.4, 0.15, 0.3, 0.28);
+        moving.anisotropy = 0.5;
+        let mut m = metrics(vec![moving]);
+        m.global_sharpness = ts.global_sharpness_min + 0.03;
+        let s = score_with(&m, &ts, sp, Balanced);
+        assert!(has(&s, CullTag::MotionBlur));
+        assert_ne!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(score_with(&m, &ts, sp, Aggressive).quality.suggested_pick, PickFlag::Reject);
+    }
+
+    #[test]
+    fn blink_rejects_follow_strictness_and_shoot_type() {
+        use RejectStrictness::*;
+        let closed = face(0.4, 0.15, 0.7, 0.05);
+        let mut laughing = closed.clone();
+        laughing.mouth_open = Some(0.4);
+        for st in [ShootType::Wedding, ShootType::Portrait, ShootType::Event, ShootType::General] {
+            let t = default_thresholds(st);
+            let s = score_with(&metrics(vec![closed.clone()]), &t, st, Balanced);
+            assert!(has(&s, CullTag::Blink), "{st:?}");
+            assert_eq!(s.quality.suggested_pick, PickFlag::Reject, "{st:?}");
+            assert_eq!(s.quality.suggested_rating, 0);
+            assert_eq!(s.quality.reasons[0].kind, SuggestionReasonKind::Blink);
+            // Candid laugh with closed eyes: kept unless aggressive.
+            let s = score_with(&metrics(vec![laughing.clone()]), &t, st, Balanced);
+            assert!(has(&s, CullTag::Blink));
+            assert_ne!(s.quality.suggested_pick, PickFlag::Reject, "{st:?}");
+            let s = score_with(&metrics(vec![laughing.clone()]), &t, st, Aggressive);
+            assert_eq!(s.quality.suggested_pick, PickFlag::Reject, "{st:?}");
+        }
+        // Eyes do not decide in Sports / Landscape.
+        for st in [ShootType::Sports, ShootType::Landscape] {
+            let t = default_thresholds(st);
+            let s = score_with(&metrics(vec![closed.clone()]), &t, st, Aggressive);
+            assert_ne!(s.quality.suggested_pick, PickFlag::Reject, "{st:?}");
+        }
+        // A downcast gaze (undetermined eyes) is never a blink reject, even aggressive.
+        let mut down = closed.clone();
+        down.mouth_width = Some(0.55);
+        let s = score_with(&metrics(vec![down]), &default_thresholds(W), W, Aggressive);
+        assert_ne!(s.quality.suggested_pick, PickFlag::Reject);
+    }
+
+    #[test]
+    fn conservative_matches_phase_7b_and_strictness_round_trips() {
+        assert_eq!(RejectStrictness::default(), RejectStrictness::Balanced);
+        for s in RejectStrictness::ALL {
+            assert_eq!(RejectStrictness::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(RejectStrictness::parse("strict"), None);
+        // Strictness only ever adds rejects: every conservative reject is a balanced one and
+        // every balanced reject an aggressive one.
+        let t = default_thresholds(W);
+        for sharp in [0.1, 0.25, 0.4, 0.6] {
+            for global in [0.2, 0.42, 0.48, 0.7] {
+                for luma in [0.03, 0.07, 0.09, 0.4] {
+                    for ear in [0.05, 0.28] {
+                        let mut m = metrics(vec![face(0.4, 0.15, sharp, ear)]);
+                        m.global_sharpness = global;
+                        m.exposure.mean_luma = luma;
+                        let p: Vec<bool> = RejectStrictness::ALL
+                            .iter()
+                            .map(|&s| score_with(&m, &t, W, s).quality.suggested_pick == PickFlag::Reject)
+                            .collect();
+                        assert!(!p[0] || p[1], "{m:?}");
+                        assert!(!p[1] || p[2], "{m:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -843,7 +1127,12 @@ pub(crate) mod tests {
         // No faces: the whole frame decides.
         let mut m = metrics(vec![]);
         m.global_sharpness = t.global_sharpness_min - 0.01;
-        assert_eq!(text_of(&score(&m, &t, W), SuggestionReasonKind::MissedFocus), "Whole frame is soft");
+        let c = score_with(&m, &t, W, RejectStrictness::Conservative);
+        assert_eq!(text_of(&c, SuggestionReasonKind::MissedFocus), "Whole frame is soft");
+        // Balanced rejects a frame that soft, and says so.
+        let s = score(&m, &t, W);
+        assert_eq!(s.quality.suggested_pick, PickFlag::Reject);
+        assert_eq!(text_of(&s, SuggestionReasonKind::MissedFocus), "Out of focus: nothing in the frame is sharp");
         m.global_sharpness = 0.05;
         assert_eq!(
             text_of(&score(&m, &t, W), SuggestionReasonKind::MissedFocus),
@@ -1006,27 +1295,29 @@ pub(crate) mod tests {
                                     m.highlights.blown = blown;
                                     m.tiles.anisotropy = aniso;
                                     m.tiles.p50 = p50;
-                                    let s = score(&m, &t, st);
-                                    n += 1;
-                                    let q = &s.quality;
-                                    if q.suggested_pick != PickFlag::Pick {
-                                        assert!(!q.reasons.is_empty(), "{st:?} {m:?} -> {q:?}");
+                                    for strictness in RejectStrictness::ALL {
+                                        let s = score_with(&m, &t, st, strictness);
+                                        n += 1;
+                                        let q = &s.quality;
+                                        if q.suggested_pick != PickFlag::Pick {
+                                            assert!(!q.reasons.is_empty(), "{st:?} {m:?} -> {q:?}");
+                                        }
+                                        if q.suggested_pick == PickFlag::Reject {
+                                            rejects += 1;
+                                            assert_ne!(q.reasons[0].kind, SuggestionReasonKind::CreativeBlur, "{q:?}");
+                                        }
+                                        if q.suggested_pick == PickFlag::Unflagged {
+                                            unflagged += 1;
+                                        }
+                                        for tag in &s.tags {
+                                            assert!(
+                                                q.reasons.iter().any(|r| r.kind == tag_kind(tag.tag)),
+                                                "tag {:?} without reason: {q:?}",
+                                                tag.tag
+                                            );
+                                        }
+                                        assert!(q.reasons.iter().all(|r| !r.text.is_empty() && !r.text.ends_with('.')));
                                     }
-                                    if q.suggested_pick == PickFlag::Reject {
-                                        rejects += 1;
-                                        assert_ne!(q.reasons[0].kind, SuggestionReasonKind::CreativeBlur, "{q:?}");
-                                    }
-                                    if q.suggested_pick == PickFlag::Unflagged {
-                                        unflagged += 1;
-                                    }
-                                    for tag in &s.tags {
-                                        assert!(
-                                            q.reasons.iter().any(|r| r.kind == tag_kind(tag.tag)),
-                                            "tag {:?} without reason: {q:?}",
-                                            tag.tag
-                                        );
-                                    }
-                                    assert!(q.reasons.iter().all(|r| !r.text.is_empty() && !r.text.ends_with('.')));
                                 }
                             }
                         }

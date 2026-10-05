@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+use super::scoring::RejectStrictness;
 use super::{AutoTag, ImageMetrics, Scored, MODEL_VERSION};
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
@@ -212,6 +213,19 @@ pub fn set_auto_tags(tx: &Transaction, id: ImageId, tags: &[AutoTag], keep: &[Cu
         }
     }
     Ok(())
+}
+
+/// `catalog_meta` key of the reject strictness (`conservative` / `balanced` /
+/// `aggressive`). Until the IPC setting (contract v19) lands this is the only place that
+/// decides it: point this function at the setting's storage and both scoring paths follow.
+pub const REJECT_STRICTNESS_KEY: &str = "reject_strictness";
+
+/// Reject strictness for scoring; missing or unknown values give the default (`balanced`).
+pub fn reject_strictness(conn: &Connection) -> AppResult<RejectStrictness> {
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM catalog_meta WHERE key = ?1", [REJECT_STRICTNESS_KEY], |r| r.get(0))
+        .optional()?;
+    Ok(v.as_deref().and_then(RejectStrictness::parse).unwrap_or_default())
 }
 
 /// One analyzed image for the rescore pass.

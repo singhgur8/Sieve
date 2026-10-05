@@ -10,6 +10,7 @@
 //!                      from another MODEL_VERSION are re-measured); default: rescore only
 //!   --shoot TYPE       shoot type (default wedding)
 //!   --thresholds JSON  partial CullThresholds override
+//!   --strictness LEVEL reject strictness: conservative | balanced (default) | aggressive
 //!   --fit-share F      share of the shoot (by capture time) used for fitting (default 0.6)
 //!   --list TAG|reject-keeper   print held-out frames with that tag / keepers suggested reject
 //! ```
@@ -27,9 +28,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sieve_lib::db::{self, repo};
+use sieve_lib::db::{self, projects, repo};
 use sieve_lib::ipc::events::{AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady};
 use sieve_lib::ipc::types::{CullThresholds, ShootType};
+use sieve_lib::ml::scoring::RejectStrictness;
+use sieve_lib::ml::store;
 use sieve_lib::ml::worker::{self, AnalysisSink};
 use sieve_lib::ml::AnalysisConfig;
 
@@ -273,6 +276,20 @@ fn main() {
     }
     let mut conn = db::open(&copy).unwrap();
     repo::set_shoot_type(&conn, shoot).unwrap();
+    // Ingest puts each folder in a project (default shoot type `general`) and images are
+    // scored with their project's shoot type, so set it there too.
+    for p in projects::list_projects(&conn).unwrap() {
+        projects::set_project_shoot_type(&conn, p.id, shoot).unwrap();
+    }
+    if let Some(level) = arg(&args, "--strictness") {
+        let level = RejectStrictness::parse(&level).expect("conservative | balanced | aggressive");
+        conn.execute(
+            "INSERT INTO catalog_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [store::REJECT_STRICTNESS_KEY, level.as_str()],
+        )
+        .unwrap();
+    }
+    println!("reject strictness: {}", store::reject_strictness(&conn).unwrap().as_str());
     if let Some(json) = arg(&args, "--thresholds") {
         let mut v = serde_json::to_value(repo::cull_thresholds(&conn, shoot).unwrap()).unwrap();
         let patch: serde_json::Value = serde_json::from_str(&json).expect("thresholds JSON");

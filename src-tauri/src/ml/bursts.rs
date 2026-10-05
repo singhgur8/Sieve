@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use super::imgproc::hamming;
-use super::scoring::FACE_SOFT;
+use super::scoring::{BurstReject, FACE_SOFT};
 use super::{Burst, BurstFrame};
 use crate::ipc::types::{ImageId, PickFlag, QualityScore, SuggestionReason, SuggestionReasonKind};
 
@@ -55,13 +55,44 @@ pub fn apply_pins(burst: &mut Burst, pins: &HashSet<ImageId>, overall: impl Fn(I
 /// Lowers a burst non-keeper's suggestions: never a pick, and at most one star below the
 /// keeper (`keeper_rating`). It is *not* rejected for being a duplicate: photographers
 /// often keep several frames of a moment (on a real proposal shoot 38% of burst
-/// non-keepers were kept), so only its own hard defects can make it a reject.
-/// `duplicate_burst` stays a tag for filtering / collapsing.
+/// non-keepers were kept), so only its own defects or a clearly better best frame
+/// ([`reject_if_clearly_worse`]) can make it a reject. `duplicate_burst` stays a tag for
+/// filtering / collapsing.
 pub fn demote(q: &mut QualityScore, keeper_rating: u8) {
     if q.suggested_pick == PickFlag::Pick {
         q.suggested_pick = PickFlag::Unflagged;
     }
     q.suggested_rating = q.suggested_rating.min(keeper_rating.saturating_sub(1));
+}
+
+/// Rejects a burst non-keeper (after [`demote`]) when the strictness allows burst rejects
+/// (`rule`) and the burst's best frame is clearly better: eyes more open, primary face
+/// sharper or a higher overall score by at least the rule's gap. Never when the best frame
+/// has a focus / motion / blink defect itself or is a reject (then "best" means little).
+/// Returns whether this call made it a reject (its duplicate reason then leads).
+pub fn reject_if_clearly_worse(q: &mut QualityScore, keeper: &QualityScore, rule: Option<BurstReject>) -> bool {
+    let Some(rule) = rule else { return false };
+    if q.suggested_pick == PickFlag::Reject || keeper.suggested_pick == PickFlag::Reject {
+        return false;
+    }
+    let keeper_defect = keeper.reasons.iter().any(|r| {
+        matches!(
+            r.kind,
+            SuggestionReasonKind::MissedFocus | SuggestionReasonKind::MotionBlur | SuggestionReasonKind::Blink
+        )
+    });
+    if keeper_defect {
+        return false;
+    }
+    let gap = |k: Option<f32>, m: Option<f32>| k.zip(m).map(|(k, m)| k - m);
+    let clearly = gap(keeper.eyes_open, q.eyes_open).is_some_and(|d| d >= rule.eyes_gap)
+        || gap(keeper.face_sharpness, q.face_sharpness).is_some_and(|d| d >= rule.face_sharpness_gap)
+        || keeper.overall - q.overall >= rule.overall_gap;
+    if clearly {
+        q.suggested_pick = PickFlag::Reject;
+        q.suggested_rating = 0;
+    }
+    clearly
 }
 
 /// Sharpness gap (0..=1 metric) above which "that one is sharper" is said.
@@ -255,6 +286,46 @@ mod tests {
         q.reasons = vec![reason(K::LowScore, "Very low overall score"), reason(K::CreativeBlur, "Shallow")];
         add_reason(&mut q, dup());
         assert_eq!(order(&q), vec![K::LowScore, K::DuplicateBurst, K::CreativeBlur]);
+    }
+
+    #[test]
+    fn burst_rejects_only_when_the_best_frame_is_clearly_better() {
+        use crate::ml::scoring::RejectStrictness;
+        let balanced = RejectStrictness::Balanced.rules().burst;
+        let keeper = quality(0.9, Some(0.7), 0.8, Some(1.0));
+        // Close frames of one moment: kept as candidates (photographers keep several).
+        let mut close = quality(0.85, Some(0.65), 0.8, Some(0.95));
+        assert!(!reject_if_clearly_worse(&mut close, &keeper, balanced));
+        assert_eq!(close.suggested_pick, PickFlag::Unflagged);
+        // Eyes much less open than in the best frame.
+        let mut eyes = quality(0.8, Some(0.7), 0.8, Some(0.6));
+        assert!(reject_if_clearly_worse(&mut eyes, &keeper, balanced));
+        assert_eq!((eyes.suggested_pick, eyes.suggested_rating), (PickFlag::Reject, 0));
+        // Face clearly softer.
+        let mut soft = quality(0.8, Some(0.5), 0.8, Some(1.0));
+        assert!(reject_if_clearly_worse(&mut soft, &keeper, balanced));
+        // Much lower overall score.
+        let mut low = quality(0.65, None, 0.8, None);
+        assert!(reject_if_clearly_worse(&mut low, &keeper, balanced));
+        // Conservative never rejects for the burst; aggressive takes smaller gaps.
+        let mut c = quality(0.5, Some(0.2), 0.8, Some(0.2));
+        assert!(!reject_if_clearly_worse(&mut c, &keeper, RejectStrictness::Conservative.rules().burst));
+        let mut a = quality(0.78, Some(0.6), 0.8, Some(1.0));
+        assert!(!reject_if_clearly_worse(&mut a.clone(), &keeper, balanced));
+        assert!(reject_if_clearly_worse(&mut a, &keeper, RejectStrictness::Aggressive.rules().burst));
+        // A best frame with its own focus / blink defect, or a reject, proves nothing.
+        let mut flawed = keeper.clone();
+        flawed.reasons = vec![reason(SuggestionReasonKind::MissedFocus, FACE_SOFT)];
+        let mut m = quality(0.5, Some(0.2), 0.8, Some(0.2));
+        assert!(!reject_if_clearly_worse(&mut m, &flawed, balanced));
+        let mut rejected = keeper.clone();
+        rejected.suggested_pick = PickFlag::Reject;
+        assert!(!reject_if_clearly_worse(&mut m, &rejected, balanced));
+        assert_eq!(m.suggested_pick, PickFlag::Unflagged);
+        // Already a reject on its own: unchanged, not attributed to the burst.
+        let mut own = quality(0.2, Some(0.1), 0.3, None);
+        own.suggested_pick = PickFlag::Reject;
+        assert!(!reject_if_clearly_worse(&mut own, &keeper, balanced));
     }
 
     #[test]
