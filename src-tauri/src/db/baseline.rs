@@ -407,6 +407,10 @@ pub fn run_by_id(conn: &Connection, id: BaselineRunId, worker_running: bool) -> 
         },
         None => None,
     };
+    let live = live_counts(conn, id)?;
+    if batch.as_ref().is_some_and(|b| b.undone_at_ms.is_some()) {
+        message = Some(undone_message(&live));
+    }
     Ok(BaselineRun {
         id,
         project_id,
@@ -419,6 +423,7 @@ pub fn run_by_id(conn: &Connection, id: BaselineRunId, worker_running: bool) -> 
         anchor: anchor.map(|a| serde_json::from_str(&a)).transpose()?,
         counts: counts.map(|c| serde_json::from_str(&c)).transpose()?.unwrap_or_default(),
         batch,
+        live,
     })
 }
 
@@ -430,13 +435,16 @@ pub fn results(
     outcomes: Option<&[BaselineOutcome]>,
 ) -> AppResult<Vec<BaselinePhotoResult>> {
     projects::require_project(conn, project_id)?;
-    let mut stmt = conn.prepare(
-        "SELECT r.image_id, r.outcome, r.reasons_json, r.scene_id, r.burst_group_id, r.auto_json, r.light_json
-           FROM baseline_results r JOIN baseline_runs b ON b.id = r.run_id
-           JOIN images i ON i.id = r.image_id
-          WHERE b.project_id = ?1
-          ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.image_id, r.outcome, r.reasons_json, r.scene_id, r.burst_group_id, r.auto_json, r.light_json,
+                    p.image_id IS NOT NULL, {ON_BASELINE_SQL}, {UNDONE_SQL}
+               FROM baseline_results r JOIN baseline_runs run ON run.id = r.run_id
+               JOIN images i ON i.id = r.image_id
+               LEFT JOIN baseline_provenance p ON p.image_id = r.image_id AND p.run_id = r.run_id
+               {STATE_JOINS}
+              WHERE run.project_id = ?1
+              ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id"
+    ))?;
     let rows = stmt.query_map([project_id], |r| {
         Ok((
             r.get::<_, ImageId>(0)?,
@@ -446,11 +454,12 @@ pub fn results(
             r.get::<_, Option<BurstGroupId>>(4)?,
             r.get::<_, Option<String>>(5)?,
             r.get::<_, Option<String>>(6)?,
+            r.get::<_, bool>(7)?.then_some((r.get::<_, bool>(8)?, r.get::<_, bool>(9)?)),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (image_id, outcome, reasons, scene_id, burst_group_id, auto, light) = row?;
+        let (image_id, outcome, reasons, scene_id, burst_group_id, auto, light, state) = row?;
         let outcome = BaselineOutcome::parse(&outcome).unwrap_or(BaselineOutcome::Failed);
         if outcomes.is_some_and(|o| !o.is_empty() && !o.contains(&outcome)) {
             continue;
@@ -463,13 +472,130 @@ pub fn results(
             burst_group_id,
             auto: auto.map(|a| serde_json::from_str(&a)).transpose()?,
             light: light.map(|a| serde_json::from_str(&a)).transpose()?,
+            state: state.map(|(on, undone)| state_of(on, undone)),
         });
     }
     Ok(out)
 }
 
+/// `BaselineRun.live` of run `run_id` (v21.1).
+pub fn live_counts(conn: &Connection, run_id: BaselineRunId) -> AppResult<BaselineLiveCounts> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {ON_BASELINE_SQL}, {UNDONE_SQL}, p.flagged AND bi.review_reason IS NOT NULL AND bi.reviewed_at IS NULL
+           FROM baseline_provenance p {STATE_JOINS}
+          WHERE p.run_id = ?1"
+    ))?;
+    let rows = stmt.query_map([run_id], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?, r.get::<_, bool>(2)?)))?;
+    let mut c = BaselineLiveCounts::default();
+    for row in rows {
+        let (on, undone, look) = row?;
+        c.written += 1;
+        match state_of(on, undone) {
+            BaselineState::OnBaseline => {
+                c.on_baseline += 1;
+                c.needs_look += u32::from(look);
+            }
+            BaselineState::UserEdited => c.user_edited += 1,
+            BaselineState::Undone => c.undone += 1,
+        }
+    }
+    Ok(c)
+}
+
+/// The run message after its batch was undone (v21.1).
+pub fn undone_message(live: &BaselineLiveCounts) -> String {
+    let photos = |n: u32| if n == 1 { "1 photo".to_owned() } else { format!("{n} photos") };
+    match live.user_edited {
+        0 => "Undone: the photos are back to how they were".to_owned(),
+        1 => format!("Undone on {}; 1 photo you changed since was kept", photos(live.undone)),
+        n => format!("Undone on {}; {n} photos you changed since were kept", photos(live.undone)),
+    }
+}
+
+/// The anchor of `project_id`'s baseline while its latest run is finished and its batch not
+/// undone (v21.1; the scene whose representative it is reads `on_baseline`).
+pub fn live_anchor(conn: &Connection, project_id: ProjectId) -> AppResult<Option<ImageId>> {
+    Ok(conn
+        .query_row(
+            "SELECT r.anchor_id FROM baseline_runs r JOIN edit_batches b ON b.id = r.batch_id
+              WHERE r.id = (SELECT MAX(id) FROM baseline_runs WHERE project_id = ?1)
+                AND r.state = 'finished' AND b.undone_at IS NULL",
+            [project_id],
+            |r| r.get::<_, Option<ImageId>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The anchor of the live baseline of the project scene `scene_id` belongs to ([`live_anchor`]).
+pub fn live_anchor_of_scene(conn: &Connection, scene_id: SceneId) -> AppResult<Option<ImageId>> {
+    let project: Option<Option<ProjectId>> = conn
+        .query_row(
+            "SELECT f.project_id FROM images i JOIN folders f ON f.id = i.folder_id WHERE i.scene_id = ?1 LIMIT 1",
+            [scene_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match project.flatten() {
+        Some(p) => live_anchor(conn, p),
+        None => Ok(None),
+    }
+}
+
+/// `EditPlan.baseline` (v21.1) of `project_id` given its keepers and their edit states:
+/// `None` unless the latest run finished with a batch that is not undone.
+pub fn plan_baseline(
+    conn: &Connection,
+    project_id: ProjectId,
+    keeper_states: &[ImageEditState],
+) -> AppResult<Option<EditPlanBaseline>> {
+    let Some(run) = get_run(conn, project_id, false)? else { return Ok(None) };
+    let Some(batch) = run.batch.filter(|b| b.undone_at_ms.is_none()) else { return Ok(None) };
+    if run.state != BaselineRunState::Finished {
+        return Ok(None);
+    }
+    let on: Vec<&ImageEditState> = keeper_states.iter().filter(|s| s.edit_source == EditSource::Baseline).collect();
+    let keeper_ids: Vec<ImageId> = keeper_states.iter().map(|s| s.image_id).collect();
+    let edited_since = provenance(conn, &keeper_ids)?
+        .iter()
+        .filter(|p| p.run_id == run.id && p.state == BaselineState::UserEdited)
+        .count();
+    Ok(Some(EditPlanBaseline {
+        run_id: run.id,
+        batch,
+        anchor_id: run.settings.anchor_id,
+        preset_id: run.settings.preset_id,
+        keepers: keeper_states.len() as u32,
+        on_baseline: on.len() as u32,
+        needs_look: on.iter().filter(|s| s.needs_review).count() as u32,
+        edited_since: edited_since as u32,
+    }))
+}
+
+/// SQL joins over `baseline_provenance p` for [`ON_BASELINE_SQL`] / [`UNDONE_SQL`].
+const STATE_JOINS: &str = "LEFT JOIN adjustments a ON a.image_id = p.image_id
+               LEFT JOIN adjustment_history h ON h.id = a.history_entry_id
+               LEFT JOIN edit_batches b ON b.id = p.batch_id
+               LEFT JOIN edit_batch_items bi ON bi.batch_id = p.batch_id AND bi.image_id = p.image_id";
+/// The photo's cursor is the entry the baseline wrote ([`BaselineState::OnBaseline`]).
+const ON_BASELINE_SQL: &str = "COALESCE(a.history_entry_id = p.history_entry_id AND h.batch_id = p.batch_id, 0)";
+/// The batch was undone and did not keep this photo (v21.1 `keepLaterEdits` stamps
+/// `kept_at`): [`BaselineState::Undone`] unless on the baseline.
+const UNDONE_SQL: &str = "(b.undone_at IS NOT NULL AND bi.kept_at IS NULL)";
+
+fn state_of(on: bool, undone: bool) -> BaselineState {
+    if on {
+        BaselineState::OnBaseline
+    } else if undone {
+        BaselineState::Undone
+    } else {
+        BaselineState::UserEdited
+    }
+}
+
 /// Provenance of `ids` (given order; photos never written by a baseline are omitted). Unknown
-/// image -> `not_found`.
+/// image -> `not_found`. v21.1: photos `undo_edit_batch(…, {keepLaterEdits})` kept read
+/// `user_edited`.
 pub fn provenance(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<BaselineProvenance>> {
     let mut by_id: HashMap<ImageId, BaselineProvenance> = HashMap::new();
     for &id in ids {
@@ -485,13 +611,10 @@ pub fn provenance(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<BaselineP
         let ph = vec!["?"; chunk.len()].join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT p.image_id, p.run_id, p.batch_id, r.anchor_id, r.preset_id, p.applied_at, p.flagged,
-                    COALESCE(a.history_entry_id = p.history_entry_id AND h.batch_id = p.batch_id, 0),
-                    b.undone_at IS NOT NULL
+                    {ON_BASELINE_SQL}, {UNDONE_SQL}
                FROM baseline_provenance p
                JOIN baseline_runs r ON r.id = p.run_id
-               LEFT JOIN adjustments a ON a.image_id = p.image_id
-               LEFT JOIN adjustment_history h ON h.id = a.history_entry_id
-               LEFT JOIN edit_batches b ON b.id = p.batch_id
+               {STATE_JOINS}
               WHERE p.image_id IN ({ph})"
         ))?;
         let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
@@ -505,13 +628,7 @@ pub fn provenance(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<BaselineP
                 preset_id: r.get(4)?,
                 applied_at_ms: r.get(5)?,
                 flagged: r.get(6)?,
-                state: if on {
-                    BaselineState::OnBaseline
-                } else if undone {
-                    BaselineState::Undone
-                } else {
-                    BaselineState::UserEdited
-                },
+                state: state_of(on, undone),
             })
         })?;
         for row in rows {
@@ -566,6 +683,7 @@ mod tests {
                 burst_group_id: None,
                 auto: None,
                 light: None,
+                state: None,
             },
             adjustments: writes.then_some(adj),
         }

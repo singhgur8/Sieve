@@ -197,37 +197,49 @@ impl LightMeter for DevelopMeter {
 
     fn measure(&self, photo: &PhotoInput, look: &ParametricAdjustments) -> AppResult<LightMeasurement> {
         let was_decoded = self.cache.is_decoded(photo.image_id);
-        let result = (|| {
-            let adj = measured_settings(photo, look);
-            let faces = super::auto::resolve_faces(&self.cache, &photo.src, photo.faces.clone());
-            let a = super::auto::auto_light(&self.cache, &photo.src, &adj, faces.as_deref())?;
-            let (wb, wb_fallback) = match a.white_balance {
-                Some(wb) => (wb, false),
-                None => match self.as_shot(photo) {
-                    Ok(wb) => (wb, true),
-                    Err(_) => return Err(AppError::invalid("could not estimate a white balance for this photo")),
-                },
-            };
-            Ok(LightMeasurement {
-                auto: LightValues {
-                    exposure: a.tone.exposure.unwrap_or(0.0),
-                    contrast: a.tone.contrast.unwrap_or(0.0),
-                    highlights: a.tone.highlights.unwrap_or(0.0),
-                    shadows: a.tone.shadows.unwrap_or(0.0),
-                    whites: a.tone.whites.unwrap_or(0.0),
-                    blacks: a.tone.blacks.unwrap_or(0.0),
-                    temperature_k: wb.temperature_k,
-                    tint: wb.tint,
-                },
-                frame: Some(a.frame),
-                wb_fallback,
-            })
-        })();
+        let adj = measured_settings(photo, look);
+        let result = measure_light(&self.cache, &photo.src, &adj, photo.faces.clone());
         if !was_decoded {
             self.cache.drop_decoded(photo.image_id);
         }
         result
     }
+}
+
+/// The light-only Auto of `src` with settings `adj` as [`LightValues`]: faces resolved
+/// ([`super::auto::resolve_faces`] on the analysis boxes `faces`), [`super::auto::auto_light`],
+/// and the camera's as-shot white balance when Auto WB cannot be estimated (`wb_fallback`).
+/// Shared by [`DevelopMeter`] and the `auto_light` command (IPC v21.1), so Develop's Auto on the
+/// anchor and the run's Auto of the anchor are the same numbers. Blocking.
+pub fn measure_light(
+    cache: &DevelopCache,
+    src: &SourceImage,
+    adj: &ParametricAdjustments,
+    faces: Option<Vec<NormRect>>,
+) -> AppResult<LightMeasurement> {
+    let faces = super::auto::resolve_faces(cache, src, faces);
+    let a = super::auto::auto_light(cache, src, adj, faces.as_deref())?;
+    let (wb, wb_fallback) = match a.white_balance {
+        Some(wb) => (wb, false),
+        None => match cache.info(src)?.as_shot {
+            Some(wb) => (wb, true),
+            None => return Err(AppError::invalid("could not estimate a white balance for this photo")),
+        },
+    };
+    Ok(LightMeasurement {
+        auto: LightValues {
+            exposure: a.tone.exposure.unwrap_or(0.0),
+            contrast: a.tone.contrast.unwrap_or(0.0),
+            highlights: a.tone.highlights.unwrap_or(0.0),
+            shadows: a.tone.shadows.unwrap_or(0.0),
+            whites: a.tone.whites.unwrap_or(0.0),
+            blacks: a.tone.blacks.unwrap_or(0.0),
+            temperature_k: wb.temperature_k,
+            tint: wb.tint,
+        },
+        frame: Some(a.frame),
+        wb_fallback,
+    })
 }
 
 /// The settings a photo is measured with: its current settings with every look group copied
@@ -891,6 +903,7 @@ pub fn compute(
         burst_group_id: p.burst_group_id,
         auto: None,
         light: None,
+        state: None,
     };
     let mut drafts: Vec<Option<BaselineDraft>> = vec![None; photos.len()];
     let mut to_measure: Vec<usize> = Vec::new();

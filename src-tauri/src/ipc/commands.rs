@@ -1979,6 +1979,44 @@ pub async fn auto_white_balance(
     note_if_missing(&catalog, id, r).await
 }
 
+/// The light-only Auto (IPC v21.1): auto white balance, then exposure, contrast, highlights,
+/// shadows, whites and blacks measured under it, for the live `adjustments` (`null` = stored);
+/// vibrance / saturation are never computed. Exactly what a baseline run measures for this photo
+/// with these settings (`BaselineAnchor.auto` for the anchor). Nothing is saved: the UI merges
+/// `light` (six sliders + custom white balance) as one history entry. Develop's generic Auto =
+/// this + `auto_tone(id, merged, ["vibrance", "saturation"])`; Auto during a baseline edit and
+/// "Start from Auto" = this alone (the preset's colours stay). Errors as `auto_tone`.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_light(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<AutoLightValues> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    let (adjustments, faces) = catalog
+        .run(move |c| {
+            let a = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            let faces = develop::auto::analysis_faces(c, id)?.map(|f| develop::auto::face_boxes(&f));
+            Ok((a, faces))
+        })
+        .await?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let r = blocking(move || {
+        let m = develop::baseline::measure_light(&cache, &src, &adjustments, faces)?;
+        Ok(AutoLightValues { light: m.auto, white_balance_estimated: !m.wb_fallback })
+    })
+    .await;
+    note_if_missing(&catalog, id, r).await
+}
+
 /// Guided-workflow step of project `projectId` (also `Project.workflowStep`).
 #[tauri::command]
 #[specta::specta]
@@ -2252,6 +2290,10 @@ pub async fn apply_all_edited_scenes(
 /// `edited` (`SceneEditEntry.appliedBatch` = null). v17: a scene apply (not undone) made from
 /// a representative whose settings this batch wrote is a later edit too ("A scene was applied
 /// from this edit since; undo that apply first").
+/// v21.1: `options.keepLaterEdits` ("Undo the rest"): no `conflict`; photos edited since (and
+/// representatives of applies built on the batch) keep their later edit (`keptIds`), the rest
+/// is restored, and the batch reads undone (a baseline run's `live` / `message` follow).
+/// `null` = linear undo as before.
 #[tauri::command]
 #[specta::specta]
 pub async fn undo_edit_batch(
@@ -2259,8 +2301,10 @@ pub async fn undo_edit_batch(
     catalog: State<'_, Catalog>,
     xmp: State<'_, XmpSync>,
     batch_id: EditBatchId,
+    options: Option<UndoBatchOptions>,
 ) -> AppResult<UndoBatchResult> {
-    let r = catalog.run(move |c| develop::batches::undo(c, batch_id)).await?;
+    let keep = options.unwrap_or_default().keep_later_edits;
+    let r = catalog.run(move |c| develop::batches::undo_with(c, batch_id, keep)).await?;
     if !r.restored_ids.is_empty() {
         xmp.notify(&app);
     }

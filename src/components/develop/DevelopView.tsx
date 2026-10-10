@@ -2,7 +2,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
 import { usePrefetchNeighbours } from "../../hooks/usePrefetch";
-import { applyAutoTone, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset, type SyncDeltaResult } from "../../ipc";
+import { applyAutoTone, applyLightValues, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset, type SyncDeltaResult } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
 import { useEditor, type Editor } from "../../hooks/useEditor";
@@ -91,6 +91,8 @@ export interface DevelopHandle {
   /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
   autoTone: () => void;
   autoWb: () => void;
+  /** v21.1 light-only Auto (`auto_light`) for the active photo, one history entry (baseline edit: Auto / "Start from Auto"). */
+  autoLight: (label?: string) => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -708,21 +710,25 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   );
 
   // ---- Auto tone / auto white balance (v14 `auto_tone`, `auto_white_balance`): one history entry each ----
+  // v21.1: generic Auto = the light-only `auto_light` (WB, then the six tone sliders, the same numbers a baseline run
+  // uses) + vibrance / saturation from `auto_tone` on the merged settings; "light" = `auto_light` alone (baseline edit).
   const runAuto = useCallback(
-    async (what: "all" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+    async (what: "all" | "light" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
       if (id == null || autoBusy) return;
       setAutoBusy(true);
       try {
         await editor.flush();
         const cur = editor.adj;
-        if (what === "all") {
-          // Generic Auto (works without a learned style): tone and white balance from this photo, one history entry.
-          const [v, w] = await Promise.all([unwrap(commands.autoTone(id, cur, null)), unwrap(commands.autoWhiteBalance(id, cur))]);
+        if (what === "all" || what === "light") {
+          // Generic Auto (works without a learned style): light + white balance from this photo, one history entry.
+          const { light } = await unwrap(commands.autoLight(id, cur));
+          const lit = applyLightValues(cur, light);
+          const presence = what === "all" ? await unwrap(commands.autoTone(id, lit, ["vibrance", "saturation"])) : null;
           editor.change((a) => {
-            const t = applyAutoTone(a, v);
-            return { ...t, whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } };
-          }, "Auto");
-          setAutoWb({ id, t: w.temperatureK, tint: w.tint });
+            const l = applyLightValues(a, light);
+            return presence ? applyAutoTone(l, presence) : l;
+          }, label ?? (what === "all" ? "Auto" : "Auto Light"));
+          setAutoWb({ id, t: light.temperatureK, tint: light.tint });
         } else if (what === "tone" || what === "key") {
           const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
           editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
@@ -751,6 +757,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const auto: AutoApi = {
     busy: autoBusy,
     all: () => void runAuto("all"),
+    light: (label?: string) => void runAuto("light", undefined, label),
     tone: () => void runAuto("tone"),
     wb: () => void runAuto("wb"),
     slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
@@ -998,6 +1005,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       pastePrevious,
       savePreset: () => setDialog({ kind: "preset" }),
       autoTone: () => autoRef.current.tone(),
+      autoLight: (label?: string) => autoRef.current.light(label),
       autoWb: () => autoRef.current.wb(),
     }),
     [revertTool, commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],

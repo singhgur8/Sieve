@@ -29,6 +29,7 @@ const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
   applied: { text: "Applied · representative", cls: "bg-emerald-950 text-emerald-200" },
   stale: { text: "Changed since applied · representative", cls: "bg-amber-950 text-amber-200" },
   reset: { text: "Reset since applied · representative", cls: "bg-amber-950 text-amber-200" },
+  baseline: { text: "On baseline · representative", cls: "bg-emerald-950 text-emerald-200" },
 };
 
 export function EditContextBar(p: Props) {

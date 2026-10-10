@@ -8,7 +8,7 @@ import type { ToastApi } from "../components/Toasts";
 import { flushEdits } from "../lib/editFlush";
 
 /** What the checklist shows for a scene (the backend status plus "auto edited, not reviewed yet"). */
-export type SceneUi = "todo" | "auto" | "edited" | "applied" | "stale" | "reset";
+export type SceneUi = "todo" | "auto" | "edited" | "applied" | "stale" | "reset" | "baseline";
 
 export interface SceneRow {
   entry: SceneEditEntry;
@@ -29,7 +29,7 @@ export interface SceneRow {
 
 export type PlanTab = "all" | "todo" | "edited" | "applied" | "skipped";
 export const rowInTab = (r: SceneRow, t: PlanTab) =>
-  t === "skipped" ? r.skipped : t === "all" ? true : r.skipped ? false : t === "todo" ? r.ui === "todo" || r.ui === "reset" : t === "applied" ? r.ui === "applied" : r.ui === "edited" || r.ui === "auto" || r.ui === "stale";
+  t === "skipped" ? r.skipped : t === "all" ? true : r.skipped ? false : t === "todo" ? r.ui === "todo" || r.ui === "reset" : t === "applied" ? r.ui === "applied" || r.ui === "baseline" : r.ui === "edited" || r.ui === "auto" || r.ui === "stale";
 
 export interface Busy {
   kind: "scene" | "all" | "auto";
@@ -344,7 +344,7 @@ export function useWorkflow(d: Deps) {
   const rows = useMemo<SceneRow[]>(() => {
     if (!plan) return [];
     return plan.scenes.map((entry, i) => {
-      const ui: SceneUi = entry.status === "to_edit" ? "todo" : entry.status === "reset" ? "reset" : entry.status === "applied" ? "applied" : entry.status === "outdated" ? "stale" : entry.autoEdited ? "auto" : "edited";
+      const ui: SceneUi = entry.status === "to_edit" ? "todo" : entry.status === "reset" ? "reset" : entry.status === "applied" ? "applied" : entry.status === "outdated" ? "stale" : entry.status === "on_baseline" ? "baseline" : entry.autoEdited ? "auto" : "edited";
       return {
         entry,
         number: i + 1,
@@ -383,7 +383,7 @@ export function useWorkflow(d: Deps) {
   const undoBatch = useCallback(
     async (batch: Pick<LastBatch, "batchId" | "label">) => {
       try {
-        const r = await unwrap(commands.undoEditBatch(batch.batchId));
+        const r = await unwrap(commands.undoEditBatch(batch.batchId, null));
         setBatchStack((st) => st.filter((b) => b.batchId !== batch.batchId));
         const tid = batchToast.current.get(batch.batchId);
         if (tid != null) {

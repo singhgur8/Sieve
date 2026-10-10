@@ -172,6 +172,86 @@ test.describe("IPC v21 mock contract", () => {
     expect(done.message).toMatch(/^Edited \d+ photos?/);
   });
 
+  test("v21.1: auto_light = the engine's Auto; scenes on the baseline; plan summary; undo keeping later edits; live counts", async ({ page }) => {
+    await openHome(page, 201, "&baseline=1");
+    type LiveRun = Run & { live: { written: number; onBaseline: number; needsLook: number; userEdited: number; undone: number }; anchor: { imageId: number; auto: Light } };
+    const run = (await inv<LiveRun>(page, "get_baseline_run", { projectId: 1 }))!;
+    const anchorId = run.settings.anchorId;
+
+    // P0-1: one Auto. auto_light on the anchor = the run's (and a preview's) Auto of the anchor.
+    const al = await inv<{ light: Light; whiteBalanceEstimated: boolean }>(page, "auto_light", { id: anchorId, adjustments: null });
+    expect(al.whiteBalanceEstimated).toBe(true);
+    expect(al.light).toEqual(run.anchor.auto);
+    const pv = await inv<{ anchor: { auto: Light } }>(page, "preview_baseline", { projectId: 1, settings: { ...run.settings, scope: { kind: "keepers" }, replaceEdited: false }, options: { sampleCount: 1 } });
+    expect(pv.anchor.auto).toEqual(al.light);
+    expect(await invErr(page, "auto_light", { id: 999999, adjustments: null })).toMatchObject({ kind: "not_found" });
+
+    // Live counts of the finished run.
+    expect(run.live.written).toBe(run.counts.applied + run.counts.flagged);
+    expect(run.live.onBaseline).toBe(run.live.written);
+    expect(run.live.needsLook).toBe(run.counts.flagged);
+
+    // P0-2: every scene is on the baseline (representatives written by it, or the anchor); nothing to apply.
+    type Plan = {
+      keeperIds: number[];
+      scenes: { sceneId: number; status: string; representativeId: number; baselineIds: number[]; imageIds: number[] }[];
+      counts: { onBaseline: number; edited: number; applied: number; toEdit: number };
+      editStates: { imageId: number; editSource: string; needsReview: boolean }[];
+      baseline: { runId: number; anchorId: number; keepers: number; onBaseline: number; needsLook: number; editedSince: number; batch: { batchId: number } } | null;
+    };
+    await inv(page, "detect_scenes", { folderId: null, projectId: 1, options: null });
+    let plan = await inv<Plan>(page, "get_edit_plan", { projectId: 1 });
+    expect(plan.scenes.length).toBeGreaterThan(0);
+    expect(plan.scenes.every((s) => s.status === "on_baseline")).toBe(true);
+    expect(plan.counts).toMatchObject({ onBaseline: plan.scenes.length, edited: 0, applied: 0, toEdit: 0 });
+    const onBaseline = plan.editStates.filter((s) => s.editSource === "baseline").length;
+    expect(plan.baseline).toMatchObject({ runId: run.id, anchorId, keepers: plan.keeperIds.length, onBaseline, needsLook: run.counts.flagged, editedSince: 0 });
+    expect(onBaseline).toBe(plan.keeperIds.length - 1);
+    expect(plan.scenes.reduce((n, s) => n + s.baselineIds.length, 0)).toBe(onBaseline);
+
+    // A representative edited after the baseline: its scene is "edited" again (refine scene by scene).
+    const sc = plan.scenes.find((s) => s.representativeId !== anchorId)!;
+    const repAdj = await inv<Adj>(page, "get_adjustments", { id: sc.representativeId });
+    await inv(page, "save_adjustments", { id: sc.representativeId, adjustments: { ...repAdj, exposure: repAdj.exposure + 0.5 }, label: "Exposure" });
+    plan = await inv<Plan>(page, "get_edit_plan", { projectId: 1 });
+    const sc2 = plan.scenes.find((s) => s.sceneId === sc.sceneId)!;
+    expect(sc2.status).toBe("edited");
+    expect(sc2.baselineIds).not.toContain(sc.representativeId);
+    expect(plan.baseline).toMatchObject({ onBaseline: onBaseline - 1, editedSince: 1 });
+
+    // P1-2: linear undo refuses; "Undo the rest" restores the others and keeps the edit.
+    const batchId = run.batch!.batchId;
+    expect(await invErr(page, "undo_edit_batch", { batchId, options: null })).toMatchObject({ kind: "conflict" });
+    const u = await inv<{ restoredIds: number[]; skippedIds: number[]; keptIds: number[] }>(page, "undo_edit_batch", { batchId, options: { keepLaterEdits: true } });
+    expect(u.keptIds).toEqual([sc.representativeId]);
+    expect(u.restoredIds.length).toBe(run.live.written - 1);
+    expect((await inv<Adj>(page, "get_adjustments", { id: sc.representativeId })).exposure).toBeCloseTo(repAdj.exposure + 0.5, 5);
+    const after = (await inv<LiveRun>(page, "get_baseline_run", { projectId: 1 }))!;
+    expect(after.batch).toMatchObject({ undoable: false });
+    expect(after.live).toEqual({ written: run.live.written, onBaseline: 0, needsLook: 0, userEdited: 1, undone: run.live.written - 1 });
+    expect(after.message).toBe(`Undone on ${run.live.written - 1} photos; 1 photo you changed since was kept`);
+    const prov = await inv<Prov[]>(page, "get_baseline_provenance", { ids: [sc.representativeId, u.restoredIds[0]] });
+    expect(prov.map((p) => p.state)).toEqual(["user_edited", "undone"]);
+    const res = await inv<(Result & { state: string | null })[]>(page, "get_baseline_results", { projectId: 1, outcomes: null });
+    expect(res.find((r) => r.imageId === sc.representativeId)!.state).toBe("user_edited");
+    expect(res.find((r) => r.imageId === u.restoredIds[0])!.state).toBe("undone");
+    expect(res.find((r) => r.imageId === anchorId)!.state).toBeNull();
+    plan = await inv<Plan>(page, "get_edit_plan", { projectId: 1 });
+    expect(plan.baseline).toBeNull();
+    expect(plan.scenes.some((s) => s.status === "on_baseline")).toBe(false);
+    expect(await invErr(page, "undo_edit_batch", { batchId, options: { keepLaterEdits: true } })).toMatchObject({ kind: "invalid_argument" });
+  });
+
+  test("v21.1: a plain undo of a run reads undone (no stale summary)", async ({ page }) => {
+    await openHome(page, 201, "&baseline=1");
+    const run = (await inv<Run & { live: { written: number } }>(page, "get_baseline_run", { projectId: 1 }))!;
+    const u = await inv<{ restoredIds: number[]; keptIds: number[] }>(page, "undo_edit_batch", { batchId: run.batch!.batchId, options: null });
+    expect(u.keptIds).toEqual([]);
+    const after = (await inv<Run & { live: { undone: number; onBaseline: number } }>(page, "get_baseline_run", { projectId: 1 }))!;
+    expect(after.message).toBe("Undone: the photos are back to how they were");
+    expect(after.live).toMatchObject({ undone: run.live.written, onBaseline: 0 });
+  });
+
   test("partition constants are exported", async ({ page }) => {
     await openHome(page, 20, "");
     const fromBindings = await page.evaluate(async () => {

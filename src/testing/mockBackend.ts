@@ -96,6 +96,7 @@ import type {
   SyncDeltaOptions,
   SyncDeltaResult,
   TransformBounds,
+  UndoBatchOptions,
   WhiteBalance,
 } from "../ipc";
 import { createMockTarget, NOT_TARGET } from "./mockTarget";
@@ -1147,6 +1148,8 @@ export function installMockBackend(count: number) {
     sceneId: number | null;
     reviewReason: string | null;
     reviewed: boolean;
+    /** v21.1: left with its later edit by `undo_edit_batch(…, {keepLaterEdits: true})` (Rust `edit_batch_items.kept_at`). */
+    keptAt?: number | null;
   }
   // v17: `bases` = representatives the batch (an apply) was made from, with the batch that wrote their settings.
   const batches = new Map<
@@ -1278,15 +1281,21 @@ export function installMockBackend(count: number) {
       const editedAt = rep.hasEdits ? lastEditAt(rep.id) : null;
       // Rust: applied while the representative's settings equal those the apply was made from.
       // v17: applied, then the representative went back to no edits -> "reset" (a to-do scene).
+      // v21.1: a representative whose settings a baseline wrote is done ("on_baseline") unless applied from them since.
+      const repOnBaseline = rep.hasEdits && (editState(rep.id).editSource === "baseline" || baseline.liveAnchor(projectOfFolder(rep.folderId)) === rep.id);
       const status: SceneEditEntry["status"] = applied
         ? !rep.hasEdits
           ? "reset"
           : JSON.stringify(getAdj(rep.id)) === applied.repSnap
             ? "applied"
-            : "outdated"
-        : rep.hasEdits
-          ? "edited"
-          : "to_edit";
+            : repOnBaseline
+              ? "on_baseline"
+              : "outdated"
+        : repOnBaseline
+          ? "on_baseline"
+          : rep.hasEdits
+            ? "edited"
+            : "to_edit";
       const appliedBatch = applied?.batchId != null ? batchInfo(applied.batchId) : null;
       const skipped = sceneSkipped.has(sc.id);
       const covered = sceneCovered.get(sc.id) ?? [];
@@ -1298,7 +1307,7 @@ export function installMockBackend(count: number) {
         appliedIds: sc.imageIds.filter((id) => id !== rep.id && src(id) === "scene_apply"),
         needsReviewIds: ks.filter((r) => editState(r.id).needsReview).map((r) => r.id),
         unappliedKeeperIds:
-          applied && !skipped && status !== "reset" ? ks.filter((r) => r.id !== rep.id && !covered.includes(r.id) && (src(r.id) === "none" || src(r.id) === "auto_style")).map((r) => r.id) : [],
+          applied && !skipped && status !== "reset" && status !== "on_baseline" ? ks.filter((r) => r.id !== rep.id && !covered.includes(r.id) && (src(r.id) === "none" || src(r.id) === "auto_style")).map((r) => r.id) : [],
         sceneId: sc.id,
         imageIds: ks.map((r) => r.id),
         memberCount: sc.imageIds.length,
@@ -1310,6 +1319,7 @@ export function installMockBackend(count: number) {
         appliedAtMs: applied?.at ?? null,
         status,
         appliedBatch: appliedBatch && appliedBatch.undoneAtMs == null ? appliedBatch : null,
+        baselineIds: ks.filter((r) => src(r.id) === "baseline").map((r) => r.id),
       });
     }
     return out;
@@ -1394,6 +1404,8 @@ export function installMockBackend(count: number) {
       return e ? { entryId: e.id, batchId: e.batchId } : null;
     },
     batchInfo: (batchId) => (batches.has(batchId) ? batchInfo(batchId) : null),
+    keptOnUndo: (batchId, id) => batches.get(batchId)?.items.find((i) => i.id === id)?.keptAt != null,
+    needsReview: (id) => editState(id).needsReview,
     presets,
     styleGroups,
     nextPresetId: () => ++presetId,
@@ -2350,6 +2362,7 @@ export function installMockBackend(count: number) {
             needsReview: needsReviewIds.length,
             unappliedKeepers: live.reduce((n, e) => n + e.unappliedKeeperIds.length, 0),
             unassignedKeepers: unassignedKeeperIds.length,
+            onBaseline: live.filter((e) => e.status === "on_baseline").length,
           };
           const plan: EditPlan = {
             projectId: pid,
@@ -2362,6 +2375,7 @@ export function installMockBackend(count: number) {
             editStates,
             needsReviewIds,
             latestBatch: latestBatch(new Set(rows.filter((r) => inScope(r, null, pid)).map((r) => r.id))),
+            baseline: baseline.planBaseline(pid, editStates),
           };
           return plan;
         }
@@ -2465,6 +2479,7 @@ export function installMockBackend(count: number) {
         }
         case "auto_white_balance":
           return { temperatureK: 5350, tint: 6 };
+        // v21.1 `auto_light`: handled by the baseline mock (`autoLightOf`, the engine's Auto).
         case "style_model_status":
           return styleModel;
         case "train_style_model": {
@@ -2507,10 +2522,13 @@ export function installMockBackend(count: number) {
           // v16: linear undo; later edits on the batch's photos block it (nothing changes).
           const conflicts = batchConflicts(args.batchId as number);
           const edited = batchEditedAfter(args.batchId as number);
-          if (edited.length)
+          // v21.1 `keepLaterEdits` ("Undo the rest"): conflicts keep their later edit, the rest is restored.
+          const keep = !!(args.options as UndoBatchOptions | null | undefined)?.keepLaterEdits;
+          const kept = keep ? new Set(conflicts) : new Set<number>();
+          if (!keep && edited.length)
             throw { kind: "conflict", message: `Later edits on ${conflicts.length} photo${conflicts.length === 1 ? "" : "s"}; undo those first` };
           // v17: an apply made from this batch's settings (Auto edit -> Apply to scene) is a later edit too.
-          if (conflicts.length)
+          if (!keep && conflicts.length)
             throw {
               kind: "conflict",
               message:
@@ -2522,8 +2540,12 @@ export function installMockBackend(count: number) {
           b.undoneAt = Date.now();
           const restoredIds: number[] = [];
           const skippedIds: number[] = [];
+          const keptIds: number[] = [];
           for (const it of b.items) {
-            if (JSON.stringify(getAdj(it.id)) === it.after) {
+            if (kept.has(it.id)) {
+              it.keptAt = b.undoneAt;
+              keptIds.push(it.id);
+            } else if (JSON.stringify(getAdj(it.id)) === it.after) {
               commit(it.id, JSON.parse(it.before) as ParametricAdjustments, `Undo ${b.label}`, false);
               // v15: the restored settings keep the provenance they had before the batch.
               const e = cursorEntry(it.id);
@@ -2536,7 +2558,7 @@ export function installMockBackend(count: number) {
           }
           // v16: scenes whose last apply was this batch are no longer applied.
           for (const [sid, a] of [...sceneApplied]) if (a.batchId === (args.batchId as number)) sceneApplied.delete(sid);
-          return { restoredIds, skippedIds };
+          return { restoredIds, skippedIds, keptIds };
         }
         // ---- IPC v15 ----
         case "set_scene_skipped": {

@@ -251,6 +251,12 @@ fn entry_for(
     } else {
         None
     };
+    let source_of = |id: ImageId| states.get(&id).map(|s| s.edit_source).unwrap_or(EditSource::None);
+    // v21.1: a representative whose settings a baseline wrote, or the live baseline's anchor,
+    // is done ("on baseline") unless the scene was applied from exactly those settings since.
+    let rep_on_baseline = rep.has_edits
+        && (source_of(rep.id) == EditSource::Baseline
+            || crate::db::baseline::live_anchor_of_scene(conn, scene_id)? == Some(rep.id));
     let status = match &row.applied_params_json {
         // v17: applied, then the representative went back to no edits (reset, or its edit
         // undone): a to-do scene, not a re-apply.
@@ -259,36 +265,40 @@ fn entry_for(
             let applied: ParametricAdjustments = serde_json::from_str(json)?;
             if applied == repo::get_adjustments(conn, rep.id)? {
                 SceneEditStatus::Applied
+            } else if rep_on_baseline {
+                SceneEditStatus::OnBaseline
             } else {
                 SceneEditStatus::Outdated
             }
         }
+        None if rep_on_baseline => SceneEditStatus::OnBaseline,
         None if rep.has_edits => SceneEditStatus::Edited,
         None => SceneEditStatus::ToEdit,
     };
-    let source_of = |id: ImageId| states.get(&id).map(|s| s.edit_source).unwrap_or(EditSource::None);
     let applied_ids: Vec<ImageId> =
         members.iter().copied().filter(|&id| id != rep.id && source_of(id) == EditSource::SceneApply).collect();
     let needs_review_ids: Vec<ImageId> =
         keepers.iter().map(|k| k.id).filter(|id| states.get(id).is_some_and(|s| s.needs_review)).collect();
-    let unapplied_keeper_ids: Vec<ImageId> =
-        if row.applied_params_json.is_none() || row.skipped || status == SceneEditStatus::Reset {
-            Vec::new()
-        } else {
-            keepers
-                .iter()
-                .map(|k| k.id)
-                .filter(|&id| id != rep.id)
-                .filter(|&id| match &row.covered {
-                    Some(covered) => {
-                        !covered.contains(&id)
-                            && matches!(source_of(id), EditSource::None | EditSource::AutoStyle | EditSource::Baseline)
-                    }
-                    // Applied before v15 (coverage unknown): keepers that still have no edit.
-                    None => source_of(id) == EditSource::None,
-                })
-                .collect()
-        };
+    let unapplied_keeper_ids: Vec<ImageId> = if row.applied_params_json.is_none()
+        || row.skipped
+        || matches!(status, SceneEditStatus::Reset | SceneEditStatus::OnBaseline)
+    {
+        Vec::new()
+    } else {
+        keepers
+            .iter()
+            .map(|k| k.id)
+            .filter(|&id| id != rep.id)
+            .filter(|&id| match &row.covered {
+                Some(covered) => {
+                    !covered.contains(&id)
+                        && matches!(source_of(id), EditSource::None | EditSource::AutoStyle | EditSource::Baseline)
+                }
+                // Applied before v15 (coverage unknown): keepers that still have no edit.
+                None => source_of(id) == EditSource::None,
+            })
+            .collect()
+    };
     // A batch undone before v16 (which did not clear the scene) is not reported.
     let applied_batch = match row.applied_batch_id {
         Some(b) => match batches::batch_info(conn, b) {
@@ -316,6 +326,7 @@ fn entry_for(
         needs_review_ids,
         unapplied_keeper_ids,
         applied_batch,
+        baseline_ids: keepers.iter().map(|k| k.id).filter(|&id| source_of(id) == EditSource::Baseline).collect(),
     })
 }
 
@@ -381,8 +392,10 @@ pub fn edit_plan(conn: &Connection, project_id: ProjectId) -> AppResult<EditPlan
                 counts.reset += 1;
                 counts.to_edit += 1;
             }
+            SceneEditStatus::OnBaseline => counts.on_baseline += 1,
         }
     }
+    let baseline = crate::db::baseline::plan_baseline(conn, project_id, &edit_states)?;
     Ok(EditPlan {
         project_id,
         keeper_rule: rule,
@@ -394,6 +407,7 @@ pub fn edit_plan(conn: &Connection, project_id: ProjectId) -> AppResult<EditPlan
         edit_states,
         needs_review_ids,
         latest_batch: batches::latest_batch_where(conn, &scope.predicate("i.folder_id"))?,
+        baseline,
     })
 }
 
@@ -973,6 +987,100 @@ mod tests {
             )
             .unwrap();
         assert_eq!((rep, source.as_deref()), (Some(ids[1]), Some("user")));
+    }
+
+    #[test]
+    fn baseline_photos_are_on_baseline_and_undo_keeps_later_edits() {
+        use crate::db::baseline as bl;
+        let (mut conn, project, scene, ids) = fixture();
+        set_representative(&conn, scene, Some(ids[1])).unwrap();
+        // Keepers 0 (anchor), 1 (representative), 3. The baseline writes 1 and flags 3.
+        let settings = BaselineSettings {
+            anchor_id: ids[0],
+            preset_id: None,
+            scope: BaselineScope::Keepers,
+            replace_edited: false,
+        };
+        let draft = |id: ImageId, outcome: BaselineOutcome| bl::BaselineDraft {
+            result: BaselinePhotoResult {
+                image_id: id,
+                outcome,
+                reasons: if outcome == BaselineOutcome::Flagged {
+                    vec![BaselineReason { kind: BaselineReasonKind::LowKey, text: "Dark on purpose".into() }]
+                } else {
+                    Vec::new()
+                },
+                scene_id: Some(scene),
+                burst_group_id: None,
+                auto: None,
+                light: None,
+                state: None,
+            },
+            adjustments: (outcome != BaselineOutcome::Anchor)
+                .then(|| ParametricAdjustments { exposure: 0.4, ..Default::default() }),
+        };
+        let look = ParametricAdjustments { vibrance: 12.0, ..Default::default() };
+        history::commit(&mut conn, ids[0], &look, "Preset: Soft Film").unwrap();
+        let run = bl::begin_run(&conn, project, &settings, "test").unwrap();
+        let drafts = [
+            draft(ids[0], BaselineOutcome::Anchor),
+            draft(ids[1], BaselineOutcome::Applied),
+            draft(ids[3], BaselineOutcome::Flagged),
+        ];
+        let (batch, _) = bl::store_results(&mut conn, run, &drafts).unwrap();
+        bl::finish_run(&conn, run, BaselineRunState::Finished, Some("Edited 2 photos")).unwrap();
+        let batch_id = batch.batch_id.unwrap();
+
+        let plan = edit_plan(&conn, project).unwrap();
+        let e = &plan.scenes[0];
+        assert_eq!(e.status, SceneEditStatus::OnBaseline);
+        assert_eq!(e.baseline_ids, vec![ids[1], ids[3]]);
+        assert!(e.unapplied_keeper_ids.is_empty());
+        assert_eq!((plan.counts.on_baseline, plan.counts.edited, plan.counts.to_edit), (1, 0, 0));
+        let b = plan.baseline.clone().unwrap();
+        assert_eq!(
+            (b.run_id, b.anchor_id, b.keepers, b.on_baseline, b.needs_look, b.edited_since),
+            (run, ids[0], 3, 2, 1, 0)
+        );
+        assert!(edited_scenes(&conn, project).unwrap().is_empty(), "apply all leaves baseline scenes alone");
+        set_representative(&conn, scene, Some(ids[0])).unwrap();
+        assert_eq!(
+            edit_plan(&conn, project).unwrap().scenes[0].status,
+            SceneEditStatus::OnBaseline,
+            "the anchor's scene"
+        );
+        set_representative(&conn, scene, Some(ids[1])).unwrap();
+        let live = bl::get_run(&conn, project, false).unwrap().unwrap().live;
+        assert_eq!(live, BaselineLiveCounts { written: 2, on_baseline: 2, needs_look: 1, user_edited: 0, undone: 0 });
+
+        // The user refines the representative after the baseline: an edited scene again.
+        let mut mine = repo::get_adjustments(&conn, ids[1]).unwrap();
+        mine.contrast = 20.0;
+        history::commit(&mut conn, ids[1], &mine, "Contrast").unwrap();
+        let plan = edit_plan(&conn, project).unwrap();
+        assert_eq!(plan.scenes[0].status, SceneEditStatus::Edited);
+        assert_eq!(plan.scenes[0].baseline_ids, vec![ids[3]]);
+        let b = plan.baseline.unwrap();
+        assert_eq!((b.on_baseline, b.edited_since), (1, 1));
+        assert_eq!(edited_scenes(&conn, project).unwrap(), vec![scene]);
+
+        // "Undo the rest": 3 goes back, 1 keeps the user's edit; the run reads undone.
+        assert_eq!(batches::undo(&mut conn, batch_id).unwrap_err().kind, ErrorKind::Conflict);
+        let u = batches::undo_with(&mut conn, batch_id, true).unwrap();
+        assert_eq!((u.restored_ids, u.kept_ids), (vec![ids[3]], vec![ids[1]]));
+        assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), mine);
+        let states: Vec<BaselineState> =
+            bl::provenance(&conn, &[ids[1], ids[3]]).unwrap().iter().map(|p| p.state).collect();
+        assert_eq!(states, vec![BaselineState::UserEdited, BaselineState::Undone]);
+        let r = bl::get_run(&conn, project, false).unwrap().unwrap();
+        assert_eq!(r.live, BaselineLiveCounts { written: 2, on_baseline: 0, needs_look: 0, user_edited: 1, undone: 1 });
+        assert_eq!(r.message.as_deref(), Some("Undone on 1 photo; 1 photo you changed since was kept"));
+        let res = bl::results(&conn, project, None).unwrap();
+        let st: Vec<Option<BaselineState>> = res.iter().map(|r| r.state).collect();
+        assert_eq!(st, vec![None, Some(BaselineState::UserEdited), Some(BaselineState::Undone)]);
+        let plan = edit_plan(&conn, project).unwrap();
+        assert!(plan.baseline.is_none());
+        assert!(plan.scenes[0].baseline_ids.is_empty());
     }
 
     #[test]

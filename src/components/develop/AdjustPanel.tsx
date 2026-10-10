@@ -56,6 +56,11 @@ export interface AutoApi {
   busy: boolean;
   /** Generic Auto: tone + white balance from the photo (no learned style needed), one history entry. */
   all: () => void;
+  /**
+   * v21.1 light-only Auto (`auto_light`: white balance + the six tone sliders, never vibrance / saturation), one history
+   * entry (default label "Auto Light"). For Auto during a baseline edit and "Start from Auto": the preset's colours stay.
+   */
+  light: (label?: string) => void;
   tone: () => void;
   wb: () => void;
   /** Shift+double-click: auto for one slider (temp / tint use the white balance, the rest `auto_tone` with that key). */

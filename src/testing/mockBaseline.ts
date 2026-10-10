@@ -1,6 +1,6 @@
 // Mock of the baseline edit commands (IPC v21) for `src/testing/mockBackend.ts`. Mirrors `db::baseline` (scope, skip /
-// replace, provenance, results, the `baseline` edit batch) with a synthetic engine that follows the *target* model
-// (not the Rust stub): look groups copied from the anchor (`BASELINE_LOOK_FIELDS`), light = the photo's synthetic Auto
+// replace, provenance, results, the `baseline` edit batch) with a synthetic engine that follows the engine's model
+// (without its smoothing): look groups copied from the anchor (`BASELINE_LOOK_FIELDS`), light = the photo's synthetic Auto
 // + the anchor's offset from its own Auto, every 11th photo flagged low-key (kept 0.5 EV darker), every 19th "Auto
 // failed" (the anchor's light), crop / transform / masks kept.
 // Switches (URL of the mock page):
@@ -10,6 +10,10 @@
 //   (+0.3 EV and warmer than Auto) — the state after UI steps 1-2; no run yet;
 // - `?baseline=1`: + a finished run on project 1 (scope keepers; results applied / flagged / skipped / anchor, one
 //   undoable batch, provenance).
+// v21.1: `auto_light` (the light-only Auto) returns the same synthetic Auto the engine uses (`autoLightOf`), so Develop's
+// Auto on the anchor reads "same as Auto"; without a switch it is the legacy Develop Auto values (exposure +0.35, 5350 K
+// / +6, as `auto_tone` / `auto_white_balance`). Runs report `live` counts and an undo message; results carry `state`;
+// `planBaseline` feeds `EditPlan.baseline`.
 // Without a switch: no presets beyond the user's, no run. `run_baseline` finishes after `window.__mockBaselineDelay` ms
 // (default 300), reporting `activity-event` kind `baseline_edit` and one `baseline-run-finished`.
 import { emit } from "@tauri-apps/api/event";
@@ -17,8 +21,10 @@ import { BASELINE_LOOK_FIELDS, MAX_BASELINE_SAMPLES, DEFAULT_BASELINE_SAMPLES } 
 import type {
   ActivityEvent,
   AdjustmentField,
+  AutoLightValues,
   BaselineAnchor,
   BaselineCounts,
+  BaselineLiveCounts,
   BaselineOutcome,
   BaselinePhotoResult,
   BaselinePlanCounts,
@@ -33,6 +39,8 @@ import type {
   BaselineState,
   EditBatchInfo,
   EditBatchResult,
+  EditPlanBaseline,
+  ImageEditState,
   ImageQuery,
   LightOffset,
   LightValues,
@@ -67,6 +75,10 @@ export interface MockBaselineContext {
   /** History cursor entry of a photo (`null` = never edited). */
   cursor: (id: number) => { entryId: number; batchId: number | null } | null;
   batchInfo: (batchId: number) => EditBatchInfo | null;
+  /** v21.1: the batch item of `id` was kept by `undo_edit_batch(…, {keepLaterEdits: true})`. */
+  keptOnUndo: (batchId: number, id: number) => boolean;
+  /** `ImageEditState.needsReview` of a photo. */
+  needsReview: (id: number) => boolean;
   presets: Preset[];
   styleGroups: StyleGroup[];
   nextPresetId: () => number;
@@ -80,7 +92,7 @@ const LABEL = "Baseline Edit";
 const ENGINE = "baseline-mock@1";
 
 type Prov = { runId: number; batchId: number; entryId: number; flagged: boolean; appliedAtMs: number; anchorId: number; presetId: number | null };
-type Run = Omit<BaselineRun, "batch"> & { batchId: number | null };
+type Run = Omit<BaselineRun, "batch" | "live"> & { batchId: number | null };
 
 const round = (v: number, step: number) => Math.round(v / step) * step;
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -97,6 +109,9 @@ export const mockAutoLight = (id: number): LightValues => ({
   temperatureK: 4800 + ((id * 53) % 1400),
   tint: (id * 7) % 16,
 });
+
+/** Legacy Develop Auto of the mock (`auto_tone` all keys + `auto_white_balance`), used without a `?baseline=` switch. */
+export const LEGACY_AUTO_LIGHT: LightValues = { exposure: 0.35, contrast: 8, highlights: -42, shadows: 31, whites: 12, blacks: -9, temperatureK: 5350, tint: 6 };
 
 const lightOf = (a: ParametricAdjustments, asShot: { temperatureK: number; tint: number }): LightValues => ({
   exposure: a.exposure,
@@ -154,6 +169,8 @@ export function createMockBaseline(ctx: MockBaselineContext) {
   let runSeq = 0;
   let activitySeq = 200_000;
   const AS_SHOT = { temperatureK: 5200, tint: 8 };
+  /** Rust `develop::baseline::measure_light`: the one light-only Auto (`auto_light` and the engine). */
+  const autoLightOf = (id: number): LightValues => (mode ? mockAutoLight(id) : { ...LEGACY_AUTO_LIGHT });
 
   const projectRows = (pid: number) =>
     ctx.rows.filter((r) => ctx.projectOf(r) === pid).sort((a, b) => (a.capture.capturedAtMs ?? 0) - (b.capture.capturedAtMs ?? 0) || a.id - b.id);
@@ -200,7 +217,7 @@ export function createMockBaseline(ctx: MockBaselineContext) {
   };
 
   const anchorOf = (s: BaselineSettings, look: ParametricAdjustments): BaselineAnchor => {
-    const auto = mockAutoLight(s.anchorId);
+    const auto = autoLightOf(s.anchorId);
     const light = lightOf(look, AS_SHOT);
     return { imageId: s.anchorId, auto, light, offset: offsetOf(light, auto) };
   };
@@ -223,12 +240,12 @@ export function createMockBaseline(ctx: MockBaselineContext) {
 
   /** Rust `develop::baseline::compute` (target model, see the header). */
   function plan(r: RawImageEntry, s: BaselineSettings, look: ParametricAdjustments, anchor: BaselineAnchor): { result: BaselinePhotoResult; next: ParametricAdjustments | null } {
-    const base = { imageId: r.id, sceneId: r.sceneId ?? null, burstGroupId: r.burstGroupId ?? null, auto: null, light: null, reasons: [] as BaselineReason[] };
+    const base = { imageId: r.id, sceneId: r.sceneId ?? null, burstGroupId: r.burstGroupId ?? null, auto: null, light: null, reasons: [] as BaselineReason[], state: null };
     if (r.id === s.anchorId) return { result: { ...base, outcome: "anchor" }, next: null };
     if (stateOf(r.id) === "edited" && !s.replaceEdited) return { result: { ...base, outcome: "skipped_edited" }, next: null };
     if (r.missingSinceMs != null) return { result: { ...base, outcome: "failed", reasons: [reason("unreadable", "The original is missing")] }, next: null };
     const reasons: BaselineReason[] = [];
-    let auto: LightValues | null = mockAutoLight(r.id);
+    let auto: LightValues | null = autoLightOf(r.id);
     let light: LightValues;
     if (r.id % 19 === 0) {
       auto = null;
@@ -278,9 +295,41 @@ export function createMockBaseline(ctx: MockBaselineContext) {
     return m;
   };
 
+  /** Rust `db::baseline::provenance` state of one photo (v21.1: kept-on-undo photos read `user_edited`). */
+  const provState = (id: number, p: Prov): BaselineState => {
+    const c = ctx.cursor(id);
+    if (c && c.entryId === p.entryId && c.batchId === p.batchId) return "on_baseline";
+    return ctx.batchInfo(p.batchId)?.undoneAtMs != null && !ctx.keptOnUndo(p.batchId, id) ? "undone" : "user_edited";
+  };
+
+  /** Rust `db::baseline::live_counts`. */
+  const liveOf = (runId: number): BaselineLiveCounts => {
+    const c: BaselineLiveCounts = { written: 0, onBaseline: 0, needsLook: 0, userEdited: 0, undone: 0 };
+    for (const [id, p] of prov) {
+      if (p.runId !== runId) continue;
+      c.written++;
+      const st = provState(id, p);
+      if (st === "on_baseline") {
+        c.onBaseline++;
+        if (p.flagged && ctx.needsReview(id)) c.needsLook++;
+      } else if (st === "user_edited") c.userEdited++;
+      else c.undone++;
+    }
+    return c;
+  };
+
+  /** Rust `db::baseline::undone_message`. */
+  const undoneMessage = (l: BaselineLiveCounts) => {
+    const photos = (n: number) => (n === 1 ? "1 photo" : `${n} photos`);
+    if (l.userEdited === 0) return "Undone: the photos are back to how they were";
+    return `Undone on ${photos(l.undone)}; ${l.userEdited === 1 ? "1 photo you changed since was kept" : `${l.userEdited} photos you changed since were kept`}`;
+  };
+
   const dto = (r: Run): BaselineRun => {
     const { batchId, ...rest } = r;
-    return { ...rest, settings: structuredClone(r.settings), batch: batchId != null ? ctx.batchInfo(batchId) : null };
+    const batch = batchId != null ? ctx.batchInfo(batchId) : null;
+    const live = liveOf(r.id);
+    return { ...rest, settings: structuredClone(r.settings), batch, live, message: batch?.undoneAtMs != null ? undoneMessage(live) : r.message };
   };
 
   /** The run's write (Rust `db::baseline::store_results`). */
@@ -435,9 +484,7 @@ export function createMockBaseline(ctx: MockBaselineContext) {
     return ids.flatMap((id) => {
       const p = prov.get(id);
       if (!p) return [];
-      const c = ctx.cursor(id);
-      const state: BaselineState =
-        c && c.entryId === p.entryId && c.batchId === p.batchId ? "on_baseline" : ctx.batchInfo(p.batchId)?.undoneAtMs != null ? "undone" : "user_edited";
+      const state = provState(id, p);
       return [{ imageId: id, runId: p.runId, batchId: p.batchId, anchorId: p.anchorId, presetId: p.presetId, appliedAtMs: p.appliedAtMs, state, flagged: p.flagged }];
     });
   }
@@ -470,7 +517,18 @@ export function createMockBaseline(ctx: MockBaselineContext) {
         const pid = args.projectId as number;
         ctx.requireProject(pid);
         const outcomes = (args.outcomes as BaselineOutcome[] | null) ?? [];
-        return (results.get(pid) ?? []).filter((r) => !outcomes.length || outcomes.includes(r.outcome));
+        const latest = [...runs].reverse().find((x) => x.projectId === pid && x.state === "finished");
+        return (results.get(pid) ?? [])
+          .filter((r) => !outcomes.length || outcomes.includes(r.outcome))
+          .map((r) => {
+            const p = prov.get(r.imageId);
+            return { ...r, state: p && latest && p.runId === latest.id ? provState(r.imageId, p) : null };
+          });
+      }
+      case "auto_light": {
+        const id = args.id as number;
+        if (!ctx.byId.has(id)) throw { kind: "not_found", message: `image ${id}` };
+        return { light: autoLightOf(id), whiteBalanceEstimated: true } satisfies AutoLightValues;
       }
       case "get_baseline_provenance":
         return provenanceOf(args.ids as number[]);
@@ -479,5 +537,36 @@ export function createMockBaseline(ctx: MockBaselineContext) {
     }
   }
 
-  return { handle, queryOk };
+  /** The project's latest run while finished with a batch that is not undone (Rust `db::baseline::live_anchor`). */
+  function liveRun(projectId: number): { run: Run; batch: EditBatchInfo } | null {
+    const r = [...runs].reverse().find((x) => x.projectId === projectId);
+    if (!r || r.state !== "finished" || r.batchId == null) return null;
+    const batch = ctx.batchInfo(r.batchId);
+    return batch && batch.undoneAtMs == null ? { run: r, batch } : null;
+  }
+  const liveAnchor = (projectId: number | null): number | null => (projectId == null ? null : (liveRun(projectId)?.run.settings.anchorId ?? null));
+
+  /** Rust `db::baseline::plan_baseline` (`EditPlan.baseline`). */
+  function planBaseline(projectId: number, keeperStates: ImageEditState[]): EditPlanBaseline | null {
+    const live = liveRun(projectId);
+    if (!live) return null;
+    const { run: r, batch } = live;
+    const on = keeperStates.filter((s) => s.editSource === "baseline");
+    const editedSince = keeperStates.filter((s) => {
+      const p = prov.get(s.imageId);
+      return !!p && p.runId === r.id && provState(s.imageId, p) === "user_edited";
+    }).length;
+    return {
+      runId: r.id,
+      batch,
+      anchorId: r.settings.anchorId,
+      presetId: r.settings.presetId,
+      keepers: keeperStates.length,
+      onBaseline: on.length,
+      needsLook: on.filter((s) => s.needsReview).length,
+      editedSince,
+    };
+  }
+
+  return { handle, queryOk, planBaseline, liveAnchor };
 }
