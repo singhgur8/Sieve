@@ -27,6 +27,8 @@ interface Props {
   flaggedReview?: boolean;
   /** Photos the latest baseline run flagged, with the reason (so a fixed photo can still say what was wrong). */
   flaggedRows?: BaselinePhotoResult[];
+  /** Back to the baseline result (shown instead of "Next to review" when none are left). */
+  onBackToResult?: () => void;
 }
 
 const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
@@ -58,7 +60,19 @@ export function EditContextBar(p: Props) {
   const showApply = sceneFlow && !repOnBaseline;
 
   const flaggedRow = p.activeId != null ? p.flaggedRows?.find((r) => r.imageId === p.activeId) : undefined;
-  const wasFlagged = !!flaggedRow && p.activeId != null && !wf.needsReviewSet.has(p.activeId) && wf.stateById.get(p.activeId)?.editSource !== "baseline";
+  const unflagged = !!flaggedRow && p.activeId != null && !wf.needsReviewSet.has(p.activeId);
+  const wasFlagged = unflagged && wf.stateById.get(p.activeId!)?.editSource !== "baseline";
+  const wasChecked = unflagged && !wasFlagged; // marked "Looks good": the baseline edit stays
+  const noneLeft = !(p.flaggedRows ?? []).some((r) => wf.needsReviewSet.has(r.imageId));
+  const nextOrBack = noneLeft && p.onBackToResult ? (
+    <button className="text-xs text-sky-300 hover:underline" onClick={p.onBackToResult} data-testid="edit-back-result" title="Back to the baseline edit result (Cmd+Alt+B)">
+      Back to the result (Cmd+Alt+B)
+    </button>
+  ) : (
+    <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (Cmd+Enter or N)">
+      Next to review ›
+    </button>
+  );
   const wasText = flaggedRow?.reasons[0]?.text ?? "needs a look";
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
   let hintText: string | null = null;
@@ -79,15 +93,13 @@ export function EditContextBar(p: Props) {
           </button>
         </>
       );
-    } else if (wasFlagged) {
+    } else if (wasFlagged || wasChecked) {
       chip = (
         <>
-          <span className="max-w-[420px] truncate rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="fixed" title="You changed this photo, so it no longer needs a look">
-            Fixed · was: {wasText.charAt(0).toLowerCase() + wasText.slice(1)}
+          <span className="max-w-[420px] truncate rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind={wasChecked ? "checked" : "fixed"} title={wasChecked ? "You marked this photo Looks good" : "You changed this photo, so it no longer needs a look"}>
+            {wasChecked ? "Checked" : "Fixed"} · was: {wasText.charAt(0).toLowerCase() + wasText.slice(1)}
           </span>
-          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (Cmd+Enter or N)">
-            Next to review ›
-          </button>
+          {nextOrBack}
         </>
       );
     } else if (isRep) {

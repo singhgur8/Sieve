@@ -735,9 +735,58 @@ test.describe("baseline edit UI", () => {
       await expect(page.getByTestId("edit-looks-good")).toBeVisible();
       await page.keyboard.press("Control+Enter");
     }
-    await expect(page.getByText(`All ${total} checked`)).toBeVisible();
+    await expect(page.getByTestId("notice").getByText(`All ${total} checked`)).toBeVisible();
     await expect(page.getByTestId("baseline-looks-good-back")).toBeVisible();
+    // R2-2: more presses never stack a second toast.
+    await page.keyboard.press("Control+Enter");
+    await page.keyboard.press("Control+Enter");
+    await expect(page.getByTestId("notice").getByText(`All ${total} checked`)).toHaveCount(1);
+    await expect(page.getByTestId("baseline-looks-good-back")).toHaveCount(1);
+    // R2-3 / R2-4: the last checked photo says Checked and offers the way back; the bar is emerald.
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("data-kind", "checked");
+    await expect(page.getByTestId("edit-chip")).toContainText(/Checked · was: \S+/);
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("title", "You marked this photo Looks good");
+    await expect(page.getByTestId("edit-next-review")).toHaveCount(0);
+    await expect(page.getByTestId("edit-back-result")).toHaveText("Back to the result (Cmd+Alt+B)");
+    await expect(page.getByTestId("baseline-review-bar")).toHaveAttribute("data-done", "1");
+    await expect(page.getByTestId("baseline-review-left")).toHaveText(`All ${total} checked`);
+    await expect(page.getByTestId("baseline-review-bar")).toHaveClass(/bg-emerald-950/);
+    // The toast goes when the Baseline view opens.
+    await page.getByTestId("edit-back-result").click();
+    await expect(page.getByTestId("baseline-looks-good-back")).toHaveCount(0);
   });
+
+  for (const withRun of [false, true]) {
+    test(`R2-1: no top bar button runs past the window edge at 1280/1440/1536/1600 (${withRun ? "with" : "without"} a baseline run)`, async ({ page }) => {
+      await openEdit(page, withRun ? "1" : "presets");
+      for (const w of [1280, 1440, 1536, 1600]) {
+        await page.setViewportSize({ width: w, height: 900 });
+        const check = async (where: string) => {
+          const over = await page.getByTestId("top-bar").locator("button").evaluateAll((els, iw) =>
+            els.map((e) => ({ e, r: e.getBoundingClientRect() })).filter(({ r }) => r.width > 0 && r.right > iw - 11).map(({ e, r }) => `${e.getAttribute("aria-label") ?? e.getAttribute("data-testid") ?? e.textContent} right=${Math.round(r.right)}`), w);
+          expect(over, `${where} at ${w}`).toEqual([]);
+        };
+        await check("plan");
+        // Labels come back from 1600 only.
+        const label = page.getByTestId("mode-grid").locator("span");
+        if (w >= 1600) await expect(label).toBeVisible();
+        else await expect(label).toBeHidden();
+      }
+      await page.setViewportSize({ width: 1440, height: 900 });
+      if (withRun) {
+        await page.getByTestId("plan-baseline").click();
+        await page.locator("[data-testid=baseline-show-flagged]").click();
+        await page.locator('[data-testid^="cell-"]').first().click();
+        await page.keyboard.press("d");
+        await expect(page.getByTestId("develop-view")).toBeVisible();
+        for (const w of [1280, 1440, 1536, 1600]) {
+          await page.setViewportSize({ width: w, height: 900 });
+          const over = await page.getByTestId("top-bar").locator("button").evaluateAll((els, iw) => els.filter((e) => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().right > iw - 11).length, w);
+          expect(over, `develop at ${w}`).toBe(0);
+        }
+      }
+    });
+  }
 
   test("N1 / N2: a finished run is announced once; opening the flagged photos drops the finish toast", async ({ page }) => {
     await openEdit(page, "anchor", 100);

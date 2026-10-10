@@ -23,7 +23,7 @@ export interface Toast {
 
 export interface ToastApi {
   toasts: Toast[];
-  push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number }) => number;
+  push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number; key?: string }) => number;
   dismiss: (id: number) => void;
   /** Drops the toast's Undo (kept text), e.g. when a newer edit made it unsafe. */
   retract: (id: number) => void;
@@ -33,6 +33,7 @@ export function useToasts(): ToastApi {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const next = useRef(1);
   const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
+  const keyed = useRef(new Map<string, number>());
 
   const dismiss = useCallback((id: number) => {
     clearTimeout(timers.current.get(id));
@@ -45,8 +46,13 @@ export function useToasts(): ToastApi {
   }, []);
 
   const push = useCallback(
-    (message: string, opts: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number } = {}) => {
+    (message: string, opts: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number; key?: string } = {}) => {
       const id = next.current++;
+      if (opts.key) {
+        const old = keyed.current.get(opts.key);
+        if (old != null) dismiss(old);
+        keyed.current.set(opts.key, id);
+      }
       const kind = opts.kind ?? "info";
       // A new message replaces plain older ones; toasts carrying an action (Undo) stay until they expire.
       setToasts((all) => [...all.filter((t) => t.action).slice(-1), { id, message, kind, action: opts.action, secondary: opts.secondary, third: opts.third }]);

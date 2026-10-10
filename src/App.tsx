@@ -1159,7 +1159,15 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // The finish toast: one Undo for the whole baseline.
   const seenRunning = useRef<number | null>(null);
   const finishToast = useRef<number | null>(null);
+  const allCheckedToast = useRef<number | null>(null);
   // Opening the flagged photos puts Looks good / Next to review where the toast sits: drop it (Undo stays in the result and on Cmd+Z).
+  // "All N checked" goes when the needs-a-look filter is turned off or the Baseline view opens.
+  useEffect(() => {
+    if ((!flaggedReview || bBar || baselineOpen != null) && allCheckedToast.current != null) {
+      toasts.dismiss(allCheckedToast.current);
+      allCheckedToast.current = null;
+    }
+  }, [flaggedReview, bBar, baselineOpen]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (flaggedReview && finishToast.current != null) {
       toasts.dismiss(finishToast.current);
@@ -1413,7 +1421,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         if (!marked && next == null && !(flaggedReview || flaggedRows.some((r) => r.imageId === active))) return setNotice("This photo is not marked as needing a look");
         void (marked ? wf.markReviewed([active]) : Promise.resolve()).then(() => {
           if (next != null) return sel.set([next], next);
-          push(`All ${total || 1} checked`, { action: { label: "Back to the baseline", testid: "baseline-looks-good-back", onClick: () => openBaseline() } });
+          allCheckedToast.current = push(`All ${total || 1} checked`, { key: "baseline-all-checked", action: { label: "Back to the baseline", testid: "baseline-looks-good-back", onClick: () => openBaseline() } });
         });
         return;
       }
@@ -2121,6 +2129,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   onShowIds={showIds}
                   onReview={reviewFrames}
                   onNextReview={() => leave(nextReview)}
+                  onBackToResult={() => leave(() => openBaseline())}
                 />
                 </>
               ) : undefined

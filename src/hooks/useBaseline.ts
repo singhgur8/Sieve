@@ -51,7 +51,6 @@ export function describeOffset(o: LightOffset | null | undefined): string {
   return parts.length > 0 ? parts.join(", ") : "same as Auto";
 }
 
-/** The project's latest baseline run, kept fresh by `baseline-run-finished`. */
 /** "Undone for 41 photos. DSC00011.ARW keeps your change." when some photos kept a later edit. */
 export function undoneText(kept: string[], total: number): string {
   if (kept.length === 0) return "Undone. The photos are back to how they were.";
@@ -84,6 +83,7 @@ export function useKeptAfterUndo(projectId: number | null, run: BaselineRun | nu
   return ids;
 }
 
+/** The project's latest baseline run, kept fresh by `baseline-run-finished`. */
 export function useBaselineRun(projectId: number | null) {
   const [run, setRun] = useState<BaselineRun | null>(null);
   const [loaded, setLoaded] = useState(false);

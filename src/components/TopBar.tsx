@@ -13,7 +13,7 @@ import { openHelp } from "../lib/helpStore";
 import { BUSY_WHY, useActivityRunning } from "../lib/activity";
 
 const btn = "flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 text-sm hover:bg-neutral-700 disabled:opacity-50";
-const labelHide = "max-[1439px]:hidden";
+const labelHide = "max-[1599px]:hidden";
 const seg = (on: boolean) => `flex h-7 items-center gap-1 whitespace-nowrap rounded px-2 text-xs ${on ? "bg-sky-800 text-sky-100" : "bg-neutral-800 hover:bg-neutral-700"}`;
 
 interface Props {
@@ -97,13 +97,13 @@ export function TopBar(p: Props) {
     <div className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 px-3" data-testid="top-bar">
       <button onClick={p.onHome} disabled={!p.onHome} className="flex items-center gap-2 rounded-md hover:opacity-80 disabled:hover:opacity-100" data-testid="home-button" title="All projects">
         <Aperture className="size-5 shrink-0 text-amber-400" />
-        <h1 className={`font-semibold tracking-tight ${p.steps ? "max-[1439px]:hidden" : ""}`}>Sieve</h1>
+        <h1 className={`font-semibold tracking-tight ${p.steps ? "max-[1599px]:hidden" : ""}`}>Sieve</h1>
       </button>
       {p.project && p.onHome && p.onOpenProject && <ProjectSwitcher project={p.project} onHome={p.onHome} onOpenProject={p.onOpenProject} onSetCover={p.onSetCover ?? null} />}
       <div className="flex" data-testid="import-split">
         <button onClick={p.onImport} disabled={p.busy} className={`${btn} rounded-r-none`} data-testid="import-button" title={`${p.project ? "Add a folder to this project" : "Import a shoot folder"}${hint("import")}`}>
           <FolderOpen className="size-4" />
-          <span className={p.steps ? "max-[1439px]:hidden" : ""}>{p.busy ? "Importing…" : "Import"}</span>
+          <span className={p.steps ? "max-[1599px]:hidden" : ""}>{p.busy ? "Importing…" : "Import"}</span>
         </button>
         <Menu trigger={<ChevronDown className="size-4" />} triggerClass={`${btn} rounded-l-none border-l border-neutral-700 px-1.5`} triggerTestId="import-options" title="Import options" disabled={p.busy}>
           {(close) => (
@@ -136,9 +136,9 @@ export function TopBar(p: Props) {
           <AnalyzeSplit catalog={c} analysis={p.analysis} hasImages={p.hasImages} detecting={p.detecting} onAnalyze={p.onAnalyze} onAutoAnalyze={p.onAutoAnalyze} onDetectScenes={p.onDetectScenes} />
         </>
       )}
-      {p.steps && <div className="mx-auto">{p.steps}</div>}
+      {p.steps && <div className="mx-auto min-w-0">{p.steps}</div>}
 
-      <div className={`${p.steps ? "" : "mx-auto"} flex gap-1`} data-testid="mode-switcher">
+      <div className={`${p.steps ? "shrink-0" : "mx-auto"} flex gap-1`} data-testid="mode-switcher">
         {p.plan && (
           <button className={seg(p.plan.on)} aria-label="Plan" aria-pressed={p.plan.on} onClick={p.plan.onPlan} title={`Plan: the scene checklist${hint("toGrid")}`} data-testid="mode-plan">
             <LayoutList className="size-3.5" /> <span className={p.steps && !p.plan.on ? labelHide : ""}>Plan</span>

@@ -1,7 +1,7 @@
 // Grid strip while the "needs a look" baseline filter is on: why those photos were flagged (grouped), and the reason
 // for the active photo. In Develop the same filter shows a slim bar with how many are left and the way back.
 import { useEffect, useState } from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import { commands, unwrap, type BaselinePhotoResult } from "../../ipc";
 
 /** The photos the project's latest baseline run flagged (reasons included). */
@@ -68,12 +68,13 @@ export function BaselineFlagBar({ projectId, activeId, reviewLeft, tick, onClear
 export function BaselineReviewBar({ projectId, reviewLeft, tick, onBack }: { projectId: number; reviewLeft: Set<number>; tick?: unknown; onBack: () => void }) {
   const rows = useFlaggedRows(projectId, tick);
   const left = rows.filter((r) => reviewLeft.has(r.imageId)).length;
+  const done = left === 0 && rows.length > 0;
   return (
-    <div className="flex h-8 shrink-0 items-center gap-2 border-b border-amber-900 bg-amber-950/70 px-3 text-xs" data-testid="baseline-review-bar" role="region" aria-label="Baseline review">
-      <AlertTriangle className="size-3.5 shrink-0 text-amber-400" aria-hidden />
-      <span className="font-semibold text-amber-200">Baseline</span>
-      <span className="text-neutral-200" data-testid="baseline-review-left">
-        Needs a look: {left} of {rows.length} left
+    <div className={`flex h-8 shrink-0 items-center gap-2 border-b px-3 text-xs ${done ? "border-emerald-900 bg-emerald-950/70" : "border-amber-900 bg-amber-950/70"}`} data-testid="baseline-review-bar" data-done={done ? "1" : undefined} role="region" aria-label="Baseline review">
+      {done ? <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" aria-hidden /> : <AlertTriangle className="size-3.5 shrink-0 text-amber-400" aria-hidden />}
+      <span className={`font-semibold ${done ? "text-emerald-200" : "text-amber-200"}`}>Baseline</span>
+      <span className={done ? "text-emerald-200" : "text-neutral-200"} data-testid="baseline-review-left">
+        {done ? `All ${rows.length} checked` : `Needs a look: ${left} of ${rows.length} left`}
       </span>
       <button className="ml-auto text-sky-300 hover:underline" data-testid="baseline-review-back" title="Back to the baseline edit result (Cmd+Alt+B)" onClick={onBack}>
         Back to the result (Cmd+Alt+B)
