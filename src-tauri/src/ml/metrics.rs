@@ -348,25 +348,70 @@ fn blown_share(rgb: &[u8], w: usize, h: usize, b: &[f32; 4]) -> f32 {
     }
 }
 
-/// Tiled whole-frame sharpness: textured tiles only; percentiles over them, so a
-/// sharp subject in a shallow-DOF frame still scores high.
-fn tile_stats(luma: &Gray) -> TileStats {
+/// Per-tile (sharpness, anisotropy) on the [`TILES_LONG`] grid, row-major; `None` = too
+/// little texture to judge. Returns `(nx, ny, tiles)`.
+fn tile_values(luma: &Gray) -> (usize, usize, Vec<Option<(f32, f32)>>) {
     let t = (luma.w.max(luma.h) / TILES_LONG).max(16);
     let (nx, ny) = (luma.w / t, luma.h / t);
-    let mut vals: Vec<(f32, f32)> = Vec::new(); // (sharpness, anisotropy)
-    let total = (nx * ny).max(1);
+    let mut out = Vec::with_capacity(nx * ny);
     for ty in 0..ny {
         for tx in 0..nx {
             let tile = imgproc::crop(luma, tx * t, ty * t, tx * t + t, ty * t + t);
             let (sh, sv, tex) = imgproc::hv_sharpness(&tile);
             if tex < TILE_MIN_TEXTURE {
+                out.push(None);
                 continue;
             }
             let mx = (sh + sv) / 2.0;
             let an = if mx > 0.0 { (sh - sv).abs() / mx } else { 0.0 };
-            vals.push((mx, an));
+            out.push(Some((mx, an)));
         }
     }
+    (nx, ny, out)
+}
+
+/// Where in the frame the sharpness is: the tile sharpness of [`TileStats`] per tile
+/// (row-major, `None` = too little texture to judge). Used by `ml::moments` for the detail
+/// focus check (is the sharpest region on the central object?).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TileGrid {
+    pub nx: usize,
+    pub ny: usize,
+    pub tiles: Vec<Option<f32>>,
+}
+
+impl TileGrid {
+    /// Tile `(tx, ty)` sharpness.
+    pub fn at(&self, tx: usize, ty: usize) -> Option<f32> {
+        self.tiles.get(ty * self.nx + tx).copied().flatten()
+    }
+}
+
+/// [`TileGrid`] of a luma image (same tiles as the stored [`TileStats`]).
+pub fn tile_grid(luma: &Gray) -> TileGrid {
+    let (nx, ny, vals) = tile_values(luma);
+    TileGrid { nx, ny, tiles: vals.into_iter().map(|v| v.map(|(s, _)| s)).collect() }
+}
+
+/// [`TileGrid`] of a preview JPEG (decoded like [`measure`], ~1024 px luma).
+pub fn preview_tile_grid(path: &Path) -> Result<TileGrid, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read preview {}: {e}", path.display()))?;
+    let mut rgb = Vec::new();
+    let (w, h) = turbo::decode_rgb_into(&bytes, u32::MAX, MAX_PIXELS, &mut rgb)?;
+    let (w, h) = (w as usize, h as usize);
+    if w < 64 || h < 64 {
+        return Err(format!("preview too small ({w}x{h})"));
+    }
+    let k = (w.max(h) as f32 / 1024.0).round().max(1.0) as usize;
+    Ok(tile_grid(&imgproc::luma_box(&rgb[..w * h * 3], w, h, k)))
+}
+
+/// Tiled whole-frame sharpness: textured tiles only; percentiles over them, so a
+/// sharp subject in a shallow-DOF frame still scores high.
+fn tile_stats(luma: &Gray) -> TileStats {
+    let (nx, ny, grid) = tile_values(luma);
+    let total = (nx * ny).max(1);
+    let mut vals: Vec<(f32, f32)> = grid.into_iter().flatten().collect(); // (sharpness, anisotropy)
     if vals.is_empty() {
         return TileStats { p90: 0.0, p50: 0.0, textured: 0.0, anisotropy: 0.0 };
     }
