@@ -485,3 +485,54 @@ No conflicts: G, E and B are each used in one place, and Shift+Down does not lea
 - The Not sure pile, the Apply dialog, the toasts and Setup focus.
 
 **Open P0 / P1 after Re-check 2: P0 1 (N2-1 scroll crash in the moment grid, Similar, Weaker and Defects lists) · P1 1 (N2-2 off-screen alternatives and focus in the moment grid).**
+
+## Re-check 3 (2026-10-10)
+
+Branch `phase-9-target-cull` at e5b1491 (N2-1 to N2-3 fixes). I used the mock backend (`vite --port 1467`) with throwaway Playwright drivers at 1280×800 on `?mock=5000&target=1`. I also ran the R1-2, R1-3 and N2-1 to N2-3 tests in `tests/ui/target-cull.spec.ts`; all 5 pass. I kept the screenshots in a scratch folder and deleted them afterwards, along with `test-data/ui-screens/`.
+
+### Verdict per item
+| Item | Verdict | Evidence |
+|---|---|---|
+| N2-1 Scroll crash | **Resolved** | `Windowed` now reads `scrollTop` before calling the setter. No crash and no page or console errors in any of these: Review grid, Shift+Right ×40 (Moment 1 → 41, reviewed 0 → 76), then the wheel to the bottom (scrollTop 31,400 of 56,400), End (DSC02499) and Home. Similar pile, wheeled to the end (21,042 of 21,648), End, Home, Down ×30. Weaker (5,234 of 5,812) and Defects (13,854 of 14,432) the same way. After a wheel scroll, the next arrow key brings the focused cell back into view. |
+| N2-2 Off-screen alternatives | **Resolved** | `useFocusIntoView` keeps the focused cell inside the viewport: Right across a row's alternatives stays between x 785 and 1113 at 1280. Rows that overflow get the right-edge fade and a `+N` chip (`+1`, `+2`). Captions read `#1 ≈ DSC00003`, and the tooltip names the full reason and the pick. The Similar pile scrolls its focused frame into view too. |
+| N2-3 Shift+arrows in Weaker / Defects, hidden aliases | **Resolved**, with a P2 leftover | Shift+arrows do nothing in Weaker and Defects. The cheat sheet now lists `Shift+Right · Shift+Down · Shift+Z (Review picks only)` and `Shift+Left · Shift+Up`. The grid footer still reads "Arrows move · Up / Down: moment" and does not mention that Shift accepts the row (N3-6). |
+
+### End-to-end walk (1280×800, 2,500 photos, 534 picks in 282 moments)
+- **Moment grid**: G, then Shift+Right ×40. Every row header was correct, reviewed rows dimmed, and the count rose by the row's picks. Shift+Left ×3 went back. End and Home work. No crash. Friction: N3-3 and N3-4.
+- **Review, two-up**: S swapped DSC00002 for DSC00007, and Cmd+Z put both back. A added DSC00007 (Picked 535), and Cmd+Z removed it (534). In the grid, X set DSC00041 aside and Cmd+Z restored it, with focus back on it. A on alternative DSC00047 added it, and Cmd+Z removed it with focus back on it. Leftovers: N3-2 and N3-5.
+- **Second look, Not sure**: A on DSC00033, then Cmd+Z: back on 33 and its reviewed mark is gone. S swapped 33 for its cover DSC00039 (same moment, 90 %). I moved on twice and pressed Cmd+Z: back on 33, with 33 Not sure and 39 Picked again. The kept strip, "you added" and the amber "Add a 3rd from this moment" all work. Leftover: N3-2 (toast copy).
+- **Second look, Similar**: scrolled fully. A on DSC00620 → Picked 535, and Cmd+Z put it back to Set aside with focus on 620. S and Cmd+Z worked the same way. **Weaker / Defects**: scrolled fully, Down ×30 keeps the focus in view, and the note "Defects are rejected when you apply" is visible.
+- **Apply**: "483 photos get the Picked flag (the other 51 picks already have it)", then "Picked 483 · Rejected 362 · Unflagged 0. 1,655 photos left as they were." and the keeper offer. Both Undo paths restore every flag: the dialog's `Undo` ("The flags are back as they were") and Cmd+Z in the Cull grid ("Undid: Apply Pick the best N"). In both cases `plan_target_apply` matches the pre-apply plan exactly. But the Best N row still says "applied 04:55 AM" (N3-1).
+
+### New findings
+
+#### N3-1 (P1) After the apply is undone, the Best N row still says "applied" **[ARCH]**
+- **Where**: `TargetEntry.tsx` `BestRow` (`run.appliedAtMs`). Backend: `db/target.rs` stamps `target_runs.applied_at` when it applies (line 1176), but `repo::restore_cull_snapshot` never clears it. The mock (`mockTarget.ts`) behaves the same way.
+- **What**: Apply, then Undo (dialog) or Cmd+Z (Cull grid). The flags are back (the plan is again 483 picks / 362 rejects), but `appliedAtMs` keeps its time. The row says "Best 800: 534 picked · … · applied 04:55 AM", and `data-applied="true"`.
+- **Why**: this row (P1-9) is how the photographer knows whether the picks are written to the flags and XMP. After an undo it says they are, when no pick flag is set. They then go to Edit or Export with keepers that are "everything not rejected". The Cmd+Z case is the likely one, because an undo hours later in the Cull grid gives no other hint.
+- **Fix** (contract, for `architect`, then `rust-engine-dev` and `frontend-dev`):
+  1. When `apply_target_selection` runs, store the previous `applied_at` with its cull snapshot (the snapshot returned as `previous`).
+  2. When that snapshot is restored, write `target_runs.applied_at` back to the previous value (`NULL` for a first apply), in the same transaction. Mirror this in `mockTarget.ts`.
+  3. Frontend: after either undo path, re-fetch `get_target_run`, so the row reads "not applied yet" (or the earlier time) and the header's Apply state updates.
+- **Acceptance**: apply, then undo with the dialog → the row ends in "not applied yet" and `data-applied="false"`. Apply again, then Cmd+Z in the Cull grid → the same. A Rust test: apply → restore → `get_target_run(..).applied_at_ms == None`.
+
+#### P2
+- **N3-2 Swap toast shows "#39" instead of the file name** (`SecondStep.tsx:368`). In Not sure, S toasts "Kept DSC00033 instead of #39". `entries.need([other])` has not loaded the entry yet, so `stemOf` falls back to the id. The Undo tooltip has the right name ("Swap DSC00039 for DSC00033"). Fix: in Not sure use `cov.coveredByName`, and elsewhere await the entry, or build the toast after `ctx.edit` resolves and reads `entries.get(other)` again. Acceptance: the toast reads "Kept DSC00033 instead of DSC00039".
+- **N3-3 Moment grid and Similar pile: the focused row is pinned to the bottom** (`useFocusIntoView`, `block: "nearest"`). While walking forward with Shift+Right or Down, the current row always sits at the bottom of the list (y 571–731 of 137–747). The top two thirds of the screen show rows already reviewed (dimmed), and the next moment is never visible in advance. Fix: for vertical moves between rows (Up / Down, Shift+arrows, ] / [), scroll the list so the focused row's top sits one row height below the list top: `list.scrollTop = rowIndex * rowH - rowH`, clamped to ≥ 0. This leaves one row of context above and 1–2 rows of lookahead below. Keep `inline: "nearest"` for horizontal moves inside a row. Acceptance: at 1280×800, after Shift+Right ×10, the focused row's top is within 210 px of the list top.
+- **N3-4 The grid header position goes stale** (`ReviewStep.tsx` sub-header). In the moment grid, "Photo 1 of 534 · Moment 1 of 282" stays the same while the focus walks to Moment 41. It follows the two-up photo, not the grid focus. Fix: in grid view, show `Moment {gRow+1} of {rows.length}` from the grid focus and hide "Photo k of N" (or show it for the focused cell).
+- **N3-5 Undo and focus leftovers in Review**:
+  1. After S then Cmd+Z, the swap's reviewed marks stay (`sieve.target.reviewed.review.1` stays `[7,2]`). DSC00002 counts as reviewed, and `]` skips it. Undo should restore the reviewed set as it was before the action, as the Second look already does.
+  2. In the grid, A on alternative DSC00047 moves the focus by column index to DSC00048. The toast reads "Added DSC00047 too", but the ring is on 48. After A, keep the focus on the added id, which now sits among the picks.
+- **N3-6 Grid footer hint** (`ReviewStep.tsx` footer): change "Up / Down: moment" to "Up / Down: moment · Shift+→/↓: accept row". This finishes N2-3.
+- At 1280, the bottom-right toast (R1-4) covers the alternatives' captions on the lowest visible grid row for 3 s. I accept that, because N3-3 moves the focused row up and away from it.
+
+### Keymap changes since Re-check 2
+None. Shift+Down / Shift+Up now appear in the cheat sheet. Shift+arrows are no-ops in Weaker and Defects. There are no conflicts.
+
+### Needs no change after Re-check 3
+- N2-1 and N2-2 as built. The `+N` chip and the fade are clear, and the `≈ DSC…` caption solves the repeated-rank confusion.
+- Swap, add, set-aside and undo in both passes and in the grid. The selections and the counts are correct, and undo returns to the photo.
+- The Apply dialog copy, the counts, the keeper offer, and the flag restore on both undo paths (apart from N3-1's stamp).
+- Full-length scrolling of the Similar, Weaker and Defects piles.
+
+**Open P0 / P1 after Re-check 3: P0 none · P1 1 (N3-1 the Best N row still says "applied" after the apply is undone; needs a backend change to restore `applied_at` with the snapshot).**
