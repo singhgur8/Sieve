@@ -616,9 +616,10 @@ test.describe("baseline edit UI", () => {
       await expect(page.getByTestId("baseline-review-left")).toContainText(`${left} of ${total} left`);
       await page.keyboard.press("Control+Enter");
     }
-    await expect(page.getByText(`All ${total} checked`)).toBeVisible();
+    await expect(page.getByTestId("notice").getByText(`All ${total} checked`)).toBeVisible();
     await expect(page.getByTestId("baseline-looks-good-back")).toBeVisible();
-    await expect(page.getByTestId("baseline-review-left")).toContainText(`0 of ${total} left`);
+    // R2-4: at 0 left the slim bar reads "All N checked" instead of "0 of N left".
+    await expect(page.getByTestId("baseline-review-left")).toContainText(`All ${total} checked`);
     await page.getByTestId("baseline-looks-good-back").click();
     await expect(view(page)).toBeVisible();
     await expect(page.getByTestId("baseline-flagged-list")).toHaveCount(0).catch(() => undefined);
