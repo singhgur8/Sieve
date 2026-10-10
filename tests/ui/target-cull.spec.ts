@@ -1244,4 +1244,87 @@ test.describe("Pick the best N: UX re-check 1", () => {
     await expect(page.getByTestId("target-sim-large")).toHaveCount(0);
     await expect(page.getByTestId("target-second")).toHaveAttribute("data-pile", "not_sure");
   });
+
+  // ---- UX re-check 2 ----
+  async function wheelAndKeys(page: Page, listId: string, key: string, n = 10) {
+    const list = page.getByTestId(listId).first();
+    await expect(list).toBeVisible();
+    const box = (await list.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    for (let k = 0; k < 5; k++) {
+      await page.mouse.wheel(0, 400);
+      await page.waitForTimeout(60);
+    }
+    for (let k = 0; k < n; k++) await page.keyboard.press(key);
+    await page.waitForTimeout(150);
+    await expect(page.getByTestId("target-view")).toBeVisible();
+    await expect(page.getByText("Something went wrong")).toHaveCount(0);
+  }
+
+  test("N2-1: wheel scroll and key moves in the moment grid, the Similar pile and the Weaker pile do not crash (1280x800)", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 5000, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "review");
+    await page.keyboard.press("g");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-view", "grid");
+    await wheelAndKeys(page, "target-grid", "Shift+ArrowRight");
+    const f = page.locator('[data-testid^="target-grid-cell-"][data-focused="true"]');
+    await expect(f).toHaveCount(1);
+    const b = (await f.boundingBox())!;
+    const scr = (await page.getByTestId("target-grid").boundingBox())!;
+    expect(b.y).toBeGreaterThanOrEqual(scr.y - 1);
+    expect(b.y + b.height).toBeLessThanOrEqual(scr.y + scr.height + 1);
+    await wheelAndKeys(page, "target-grid", "ArrowDown");
+
+    await tab(page, "second");
+    await page.getByTestId("target-pile-similar").click();
+    await wheelAndKeys(page, "target-similar", "ArrowDown");
+    await wheelAndKeys(page, "target-similar", "Shift+ArrowDown", 6);
+    await page.getByTestId("target-pile-weaker").click();
+    await wheelAndKeys(page, "target-grid", "ArrowDown");
+    await page.getByTestId("target-pile-defects").click();
+    await wheelAndKeys(page, "target-grid", "ArrowDown");
+  });
+
+  test("N2-2: the focused moment-grid cell scrolls into view; overflowing alternatives show +N; captions name their pick", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 5000, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "review");
+    await page.keyboard.press("g");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-view", "grid");
+    await page.keyboard.press("ArrowDown"); // moment 2
+    for (let k = 0; k < 6; k++) await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(200);
+    const f = page.locator('[data-testid^="target-grid-cell-"][data-focused="true"]');
+    await expect(f).toHaveCount(1);
+    const b = (await f.boundingBox())!;
+    const vp = page.viewportSize()!;
+    expect(b.x).toBeGreaterThanOrEqual(0);
+    expect(b.x + b.width).toBeLessThanOrEqual(vp.width + 1);
+    const caps = page.locator('[data-testid="target-alt-caption"]');
+    if ((await caps.count()) > 0) await expect(caps.first()).toContainText(/≈ \S+/);
+    // The Similar pile keeps its focused frame in view too.
+    await tab(page, "second");
+    await page.getByTestId("target-pile-similar").click();
+    for (let k = 0; k < 8; k++) await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(200);
+    const sf = page.locator('[data-testid^="target-sim-frame-"][data-focused="true"]').first();
+    const sb = (await sf.boundingBox())!;
+    expect(sb.x + sb.width).toBeLessThanOrEqual(vp.width + 1);
+  });
+
+  test("N2-3: Shift+arrows do nothing in Weaker and Defects", async ({ page }) => {
+    await openSecond(page, "&target=answered", 5000);
+    for (const p of ["weaker", "defects"]) {
+      await page.getByTestId(`target-pile-${p}`).click();
+      await expect(page.locator('[data-testid^="target-cell-"]').first()).toBeVisible();
+      const before = await attr(page, "target-second", "data-current");
+      for (const k of ["Shift+ArrowDown", "Shift+ArrowRight", "Shift+ArrowUp", "Shift+ArrowLeft"]) await page.keyboard.press(k);
+      expect(await attr(page, "target-second", "data-current")).toBe(before);
+    }
+  });
 });

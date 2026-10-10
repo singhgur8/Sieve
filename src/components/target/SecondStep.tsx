@@ -7,7 +7,7 @@ import { commands, DEFAULT_QUERY, unwrap, type CoveredBy, type ImageSelection, t
 import { previewSrc } from "../../lib/entryImage";
 import { hint } from "../../lib/keymap";
 import { loadReviewed, num, ordinal, type Pile, PILE_HINT, PILE_LABEL, pileOf, PILES, saveReviewed, stemOf, type Pass } from "../../lib/target";
-import { ActionButton, Pic, Reasons, ShotBadge, useSyncedZoom, Windowed, ZoomPic } from "./bits";
+import { ActionButton, OverflowStrip, Pic, useFocusIntoView, Reasons, ShotBadge, useSyncedZoom, Windowed, ZoomPic } from "./bits";
 import type { StageRef } from "./SetupStep";
 import type { TargetCtx } from "./types";
 
@@ -300,6 +300,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const advance = () => jumpNS(at + 1);
 
   // ---- navigation: Similar / grids ----
+  useFocusIntoView(pile === "similar" && fid != null ? `target-sim-frame-${fid}` : null);
   const flatList = pile === "similar" ? flat : pile === "not_sure" ? [] : list;
   const fAt = fid != null ? flatList.indexOf(fid) : -1;
   const moveF = (to: number) => {
@@ -399,9 +400,9 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
             return ns ? jumpNS(at + 1, false) : moveF(fAt + 1), true;
           case "targetNextMoment":
           case "targetSkipMoment":
-            return ns ? nextMomentNS() : sim ? nextMomentSim() : moveF(fAt + 1), true;
+            return ns ? nextMomentNS() : sim ? nextMomentSim() : undefined, true;
           case "targetPrevMoment":
-            return ns ? prevMomentNS() : sim ? prevMomentSim() : moveF(fAt - 1), true;
+            return ns ? prevMomentNS() : sim ? prevMomentSim() : undefined, true;
           case "targetNextOpen":
             return ns ? openNS(1) : sim ? openSim(1) : undefined, true;
           case "targetPrevOpen":
@@ -718,7 +719,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
                         )}
                       </div>
                       <div className="mt-1 h-[112px] w-px shrink-0 bg-neutral-700" />
-                      <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto px-1 py-1" data-testid={`target-sim-frames-${n}`}>
+                      <OverflowStrip testid={`target-sim-frames-${n}`}>
                         {r.frames.map((f) => {
                           const s = sels.get(f);
                           const on = f === fid;
@@ -750,7 +751,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
                             </button>
                           );
                         })}
-                      </div>
+                      </OverflowStrip>
                     </div>
                   );
                 }}

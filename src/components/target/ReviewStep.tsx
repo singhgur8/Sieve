@@ -6,7 +6,7 @@ import { commands, DEFAULT_QUERY, unwrap, type Alternatives, type ImageSelection
 import { previewSrc } from "../../lib/entryImage";
 import { hint } from "../../lib/keymap";
 import { clockOf, loadReviewed, momentLabel, num, saveReviewed, SHOT_LABEL, stemOf } from "../../lib/target";
-import { ActionButton, Pic, Reasons, ShotBadge, useSyncedZoom, Windowed, ZoomPic } from "./bits";
+import { ActionButton, OverflowStrip, Pic, useFocusIntoView, Reasons, ShotBadge, useSyncedZoom, Windowed, ZoomPic } from "./bits";
 import type { StageRef } from "./SetupStep";
 import type { TargetCtx } from "./types";
 
@@ -288,6 +288,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
   const gCells = view === "grid" && rows[gRow] ? cellsOf(rows[gRow]) : [];
   const gCol = g ? Math.max(0, Math.min(gCells.length - 1, g.col)) : 0;
   const gid = gCells[gCol] ?? null;
+  useFocusIntoView(view === "grid" && gid != null ? `target-grid-cell-${gid}` : null);
   useEffect(() => {
     if (view === "grid") lastRow.current = gRow;
   }, [view, gRow]);
@@ -615,21 +616,21 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
                   })}
                 </div>
                 <div className="mt-1 h-40 w-px shrink-0 bg-neutral-700" />
-                <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto px-1 py-1" data-testid={`target-grid-alts-${n}`}>
+                <OverflowStrip testid={`target-grid-alts-${n}`}>
                   {alts.map((a, k) => {
                     const on = a.imageId === gid;
                     const e = entries.get(a.imageId);
                     return (
-                      <button key={a.imageId} className={`w-40 shrink-0 rounded text-left ${on ? ring : ""}`} data-testid={`target-grid-cell-${a.imageId}`} data-kind="alt" data-focused={on} title={`${stemOf(e, a.imageId)}: ${a.reasons[0]?.text ?? "alternative"}. A adds it, Enter opens it`} onClick={() => setG({ key: r.key, col: r.picks.length + k })}>
+                      <button key={a.imageId} className={`w-40 shrink-0 rounded text-left ${on ? ring : ""}`} data-testid={`target-grid-cell-${a.imageId}`} data-kind="alt" data-focused={on} title={`${stemOf(e, a.imageId)}: ${a.reasons[0]?.text ?? "alternative"} (#${a.rank ?? k + 1} alternative of ${a.alternativeOf != null ? stemOf(entries.get(a.alternativeOf), a.alternativeOf) : "this moment"}). A adds it, Enter opens it`} onClick={() => setG({ key: r.key, col: r.picks.length + k })}>
                         <Pic entry={e} className="h-[112px] w-40 rounded ring-1 ring-sky-900" />
                         <div className="mt-0.5 flex items-center gap-1 text-[11px] leading-4">
                           <b className="shrink-0 text-sky-300">#{a.rank ?? k + 1}</b>
-                          <span className="truncate text-neutral-400">{a.reasons[0]?.text ?? stemOf(e, a.imageId)}</span>
+                          <span className="truncate text-neutral-400" data-testid="target-alt-caption">≈ {a.alternativeOf != null ? stemOf(entries.get(a.alternativeOf), a.alternativeOf) : stemOf(e, a.imageId)}</span>
                         </div>
                       </button>
                     );
                   })}
-                </div>
+                </OverflowStrip>
               </div>
             </div>
           );

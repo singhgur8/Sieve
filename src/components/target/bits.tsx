@@ -1,5 +1,5 @@
 // Small parts shared by the steps of "Pick the best N".
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ImageOff, Loader2 } from "lucide-react";
 import type { ImageSelection, RawImageEntry, ShotType } from "../../ipc";
 import { previewSrc, thumbSrc } from "../../lib/entryImage";
@@ -158,7 +158,11 @@ export function Windowed({ count, focusRow, renderRow, testid, onWidth, rowH = 1
       </div>,
     );
   return (
-    <div ref={ref} className="min-h-0 flex-1 overflow-y-auto" data-testid={testid} onScroll={(e) => setView((v) => ({ ...v, top: e.currentTarget.scrollTop }))}>
+    <div ref={ref} className="min-h-0 flex-1 overflow-y-auto" data-testid={testid} onScroll={(e) => {
+      // Read before the updater runs: React clears currentTarget by then (N2-1).
+      const top = e.currentTarget.scrollTop;
+      setView((v) => ({ ...v, top }));
+    }}>
       <div className="relative" style={{ height: count * rowH }}>
         {rows}
       </div>
@@ -166,3 +170,56 @@ export function Windowed({ count, focusRow, renderRow, testid, onWidth, rowH = 1
   );
 }
 
+
+/** N2-2: bring the focused cell into view (horizontal strips and the row list). Retries because virtualized rows mount a frame later. */
+export function useFocusIntoView(testid: string | null, active = true) {
+  useEffect(() => {
+    if (!active || !testid) return;
+    let tries = 0;
+    let raf = 0;
+    const go = () => {
+      const el = document.querySelector<HTMLElement>(`[data-testid="${testid}"]`);
+      if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      else if (tries++ < 6) raf = requestAnimationFrame(go);
+    };
+    go();
+    return () => cancelAnimationFrame(raf);
+  }, [testid, active]);
+}
+
+/** N2-2: a horizontal strip that fades out at the right edge and shows a "+N" chip when N children are cut off. */
+export function OverflowStrip({ testid, className, children }: { testid: string; className?: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState(0);
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const right = el.getBoundingClientRect().right;
+    let n = 0;
+    for (const c of Array.from(el.children)) if (c.getBoundingClientRect().right > right + 1) n++;
+    setMore(n);
+  }, []);
+  useLayoutEffect(() => {
+    measure();
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+  return (
+    <div className="relative flex min-w-0 flex-1">
+      <div ref={ref} className={`flex min-w-0 flex-1 gap-2 overflow-x-auto px-1 py-1 ${className ?? ""}`} data-testid={testid} data-more={more} onScroll={measure}>
+        {children}
+      </div>
+      {more > 0 && (
+        <>
+          <div className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-neutral-950" data-testid={`${testid}-fade`} />
+          <span className="pointer-events-none absolute right-1 top-1 rounded bg-sky-900/90 px-1.5 text-[11px] text-sky-100" data-testid={`${testid}-more`}>
+            +{more}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
