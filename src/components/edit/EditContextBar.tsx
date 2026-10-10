@@ -22,8 +22,6 @@ interface Props {
   onNextReview: () => void;
   /** The Baseline bar is shown above (step 3 of the baseline edit): the old scene flow (Apply / Auto edit) stays out of the way. */
   baselineBar?: boolean;
-  /** Representatives whose settings are still what a baseline run wrote: nothing to apply from them. */
-  onBaseline?: Set<number>;
   /** Reviewing the photos the baseline flagged: Apply to scene is a neutral, explained action. */
   flaggedReview?: boolean;
 }
@@ -35,6 +33,7 @@ const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
   applied: { text: "Applied · representative", cls: "bg-emerald-950 text-emerald-200" },
   stale: { text: "Changed since applied · representative", cls: "bg-amber-950 text-amber-200" },
   reset: { text: "Reset since applied · representative", cls: "bg-amber-950 text-amber-200" },
+  baseline: { text: "On baseline · representative", cls: "bg-emerald-950 text-emerald-200" },
 };
 
 export function EditContextBar(p: Props) {
@@ -50,7 +49,7 @@ export function EditContextBar(p: Props) {
   // Opening the representative is pointless while it is the photo on screen.
   const block = block0 && !block0.soft ? (isRep && block0.fix === "open" ? { ...block0, fix: undefined } : block0) : null;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
-  const repOnBaseline = !!row && !!p.onBaseline?.has(row.entry.representativeId);
+  const repOnBaseline = row?.ui === "baseline";
   const sceneFlow = !p.baselineBar;
   const showApply = sceneFlow && !repOnBaseline;
 

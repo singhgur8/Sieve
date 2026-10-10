@@ -167,13 +167,14 @@ export function lightOfAdjustments(a: ParametricAdjustments): NonNullable<Baseli
  * Step 3 opens: the anchor's light starts at its own Auto (+ the preset's light values), so "same as Auto" is the
  * zero point. Returns the preset's light values for the "Start from Auto" button. One history entry.
  */
-export async function startAnchorFromAuto(projectId: number, anchorId: number, presetId: number | null, presetHasWb: boolean): Promise<NonNullable<BaselineSession["presetLight"]> | null> {
+export async function startAnchorFromAuto(_projectId: number, anchorId: number, _presetId: number | null, presetHasWb: boolean): Promise<NonNullable<BaselineSession["presetLight"]> | null> {
   const h = await unwrap(commands.getHistory(anchorId));
   const cur = await unwrap(commands.getAdjustments(anchorId));
   const presetLight = lightOfAdjustments(cur);
   if (!anchorLightUntouched(h.entries)) return null;
-  const pv = await unwrap(commands.previewBaseline(projectId, baselineSettings(anchorId, presetId), { sampleCount: 1, imageIds: null }));
-  const l = startLight(pv.anchor.auto, presetLight, presetHasWb ? cur.whiteBalance : null);
+  // v21.1 `auto_light`: the same numbers the engine's meter gives (`BaselineAnchor.auto`).
+  const { light } = await unwrap(commands.autoLight(anchorId, cur));
+  const l = startLight(light, presetLight, presetHasWb ? cur.whiteBalance : null);
   await unwrap(
     commands.saveAdjustments(
       anchorId,
@@ -184,28 +185,9 @@ export async function startAnchorFromAuto(projectId: number, anchorId: number, p
   return presetLight;
 }
 
-/** Ids (of `ids`) whose settings are still exactly what a baseline run wrote (`get_baseline_provenance` state `on_baseline`). */
-export function useOnBaselineIds(ids: number[], tick: unknown): Set<number> {
-  const [set, setSet] = useState<Set<number>>(new Set());
-  const key = ids.join(",");
-  useEffect(() => {
-    if (ids.length === 0) return void setSet((s) => (s.size === 0 ? s : new Set()));
-    let dead = false;
-    unwrap(commands.getBaselineProvenance(ids))
-      .then((r) => !dead && setSet(new Set(r.filter((x) => x.state === "on_baseline").map((x) => x.imageId))))
-      .catch(() => {});
-    return () => {
-      dead = true;
-    };
-  }, [key, tick]); // eslint-disable-line react-hooks/exhaustive-deps
-  return set;
-}
-
 /**
  * `undo_edit_batch(batchId, { keepLaterEdits })` (architect, pending) restores the photos still on the batch's entry and
  * leaves the ones edited since. The generated wrapper takes a second argument once the contract has it; until then the
  * "Undo the rest" button is not offered.
  */
-export const KEEP_LATER_SUPPORTED = commands.undoEditBatch.length >= 2;
-type UndoWithOptions = (batchId: number, options: { keepLaterEdits: boolean } | null) => ReturnType<typeof commands.undoEditBatch>;
-export const undoEditBatchWith = (batchId: number, options: { keepLaterEdits: boolean } | null) => (commands.undoEditBatch as unknown as UndoWithOptions)(batchId, options);
+export const KEEP_LATER_SUPPORTED = true;

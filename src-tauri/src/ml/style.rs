@@ -4,7 +4,9 @@
 //!
 //! - Training data: every catalog image whose stored settings are a style sample
 //!   ([`style_model::is_style_sample`]: something beyond crop / masks differs from the format's
-//!   defaults), incl. edits read from Lightroom sidecars. Features per image
+//!   defaults) **and** the user's own ([`trainable`]: edit source `user` or `sidecar`, incl.
+//!   edits read from Lightroom sidecars; baseline / auto-style / scene-apply / pasted
+//!   settings are machine-made and excluded, v21). Features per image
 //!   ([`style_model::FrameContext`]): one neutral render (`ParametricAdjustments::defaults_for`
 //!   the format) through `DevelopCache::render_image` at `scene::STATS_MAX_EDGE` measured by
 //!   [`RenderFeatures::from_render`], the as-shot white balance of that render and Sieve's
@@ -406,6 +408,19 @@ impl<'c> ContextBuilder<'c> {
     }
 }
 
+/// The ids of `ids` (same order) whose current settings are the user's own: edit source `user`
+/// (sliders, presets, Auto in Develop) or `sidecar` (read from XMP, e.g. edited in Lightroom).
+/// Machine-made settings (baseline runs, "Auto edit (my style)", Apply to Scene, paste / sync)
+/// never become training examples (v21).
+pub fn trainable(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<ImageId>> {
+    let states = crate::develop::batches::edit_states(conn, ids)?;
+    Ok(states
+        .into_iter()
+        .filter(|s| matches!(s.edit_source, EditSource::User | EditSource::Sidecar))
+        .map(|s| s.image_id)
+        .collect())
+}
+
 /// Every style sample in the catalog (see the module docs), capture order.
 pub fn style_sample_frames(conn: &Connection) -> AppResult<Vec<CatalogFrame>> {
     let ids: Vec<ImageId> = conn
@@ -415,6 +430,7 @@ pub fn style_sample_frames(conn: &Connection) -> AppResult<Vec<CatalogFrame>> {
         )?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
+    let ids = trainable(conn, &ids)?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let f = CatalogFrame::load(conn, id, None)?;
@@ -431,8 +447,10 @@ pub fn count_style_samples(conn: &Connection) -> AppResult<u32> {
         "SELECT i.format, a.image_id FROM adjustments a JOIN images i ON i.id = a.image_id WHERE a.neutral = 0",
     )?;
     let rows: Vec<(String, ImageId)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let keep: std::collections::HashSet<ImageId> =
+        trainable(conn, &rows.iter().map(|(_, id)| *id).collect::<Vec<_>>())?.into_iter().collect();
     let mut n = 0;
-    for (format, id) in rows {
+    for (format, id) in rows.into_iter().filter(|(_, id)| keep.contains(id)) {
         let Some(format) = ImageFormat::parse(&format) else { continue };
         if style_model::is_style_sample(&repo::get_adjustments(conn, id)?, format) {
             n += 1;

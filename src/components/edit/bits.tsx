@@ -12,6 +12,7 @@ export const STATUS_ICON: Record<SceneUi, { icon: typeof Circle; cls: string }> 
   applied: { icon: CheckCircle2, cls: "text-emerald-400" },
   stale: { icon: RefreshCw, cls: "text-amber-400" },
   reset: { icon: RefreshCw, cls: "text-amber-400" },
+  baseline: { icon: CheckCircle2, cls: "text-emerald-400" },
 };
 
 export function StatusIcon({ ui, className = "size-5" }: { ui: SceneUi; className?: string }) {
@@ -34,6 +35,8 @@ export function statusLine(r: SceneRow): { text: string; cls: string; extra?: st
       return { text: "Changed since it was applied", cls: "text-amber-300" };
     case "reset":
       return { text: `Representative reset · ${r.applied} photo${r.applied === 1 ? "" : "s"} keep the earlier look`, cls: "text-amber-300" };
+    case "baseline":
+      return { text: "On baseline", cls: "text-emerald-300", extra: r.review.length > 0 ? ` · ${r.review.length} need a look` : undefined };
     case "applied": {
       const extra = `${r.review.length > 0 ? ` · ${r.review.length} need a look` : ""}${r.unapplied.length > 0 ? ` · ${r.unapplied.length} new keeper${r.unapplied.length === 1 ? "" : "s"} not edited` : ""}`;
       return { text: `Applied to ${r.applied > 0 ? r.applied : n}`, cls: "text-emerald-300", extra: extra || undefined };
@@ -51,6 +54,7 @@ export function applyBlock(r: SceneRow | undefined): { reason: string; fix?: App
   if (r.ui === "reset") return { reason: "Edit the representative first (it was reset)", fix: "open" };
   if (r.targets === 0) return { reason: "No keepers in this scene" };
   if (r.ui === "applied" && r.unapplied.length === 0) return { reason: "Already applied", soft: true };
+  if (r.ui === "baseline") return { reason: "On the baseline: applying replaces the baseline light of this scene's photos", soft: true };
   return null;
 }
 

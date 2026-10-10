@@ -4489,6 +4489,14 @@ string_enum! {
         /// (`appliedBatch` stays undoable when nothing blocks it). A to-do scene: edit the
         /// representative, then apply; not applied by `apply_all_edited_scenes`.
         Reset => "reset",
+        /// v21.1: the representative's current settings were written by a baseline run
+        /// (`ImageEditState.editSource` = `baseline`), or it is the anchor of the project's live
+        /// baseline (`EditPlan.baseline`), and the scene was not applied from them: done ("On
+        /// baseline"), like `applied`. Not applied by `apply_all_edited_scenes`;
+        /// `apply_scene_edit` still works (it replaces the members' baseline light with a match
+        /// of the representative). A representative edited after the baseline reads `edited`
+        /// (with `baselineIds` non-empty: "You changed the representative after the baseline").
+        OnBaseline => "on_baseline",
     }
 }
 
@@ -4551,6 +4559,9 @@ pub struct SceneEditEntry {
     /// state). Row "Undo apply" = `undo_edit_batch(appliedBatch.batchId)` while
     /// `appliedBatch.undoable`; persisted, so it survives leaving the workflow.
     pub applied_batch: Option<EditBatchInfo>,
+    /// v21.1: keepers of this scene (representative included) whose current settings were
+    /// written by a baseline run (`ImageEditState.editSource` = `baseline`), capture order.
+    pub baseline_ids: Vec<ImageId>,
 }
 
 /// Scenes with at most this many keepers are `SceneEditEntry.minor` (v15).
@@ -4622,6 +4633,9 @@ pub struct EditPlanCounts {
     pub unapplied_keepers: u32,
     /// `EditPlan.unassignedKeeperIds.length`.
     pub unassigned_keepers: u32,
+    /// Scenes with status `on_baseline` (v21.1), not skipped. Done like `applied`: progress =
+    /// `applied + onBaseline + skipped` of `scenes`.
+    pub on_baseline: u32,
 }
 
 /// `get_edit_plan(projectId)`: the Edit step of one project.
@@ -4651,6 +4665,9 @@ pub struct EditPlan {
     /// the project (v16); `null` = none. Its `undoable` says whether `undo_edit_batch` would
     /// succeed now (linear undo: a later edit of its photos blocks it).
     pub latest_batch: Option<EditBatchInfo>,
+    /// v21.1: the project's baseline while its latest run is finished and its batch not undone
+    /// (`null` otherwise): the Plan header "Baseline: 42 of 43 keepers · 7 need a look".
+    pub baseline: Option<EditPlanBaseline>,
 }
 
 /// Options of `apply_scene_edit` / `apply_all_edited_scenes`. `null` on the wire = default.
@@ -4864,6 +4881,20 @@ pub struct UndoBatchResult {
     /// cursor is before the batch's entry): left alone. (Before v16 also images edited after
     /// the batch; since v16 those make the whole undo fail with `conflict`.)
     pub skipped_ids: Vec<ImageId>,
+    /// v21.1, `keepLaterEdits` only: images edited after the batch (or the representative of a
+    /// scene apply built on it) that were left with the later edit. Empty otherwise.
+    pub kept_ids: Vec<ImageId>,
+}
+
+/// Options of `undo_edit_batch` (v21.1; `null` = defaults = linear undo).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UndoBatchOptions {
+    /// `false` (default): linear undo, any later edit of the batch's photos fails the call with
+    /// `conflict`. `true` ("Undo the rest"): restore the photos still carrying what the batch
+    /// wrote and keep the ones changed since (`UndoBatchResult.keptIds`); the batch then reads
+    /// undone. Mirrors "a re-run updates only photos still on the baseline".
+    pub keep_later_edits: bool,
 }
 
 string_enum! {

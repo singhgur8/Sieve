@@ -121,7 +121,7 @@ test.describe("copy / paste keys", () => {
 });
 
 test.describe("Auto", () => {
-  test("generic Auto sits at the top of Basic, always enabled, runs auto_tone + auto_white_balance as one entry", async ({ page }) => {
+  test("generic Auto sits at the top of Basic, always enabled, runs auto_light + auto_tone (vibrance / saturation) as one entry", async ({ page }) => {
     await openDevelop(page);
     const auto = page.getByTestId("auto-all");
     await expect(auto).toBeEnabled();
@@ -133,8 +133,14 @@ test.describe("Auto", () => {
     await expect(val(page, "exposure")).toHaveText("+0.35");
     await expect.poll(async () => (await saved(page)).length).toBe(1);
     expect((await saved(page))[0].args.label).toBe("Auto");
-    expect((await calls(page, "auto_tone")).length).toBe(1);
-    expect((await calls(page, "auto_white_balance")).length).toBe(1);
+    // v21.1: light (WB + six tone sliders) from `auto_light`, then vibrance / saturation on the merged settings.
+    expect((await calls(page, "auto_light")).length).toBe(1);
+    const tone = await calls(page, "auto_tone");
+    expect(tone.length).toBe(1);
+    expect(tone[0].args.keys).toEqual(["vibrance", "saturation"]);
+    expect((tone[0].args.adjustments as { exposure: number }).exposure).toBe(0.35);
+    expect((await calls(page, "auto_white_balance")).length).toBe(0);
+    await expect(val(page, "vibrance")).toHaveText("+10");
   });
 });
 

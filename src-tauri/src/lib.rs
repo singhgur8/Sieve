@@ -151,6 +151,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::resolve_preset,
             commands::auto_tone,
             commands::auto_white_balance,
+            commands::auto_light,
             commands::get_workflow_step,
             commands::set_workflow_step,
             commands::set_keeper_rule,

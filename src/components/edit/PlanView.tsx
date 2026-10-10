@@ -18,6 +18,7 @@ const TABS: { id: PlanTab; label: string }[] = [
   { id: "todo", label: "To do" },
   { id: "edited", label: "Edited" },
   { id: "applied", label: "Applied" },
+  { id: "baseline", label: "On baseline" },
   { id: "skipped", label: "Skipped" },
 ];
 
@@ -50,8 +51,6 @@ interface Props {
   /** Baseline edit (Phase 10): the main path of the Edit step. */
   onBaseline?: () => void;
   baselineRun?: BaselineRun | null;
-  /** Representatives whose settings are still what a baseline run wrote (`get_baseline_provenance`): nothing to apply from them. */
-  onBaselineIds?: Set<number>;
   /** Flagged photos the user has not marked "Looks good" yet (null = no baseline result). */
   flaggedLeft?: number | null;
   /** Banner: open the baseline view straight on "Finish in Lightroom". */
@@ -68,11 +67,9 @@ export function PlanView(p: Props) {
   const counts = wf.plan?.counts;
   const todo = rows.filter((r) => (r.ui === "todo" || r.ui === "reset") && !r.skipped);
   // Scenes the "Apply" button handles: edited ones, and applied ones that gained keepers since.
-  const onBase = p.onBaselineIds;
-  const isOnBase = (r: SceneRow) => !!onBase?.has(r.entry.representativeId);
-  const pending = rows.filter((r) => !r.skipped && !isOnBase(r) && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
-  const bRun = p.baselineRun;
-  const baselineDone = bRun?.state === "finished" && bRun.batch != null && bRun.batch.undoneAtMs == null;
+  const pending = rows.filter((r) => !r.skipped && r.ui !== "baseline" && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
+  const bPlan = wf.plan?.baseline ?? null; // v21.1: present while the latest run is finished and not undone
+  const baselineDone = bPlan != null;
   const pendingTargets = pending.reduce((a, r) => a + (r.ui === "applied" ? r.unapplied.length : r.targets), 0);
   const allDone = wf.done;
   const visible = wf.layout.visible;
@@ -199,7 +196,7 @@ export function PlanView(p: Props) {
                   <span className="h-full bg-sky-500" style={{ width: `${(((counts?.edited ?? 0) + (counts?.outdated ?? 0)) / rows.length) * 100}%` }} />
                 </span>
                 <span className="min-w-0 truncate whitespace-nowrap" data-testid="plan-counts" data-kind={baselineDone ? "baseline" : "scenes"}>
-                  {baselineDone && bRun ? `Baseline: ${bRun.counts.applied + bRun.counts.flagged} of ${keeperCount} keepers${(p.flaggedLeft ?? bRun.counts.flagged) > 0 ? ` · ${p.flaggedLeft ?? bRun.counts.flagged} need a look` : ""}` : `${(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · ${counts?.applied ?? 0} applied · ${counts?.toEdit ?? 0} to do${(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}`}
+                  {bPlan ? `Baseline: ${bPlan.onBaseline} of ${bPlan.keepers} keepers${bPlan.needsLook > 0 ? ` · ${bPlan.needsLook} need a look` : ""}` : `${(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · ${counts?.applied ?? 0} applied · ${counts?.toEdit ?? 0} to do${(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}`}
                 </span>
               </div>
             )}
@@ -378,8 +375,10 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const { wf, lib } = p;
   const e = r.entry;
   const id = e.sceneId;
-  const onBase = !!p.onBaselineIds?.has(e.representativeId);
-  const line = onBase && !r.skipped ? { text: "On baseline", cls: "text-emerald-300", extra: r.review.length > 0 ? ` · ${r.review.length} need a look` : undefined } : statusLine(r);
+  const onBase = r.ui === "baseline";
+  // The representative was edited after the baseline (some of its scene is still on it): Apply stays, with a warning.
+  const refined = r.ui === "edited" && e.baselineIds.length > 0 && !r.skipped;
+  const line = refined ? { text: `You changed the representative after the baseline · Apply to ${r.targets}`, cls: "text-amber-300" } : statusLine(r);
   const t = p.sceneTimes(id);
   const repEntry = lib.getEntry(e.representativeId);
   const others = e.imageIds.filter((i) => i !== e.representativeId);

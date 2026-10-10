@@ -7,6 +7,7 @@ import type {
   AdjustmentField,
   AppError,
   AutoToneValues,
+  LightValues,
   ColorGrading,
   ColorWheel,
   CropSettings,
@@ -344,6 +345,22 @@ export function applyAutoTone(adj: ParametricAdjustments, auto: AutoToneValues):
   return out;
 }
 
+/**
+ * Merges an `auto_light` result (v21.1: six tone sliders + white balance, custom) into `adj`; vibrance / saturation and
+ * everything else stay. Develop's generic Auto then runs `auto_tone(id, merged, ["vibrance", "saturation"])`.
+ */
+export function applyLightValues(adj: ParametricAdjustments, light: LightValues): CompleteAdjustments {
+  const out = structuredClone(completeAdjustments(adj));
+  out.exposure = light.exposure;
+  out.contrast = light.contrast;
+  out.highlights = light.highlights;
+  out.shadows = light.shadows;
+  out.whites = light.whites;
+  out.blacks = light.blacks;
+  out.whiteBalance = { mode: "custom", temperatureK: light.temperatureK, tint: light.tint };
+  return out;
+}
+
 /** Keeper rule on culling values. Mirror of Rust `KeeperRule::is_keeper_values`. */
 export function isKeeperValues(
   rule: KeeperRule,
@@ -375,7 +392,8 @@ export function isKeeper(rule: KeeperRule, e: RawImageEntry): boolean {
  * since its apply). An empty plan (no keepers) is not done.
  */
 export function isEditPlanDone(plan: EditPlan): boolean {
-  return plan.scenes.length > 0 && !plan.outdated && plan.scenes.every((s) => s.skipped || s.status === "applied");
+  // v21.1: scenes on the baseline count as done, like applied ones.
+  return plan.scenes.length > 0 && !plan.outdated && plan.scenes.every((s) => s.skipped || s.status === "applied" || s.status === "on_baseline");
 }
 
 /** File-name template tokens (mirror of Rust `FILENAME_TOKENS` / `parse_filename_template`). */

@@ -1,8 +1,7 @@
 // Compact bar above Develop while a Baseline edit is being set up (step 3): the preset, how the anchor photo differs from
 // its own Auto, and the way on to "Edit the rest".
 import { ArrowRight, Layers, Wand2, X } from "lucide-react";
-import type { LightValues } from "../../ipc";
-import { describeOffset, startLight, useAnchorOffset, type BaselineSession } from "../../hooks/useBaseline";
+import { describeOffset, useAnchorOffset, type BaselineSession } from "../../hooks/useBaseline";
 
 interface Props {
   projectId: number;
@@ -12,8 +11,8 @@ interface Props {
   /** Bumped after every committed edit so the offset is measured again. */
   tick: number;
   onRest: () => void;
-  /** Set the open photo's light to `light` (its Auto + the preset's own light values). */
-  onStartFromAuto: (light: LightValues) => void;
+  /** The open photo's light := its Auto (`auto_light`), one history entry. */
+  onStartFromAuto: () => void;
   onGoAnchor: () => void;
   onClose: () => void;
 }
@@ -41,7 +40,7 @@ export function BaselineBar({ projectId, session, activeId, anchorName, tick, on
           data-testid="baseline-bar-auto"
           disabled={!anchor || !onAnchor}
           title={onAnchor ? "Set exposure, contrast, highlights, shadows, whites, blacks and white balance to Auto for this photo. The preset's colours stay" : `Open the anchor photo (${anchorName}) first`}
-          onClick={() => anchor && onStartFromAuto(startLight(anchor.auto, undefined, null))}
+          onClick={onStartFromAuto}
         >
           <Wand2 className="size-3.5" aria-hidden /> Start from Auto
         </button>

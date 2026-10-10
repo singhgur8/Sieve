@@ -271,7 +271,7 @@ export function RestStep(p: Props) {
   const stubEngine = p.run?.engineVersion.startsWith("baseline-stub") ?? false;
   const left = flagged.filter((f) => p.reviewLeft.has(f.imageId)).length;
   const laterNames = later.slice(0, 3).map(nm).join(", ") + (later.length > 3 ? ` and ${later.length - 3} more` : "");
-  const restCount = Math.max(0, (batch?.imageCount ?? 0) - later.length);
+  const restCount = Math.max(0, (batch?.imageCount ?? 0) - (batch?.conflictCount ?? 0));
   const unitFor = (sc: ScopeKind) => (sc === "keepers" ? "keeper" : "photo");
 
   // Samples grouped by scene (After only) or in plan order (Before / after).

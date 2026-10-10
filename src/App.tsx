@@ -36,8 +36,8 @@ import { StyleDialogs } from "./components/edit/StyleDialogs";
 import { useWorkflow } from "./hooks/useWorkflow";
 import { BaselineView, type BaselineStepId } from "./components/baseline/BaselineView";
 import { BaselineBar } from "./components/baseline/BaselineBar";
-import { BaselineFlagBar, BaselineReviewBar, useFlaggedRows } from "./components/baseline/BaselineFlagBar";
-import { EMPTY_SESSION, START_LABEL, useBaselineRun, useOnBaselineIds, type BaselineSession } from "./hooks/useBaseline";
+import { BaselineFlagBar, BaselineReviewBar } from "./components/baseline/BaselineFlagBar";
+import { EMPTY_SESSION, START_LABEL, useBaselineRun, type BaselineSession } from "./hooks/useBaseline";
 import { MatchPanel } from "./components/scenes/MatchPanel";
 import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -1150,27 +1150,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   useEffect(() => {
     if (projectId != null) void refreshBaselineRun();
   }, [wf.plan]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Scenes whose representative is still exactly what the baseline wrote: the old "Apply to scene" has nothing to add there
-  // (until the backend reports the scene state itself).
-  const bRepIds = useMemo(() => (baselineRun.run ? wf.rows.map((r) => r.entry.representativeId) : []), [baselineRun.run?.id, wf.rows]); // eslint-disable-line react-hooks/exhaustive-deps
-  const provOnBase = useOnBaselineIds(bRepIds, wf.plan);
-  // The anchor itself is never written by a run (no provenance): it counts as on the baseline until it is edited again.
-  const bRun = baselineRun.run;
-  const bRunLive = bRun?.state === "finished" && bRun.batch != null && bRun.batch.undoneAtMs == null ? bRun : null;
-  const [anchorRefined, setAnchorRefined] = useState(true);
-  useEffect(() => {
-    if (!bRunLive) return void setAnchorRefined(true);
-    let dead = false;
-    unwrap(commands.getHistory(bRunLive.settings.anchorId))
-      .then((h) => !dead && setAnchorRefined(h.entries.some((e) => e.label !== "Original" && e.createdAtMs > (bRunLive.finishedAtMs ?? 0))))
-      .catch(() => {});
-    return () => {
-      dead = true;
-    };
-  }, [bRunLive?.id, bRunLive?.batch?.batchId, wf.plan]); // eslint-disable-line react-hooks/exhaustive-deps
-  const onBaselineIds = useMemo(() => (bRunLive && !anchorRefined ? new Set([...provOnBase, bRunLive.settings.anchorId]) : provOnBase), [provOnBase, bRunLive?.id, anchorRefined]); // eslint-disable-line react-hooks/exhaustive-deps
-  const flaggedRows = useFlaggedRows(baselineRun.run?.state === "finished" ? projectId : null, baselineRun.run?.id);
-  const flaggedLeft = baselineRun.run?.state === "finished" ? flaggedRows.filter((r) => wf.needsReviewSet.has(r.imageId)).length : null;
+  // v21.1: the Plan carries the baseline (scene status on_baseline, EditPlan.baseline).
+  const bRunLive = wf.plan?.baseline ?? null;
+  const flaggedLeft = bRunLive ? bRunLive.needsLook : null;
   const flaggedReview = !!query.baselineOutcomes?.includes("flagged");
   // The finish toast: one Undo for the whole baseline.
   const seenRunning = useRef<number | null>(null);
@@ -2010,7 +1992,6 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               summary={cullSum.summary}
               onBaseline={() => openBaseline()}
               baselineRun={baselineRun.run}
-              onBaselineIds={onBaselineIds}
               flaggedLeft={flaggedLeft}
               onBaselineFinish={() => openBaseline(5)}
             />
@@ -2100,7 +2081,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                     activeId={active ?? null}
                     anchorName={lib.getEntry(bSession.anchorId)?.fileName ?? `#${bSession.anchorId}`}
                     tick={bTick}
-                    onStartFromAuto={(l) => develop.current?.setLight(l, START_LABEL)}
+                    onStartFromAuto={() => develop.current?.autoLight(START_LABEL)}
                     onGoAnchor={() => sel.set([bSession.anchorId!], bSession.anchorId!)}
                     onClose={() => setBBar(false)}
                     onRest={() =>
@@ -2114,7 +2095,6 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 {!bBar && flaggedReview && projectId != null && <BaselineReviewBar projectId={projectId} reviewLeft={wf.needsReviewSet} tick={baselineRun.run?.id} onBack={() => leave(() => openBaseline())} />}
                 <EditContextBar
                   baselineBar={bBar}
-                  onBaseline={onBaselineIds}
                   flaggedReview={flaggedReview && !bBar}
                   wf={wf}
                   rows={wf.rows}

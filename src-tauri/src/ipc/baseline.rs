@@ -472,6 +472,11 @@ pub struct BaselinePhotoResult {
     pub auto: Option<LightValues>,
     /// The light values written (Auto + offset, smoothed, clamped); `null` when not written.
     pub light: Option<LightValues>,
+    /// v21.1: where the photo stands now (`get_baseline_results` only, derived on read like
+    /// `BaselineProvenance.state`): `on_baseline`, `user_edited` (changed since, or kept by
+    /// `undo_edit_batch(…, {keepLaterEdits: true})`) or `undone`. `null` for outcomes that
+    /// wrote nothing, for photos a later run rewrote, and in `preview_baseline`.
+    pub state: Option<BaselineState>,
 }
 
 /// One photo of a preview: its result and the settings before / after (nothing written).
@@ -575,8 +580,66 @@ pub struct BaselineRun {
     /// Zero until finished.
     pub counts: BaselineCounts,
     /// The edit batch it wrote (kind `baseline`): undo with `undo_edit_batch(batch.batchId)`
-    /// while `batch.undoable`. `null` = nothing written.
+    /// while `batch.undoable`, or `undo_edit_batch(batch.batchId, {keepLaterEdits: true})`
+    /// ("Undo the rest", v21.1) while `batch.undoneAtMs` is null. `null` = nothing written.
     pub batch: Option<EditBatchInfo>,
+    /// v21.1: where the photos this run wrote stand now (derived on read; all zero until it
+    /// finished). After an undo `message` is replaced by the undo summary ("Undone: the
+    /// photos are back to how they were", or "… 1 photo you changed since was kept").
+    pub live: BaselineLiveCounts,
+}
+
+/// Where the photos a run wrote stand now (IPC v21.1, `BaselineRun.live`), per
+/// [`BaselineProvenance`] state. Photos a later run rewrote count for that run only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineLiveCounts {
+    /// Photos this run wrote that no later run rewrote (`onBaseline + userEdited + undone`).
+    pub written: u32,
+    /// Still carrying what the run wrote (a re-run updates them).
+    pub on_baseline: u32,
+    /// Of `onBaseline`: written as flagged and not reviewed / edited yet ("7 need a look").
+    pub needs_look: u32,
+    /// Changed since (an edit, a paste, another batch), incl. photos `keepLaterEdits` kept.
+    pub user_edited: u32,
+    /// Put back by undoing the run's batch.
+    pub undone: u32,
+}
+
+/// `EditPlan.baseline` (IPC v21.1): the project's baseline in the Edit step's terms (keepers
+/// under `CatalogState.keeperRule`). Present while the latest run is finished and its batch is
+/// not undone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditPlanBaseline {
+    pub run_id: BaselineRunId,
+    pub batch: EditBatchInfo,
+    pub anchor_id: ImageId,
+    pub preset_id: Option<PresetId>,
+    /// `EditPlan.keeperIds.length` ("of 43 keepers").
+    pub keepers: u32,
+    /// Keepers whose current settings are a baseline's (`editSource` = `baseline`): "42".
+    pub on_baseline: u32,
+    /// Of `onBaseline`: flagged and not reviewed yet ("7 need a look").
+    pub needs_look: u32,
+    /// Keepers this run wrote that were changed since (`BaselineState::UserEdited`).
+    pub edited_since: u32,
+}
+
+/// Result of `auto_light` (IPC v21.1): **the** light-only Auto of one photo
+/// (`develop::auto::auto_light`: auto white balance first, then the six tone sliders measured
+/// under it, faces resolved as in Develop; vibrance / saturation never). Identical to what a
+/// baseline run measures for that photo with the same settings (`BaselineAnchor.auto` for the
+/// anchor), so "Auto, then nudge" starts the anchor's offset at exactly zero.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoLightValues {
+    /// Exposure, contrast, highlights, shadows, whites, blacks and a custom white balance.
+    pub light: LightValues,
+    /// `false`: auto white balance could not be estimated (too few neutral pixels); the
+    /// camera's as-shot temperature / tint is returned, and the tone was measured under the
+    /// photo's own white balance (as the baseline does).
+    pub white_balance_estimated: bool,
 }
 
 string_enum! {

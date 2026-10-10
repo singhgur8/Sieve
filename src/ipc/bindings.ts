@@ -712,6 +712,53 @@ export const commands = {
 	 */
 	transform?: TransformSettings,
 } | null) => typedError<WhiteBalanceValues, AppError>(__TAURI_INVOKE("auto_white_balance", { id, adjustments })),
+	/**
+	 *  The light-only Auto (IPC v21.1): auto white balance, then exposure, contrast, highlights,
+	 *  shadows, whites and blacks measured under it, for the live `adjustments` (`null` = stored);
+	 *  vibrance / saturation are never computed. Exactly what a baseline run measures for this photo
+	 *  with these settings (`BaselineAnchor.auto` for the anchor). Nothing is saved: the UI merges
+	 *  `light` (six sliders + custom white balance) as one history entry. Develop's generic Auto =
+	 *  this + `auto_tone(id, merged, ["vibrance", "saturation"])`; Auto during a baseline edit and
+	 *  "Start from Auto" = this alone (the preset's colours stay). Errors as `auto_tone`.
+	 */
+	autoLight: (id: number, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
+} | null) => typedError<AutoLightValues, AppError>(__TAURI_INVOKE("auto_light", { id, adjustments })),
 	/**  Guided-workflow step of project `projectId` (also `Project.workflowStep`). */
 	getWorkflowStep: (projectId: number) => typedError<WorkflowStep, AppError>(__TAURI_INVOKE("get_workflow_step", { projectId })),
 	setWorkflowStep: (projectId: number, step: WorkflowStep) => typedError<null, AppError>(__TAURI_INVOKE("set_workflow_step", { projectId, step })),
@@ -803,8 +850,20 @@ export const commands = {
 	 *  `edited` (`SceneEditEntry.appliedBatch` = null). v17: a scene apply (not undone) made from
 	 *  a representative whose settings this batch wrote is a later edit too ("A scene was applied
 	 *  from this edit since; undo that apply first").
+	 *  v21.1: `options.keepLaterEdits` ("Undo the rest"): no `conflict`; photos edited since (and
+	 *  representatives of applies built on the batch) keep their later edit (`keptIds`), the rest
+	 *  is restored, and the batch reads undone (a baseline run's `live` / `message` follow).
+	 *  `null` = linear undo as before.
 	 */
-	undoEditBatch: (batchId: number) => typedError<UndoBatchResult, AppError>(__TAURI_INVOKE("undo_edit_batch", { batchId })),
+	undoEditBatch: (batchId: number, options: {
+	/**
+	 *  `false` (default): linear undo, any later edit of the batch's photos fails the call with
+	 *  `conflict`. `true` ("Undo the rest"): restore the photos still carrying what the batch
+	 *  wrote and keep the ones changed since (`UndoBatchResult.keptIds`); the batch then reads
+	 *  undone. Mirrors "a re-run updates only photos still on the baseline".
+	 */
+	keepLaterEdits?: boolean,
+} | null) => typedError<UndoBatchResult, AppError>(__TAURI_INVOKE("undo_edit_batch", { batchId, options })),
 	/**
 	 *  Lightroom's "Previous" / Paste from previous (Cmd+Alt+V): copies the stored settings of
 	 *  `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
@@ -1253,9 +1312,16 @@ export const commands = {
 	counts: BaselineCounts,
 	/**
 	 *  The edit batch it wrote (kind `baseline`): undo with `undo_edit_batch(batch.batchId)`
-	 *  while `batch.undoable`. `null` = nothing written.
+	 *  while `batch.undoable`, or `undo_edit_batch(batch.batchId, {keepLaterEdits: true})`
+	 *  ("Undo the rest", v21.1) while `batch.undoneAtMs` is null. `null` = nothing written.
 	 */
 	batch: EditBatchInfo | null,
+	/**
+	 *  v21.1: where the photos this run wrote stand now (derived on read; all zero until it
+	 *  finished). After an undo `message` is replaced by the undo summary ("Undone: the
+	 *  photos are back to how they were", or "… 1 photo you changed since was kept").
+	 */
+	live: BaselineLiveCounts,
 } | null, AppError>(__TAURI_INVOKE("get_baseline_run", { projectId })),
 	/**
 	 *  Per-photo results of the project's latest finished run, capture order, filtered by
@@ -1722,6 +1788,24 @@ export type ApplySuggestionsResult = {
 };
 
 /**
+ *  Result of `auto_light` (IPC v21.1): **the** light-only Auto of one photo
+ *  (`develop::auto::auto_light`: auto white balance first, then the six tone sliders measured
+ *  under it, faces resolved as in Develop; vibrance / saturation never). Identical to what a
+ *  baseline run measures for that photo with the same settings (`BaselineAnchor.auto` for the
+ *  anchor), so "Auto, then nudge" starts the anchor's offset at exactly zero.
+ */
+export type AutoLightValues = {
+	/**  Exposure, contrast, highlights, shadows, whites, blacks and a custom white balance. */
+	light: LightValues,
+	/**
+	 *  `false`: auto white balance could not be estimated (too few neutral pixels); the
+	 *  camera's as-shot temperature / tint is returned, and the tone was measured under the
+	 *  photo's own white balance (as the baseline does).
+	 */
+	whiteBalanceEstimated: boolean,
+};
+
+/**
  *  Values of Lightroom's Basic "Auto" (`auto_tone`): absolute slider values for the
  *  requested sliders, `null` for sliders not requested.
  */
@@ -1755,6 +1839,23 @@ export type BaselineCounts = {
 	skippedEdited: number,
 	anchor: number,
 	failed: number,
+};
+
+/**
+ *  Where the photos a run wrote stand now (IPC v21.1, `BaselineRun.live`), per
+ *  [`BaselineProvenance`] state. Photos a later run rewrote count for that run only.
+ */
+export type BaselineLiveCounts = {
+	/**  Photos this run wrote that no later run rewrote (`onBaseline + userEdited + undone`). */
+	written: number,
+	/**  Still carrying what the run wrote (a re-run updates them). */
+	onBaseline: number,
+	/**  Of `onBaseline`: written as flagged and not reviewed / edited yet ("7 need a look"). */
+	needsLook: number,
+	/**  Changed since (an edit, a paste, another batch), incl. photos `keepLaterEdits` kept. */
+	userEdited: number,
+	/**  Put back by undoing the run's batch. */
+	undone: number,
 };
 
 /**  What a baseline run did with one photo (IPC v21). */
@@ -1792,6 +1893,13 @@ export type BaselinePhotoResult = {
 	auto: LightValues | null,
 	/**  The light values written (Auto + offset, smoothed, clamped); `null` when not written. */
 	light: LightValues | null,
+	/**
+	 *  v21.1: where the photo stands now (`get_baseline_results` only, derived on read like
+	 *  `BaselineProvenance.state`): `on_baseline`, `user_edited` (changed since, or kept by
+	 *  `undo_edit_batch(…, {keepLaterEdits: true})`) or `undone`. `null` for outcomes that
+	 *  wrote nothing, for photos a later run rewrote, and in `preview_baseline`.
+	 */
+	state: BaselineState | null,
 };
 
 /**  Counts of a planned run (`preview_baseline`): known without computing any Auto. */
@@ -1890,9 +1998,16 @@ export type BaselineRun = {
 	counts: BaselineCounts,
 	/**
 	 *  The edit batch it wrote (kind `baseline`): undo with `undo_edit_batch(batch.batchId)`
-	 *  while `batch.undoable`. `null` = nothing written.
+	 *  while `batch.undoable`, or `undo_edit_batch(batch.batchId, {keepLaterEdits: true})`
+	 *  ("Undo the rest", v21.1) while `batch.undoneAtMs` is null. `null` = nothing written.
 	 */
 	batch: EditBatchInfo | null,
+	/**
+	 *  v21.1: where the photos this run wrote stand now (derived on read; all zero until it
+	 *  finished). After an undo `message` is replaced by the undo summary ("Undone: the
+	 *  photos are back to how they were", or "… 1 photo you changed since was kept").
+	 */
+	live: BaselineLiveCounts,
 };
 
 /**
@@ -2743,6 +2858,31 @@ export type EditPlan = {
 	 *  succeed now (linear undo: a later edit of its photos blocks it).
 	 */
 	latestBatch: EditBatchInfo | null,
+	/**
+	 *  v21.1: the project's baseline while its latest run is finished and its batch not undone
+	 *  (`null` otherwise): the Plan header "Baseline: 42 of 43 keepers · 7 need a look".
+	 */
+	baseline: EditPlanBaseline | null,
+};
+
+/**
+ *  `EditPlan.baseline` (IPC v21.1): the project's baseline in the Edit step's terms (keepers
+ *  under `CatalogState.keeperRule`). Present while the latest run is finished and its batch is
+ *  not undone.
+ */
+export type EditPlanBaseline = {
+	runId: number,
+	batch: EditBatchInfo,
+	anchorId: number,
+	presetId: number | null,
+	/**  `EditPlan.keeperIds.length` ("of 43 keepers"). */
+	keepers: number,
+	/**  Keepers whose current settings are a baseline's (`editSource` = `baseline`): "42". */
+	onBaseline: number,
+	/**  Of `onBaseline`: flagged and not reviewed yet ("7 need a look"). */
+	needsLook: number,
+	/**  Keepers this run wrote that were changed since (`BaselineState::UserEdited`). */
+	editedSince: number,
 };
 
 /**  Scene counts of an `EditPlan` (v15). Status counts are over scenes that are not skipped. */
@@ -2764,6 +2904,11 @@ export type EditPlanCounts = {
 	unappliedKeepers: number,
 	/**  `EditPlan.unassignedKeeperIds.length`. */
 	unassignedKeepers: number,
+	/**
+	 *  Scenes with status `on_baseline` (v21.1), not skipped. Done like `applied`: progress =
+	 *  `applied + onBaseline + skipped` of `scenes`.
+	 */
+	onBaseline: number,
 };
 
 /**
@@ -5097,6 +5242,11 @@ export type SceneEditEntry = {
 	 *  `appliedBatch.undoable`; persisted, so it survives leaving the workflow.
 	 */
 	appliedBatch: EditBatchInfo | null,
+	/**
+	 *  v21.1: keepers of this scene (representative included) whose current settings were
+	 *  written by a baseline run (`ImageEditState.editSource` = `baseline`), capture order.
+	 */
+	baselineIds: number[],
 };
 
 /**  Progress of one scene in the Edit step checklist. */
@@ -5115,7 +5265,17 @@ export type SceneEditStatus =
  *  (`appliedBatch` stays undoable when nothing blocks it). A to-do scene: edit the
  *  representative, then apply; not applied by `apply_all_edited_scenes`.
  */
-"reset";
+"reset" | 
+/**
+ *  v21.1: the representative's current settings were written by a baseline run
+ *  (`ImageEditState.editSource` = `baseline`), or it is the anchor of the project's live
+ *  baseline (`EditPlan.baseline`), and the scene was not applied from them: done ("On
+ *  baseline"), like `applied`. Not applied by `apply_all_edited_scenes`;
+ *  `apply_scene_edit` still works (it replaces the members' baseline light with a match
+ *  of the representative). A representative edited after the baseline reads `edited`
+ *  (with `baselineIds` non-empty: "You changed the representative after the baseline").
+ */
+"on_baseline";
 
 /**  How a scene's membership was decided. */
 export type SceneMethod = 
@@ -5956,6 +6116,17 @@ export type UiPrefs = {
 	sceneStripVisible?: boolean | null,
 };
 
+/**  Options of `undo_edit_batch` (v21.1; `null` = defaults = linear undo). */
+export type UndoBatchOptions = {
+	/**
+	 *  `false` (default): linear undo, any later edit of the batch's photos fails the call with
+	 *  `conflict`. `true` ("Undo the rest"): restore the photos still carrying what the batch
+	 *  wrote and keep the ones changed since (`UndoBatchResult.keptIds`); the batch then reads
+	 *  undone. Mirrors "a re-run updates only photos still on the baseline".
+	 */
+	keepLaterEdits?: boolean,
+};
+
 /**  Result of `undo_edit_batch`. */
 export type UndoBatchResult = {
 	/**  Images put back to their settings before the batch (one "Undo <label>" history entry each). */
@@ -5966,6 +6137,11 @@ export type UndoBatchResult = {
 	 *  the batch; since v16 those make the whole undo fail with `conflict`.)
 	 */
 	skippedIds: number[],
+	/**
+	 *  v21.1, `keepLaterEdits` only: images edited after the batch (or the representative of a
+	 *  scene apply built on it) that were left with the later edit. Empty otherwise.
+	 */
+	keptIds: number[],
 };
 
 /**  See [`MaskShape::Unsupported`]. */

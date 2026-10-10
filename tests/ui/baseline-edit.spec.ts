@@ -334,7 +334,8 @@ test.describe("baseline edit UI", () => {
     // The Auto button does light and white balance only; the preset's colours survive.
     await expect(page.getByTestId("auto-all")).toHaveAttribute("title", /preset's colours are kept/);
     await page.getByTestId("auto-all").click();
-    await expect.poll(async () => (await inv<{ exposure: number }>(page, "get_adjustments", { id })).exposure).toBeCloseTo(0.35, 2);
+    // v21.1: Develop's Auto here is the engine's meter, so Auto reads "same as Auto" in the bar.
+    await expect(page.getByTestId("baseline-bar-offset")).toHaveText("same as Auto");
     adj = await inv<{ vibrance: number; saturation: number }>(page, "get_adjustments", { id });
     expect([adj.vibrance, adj.saturation]).toEqual([12, -6]);
     // Start from Auto puts the light back at the baseline's Auto: offset zero again.
@@ -482,12 +483,18 @@ test.describe("baseline edit UI", () => {
     await expect(view(page)).toHaveAttribute("data-step", "4");
     await expect(page.getByTestId("baseline-undo")).toBeDisabled();
     await expect(page.getByTestId("baseline-undo-blocked")).toContainText(/You changed 1 photo after the baseline \(\S+\)/);
-    // "Undo the rest" needs the architect's keepLaterEdits option; it is offered once the contract has it.
-    const supported = await page.getByTestId("baseline-undo-rest").count();
-    if (supported === 0) await expect(page.getByTestId("baseline-undo-blocked")).toContainText("Undo that change in Develop first");
+    await expect(page.getByTestId("baseline-undo-blocked")).toContainText("Undo the rest puts the other");
     // Cmd+Z in the view explains instead of staying silent.
     await page.keyboard.press("Control+z");
     await expect(page.getByText(/Later edits on 1 photo/)).toBeVisible();
+    // Undo the rest: everything else goes back, the changed photo keeps its edit.
+    const total = Number((await inv<{ batch: { imageCount: number } }>(page, "get_baseline_run", { projectId: 1 })).batch.imageCount);
+    await expect(page.getByTestId("baseline-undo-rest")).toContainText(`Undo the rest (${total - 1})`);
+    await clearCalls(page);
+    await page.getByTestId("baseline-undo-rest").click();
+    await expect.poll(async () => (await calls(page, "undo_edit_batch")).length).toBe(1);
+    expect(((await calls(page, "undo_edit_batch"))[0].args.options as { keepLaterEdits: boolean }).keepLaterEdits).toBe(true);
+    await expect(page.getByTestId("baseline-result-message")).toContainText("Undone");
   });
 
   test("P1-3: Finish in Lightroom shows the folder, the import-preset trap, the overwrite warning and the LUT caveat", async ({ page }) => {

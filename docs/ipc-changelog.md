@@ -1151,15 +1151,21 @@ Semantics (implemented in `db::baseline` + `develop::baseline`, tested there)
 - Sidecars: the batch marks photos XMP-dirty and notifies auto-sync, so the `crs:` values land in the XMPs (Lightroom:
   Read Metadata from Files).
 
-Stub engine (TODO-free; runs end to end)
-- `develop::baseline`: `BaselineEdit` managed state (`new`, `is_running`, `start`, `cancel`; registered in `lib.rs`),
-  worker + activity + event + XMP notify, `prepare`, `preview`, `run_pipeline`, `compute`; stages `measure_anchor`
-  (real: Auto of the anchor with its look, offset), `photo_light` (**stub: plain Auto, no offset**; Auto failure ->
-  anchor light, flagged `auto_failed`), `low_key` (**stub: never**), `smooth` (**stub: no-op**), `clamp_light`
-  (clamp + Lightroom rounding), `compose` (look copied, light set, never kept), `pick_samples` (scenes round-robin,
-  evenly spaced, one per burst first). `LightMeter` trait (`auto_light`, `as_shot`) with `DevelopMeter` (develop
-  cache: `auto::auto_tone_with_faces` on the six light sliders + `auto::auto_white_balance`) so tests use synthetic
-  meters. `ENGINE_VERSION = "baseline-stub-1"`.
+Engine (`develop::baseline`, `ENGINE_VERSION = "baseline-2"`; v21 shipped a stub, replaced by rust-engine-dev's
+light normalization engine, decisions.md 2026-10-10 "Baseline engine")
+- `BaselineEdit` managed state (`new`, `is_running`, `start`, `cancel`; registered in `lib.rs`), worker + activity +
+  event + XMP notify, `prepare`, `preview`, `run_pipeline`, `compute`. Stages: measure (parallel, progress + cancel per
+  photo) with the one light-only Auto `develop::auto::auto_light` (auto WB, then the six tone sliders under it, faces
+  as in Develop; never vibrance / saturation; camera as-shot WB when Auto WB fails) + frame statistics;
+  `measure_anchor` (anchor light, its Auto, offset; `as_shot` anchors resolved); `photo_light` = Auto + offset
+  (exposure EV, tone slider units, temperature in mireds, tint additive; Auto failure -> anchor light, `auto_failed`);
+  `low_key` (silhouettes / deliberate low-key keep the offset without Auto's lift, flagged `silhouette` / `low_key`);
+  `smooth` (per scene, photos without one chained by capture time, then per burst; pull to the robust centre or the
+  anchor's value; scene-referred exposure from EXIF; WB clustered per lighting -> `mixed_light`; exposure clusters for
+  flash vs ambient); `clamp_light` (sane bounds + Lightroom rounding, `clamped`); `compose` (look copied, light set,
+  never kept); `pick_samples` (scenes round-robin, evenly spaced, one per burst first). `LightMeter` trait
+  (`auto_light`, `as_shot`, `measure`) with `DevelopMeter`; synthetic meters in tests (`develop::baseline::synth`,
+  `examples/baseline_eval.rs`). Deterministic. v21.1: `measure_light` shared with the `auto_light` command.
 - `db::baseline`: `resolve_settings`, `scope_photos`, `photo_states`, `plan_counts`, `look_source`, `begin_run`,
   `set_anchor`, `finish_run`, `store_results`, `get_run`, `run_by_id`, `results`, `provenance`.
 
@@ -1168,8 +1174,8 @@ Mock backend (`src/testing/mockBaseline.ts`, wired in `mockBackend.ts`)
   / `list_presets` / `apply_preset`. `?baseline=anchor`: + the anchor = project 1's first keeper with Soft Film applied
   and +0.3 EV / warmer than Auto (UI steps 1-2 done), no run. `?baseline=1`: + a finished run on project 1 (keepers;
   applied / flagged low-key + auto-failed / anchor results, one undoable `baseline` batch, provenance).
-- The mock engine follows the target model (Auto + offset; every 11th photo low-key 0.5 EV darker, every 19th Auto
-  failed), not the Rust stub, so the UI shows realistic values. `run_baseline` finishes after
+- The mock engine follows the model (Auto + offset; every 11th photo low-key 0.5 EV darker, every 19th Auto
+  failed) without smoothing, so the UI shows realistic values. `run_baseline` finishes after
   `window.__mockBaselineDelay` ms (default 300) with `activity-event` kind `baseline_edit` + one
   `baseline-run-finished`; cancel, results, provenance (incl. `user_edited` after a save), `ImageQuery.baselineOutcomes`,
   `needsReview` for flagged photos and `undo_edit_batch` are mirrored. Contract check: `tests/ui/ipc-v21-mock.spec.ts`.
@@ -1201,6 +1207,71 @@ Who implements what
   auto-sync / `writeXmpAllDirty`, exact Lightroom steps). Show provenance badges from `getBaselineProvenance` /
   `ImageEditState.editSource === "baseline"`. `isFiltered` / `describeFilters` / chips / `membershipSensitive` must know
   `baselineOutcomes`.
+
+## v21.1 — 2026-10-10 (Phase 10 UX review [ARCH] items: one Auto, scenes on the baseline, undo that keeps later edits)
+
+Schema v22 (migration `0022_undo_keep_later.sql`: `edit_batch_items.kept_at INTEGER`). `src/ipc/bindings.ts`
+regenerated. Additive except `undo_edit_batch` (new trailing parameter: TS callers pass `null`) and the new
+`SceneEditStatus` value (exhaustive `Record<SceneEditStatus | SceneUi, …>` literals need the key).
+
+P0-1 One Auto
+- New command `auto_light(id, adjustments: ParametricAdjustments | null) -> AutoLightValues` (TS
+  `commands.autoLight`): auto white balance, then exposure / contrast / highlights / shadows / whites / blacks measured
+  under it, faces as in Develop; never vibrance / saturation. Same function as the engine's meter
+  (`develop::baseline::measure_light` over `develop::auto::auto_light`), so on the anchor it equals
+  `BaselineAnchor.auto` exactly. Nothing saved. Errors as `auto_tone` (`not_found`, `file_missing`, `decode_failed`;
+  `invalid_argument` when neither Auto WB nor the camera's as-shot WB is known).
+- `AutoLightValues {light: LightValues, whiteBalanceEstimated: boolean}` (`false` = camera as-shot WB returned).
+- TS helper `applyLightValues(adj, light)` (six sliders + custom WB; everything else kept).
+- Develop's generic Auto (`auto-all`, `AutoApi.all`) = `auto_light` + `auto_tone(id, merged, ["vibrance",
+  "saturation"])`, one "Auto" entry (was `auto_tone` all keys + `auto_white_balance` in parallel; the tone is now
+  measured under the white balance it sets). New `AutoApi.light(label?)` and `DevelopHandle.autoLight(label?)` =
+  `auto_light` alone, one entry (default label "Auto Light"): for Auto during a baseline edit and "Start from Auto".
+  `auto_tone` / `auto_white_balance` / the Tone and WB Auto buttons are unchanged.
+
+P0-2 Scenes on the baseline
+- `SceneEditStatus::OnBaseline` (`"on_baseline"`): the representative's settings were written by a baseline
+  (`editSource` = `baseline`) or it is the live baseline's anchor, and the scene was not applied from exactly those
+  settings since. Done like `applied`; `apply_all_edited_scenes` skips it (`apply_scene_edit` still works).
+  `unappliedKeeperIds` is empty for it. A representative edited after the baseline reads `edited`.
+- `SceneEditEntry.baselineIds: ImageId[]` (keepers with edit source `baseline`, capture order).
+- `EditPlanCounts.onBaseline` (not skipped). Progress = `applied + onBaseline + skipped`; `isEditPlanDone` counts
+  `on_baseline` as done.
+- `EditPlan.baseline: EditPlanBaseline | null` = `{runId, batch: EditBatchInfo, anchorId, presetId, keepers,
+  onBaseline, needsLook, editedSince}` while the project's latest run is finished and its batch not undone. Header:
+  "Baseline: {onBaseline} of {keepers} keepers · {needsLook} need a look".
+
+P1-2 Undo that keeps later edits
+- `undo_edit_batch(batchId, options: UndoBatchOptions | null)`; `UndoBatchOptions {keepLaterEdits: boolean}`
+  (`#[serde(default)]`). With `keepLaterEdits`: no `conflict`; photos edited after the batch and representatives of
+  applies built on it are left alone (`UndoBatchResult.keptIds`, new field; empty otherwise), the rest is restored as
+  before, the batch reads undone (`undoneAtMs` set, `undoable` false). Already undone -> `invalid_argument`.
+  "Undo the rest (N)" label: N = `batch.imageCount - batch.conflictCount`.
+- Kept photos read `BaselineState::UserEdited` (not `undone`).
+- `BaselineRun.live: BaselineLiveCounts {written, onBaseline, needsLook, userEdited, undone}` (derived on read; the
+  photos this run wrote that no later run rewrote). After the batch is undone `BaselineRun.message` =
+  "Undone: the photos are back to how they were" or "Undone on 41 photos; 1 photo you changed since was kept".
+- `BaselinePhotoResult.state: BaselineState | null` (current state in `get_baseline_results`; `null` for outcomes that
+  wrote nothing, photos a later run rewrote, and in previews).
+
+Mock (`src/testing/mockBaseline.ts`, `mockBackend.ts`): `auto_light` returns the mock engine's Auto (`autoLightOf`:
+`mockAutoLight(id)` with a `?baseline=` switch, else the legacy Develop Auto values +0.35 EV / 5350 K, so old specs
+are unchanged); `on_baseline` scenes (incl. the anchor's), `baselineIds`, `counts.onBaseline`, `EditPlan.baseline`,
+`keepLaterEdits` undo with `keptIds` / `keptAt`, `live`, undo message, results `state`. Contract check:
+`tests/ui/ipc-v21-mock.spec.ts` (two v21.1 tests); `develop-feel.spec.ts` updated for the new Auto calls.
+
+Who implements what
+- architect (done): types, migration 0022, `auto_light` command, `batches::undo_with`, `on_baseline` status / counts /
+  `EditPlan.baseline` (`scene::workflow`, `db::baseline::{plan_baseline, live_anchor, live_counts}`), provenance with
+  `kept_at`, run `live` / message, results `state`, Rust tests, bindings, mock + spec, Develop's generic Auto,
+  minimal UI typing (`SceneUi` `"baseline"`: status icon / line / chip, Applied tab, `applyBlock` soft reason).
+- frontend-dev: use `DevelopHandle.autoLight("Baseline: start from Auto")` / `AutoApi.light` for Start from Auto and
+  the Auto button while the Baseline bar is shown (drop the `previewBaseline(...).anchor.auto` workaround); Plan
+  header from `plan.baseline`, `On baseline` chip / tab, no Apply to N for `ui === "baseline"` (amber "You changed
+  the representative after the baseline" when `status === "edited" && baselineIds.length > 0`), step pill
+  `Edit · baseline ✓` while `plan.baseline` is set; "Undo the rest (N)" = `undoEditBatch(batchId, {keepLaterEdits:
+  true})` when `batch.conflictCount > 0`; banner / result text from `run.message` + `run.live` after any undo
+  (`useBaselineRun.refresh()`); any new `undoEditBatch` call needs the second argument.
 
 ## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
 

@@ -364,6 +364,14 @@ pub fn applied_from_message(n: usize) -> String {
 /// Scenes whose last apply was this batch lose their applied state (status back to
 /// `edited`; apply again to re-apply). Atomic.
 pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatchResult> {
+    undo_with(conn, batch_id, false)
+}
+
+/// [`undo`], or with `keep_later_edits` (v21.1, "Undo the rest"): photos edited after the
+/// batch and representatives of applies built on it ([`conflict_ids`]) are not a conflict but
+/// left alone (`kept_ids`, their items stamped `kept_at`); the rest is restored as usual and
+/// the batch reads undone. Applies built on the batch stay as they are.
+pub fn undo_with(conn: &mut Connection, batch_id: EditBatchId, keep_later_edits: bool) -> AppResult<UndoBatchResult> {
     let row: Option<(String, Option<i64>)> = conn
         .query_row("SELECT label, undone_at FROM edit_batches WHERE id = ?1", [batch_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -373,15 +381,20 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
     if undone.is_some() {
         return Err(AppError::invalid("this edit was already undone"));
     }
-    let edited = edited_after_ids(conn, batch_id)?;
-    if !edited.is_empty() {
-        let n = conflict_ids(conn, batch_id)?.len();
-        return Err(AppError::new(ErrorKind::Conflict, conflict_message(n)));
-    }
-    let dependent = dependent_ids(conn, batch_id)?;
-    if !dependent.is_empty() {
-        return Err(AppError::new(ErrorKind::Conflict, applied_from_message(dependent.len())));
-    }
+    let kept = if keep_later_edits {
+        conflict_ids(conn, batch_id)?
+    } else {
+        let edited = edited_after_ids(conn, batch_id)?;
+        if !edited.is_empty() {
+            let n = conflict_ids(conn, batch_id)?.len();
+            return Err(AppError::new(ErrorKind::Conflict, conflict_message(n)));
+        }
+        let dependent = dependent_ids(conn, batch_id)?;
+        if !dependent.is_empty() {
+            return Err(AppError::new(ErrorKind::Conflict, applied_from_message(dependent.len())));
+        }
+        Vec::new()
+    };
     type Item = (ImageId, String, String, Option<String>, Option<EditBatchId>);
     let items: Vec<Item> = conn
         .prepare(
@@ -394,6 +407,10 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
     let mut restore = Vec::new();
     let mut sources = HashMap::new();
     for (id, before, after, before_source, before_batch) in items {
+        if kept.contains(&id) {
+            result.kept_ids.push(id);
+            continue;
+        }
         let after: ParametricAdjustments = serde_json::from_str(&after)?;
         if repo::get_adjustments(conn, id)? == after {
             restore.push((id, serde_json::from_str::<ParametricAdjustments>(&before)?));
@@ -411,7 +428,14 @@ pub fn undo(conn: &mut Connection, batch_id: EditBatchId) -> AppResult<UndoBatch
             stamp_cursor(&inner, *id, Some(src.as_deref().unwrap_or(EditSource::User.as_str())), *b)?;
         }
     }
-    inner.execute("UPDATE edit_batches SET undone_at = ?2 WHERE id = ?1", params![batch_id, now_ms()])?;
+    let now = now_ms();
+    for id in &result.kept_ids {
+        inner.execute(
+            "UPDATE edit_batch_items SET kept_at = ?3 WHERE batch_id = ?1 AND image_id = ?2",
+            params![batch_id, id, now],
+        )?;
+    }
+    inner.execute("UPDATE edit_batches SET undone_at = ?2 WHERE id = ?1", params![batch_id, now])?;
     inner.execute(
         "UPDATE scenes SET applied_at_ms = NULL, applied_params_json = NULL, applied_batch_id = NULL,
                            applied_covered_json = NULL
@@ -600,7 +624,7 @@ mod tests {
         history::undo(&mut conn, ids[1]).unwrap();
         assert!(batch_info(&conn, batch).unwrap().undoable);
         let u = undo(&mut conn, batch).unwrap();
-        assert_eq!(u, UndoBatchResult { restored_ids: vec![ids[0]], skipped_ids: vec![ids[1]] });
+        assert_eq!(u, UndoBatchResult { restored_ids: vec![ids[0]], skipped_ids: vec![ids[1]], kept_ids: vec![] });
         assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap(), ParametricAdjustments::default());
         assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), ParametricAdjustments::default());
         let info = batch_info(&conn, batch).unwrap();
@@ -677,6 +701,45 @@ mod tests {
         assert_eq!(u.restored_ids, ids);
         assert!(u.skipped_ids.is_empty());
         assert_eq!(latest_batch_where(&conn, "1").unwrap(), None);
+    }
+
+    #[test]
+    fn undo_keeping_later_edits_restores_the_rest() {
+        let mut conn = fixture();
+        let ids = image_ids(&conn);
+        let a = commit_recorded(&mut conn, &items(&ids, 0.5), LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        // The user changes one photo after the batch: linear undo refuses, nothing changes.
+        history::commit(&mut conn, ids[1], &adj(1.2), "Exposure").unwrap();
+        assert_eq!(undo(&mut conn, a).unwrap_err().kind, ErrorKind::Conflict);
+        let info = batch_info(&conn, a).unwrap();
+        assert_eq!((info.undoable, info.conflict_count), (false, 1));
+        // "Undo the rest": the other two go back, the edited one keeps the user's edit.
+        let u = undo_with(&mut conn, a, true).unwrap();
+        assert_eq!(
+            u,
+            UndoBatchResult { restored_ids: vec![ids[0], ids[2]], skipped_ids: vec![], kept_ids: vec![ids[1]] }
+        );
+        assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap(), ParametricAdjustments::default());
+        assert_eq!(repo::get_adjustments(&conn, ids[1]).unwrap(), adj(1.2));
+        let kept: Option<i64> = conn
+            .query_row("SELECT kept_at FROM edit_batch_items WHERE batch_id = ?1 AND image_id = ?2", [a, ids[1]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(kept.is_some());
+        let info = batch_info(&conn, a).unwrap();
+        assert!(info.undone_at_ms.is_some() && !info.undoable);
+        assert_eq!(undo_with(&mut conn, a, true).unwrap_err().kind, ErrorKind::InvalidArgument);
+        // Without later edits, keepLaterEdits is a plain undo.
+        let b = commit_recorded(&mut conn, &items(&ids[..1], 0.7), LABEL_STYLE, BatchKind::StylePrediction)
+            .unwrap()
+            .batch_id
+            .unwrap();
+        let u = undo_with(&mut conn, b, true).unwrap();
+        assert_eq!((u.restored_ids, u.kept_ids), (vec![ids[0]], vec![]));
     }
 
     #[test]

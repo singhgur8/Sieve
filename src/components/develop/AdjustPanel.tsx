@@ -56,6 +56,11 @@ export interface AutoApi {
   busy: boolean;
   /** Generic Auto: tone + white balance from the photo (no learned style needed), one history entry. */
   all: () => void;
+  /**
+   * v21.1 light-only Auto (`auto_light`: white balance + the six tone sliders, never vibrance / saturation), one history
+   * entry (default label "Auto Light"). For Auto during a baseline edit and "Start from Auto": the preset's colours stay.
+   */
+  light: (label?: string) => void;
   tone: () => void;
   wb: () => void;
   /** Shift+double-click: auto for one slider (temp / tint use the white balance, the rest `auto_tone` with that key). */
@@ -299,7 +304,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                   <button
                     className="flex h-6 items-center gap-1 rounded bg-sky-800 px-3 text-xs font-medium text-sky-50 hover:bg-sky-700 disabled:opacity-60"
                     disabled={auto.busy}
-                    onClick={auto.all}
+                    onClick={auto.lightOnly ? () => auto.light() : auto.all}
                     title={auto.lightOnly ? "Auto light and white balance (the preset's colours are kept during the baseline edit)" : `Auto: set exposure, contrast, highlights, shadows and white balance from this photo's analysis. Works on any photo, no learned style needed. Not the same as "Auto edit (my style)", which applies your own editing style to a whole scene.`}
                     data-testid="auto-all"
                   >

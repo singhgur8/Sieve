@@ -34,6 +34,7 @@ src-tauri/
                                quality_scores.scored_pick (IPC v20, target-count culling)
   migrations/0020_target_review.sql v20: target_selection.origin, target_similarity (IPC v20.1)
   migrations/0021_baseline_edit.sql v21: baseline_runs, baseline_results, baseline_provenance; `baseline` batch kind
+  migrations/0022_undo_keep_later.sql v22: edit_batch_items.kept_at ("Undo the rest", IPC v21.1)
                                + history source (IPC v21, baseline edit)
   src/
     main.rs                    -> sieve_lib::run()
@@ -78,7 +79,7 @@ src-tauri/
     xmp/masks.rs               crs:MaskGroupBasedCorrections <-> masks (mapping tables, Lightroom mattes) (v10)
     develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
     develop/edited.rs          edited-preview disk cache + low-priority regeneration worker (IPC v19.1)
-    develop/baseline.rs        baseline edit engine (look copy + per-photo light) + BaselineEdit worker (v21; engine stub)
+    develop/baseline.rs        baseline edit engine (look copy + per-photo light, engine `baseline-2`) + BaselineEdit worker (v21)
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
@@ -850,7 +851,7 @@ migrations tracked by `PRAGMA user_version`.
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated); v13: `source` (who produced it) and `batch_id` (edit batch that wrote it) |
 | `presets` | `group_id` (style group, v12), name (unique per group, NOCASE), params JSON, fields JSON, `source_format`, `settings_json` + `setting_keys_json` (imported crs: settings), `supports_amount`, `warnings_json` |
 | `style_groups` / `style_profiles` | style library (v12): groups per imported source folder + built-ins 1 "User Presets" / 2 "LUTs"; looks / DCPs (read in place) / LUTs (library copies) |
-| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene); v13: `before_source` / `before_batch_id` (restored by undo), `review_reason` / `reviewed_at` (needs a look); v15: `edit_batch_bases` (batch, representative, base batch): an apply made from settings another batch wrote blocks that batch's undo (IPC v17) |
+| `edit_batches` / `edit_batch_items` | undoable multi-image edits (v12): per image `before_json` / `after_json` (+ scene); v13: `before_source` / `before_batch_id` (restored by undo), `review_reason` / `reviewed_at` (needs a look); v15: `edit_batch_bases` (batch, representative, base batch): an apply made from settings another batch wrote blocks that batch's undo (IPC v17); v22: `kept_at` = left with its later edit by `undo_edit_batch(…, {keepLaterEdits})` (IPC v21.1) |
 | `style_models` / `style_features` | personal style model blobs + validation; per-image features (v12, owned by `ml::style`) |
 | `export_presets` | user export presets: name (unique, NOCASE), `ExportSettings` JSON (built-ins are in code) |
 | `export_jobs` | one per `export_images`: state, resolved output dir, settings JSON, counters, timestamps, `project_id` (v12: all images in one project, else NULL) |
@@ -1073,14 +1074,40 @@ Each row lists the `crs:` keys it owns (`crs_key_class(name)`); keys Sieve does 
 removal, red eye) are never touched. Vibrance / saturation are look although Lightroom's Auto sets them (they are the
 preset's colour); the light Auto is the six tone sliders + auto WB.
 
-**Light model** (`develop::baseline`): light(photo) = Auto(photo, rendered with the look) + offset, offset =
-anchor light - Auto(anchor) (`LightOffset`: EV / slider deltas, temperature in mireds, tint additive), so "a bit warmer /
-brighter than Auto" carries over while a dark church and a sunny park both land well exposed. Then smoothing per burst /
-scene (no flicker), low-key / silhouette frames kept dark and flagged, clamps + Lightroom rounding. Auto failing ->
-the anchor's light, flagged. Stages: `measure_anchor`, `photo_light`, `low_key`, `smooth`, `clamp_light`, `compose`
-(look copied, light set, never kept), driven by `compute` over a `LightMeter` (`DevelopMeter` = `develop::auto` on the
-develop cache; synthetic meters in tests). v21 ships a stub engine (plain Auto, no offset / smoothing / low-key) that
-runs end to end.
+**One Auto** (IPC v21.1): `develop::auto::auto_light` is the only light-only Auto: auto white balance first, then
+exposure, contrast, highlights, shadows, whites and blacks measured under it, faces resolved as in Develop (analysis
+boxes, else on-demand detection, else the bounded skin estimate); vibrance / saturation are never touched (they are
+look). `develop::baseline::measure_light` wraps it (camera as-shot WB when Auto WB cannot be estimated) and is used by
+both the engine's `DevelopMeter` and the `auto_light` command, so Develop's Auto on the anchor returns exactly
+`BaselineAnchor.auto` and "Auto, then nudge" starts the anchor's offset at zero. Develop's generic Auto button =
+`auto_light` + `auto_tone(…, ["vibrance", "saturation"])` on the merged settings (one "Auto" entry); during a baseline
+edit and for "Start from Auto" the UI uses `auto_light` alone so the preset's colours stay.
+
+**Light model** (`develop::baseline`, engine `baseline-2`, rust-engine-dev; decisions.md 2026-10-10 "Baseline engine"):
+light(photo) = Auto(photo, measured with the anchor's look) + offset, offset = anchor light - Auto(anchor)
+(`LightOffset`: exposure in EV, tone sliders in slider units, temperature in **mireds** so "a bit warmer than Auto"
+means the same shift under tungsten and daylight, tint additive). So the anchor's taste carries over while a dark church
+and a sunny park both land well exposed. Five stages, driven by `compute` over a `LightMeter` (`DevelopMeter` on the
+develop cache; synthetic meters in tests):
+1. **Measure** (parallel, `measure_threads` workers, progress + cancel per photo; sources it decoded are dropped again
+   so memory stays flat): `measure_light` on the photo's settings with the anchor's look groups, plus the frame
+   statistics as exposed (every Auto slider at 0).
+2. **Auto + offset** (`photo_light`); an `as_shot` anchor uses the camera's as-shot values; Auto failing -> the
+   anchor's light, flagged `auto_failed` (smoothing then gives it its scene's light).
+3. **Low-key / silhouette** (`low_key`): frames Auto wants to brighten that are back-lit silhouettes or deliberately
+   dark keep the offset **without Auto's lift** (exposure / shadows not raised) and are flagged `silhouette` / `low_key`.
+4. **Smoothing** (`smooth`): per scene (photos without one chained by capture time, gaps <= 90 s), then per burst;
+   each value is pulled towards the group's robust centre (median, or the anchor's value in the anchor's group) keeping
+   part of each photo's own deviation. Exposure is smoothed scene-referred (Auto EV + the camera's EXIF exposure).
+   White balance is clustered per lighting (mireds, gap 40): mixed light keeps one balance per light and flags
+   `mixed_light`; exposure clusters likewise (flash vs ambient). Low-key frames are smoothed only among themselves.
+5. **Clamps** (`clamp_light`): sane bounds, Lightroom rounding (0.05 EV, integers, whole Kelvin); out-of-range adds
+   `clamped` (not a flag on its own).
+`compose` then copies the look, sets the light and keeps the never groups. Deterministic (capture-time order,
+order-independent measurement). Dark scenes stay somewhat darker than a bright anchor scene because Auto keeps part of
+a scene's mood (synthetic shoot: frame L* SD per scene 4.6 -> 1.4 church, 6.8 -> 1.0 outdoor, 6.2 -> 2.1 tungsten vs
+copy-paste; silhouettes / low-key all flagged, 0 false flags; look keys byte-identical). A preview runs the same stages
+on the sampled frames only, so its values can differ from the run's by up to the smoothing pull.
 
 **Run** (`BaselineEdit` worker, one at a time, own catalog connection): resolve settings (anchor / selection in the
 project, preset exists) -> scope (`keepers` by the keeper rule = the delivery set after Pick the best N, `all`, or a
@@ -1088,16 +1115,21 @@ selection; capture order) -> measure the anchor (stored on the run) -> plan ever
 batch (kind `baseline`, label "Baseline Edit", history source `baseline`) + per-photo results + provenance in one
 savepoint (`db::baseline::store_results`). Cancel / failure before that writes nothing. Progress: `activityEvent` kind
 `baseline_edit`; end: one `baselineRunFinished`; XMP auto-sync notified. Undo = `undo_edit_batch(run.batch.batchId)`
-(linear-undo rules of v16 unchanged). Preview (`preview_baseline`) runs the same `compute` on ~12 samples spread
+(linear-undo rules of v16), or "Undo the rest" (v21.1) = `undo_edit_batch(batchId, {keepLaterEdits: true})`: photos
+still on the baseline go back, photos the user changed since keep the change (`keptIds`; their batch item is stamped
+`edit_batch_items.kept_at`, migration 0022, so their provenance reads `user_edited`, not `undone`). After any undo
+`BaselineRun.message` reads the undo summary and `BaselineRun.live` (on baseline / needs a look / user edited / undone,
+derived on read) follows, so no screen shows a stale "Edited 42". Preview (`preview_baseline`) runs the same `compute` on ~12 samples spread
 across scenes (`pick_samples`) and returns before / after settings; the UI renders `after` through the normal
 `render_preview` path (no new render route).
 
 **Outcomes**: `applied`; `flagged` (written, needs a look: the batch item's `review_reason`, so `ImageEditState.
 needsReview` / `mark_reviewed` work as for scene applies); `skipped_edited` (already edited, unless `replaceEdited`);
-`anchor` (never written); `failed` (original missing). Grid filter `ImageQuery.baselineOutcomes`.
+`anchor` (never written); `failed` (original missing). Grid filter `ImageQuery.baselineOutcomes`. Results of
+`get_baseline_results` carry the photo's current `state` (v21.1).
 
 **Provenance** (`baseline_provenance`, derived on read): a photo is `on_baseline` while its history cursor is the entry
-the baseline wrote (and that entry carries the run's batch id), `undone` when the batch was undone, else
+the baseline wrote (and that entry carries the run's batch id), `undone` when the batch was undone (and did not keep the photo, v21.1), else
 `user_edited`. So user edits after the baseline mark the photo without triggers, per-photo undo back to the baseline
 entry restores it, and a re-run after changing the anchor updates unedited photos and photos still on the baseline
 only.
@@ -1108,7 +1140,12 @@ Apply to Scene as the primary Edit-step path** (one anchor for the whole shoot i
 keeper rule for scope, `edit_batches` + `undo_edit_batch` + needs-review for the batch, the edited-preview cache and
 XMP auto-sync for output, `develop::auto` (Phase 8b auto tone / WB) as the per-photo Auto, the style library presets
 (IPC v14) as the look source. Apply to Scene stays available for per-scene refinement after a baseline: it treats
-`baseline` photos like `auto_style` ones (unapplied keepers it may overwrite). Scene matching's relative grading
+`baseline` photos like `auto_style` ones (unapplied keepers it may overwrite). In the Edit plan (v21.1) a scene whose
+representative is on the baseline (edit source `baseline`) or is the live baseline's anchor has status `on_baseline`:
+done like `applied`, counted in `EditPlanCounts.onBaseline`, never applied by `apply_all_edited_scenes`, and the UI
+offers no Apply to N for it. A representative edited after the baseline reads `edited` again (with
+`SceneEditEntry.baselineIds` non-empty), which is how per-scene refinement stays possible. `EditPlan.baseline` gives the
+header summary ("Baseline: 42 of 43 keepers · 7 need a look") while the latest run is finished and not undone. Scene matching's relative grading
 (`scene::matching`) is not used: the anchor offset over Auto is the relative part. The **style model**
 (`ml::style`, "Auto edit (my style)") is independent and not used by v21; a later engine may use its prediction instead
 of plain Auto as the per-photo base (same `LightMeter` seam). Note: style training today takes every photo with

@@ -552,6 +552,17 @@ impl DevelopCache {
         }
     }
 
+    /// The decoded source of `id` is in the LRU (batch work uses this with
+    /// [`Self::drop_decoded`] to leave the cache as it found it).
+    pub fn is_decoded(&self, id: ImageId) -> bool {
+        lock(&self.inner.lru).map.contains_key(&id)
+    }
+
+    /// Drops only the decoded source of `id` from the LRU (renders, tickets and mattes stay).
+    pub fn drop_decoded(&self, id: ImageId) {
+        lock(&self.inner.lru).map.remove(&id);
+    }
+
     /// Issues the next ticket for (image, slot). Call on the async side, before any
     /// blocking work, so tickets follow request arrival order.
     pub fn ticket(&self, image_id: ImageId, slot: RenderSlot) -> RenderTicket {
