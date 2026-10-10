@@ -408,3 +408,80 @@ Everything else in the proposed keymap above has landed. There are no conflicts:
 - The Defects and Weaker grids.
 
 **Open P0 / P1 after Re-check 1: P0 none · P1 3 (R1-1 weak cross-moment cover and its swap, R1-2 pass 1 moment grid, R1-3 Similar pile focus and kept column).**
+
+## Re-check 2 (2026-10-10)
+
+Branch `phase-9-target-cull` at df3201f (R1-1 to R1-9 frontend). I used the mock backend (`vite --port 1466`) with throwaway Playwright drivers at 1280×800 and 1440×900 on `?mock=5000&target=1`. I also ran the 11 "UX re-check 1" tests in `tests/ui/target-cull.spec.ts`; all 11 pass. I deleted the screenshots and drivers afterwards (`test-data/ux-review/`, `test-data/ui-screens/`).
+
+### Verdict per item
+| Item | Verdict | Evidence |
+|---|---|---|
+| R1-1 Weak cross-moment cover | **Resolved** | When the cover is `another_moment` and below 70 %, the photo spans the full width. A 48×32 cover thumb shows the note "… (kept, another moment) · 50%". S is disabled and pressing it flashes "DSC000xx is the pick of another moment. A keeps this one too", with no `swap_alternative` call. A is labelled Keep. A same-moment cover still shows two panes with S enabled. |
+| R1-2 Review moment grid (G) | **Resolved as specced, but it crashes (N2-1) and clips alternatives (N2-2)** | G toggles `data-view`. The grid opens on the first unreviewed row (row 1 after reviewing moment 1). Picks are 240×160, alternatives 160×112, and the row header reads "Moment 2 of 282 · 02:00 PM · Couple · 3 picked · 4 alternatives". Reviewed rows show at 60 %. 3 rows fit at 1280×800. The two-up strip starts with the current pick, white ring, "Showing". |
+| R1-3 Similar pile | **Resolved** | The outline is visible on all 4 sides of row 1, frame 1. Up to 3 kept tiles, then "+N more". "you added", the amber line and the amber `Add a 4th` button all work. Labels read "82% · like DSC00048". The pile crashes on scroll (N2-1). |
+| R1-4 Toast placement | **Resolved** | Toasts sit bottom right (`bottom-[64px] right-3`, 360 px) and leave `Show in grid` / `Second look →` free. |
+| R1-5 Number format | **Resolved** | `plural()` uses `num()` ("1,656 photos …"). The caption reads "92%". |
+| R1-6 Apply copy | **Resolved** | "482 photos get the Picked flag (the other 53 picks already have it)." |
+| R1-7 Shift+Z | **Resolved** | Shift+Z accepts the rest of the moment in Review and does nothing in the Second look. The cheat sheet says "Shift+Z (Review picks only)". |
+| R1-8 Setup focus | **Resolved** | On a fresh shoot, B focuses and selects the count, so B → type → Enter runs. On a finished run, B opens Review, as designed. |
+| R1-9 Similar large view (E) | **Resolved** | E shows the focused frame next to its kept photo with captions ("Set aside DSC00021 · Almost the same as DSC00023" / "Picked DSC00023 81% similar"). E or Esc returns to the rows, and Esc does not close the overlay. E does nothing in Not sure, and G does nothing in the Second look. |
+
+### Shift+Down = next moment (and Shift+Up = previous) outside the grid
+This chord was added in `keymap.ts` for every Review and Second look view, not only the moment grid. I checked each view.
+
+| View | Down | Shift+Down | Verdict |
+|---|---|---|---|
+| Review, moment grid | next row (= next moment) | accept the row and go to the next one | Consistent: Shift adds "accept". |
+| Review, two-up | next alternative | mark the moment's picks reviewed and go to the next moment (2 → 10, reviewed 0 → 3) | No conflict. A small surprise: plain Down cycles alternatives, while Shift+Down leaves the moment. It behaves exactly like the visible Shift+Right, so I accept it. |
+| Second look, Not sure | (nothing) | skip the rest of the moment (33 → 55) | Same as Shift+Space / Shift+Right. Fine. |
+| Second look, Similar | next row | mark the row reviewed and go to the next one | Consistent with the grid. |
+| Second look, Weaker / Defects | next row (26 → 76) | next **frame** (76 → 80) | Odd: with Shift, Down moves less than without it. P2 (N2-3). |
+| Main Cull grid (overlay closed) | – | extends the selection (1 → 7 selected), Lightroom behavior | No leak. The overlay keymap is only active while the overlay is open. |
+| Setup count field | – | – | Typing targets are ignored (`isTypingTarget`). Setup only listens to Esc. |
+
+Discoverability: the cheat sheet shows only `Shift+Right` for "next moment" and `Shift+Left` for "previous". Shift+Down / Shift+Up are hidden aliases. That is harmless, but see N2-3.
+
+### New findings
+
+#### N2-1 (P0) Scrolling any windowed list crashes Pick the best N
+- **Where**: `src/components/target/bits.tsx`, `Windowed`, line 161:
+  `onScroll={(e) => setView((v) => ({ ...v, top: e.currentTarget.scrollTop }))}`. It is used by the Review moment grid (`ReviewStep.tsx:584`), the Similar pile (`SecondStep.tsx:665`) and the Weaker / Defects grids (`SecondStep.tsx:793`). The same code was in `SecondStep` at c4d2e18, so this is a latent bug that Re-check 1 missed. It is now on the main pass-1 path.
+- **What**: the state updater runs after React has cleared `e.currentTarget`. The result is "TypeError: Cannot read properties of null (reading 'scrollTop')", and the overlay is replaced by "Something went wrong in Pick the best N".
+  Reproduced at 1280×800 and 1440×900, every time, for:
+  - Review grid: ArrowDown ×10, Shift+Right ×5, `Accept row` clicked 4 times, mouse-wheel scrolling.
+  - Similar pile: ArrowDown ×8, Shift+Down ×6, wheel.
+  - Weaker pile: ArrowDown ×8, wheel.
+  Only moves that stay inside the first screen survive.
+- **Why**: the moment grid exists so a photographer can walk 282 moments with Shift+Right. In practice it dies at the 4th row, and the Similar and Weaker piles die at the first scroll. "Reload view" loses their place. Nothing is lost from the catalog, but the pass cannot be finished.
+- **Fix**: read the value before calling the setter:
+  `onScroll={(e) => { const top = e.currentTarget.scrollTop; setView((v) => ({ ...v, top })); }}`.
+- **Acceptance**: a new test, for each of `target-grid`, the Similar pile and the Weaker pile at 1280×800, scrolls each list 5 × 400 px with the mouse wheel, and presses ArrowDown ×10 (Shift+Right ×10 in the grid). After that the overlay is still open and the focused cell is in view.
+
+#### N2-2 (P1) Moment grid: alternatives past the right edge are clipped, and keyboard focus can sit off screen
+- **Where**: `ReviewStep.tsx`, `target-grid-alts-*` (`overflow-x-auto`, no scroll-into-view).
+- **What**: 3 picks take 744 px, so at 1280 only 2.9 alternatives fit and at 1440 about 3.9. On Moment 2 (3 picks, 4 alternatives), Right ×6 focuses DSC00011 at x = 1289. At 1280 that is completely off screen, and at 1440 it is clipped. A then adds a photo the user cannot see.
+  - The captions "#1 Almost the same as DSC0…" cut off the name of the pick each alternative belongs to. Ranks repeat ("#1", "#1", "#2"), so it is unclear which pick an alternative is the #1 of.
+- **Fix**:
+  1. When `g` changes, call `scrollIntoView({ block: "nearest", inline: "nearest" })` on the focused cell (the same for `target-sim-frame-*` in the Similar pile).
+  2. When a row's alternatives overflow, show a right-edge fade (`bg-gradient-to-l from-neutral-950`, 24 px) and a `+N` count chip at the end of the visible alternatives.
+  3. Change the alternative caption to `#1 ≈ DSC00002` (rank plus the stem of the pick it is an alternative of, from `alternativeOf`). Put the full reason in the tooltip.
+- **Acceptance**: at 1280×800, Moment 2, Right ×6: the focused cell's bounding box lies inside the viewport. The caption contains the stem of its pick.
+
+#### N2-3 (P2) Shift+Down in Weaker / Defects, and the hidden aliases
+- In the Weaker / Defects grids, `targetNextMoment` / `targetPrevMoment` fall through to `moveF(±1)`, so Shift+Down moves one frame while Down moves one row. Make Shift+Down / Shift+Up (and Shift+Right / Shift+Left) do nothing there. These piles have no moments.
+- Add `Shift+Down` / `Shift+Up` to the `display` of `targetNextMoment` / `targetPrevMoment` in `keymap.ts`. Then the Review grid footer ("Up / Down: moment") and the cheat sheet both show that Shift+Down accepts the row.
+
+### Keymap changes since Re-check 1
+| Action | Now | Proposed |
+|---|---|---|
+| Next / previous moment (Review, Not sure, Similar) | Shift+Right/Left, Shift+Down/Up (hidden), Shift+Z (Review) | keep; show Shift+Down/Up in the cheat sheet (N2-3) |
+| Shift+arrows in Weaker / Defects | Shift+Down/Right = next frame | no-op (N2-3) |
+
+No conflicts: G, E and B are each used in one place, and Shift+Down does not leak into the Cull grid.
+
+### Needs no change after Re-check 2
+- R1-1, R1-3 to R1-9 as built (apart from the shared scroll crash).
+- The two-up Review strip with "Showing".
+- The Not sure pile, the Apply dialog, the toasts and Setup focus.
+
+**Open P0 / P1 after Re-check 2: P0 1 (N2-1 scroll crash in the moment grid, Similar, Weaker and Defects lists) · P1 1 (N2-2 off-screen alternatives and focus in the moment grid).**
