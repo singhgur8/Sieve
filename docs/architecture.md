@@ -1011,6 +1011,27 @@ aside, unflagged -> a delivered photo becomes not sure); target edits (`swap_alt
 unflagged); `restore_target_snapshot` undoes them (rows + flags). Re-runs pass locked rows to the engine
 (`SelectionInput.locked`) and `store_results` never changes their choice.
 
+v20.1 (UX review 9, schema v20 `0020_target_review.sql`):
+- **Flag model**: target edits write flags at once, as the user's: keep (`set_target_choice` with the same choice) and
+  add / swap in -> pick; set aside / not sure / swap out -> a pick becomes unflagged (never a reject). Apply flags the
+  rest. `lock_target_choices(ids)` locks rows without touching flags (reviewed picks before a re-run).
+- **Apply**: `plan_target_apply(projectId, {rejects})` is the dry run of `apply_target_selection(projectId,
+  {rejects})` (same `apply_steps` code): picks / rejects / rejectable / unflags / unchanged / userFlagged. With
+  `rejects: false` a reject suggestion is not written (a Sieve pick on that photo is cleared). The result carries the
+  `CullSnapshot`s of the changed flags; the UI records them on the Cull undo stack ("Apply Pick the best N",
+  `restore_cull_snapshot`). Selection rows are not changed by apply; `applied_at` stays after an undo.
+- **Covered by**: every run stores the visual similarity of every pair of frames in the same moment
+  (`target_similarity`, `ml::selection::moment_similarities`; moments over 300 frames keep pairs >= 0.3).
+  `db::target::refresh_covers` recomputes `covered_by` for whole moments after every edit (`edit`, `note_user_flags`,
+  locked rows after `store_results`): nearest delivered frame of the same moment, else a still-delivered cover from
+  another moment, else none. Edits snapshot whole moments, so `restore_target_snapshot` restores covers exactly.
+  `target_selection.origin` (`engine` / `user`) records who made the choice: `CoveredBy.coveredByOrigin`,
+  `Moment.userDeliveredIds`. Tier (`SimilarityTier`) and text are derived on read.
+- **Second-look piles** (`TargetPile`, `db::target::PILE_SQL`): not sure / defects (Apply would reject it, or the user
+  rejected it) / similar (near-duplicate or not-best-of-setup reason, or covered at >= 0.7) / weaker. Exposed as
+  `ImageSelection.pile`, `TargetCounts.piles`, `ImageQuery.targetPiles`; plus `ImageQuery.targetReasonKinds` (first
+  reason) and `ImageSort::TargetMoment` (moment start, then score).
+
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.
 - `cargo test` fails (`bindings_are_up_to_date`) if the committed bindings are stale;

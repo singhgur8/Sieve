@@ -313,6 +313,7 @@ pub fn run_pipeline(
     if cancelled() {
         return Ok(PipelineOutcome { cancelled: true, ..PipelineOutcome::default() });
     }
+    target::store_similarities(conn, job.project_id, &moment_similarities(&input.plan))?;
     target::store_results(conn, job.project_id, &input.plan.moments, &drafts)?;
     let counts = target::counts(conn, job.project_id)?;
     let message = if drafts.is_empty() {
@@ -334,6 +335,35 @@ pub fn run_pipeline(
     };
     let model_version = format!("{}+{}", identity.model_version.as_deref().unwrap_or("no-identity"), SELECTION_VERSION);
     Ok(PipelineOutcome { cancelled: false, message, model_version })
+}
+
+/// Moments with more frames than this only store pairs at least [`PAIR_MIN_LARGE`] similar.
+const PAIR_ALL_UP_TO: usize = 300;
+const PAIR_MIN_LARGE: f32 = 0.3;
+
+/// Visual similarity ([`moments::similarity`]) of every pair of frames in the same moment, for
+/// `db::target::store_similarities` (v20.1: "covered by" is recomputed from them after the
+/// user's edits). Large moments keep only the pairs that could matter.
+pub fn moment_similarities(plan: &moments::MomentPlan) -> Vec<(ImageId, ImageId, f32)> {
+    let mut by_moment: BTreeMap<u32, Vec<&FrameSignals>> = BTreeMap::new();
+    for f in &plan.frames {
+        if let Some(k) = f.moment_key {
+            by_moment.entry(k).or_default().push(f);
+        }
+    }
+    let mut out = Vec::new();
+    for frames in by_moment.values() {
+        let min = if frames.len() > PAIR_ALL_UP_TO { PAIR_MIN_LARGE } else { f32::NEG_INFINITY };
+        for (i, a) in frames.iter().enumerate() {
+            for b in &frames[i + 1..] {
+                let sim = moments::similarity(a, b);
+                if sim >= min {
+                    out.push((a.image_id, b.image_id, sim));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Everything [`select`] decides from.

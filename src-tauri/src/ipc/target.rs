@@ -17,6 +17,12 @@
 //! with `pick` dropped (confident-defect rejects of the project's `RejectStrictness` stay).
 //! `apply_target_selection` writes it to the flags (origin `auto`); the user's own flags always
 //! win and lock the photo's choice (see `docs/architecture.md`, "Target-count culling").
+//!
+//! v20.1 (UX review 9): target edits (keep, swap, add, set aside, not sure) write the flags
+//! of the photos they touch at once, as the user's; `apply_target_selection` flags the rest
+//! (dry run: `plan_target_apply`) and returns `CullSnapshot`s for one-step undo. `covered_by`
+//! is recomputed within the moment after every edit (frame similarities stored per run),
+//! with a similarity tier and who delivered the covering photo.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -130,6 +136,80 @@ string_enum! {
     }
 }
 
+string_enum! {
+    /// Who made a photo's current selection choice (IPC v20.1).
+    pub enum ChoiceOrigin {
+        /// The engine (a target run).
+        Engine => "engine",
+        /// The user: a target edit (swap, add, set aside, not sure) or their own flag changed
+        /// the choice. Locking a choice without changing it (keep, review lock) keeps the origin.
+        User => "user",
+    }
+}
+
+/// Similarity from which two frames count as "almost identical" ([`SimilarityTier`]).
+pub const SIMILARITY_NEAR_IDENTICAL: f32 = 0.9;
+/// Similarity from which two frames count as "very similar" ([`SimilarityTier`]).
+pub const SIMILARITY_VERY_SIMILAR: f32 = 0.7;
+
+string_enum! {
+    /// How close a photo is to the delivered photo covering it (IPC v20.1), for the wording
+    /// "Almost identical to DSC0412 (kept)" / "Similar to …" / "Same moment as …" / "Looks
+    /// like … (kept, another moment)".
+    pub enum SimilarityTier {
+        /// Same moment, similarity >= [`SIMILARITY_NEAR_IDENTICAL`] (0.9).
+        NearIdentical => "near_identical",
+        /// Same moment, similarity >= [`SIMILARITY_VERY_SIMILAR`] (0.7).
+        VerySimilar => "very_similar",
+        /// Same moment, less similar.
+        SameMoment => "same_moment",
+        /// The covering photo is in another moment.
+        AnotherMoment => "another_moment",
+    }
+}
+
+impl SimilarityTier {
+    pub fn of(similarity: f32, same_moment: bool) -> Self {
+        if !same_moment {
+            SimilarityTier::AnotherMoment
+        } else if similarity >= SIMILARITY_NEAR_IDENTICAL {
+            SimilarityTier::NearIdentical
+        } else if similarity >= SIMILARITY_VERY_SIMILAR {
+            SimilarityTier::VerySimilar
+        } else {
+            SimilarityTier::SameMoment
+        }
+    }
+}
+
+string_enum! {
+    /// Second-look pile of a `not_sure` / `set_aside` photo (IPC v20.1). Computed by the
+    /// backend, first match wins:
+    /// 1. `not_sure`: choice `not_sure`;
+    /// 2. `defects`: `set_aside` and Apply would reject it (the effective suggestion is
+    ///    `reject`: a confident defect) or the user rejected it;
+    /// 3. `similar`: `set_aside` with first reason `near_duplicate` / `not_best_of_setup`, or
+    ///    covered by a delivered photo at similarity >= 0.7;
+    /// 4. `weaker`: every other `set_aside` photo (stays unflagged at Apply).
+    pub enum TargetPile {
+        NotSure => "not_sure",
+        Similar => "similar",
+        Weaker => "weaker",
+        Defects => "defects",
+    }
+}
+
+/// Photos per second-look pile ([`TargetPile`]); `notSure + similar + weaker + defects =
+/// TargetCounts.notSure + TargetCounts.setAside`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPileCounts {
+    pub not_sure: u32,
+    pub similar: u32,
+    pub weaker: u32,
+    pub defects: u32,
+}
+
 /// A group of frames of the same scene and people across the shoot (IPC v20).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -146,6 +226,9 @@ pub struct Moment {
     pub person_ids: Vec<PersonId>,
     /// Members chosen for delivery, in capture order.
     pub delivered_ids: Vec<ImageId>,
+    /// v20.1: the members of `deliveredIds` the user put there (origin `user`: added, swapped
+    /// in, picked), in capture order.
+    pub user_delivered_ids: Vec<ImageId>,
     /// Best frame (the cover of the moment), if any.
     pub representative_id: Option<ImageId>,
 }
@@ -269,13 +352,20 @@ pub struct ImageSelection {
     /// Similarity to `coveredBy`, 0..=1 (1 = identical).
     #[specta(type = Option<Number>)]
     pub covered_similarity: Option<f32>,
+    /// v20.1: tier of `coveredSimilarity` (`null` without `coveredBy`).
+    pub covered_tier: Option<SimilarityTier>,
     /// Selection priority 0..=1 (higher = chosen earlier).
     #[specta(type = Number)]
     pub score: f32,
     /// Most important first.
     pub reasons: Vec<TargetReason>,
-    /// The user decided (target edit or own flag): re-runs keep the choice.
+    /// The user decided (target edit or own flag, or `lock_target_choices`): re-runs keep
+    /// the choice.
     pub locked: bool,
+    /// v20.1: who made the current choice.
+    pub origin: ChoiceOrigin,
+    /// v20.1: second-look pile (`not_sure` / `set_aside` photos only, else `null`).
+    pub pile: Option<TargetPile>,
     /// People recognised in the photo.
     pub person_ids: Vec<PersonId>,
 }
@@ -303,6 +393,8 @@ pub struct TargetCounts {
     pub locked: u32,
     /// Shot types present, in `ShotType` order.
     pub per_shot_type: Vec<ShotTypeCount>,
+    /// v20.1: second-look piles.
+    pub piles: TargetPileCounts,
 }
 
 /// A project's latest target run (IPC v20).
@@ -340,18 +432,28 @@ pub struct Alternatives {
     pub alternatives: Vec<ImageSelection>,
 }
 
-/// `get_covered_by` result (IPC v20): "already kept a similar one".
+/// `get_covered_by` result (IPC v20): "already kept a similar one". v20.1: recomputed within
+/// the moment after every edit (the nearest delivered frame of the same moment, including
+/// photos the user added), with a tier and the covering photo's origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CoveredBy {
     pub image_id: ImageId,
     /// The delivered similar photo.
     pub covered_by_id: ImageId,
+    /// v20.1: its file name without extension, e.g. "DSC0412".
+    pub covered_by_name: String,
     #[specta(type = Number)]
     pub similarity: f32,
+    /// v20.1: wording tier of `similarity` / `sameMoment`.
+    pub tier: SimilarityTier,
     /// Both photos are in the same moment.
     pub same_moment: bool,
-    /// User-facing, e.g. "Already kept a similar one: DSC0412".
+    /// v20.1: who delivered `coveredById` (`user` = the user added / swapped / picked it).
+    pub covered_by_origin: ChoiceOrigin,
+    /// User-facing, by tier: "Almost identical to DSC0412 (kept)", "Similar to DSC0412
+    /// (kept)", "Same moment as DSC0412 (kept)", "Looks like DSC0412 (kept, another moment)";
+    /// "kept" reads "you added it" when `coveredByOrigin` is `user`.
     pub text: String,
 }
 
@@ -364,7 +466,14 @@ pub struct TargetSnapshot {
     pub alternative_of: Option<ImageId>,
     pub rank: Option<u32>,
     pub covered_by: Option<ImageId>,
+    /// v20.1.
+    #[specta(type = Option<Number>)]
+    pub covered_similarity: Option<f32>,
     pub locked: bool,
+    /// v20.1.
+    pub origin: ChoiceOrigin,
+    /// v20.1: restored too (an undone add loses its "You added this").
+    pub reasons: Vec<TargetReason>,
     pub cull: CullSnapshot,
 }
 
@@ -379,4 +488,61 @@ pub struct TargetEditResult {
     /// Their state before the edit (`restore_target_snapshot` undoes it).
     pub previous: Vec<TargetSnapshot>,
     pub counts: TargetCounts,
+}
+
+/// `plan_target_apply` / `apply_target_selection` options (IPC v20.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApplyOptions {
+    /// Also reject the photos Sieve is confident are defects (the effective suggestion is
+    /// `reject`). The dialog shows it as a checkbox, on by default. `false`: those photos are
+    /// left as they are, except that a stale Sieve pick on them is cleared.
+    pub rejects: bool,
+}
+
+impl Default for TargetApplyOptions {
+    fn default() -> Self {
+        Self { rejects: true }
+    }
+}
+
+/// `plan_target_apply` result: exactly what `apply_target_selection` with the same options
+/// would do now (IPC v20.1). Over the project's photos with a selection row:
+/// `total = picks + rejects + unflags + unchanged + userFlagged`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApplyPlan {
+    pub total: u32,
+    /// Photos that would get the Picked flag.
+    pub picks: u32,
+    /// Photos that would be rejected (0 with `rejects: false`).
+    pub rejects: u32,
+    /// Photos `rejects: true` would reject, whatever the options (confident defects not
+    /// rejected yet), for the checkbox label "Also reject N photos with clear defects".
+    pub rejectable: u32,
+    /// Photos that would lose a flag Sieve set earlier (a stale pick / reject).
+    pub unflags: u32,
+    /// Unflagged or Sieve-flagged photos already matching the selection.
+    pub unchanged: u32,
+    /// Photos the user flagged (pick or reject, incl. by target edits): never touched.
+    pub user_flagged: u32,
+}
+
+/// `apply_target_selection` result (IPC v20.1; was `ApplySuggestionsResult`). Picks and
+/// rejects are counted separately; same fields as the plan.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApplyResult {
+    pub picks: u32,
+    pub rejects: u32,
+    pub unflags: u32,
+    pub unchanged: u32,
+    pub user_flagged: u32,
+    /// Images whose flag changed (refetch with `get_images`).
+    pub changed: Vec<ImageId>,
+    /// Their flags before the apply: push on the Cull undo stack ("Apply Pick the best N") and
+    /// undo with `restore_cull_snapshot(previous)` (apply does not change selection rows).
+    pub previous: Vec<CullSnapshot>,
+    /// `TargetRun.appliedAtMs` now.
+    pub applied_at_ms: i64,
 }

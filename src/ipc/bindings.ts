@@ -1127,10 +1127,20 @@ export const commands = {
 	imageId: number,
 	/**  The delivered similar photo. */
 	coveredById: number,
+	/**  v20.1: its file name without extension, e.g. "DSC0412". */
+	coveredByName: string,
 	similarity: number,
+	/**  v20.1: wording tier of `similarity` / `sameMoment`. */
+	tier: SimilarityTier,
 	/**  Both photos are in the same moment. */
 	sameMoment: boolean,
-	/**  User-facing, e.g. "Already kept a similar one: DSC0412". */
+	/**  v20.1: who delivered `coveredById` (`user` = the user added / swapped / picked it). */
+	coveredByOrigin: ChoiceOrigin,
+	/**
+	 *  User-facing, by tier: "Almost identical to DSC0412 (kept)", "Similar to DSC0412
+	 *  (kept)", "Same moment as DSC0412 (kept)", "Looks like DSC0412 (kept, another moment)";
+	 *  "kept" reads "you added it" when `coveredByOrigin` is `user`.
+	 */
 	text: string,
 } | null, AppError>(__TAURI_INVOKE("get_covered_by", { imageId })),
 	/**
@@ -1147,8 +1157,9 @@ export const commands = {
 	addAlternative: (imageId: number) => typedError<TargetEditResult, AppError>(__TAURI_INVOKE("add_alternative", { imageId })),
 	/**
 	 *  Moves photos to `deliver` / `not_sure` / `set_aside` (locked; `alternative` ->
-	 *  `invalid_argument`). Joining the delivery set picks a photo, leaving it unflags a pick;
-	 *  set aside never rejects. Undo: `restore_target_snapshot(result.previous)`.
+	 *  `invalid_argument`). The flag follows at once, as the user's, also when the choice is
+	 *  unchanged (Keep): `deliver` picks, the others unflag a pick; set aside never rejects.
+	 *  Undo: `restore_target_snapshot(result.previous)`.
 	 */
 	setTargetChoice: (ids: number[], choice: TargetChoice) => typedError<TargetEditResult, AppError>(__TAURI_INVOKE("set_target_choice", { ids, choice })),
 	/**
@@ -1157,12 +1168,27 @@ export const commands = {
 	 */
 	restoreTargetSnapshot: (snapshots: TargetSnapshot[]) => typedError<number[], AppError>(__TAURI_INVOKE("restore_target_snapshot", { snapshots })),
 	/**
-	 *  Writes the selection to the flags: delivered -> pick, the rest -> the scorer's suggestion
-	 *  without its pick (confident-defect rejects stay), for photos that are unflagged or flagged
-	 *  by Sieve (origin `auto`); the user's flags and all stars are left alone. Same result type as
-	 *  `apply_suggestions`. Unknown project -> `not_found`.
+	 *  Writes the selection to the flags (v20.1 options + result): delivered -> pick, the rest ->
+	 *  the scorer's suggestion without its pick (confident-defect rejects only with
+	 *  `opts.rejects`), for photos that are unflagged or flagged by Sieve (origin `auto`); the
+	 *  user's flags (incl. target edits) and all stars are left alone. Flags go to the catalog and
+	 *  the XMP sidecars (auto-sync notified). Undo: `restore_cull_snapshot(result.previous)`.
+	 *  Unknown project -> `not_found`.
 	 */
-	applyTargetSelection: (projectId: number) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_target_selection", { projectId })),
+	applyTargetSelection: (projectId: number, opts: TargetApplyOptions) => typedError<TargetApplyResult, AppError>(__TAURI_INVOKE("apply_target_selection", { projectId, opts })),
+	/**
+	 *  Dry run of `apply_target_selection` with the same options (v20.1): exact counts of picks,
+	 *  rejects (and the rejects available with `rejects: true`), unflags, unchanged photos and the
+	 *  user's flags it would skip. Nothing is written. Unknown project -> `not_found`.
+	 */
+	planTargetApply: (projectId: number, opts: TargetApplyOptions) => typedError<TargetApplyPlan, AppError>(__TAURI_INVOKE("plan_target_apply", { projectId, opts })),
+	/**
+	 *  Locks the selection rows of `ids` as they are (no flag, choice or reason change; not an
+	 *  undoable edit), so a re-run keeps them: call it with the delivered photos the user reviewed
+	 *  before `run_target_selection` (v20.1). Ids without a row are ignored; unknown image ->
+	 *  `not_found`. Returns the ids newly locked.
+	 */
+	lockTargetChoices: (ids: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("lock_target_choices", { ids })),
 };
 
 /** Events */
@@ -1928,6 +1954,16 @@ export type CatalogState = {
 	keeperRule: KeeperRule,
 };
 
+/**  Who made a photo's current selection choice (IPC v20.1). */
+export type ChoiceOrigin = 
+/**  The engine (a target run). */
+"engine" | 
+/**
+ *  The user: a target edit (swap, add, set aside, not sure) or their own flag changed
+ *  the choice. Locking a choice without changing it (keep, review lock) keeps the origin.
+ */
+"user";
+
 /**  JPEG chroma subsampling. `444` keeps full colour resolution (larger files). */
 export type ChromaSubsampling = "444" | "422" | "420";
 
@@ -1994,15 +2030,29 @@ export type ColorWheel = {
 	luminance: number,
 };
 
-/**  `get_covered_by` result (IPC v20): "already kept a similar one". */
+/**
+ *  `get_covered_by` result (IPC v20): "already kept a similar one". v20.1: recomputed within
+ *  the moment after every edit (the nearest delivered frame of the same moment, including
+ *  photos the user added), with a tier and the covering photo's origin.
+ */
 export type CoveredBy = {
 	imageId: number,
 	/**  The delivered similar photo. */
 	coveredById: number,
+	/**  v20.1: its file name without extension, e.g. "DSC0412". */
+	coveredByName: string,
 	similarity: number,
+	/**  v20.1: wording tier of `similarity` / `sameMoment`. */
+	tier: SimilarityTier,
 	/**  Both photos are in the same moment. */
 	sameMoment: boolean,
-	/**  User-facing, e.g. "Already kept a similar one: DSC0412". */
+	/**  v20.1: who delivered `coveredById` (`user` = the user added / swapped / picked it). */
+	coveredByOrigin: ChoiceOrigin,
+	/**
+	 *  User-facing, by tier: "Almost identical to DSC0412 (kept)", "Similar to DSC0412
+	 *  (kept)", "Same moment as DSC0412 (kept)", "Looks like DSC0412 (kept, another moment)";
+	 *  "kept" reads "you added it" when `coveredByOrigin` is `user`.
+	 */
 	text: string,
 };
 
@@ -2976,6 +3026,16 @@ export type ImageQuery = {
 	 *  without a selection row never match), e.g. `["not_sure", "set_aside"]` for pass 2.
 	 */
 	targetChoices?: TargetChoice[],
+	/**
+	 *  v20.1: only photos whose first selection reason (`ImageSelection.reasons[0].kind`) is
+	 *  one of these (empty = no constraint; photos without a selection row never match).
+	 */
+	targetReasonKinds?: TargetReasonKind[],
+	/**
+	 *  v20.1: only photos in one of these second-look piles (`ImageSelection.pile`; empty =
+	 *  no constraint), e.g. `["not_sure"]` for the Second look's default pile.
+	 */
+	targetPiles?: TargetPile[],
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -3002,12 +3062,21 @@ export type ImageSelection = {
 	coveredBy: number | null,
 	/**  Similarity to `coveredBy`, 0..=1 (1 = identical). */
 	coveredSimilarity: number | null,
+	/**  v20.1: tier of `coveredSimilarity` (`null` without `coveredBy`). */
+	coveredTier: SimilarityTier | null,
 	/**  Selection priority 0..=1 (higher = chosen earlier). */
 	score: number,
 	/**  Most important first. */
 	reasons: TargetReason[],
-	/**  The user decided (target edit or own flag): re-runs keep the choice. */
+	/**
+	 *  The user decided (target edit or own flag, or `lock_target_choices`): re-runs keep
+	 *  the choice.
+	 */
 	locked: boolean,
+	/**  v20.1: who made the current choice. */
+	origin: ChoiceOrigin,
+	/**  v20.1: second-look pile (`not_sure` / `set_aside` photos only, else `null`). */
+	pile: TargetPile | null,
 	/**  People recognised in the photo. */
 	personIds: number[],
 };
@@ -3021,7 +3090,14 @@ export type ImageSort =
 /**  Best `QualityScore.overall` first; unscored images last. */
 "quality" | 
 /**  Most stars first; ties in capture order. */
-"rating";
+"rating" | 
+/**
+ *  v20.1, Pick the best N: by target-run moment (moment start time, then moment id),
+ *  within a moment by selection `score` (best first), then capture order. Photos
+ *  without a moment come last, in capture order. Descending reverses the moment order
+ *  only (the best frame of each moment stays first).
+ */
+"target_moment";
 
 /**
  *  Measurements of an image rendered through the develop pipeline with given adjustments
@@ -3816,6 +3892,11 @@ export type Moment = {
 	personIds: number[],
 	/**  Members chosen for delivery, in capture order. */
 	deliveredIds: number[],
+	/**
+	 *  v20.1: the members of `deliveredIds` the user put there (origin `user`: added, swapped
+	 *  in, picked), in capture order.
+	 */
+	userDeliveredIds: number[],
 	/**  Best frame (the cover of the moment), if any. */
 	representativeId: number | null,
 };
@@ -4747,6 +4828,21 @@ export type ShotTypeCount = {
 	deliver: number,
 };
 
+/**
+ *  How close a photo is to the delivered photo covering it (IPC v20.1), for the wording
+ *  "Almost identical to DSC0412 (kept)" / "Similar to …" / "Same moment as …" / "Looks
+ *  like … (kept, another moment)".
+ */
+export type SimilarityTier = 
+/**  Same moment, similarity >= [`SIMILARITY_NEAR_IDENTICAL`] (0.9). */
+"near_identical" | 
+/**  Same moment, similarity >= [`SIMILARITY_VERY_SIMILAR`] (0.7). */
+"very_similar" | 
+/**  Same moment, less similar. */
+"same_moment" | 
+/**  The covering photo is in another moment. */
+"another_moment";
+
 /**  A scene `apply_all_edited_scenes` could not apply (v17). */
 export type SkippedScene = {
 	sceneId: number,
@@ -5101,6 +5197,61 @@ export type TagSource =
 /**  Applied by the user. */
 "user";
 
+/**  `plan_target_apply` / `apply_target_selection` options (IPC v20.1). */
+export type TargetApplyOptions = {
+	/**
+	 *  Also reject the photos Sieve is confident are defects (the effective suggestion is
+	 *  `reject`). The dialog shows it as a checkbox, on by default. `false`: those photos are
+	 *  left as they are, except that a stale Sieve pick on them is cleared.
+	 */
+	rejects: boolean,
+};
+
+/**
+ *  `plan_target_apply` result: exactly what `apply_target_selection` with the same options
+ *  would do now (IPC v20.1). Over the project's photos with a selection row:
+ *  `total = picks + rejects + unflags + unchanged + userFlagged`.
+ */
+export type TargetApplyPlan = {
+	total: number,
+	/**  Photos that would get the Picked flag. */
+	picks: number,
+	/**  Photos that would be rejected (0 with `rejects: false`). */
+	rejects: number,
+	/**
+	 *  Photos `rejects: true` would reject, whatever the options (confident defects not
+	 *  rejected yet), for the checkbox label "Also reject N photos with clear defects".
+	 */
+	rejectable: number,
+	/**  Photos that would lose a flag Sieve set earlier (a stale pick / reject). */
+	unflags: number,
+	/**  Unflagged or Sieve-flagged photos already matching the selection. */
+	unchanged: number,
+	/**  Photos the user flagged (pick or reject, incl. by target edits): never touched. */
+	userFlagged: number,
+};
+
+/**
+ *  `apply_target_selection` result (IPC v20.1; was `ApplySuggestionsResult`). Picks and
+ *  rejects are counted separately; same fields as the plan.
+ */
+export type TargetApplyResult = {
+	picks: number,
+	rejects: number,
+	unflags: number,
+	unchanged: number,
+	userFlagged: number,
+	/**  Images whose flag changed (refetch with `get_images`). */
+	changed: number[],
+	/**
+	 *  Their flags before the apply: push on the Cull undo stack ("Apply Pick the best N") and
+	 *  undo with `restore_cull_snapshot(previous)` (apply does not change selection rows).
+	 */
+	previous: CullSnapshot[],
+	/**  `TargetRun.appliedAtMs` now. */
+	appliedAtMs: number,
+};
+
 /**  Choice of the selection for one photo (IPC v20). */
 export type TargetChoice = 
 /**  In the delivery set (suggested pick). */
@@ -5129,6 +5280,8 @@ export type TargetCounts = {
 	locked: number,
 	/**  Shot types present, in `ShotType` order. */
 	perShotType: ShotTypeCount[],
+	/**  v20.1: second-look piles. */
+	piles: TargetPileCounts,
 };
 
 /**  Result of a target edit (`swap_alternative`, `add_alternative`, `set_target_choice`). */
@@ -5140,6 +5293,29 @@ export type TargetEditResult = {
 	/**  Their state before the edit (`restore_target_snapshot` undoes it). */
 	previous: TargetSnapshot[],
 	counts: TargetCounts,
+};
+
+/**
+ *  Second-look pile of a `not_sure` / `set_aside` photo (IPC v20.1). Computed by the
+ *  backend, first match wins:
+ *  1. `not_sure`: choice `not_sure`;
+ *  2. `defects`: `set_aside` and Apply would reject it (the effective suggestion is
+ *     `reject`: a confident defect) or the user rejected it;
+ *  3. `similar`: `set_aside` with first reason `near_duplicate` / `not_best_of_setup`, or
+ *     covered by a delivered photo at similarity >= 0.7;
+ *  4. `weaker`: every other `set_aside` photo (stays unflagged at Apply).
+ */
+export type TargetPile = "not_sure" | "similar" | "weaker" | "defects";
+
+/**
+ *  Photos per second-look pile ([`TargetPile`]); `notSure + similar + weaker + defects =
+ *  TargetCounts.notSure + TargetCounts.setAside`.
+ */
+export type TargetPileCounts = {
+	notSure: number,
+	similar: number,
+	weaker: number,
+	defects: number,
 };
 
 /**
@@ -5241,7 +5417,13 @@ export type TargetSnapshot = {
 	alternativeOf: number | null,
 	rank: number | null,
 	coveredBy: number | null,
+	/**  v20.1. */
+	coveredSimilarity: number | null,
 	locked: boolean,
+	/**  v20.1. */
+	origin: ChoiceOrigin,
+	/**  v20.1: restored too (an undone add loses its "You added this"). */
+	reasons: TargetReason[],
 	cull: CullSnapshot,
 };
 

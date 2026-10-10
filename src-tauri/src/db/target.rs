@@ -14,8 +14,15 @@
 //! - User decisions win: target edits and the user's own flags ([`note_user_flags`]) lock the
 //!   row (`locked = 1`); [`store_results`] never replaces a locked row's choice; [`apply`]
 //!   only changes unflagged photos and flags Sieve set (`pick_origin = 'auto'`).
-//! - Target edits write the flags of the photos they move in / out of the delivery set as the
-//!   user's (`pick` / `unflagged`, origin `user`).
+//! - Target edits write the flags of the photos they touch as the user's (`pick` for the
+//!   delivery set, a pick becomes `unflagged` outside it; origin `user`), at once (v20.1:
+//!   keeping a delivered photo picks it too). [`apply`] flags the rest.
+//! - v20.1: `covered_by` of every non-delivered row of a moment touched by an edit is
+//!   recomputed from the frame similarities stored per run ([`store_similarities`]):
+//!   the most similar delivered frame of the same moment (photos the user added included);
+//!   without one, a still-delivered cover from another moment is kept, else cleared.
+//! - v20.1: `origin` = who made the current choice (`engine` on store, `user` when a user edit
+//!   changes the choice; a lock without a change keeps it).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -24,10 +31,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::db::{now_ms, repo};
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    Alternatives, ApplySuggestionsResult, CoveredBy, ImageId, ImageSelection, Moment, MomentId, NormRect,
-    PeopleOverview, Person, PersonId, PersonRole, PickFlag, PickOrigin, ProjectId, ShootType, ShotType, ShotTypeCount,
-    TargetChoice, TargetCounts, TargetReason, TargetReasonKind, TargetRun, TargetRunSettings, TargetRunState,
-    TargetSnapshot,
+    Alternatives, ChoiceOrigin, CoveredBy, ImageId, ImageSelection, Moment, MomentId, NormRect, PeopleOverview, Person,
+    PersonId, PersonRole, PickFlag, PickOrigin, ProjectId, ShootType, ShotType, ShotTypeCount, SimilarityTier,
+    TargetApplyOptions, TargetApplyPlan, TargetApplyResult, TargetChoice, TargetCounts, TargetPile, TargetReason,
+    TargetReasonKind, TargetRun, TargetRunSettings, TargetRunState, TargetSnapshot,
 };
 
 /// Faces shown per person (`Person.samples`).
@@ -296,9 +303,117 @@ pub fn locked_choices(conn: &Connection, project_id: ProjectId) -> AppResult<Vec
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Replaces the stored frame similarities of the project's photos with `pairs` (`(a, b,
+/// similarity)`, any order; pairs of the same moment, see `ml::selection::moment_similarities`).
+/// Written by every run before [`store_results`]; [`refresh_covers`] reads them. Pairs naming
+/// a photo outside the project, self pairs and non-finite values are skipped. Atomic.
+pub fn store_similarities(
+    conn: &mut Connection,
+    project_id: ProjectId,
+    pairs: &[(ImageId, ImageId, f32)],
+) -> AppResult<()> {
+    let tx = conn.savepoint()?;
+    let members: BTreeSet<ImageId> = {
+        let mut stmt =
+            tx.prepare("SELECT i.id FROM images i JOIN folders f ON f.id = i.folder_id WHERE f.project_id = ?1")?;
+        let ids = stmt.query_map([project_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        ids
+    };
+    tx.execute(
+        "DELETE FROM target_similarity WHERE image_a IN
+             (SELECT i.id FROM images i JOIN folders f ON f.id = i.folder_id WHERE f.project_id = ?1)",
+        [project_id],
+    )?;
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO target_similarity (image_a, image_b, similarity) VALUES (?1, ?2, ?3)
+             ON CONFLICT(image_a, image_b) DO UPDATE SET similarity = excluded.similarity",
+        )?;
+        for &(a, b, sim) in pairs {
+            if a == b || !sim.is_finite() || !members.contains(&a) || !members.contains(&b) {
+                continue;
+            }
+            let sim = ((sim.clamp(0.0, 1.0) * 1000.0).round() / 1000.0) as f64;
+            insert.execute(params![a.min(b), a.max(b), sim])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Stored similarity of two frames ([`store_similarities`]), if any.
+fn pair_similarity(conn: &Connection, a: ImageId, b: ImageId) -> AppResult<Option<f32>> {
+    Ok(conn
+        .prepare_cached("SELECT similarity FROM target_similarity WHERE image_a = ?1 AND image_b = ?2")?
+        .query_row([a.min(b), a.max(b)], |r| r.get::<_, f64>(0))
+        .optional()?
+        .map(|v| v as f32))
+}
+
+/// One row of a moment for [`refresh_covers`]: id, choice, cover, cover similarity, cover's choice.
+type CoverRow = (ImageId, TargetChoice, Option<ImageId>, Option<f64>, Option<String>);
+
+/// Recomputes `covered_by` / `covered_similarity` of every row of `moments` (see module docs):
+/// delivered rows have none; a non-delivered row is covered by its most similar delivered
+/// frame of the same moment (ties: lower id); without a stored similarity to any of them, a
+/// cover that is still delivered is kept (another moment, or catalogs from before v20.1),
+/// else cleared.
+pub fn refresh_covers(conn: &Connection, moments: &BTreeSet<MomentId>) -> AppResult<()> {
+    let mut rows_stmt = conn.prepare_cached(
+        "SELECT s.image_id, s.choice, s.covered_by, s.covered_similarity, c.choice FROM target_selection s
+         LEFT JOIN target_selection c ON c.image_id = s.covered_by WHERE s.moment_id = ?1 ORDER BY s.image_id",
+    )?;
+    let mut update = conn.prepare_cached(
+        "UPDATE target_selection SET covered_by = ?2, covered_similarity = ?3 WHERE image_id = ?1
+           AND (covered_by IS NOT ?2 OR covered_similarity IS NOT ?3)",
+    )?;
+    for &m in moments {
+        let rows: Vec<CoverRow> = rows_stmt
+            .query_map([m], |r| Ok((r.get(0)?, choice_col(r, 1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        let delivered: Vec<ImageId> = rows.iter().filter(|r| r.1 == TargetChoice::Deliver).map(|r| r.0).collect();
+        for (id, choice, cover, cover_sim, cover_choice) in &rows {
+            let next: (Option<ImageId>, Option<f64>) = if *choice == TargetChoice::Deliver {
+                (None, None)
+            } else {
+                let mut best: Option<(ImageId, f32)> = None;
+                for &d in &delivered {
+                    if let Some(sim) = pair_similarity(conn, *id, d)? {
+                        if best.is_none_or(|(_, b)| sim > b) {
+                            best = Some((d, sim));
+                        }
+                    }
+                }
+                match best {
+                    Some((d, sim)) => (Some(d), Some(sim as f64)),
+                    None if cover.is_some() && cover_choice.as_deref() == Some(TargetChoice::Deliver.as_str()) => {
+                        (*cover, *cover_sim)
+                    }
+                    None => (None, None),
+                }
+            };
+            update.execute(params![id, next.0, next.1])?;
+        }
+    }
+    Ok(())
+}
+
+/// Moments of `ids` (rows without a moment are skipped).
+fn moments_of(conn: &Connection, ids: impl IntoIterator<Item = ImageId>) -> AppResult<BTreeSet<MomentId>> {
+    let mut stmt = conn.prepare_cached("SELECT moment_id FROM target_selection WHERE image_id = ?1")?;
+    let mut out = BTreeSet::new();
+    for id in ids {
+        if let Some(Some(m)) = stmt.query_row([id], |r| r.get::<_, Option<MomentId>>(0)).optional()? {
+            out.insert(m);
+        }
+    }
+    Ok(out)
+}
+
 /// Stores a run's moments and selection: the project's moments are replaced; unlocked rows are
-/// replaced by `drafts`; a locked row keeps its choice / alternative / rank / reasons / lock and
-/// only takes the draft's moment, shot type and score. Drafts for photos outside the project
+/// replaced by `drafts` (origin `engine`); a locked row keeps its choice / alternative / rank /
+/// reasons / lock / origin and only takes the draft's moment, shot type and score (its cover is
+/// then recomputed, [`refresh_covers`]). Drafts for photos outside the project
 /// -> `invalid_argument`; a `moment_key` without a moment -> `invalid_argument`. Refreshes the
 /// suggestion overlay of the whole project. Atomic.
 pub fn store_results(
@@ -375,6 +490,9 @@ pub fn store_results(
             }
         }
     }
+    // Locked rows kept their cover from before the run: recompute their moments.
+    let locked_moments = moments_of(&tx, locked.iter().copied())?;
+    refresh_covers(&tx, &locked_moments)?;
     overlay_project(&tx, project_id)?;
     tx.commit()?;
     Ok(())
@@ -526,8 +644,32 @@ pub fn counts(conn: &Connection, project_id: ProjectId) -> AppResult<TargetCount
         .collect::<Result<_, _>>()?;
     per.sort_by_key(|s| ShotType::ALL.iter().position(|t| *t == s.shot_type));
     c.per_shot_type = per;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT pile, COUNT(*) FROM (SELECT ({PILE_SQL}) AS pile FROM target_selection s WHERE s.project_id = ?1)
+         WHERE pile IS NOT NULL GROUP BY pile"
+    ))?;
+    let rows = stmt.query_map([project_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?;
+    for row in rows {
+        let (pile, n) = row?;
+        match TargetPile::parse(&pile) {
+            Some(TargetPile::NotSure) => c.piles.not_sure = n,
+            Some(TargetPile::Similar) => c.piles.similar = n,
+            Some(TargetPile::Weaker) => c.piles.weaker = n,
+            Some(TargetPile::Defects) => c.piles.defects = n,
+            None => {}
+        }
+    }
     Ok(c)
 }
+
+/// SQL expression of a selection row's second-look pile ([`TargetPile`]; row alias `s`).
+pub const PILE_SQL: &str = "CASE WHEN s.choice = 'not_sure' THEN 'not_sure'
+        WHEN s.choice <> 'set_aside' THEN NULL
+        WHEN (SELECT pick FROM images WHERE id = s.image_id) = 'reject'
+          OR (SELECT suggested_pick FROM quality_scores WHERE image_id = s.image_id) = 'reject' THEN 'defects'
+        WHEN json_extract(s.reasons_json, '$[0].kind') IN ('near_duplicate', 'not_best_of_setup')
+          OR (s.covered_by IS NOT NULL AND s.covered_similarity >= 0.7) THEN 'similar'
+        ELSE 'weaker' END";
 
 // ---------------------------------------------------------------------------
 // People / moments reads
@@ -539,6 +681,10 @@ fn role_col(r: &Row, idx: usize) -> rusqlite::Result<PersonRole> {
 
 fn choice_col(r: &Row, idx: usize) -> rusqlite::Result<TargetChoice> {
     Ok(TargetChoice::parse(&r.get::<_, String>(idx)?).unwrap_or(TargetChoice::NotSure))
+}
+
+fn origin_col(r: &Row, idx: usize) -> rusqlite::Result<ChoiceOrigin> {
+    Ok(ChoiceOrigin::parse(&r.get::<_, String>(idx)?).unwrap_or(ChoiceOrigin::Engine))
 }
 
 fn shot_col(r: &Row, idx: usize) -> rusqlite::Result<ShotType> {
@@ -702,23 +848,28 @@ pub fn list_moments(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<M
                 person_ids: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
                 image_ids: Vec::new(),
                 delivered_ids: Vec::new(),
+                user_delivered_ids: Vec::new(),
             })
         })?
         .collect::<Result<_, _>>()?;
     let index: HashMap<MomentId, usize> = moments.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
     let mut stmt = conn.prepare(
-        "SELECT s.moment_id, s.image_id, s.choice FROM target_selection s JOIN images i ON i.id = s.image_id
+        "SELECT s.moment_id, s.image_id, s.choice, s.origin FROM target_selection s JOIN images i ON i.id = s.image_id
          WHERE s.project_id = ?1 AND s.moment_id IS NOT NULL
          ORDER BY i.captured_at_ms IS NULL, i.captured_at_ms, i.id",
     )?;
-    let rows =
-        stmt.query_map([project_id], |r| Ok((r.get::<_, MomentId>(0)?, r.get::<_, ImageId>(1)?, choice_col(r, 2)?)))?;
+    let rows = stmt.query_map([project_id], |r| {
+        Ok((r.get::<_, MomentId>(0)?, r.get::<_, ImageId>(1)?, choice_col(r, 2)?, origin_col(r, 3)?))
+    })?;
     for row in rows {
-        let (m, image, choice) = row?;
+        let (m, image, choice, origin) = row?;
         if let Some(&i) = index.get(&m) {
             moments[i].image_ids.push(image);
             if choice == TargetChoice::Deliver {
                 moments[i].delivered_ids.push(image);
+                if origin == ChoiceOrigin::User {
+                    moments[i].user_delivered_ids.push(image);
+                }
             }
         }
     }
@@ -730,37 +881,51 @@ pub fn list_moments(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<M
 // Selection reads
 // ---------------------------------------------------------------------------
 
+// Column 13 is [`PILE_SQL`], spliced in by [`selection_sql`].
 const SELECTION_SQL: &str = "SELECT s.image_id, s.choice, s.moment_id, s.shot_type, s.alternative_of, s.rank,
         s.covered_by, s.covered_similarity, s.score, s.reasons_json, s.locked,
         (SELECT json_group_array(DISTINCT e.person_id) FROM face_embeddings e
-          WHERE e.image_id = s.image_id AND e.person_id IS NOT NULL)
+          WHERE e.image_id = s.image_id AND e.person_id IS NOT NULL),
+        s.origin, (#PILE#), (SELECT c.moment_id FROM target_selection c WHERE c.image_id = s.covered_by)
      FROM target_selection s";
+
+/// [`SELECTION_SQL`] followed by `tail` (a `WHERE` / `ORDER BY`).
+fn selection_sql(tail: &str) -> String {
+    format!("{} {tail}", SELECTION_SQL.replace("#PILE#", PILE_SQL))
+}
 
 fn selection_from_row(r: &Row) -> rusqlite::Result<ImageSelection> {
     let mut person_ids: Vec<PersonId> = serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default();
     person_ids.sort_unstable();
+    let moment_id: Option<MomentId> = r.get(2)?;
+    let covered_by: Option<ImageId> = r.get(6)?;
+    let covered_similarity = r.get::<_, Option<f64>>(7)?.map(|v| v as f32);
+    let cover_moment: Option<MomentId> = r.get(14)?;
+    let covered_tier = covered_by.map(|_| {
+        SimilarityTier::of(covered_similarity.unwrap_or(0.0), moment_id.is_some() && moment_id == cover_moment)
+    });
     Ok(ImageSelection {
         image_id: r.get(0)?,
         choice: choice_col(r, 1)?,
-        moment_id: r.get(2)?,
+        moment_id,
         shot_type: r.get::<_, Option<String>>(3)?.as_deref().and_then(ShotType::parse),
         alternative_of: r.get(4)?,
         rank: r.get(5)?,
-        covered_by: r.get(6)?,
-        covered_similarity: r.get::<_, Option<f64>>(7)?.map(|v| v as f32),
+        covered_by,
+        covered_similarity,
+        covered_tier,
         score: r.get::<_, f64>(8)? as f32,
         reasons: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
         locked: r.get(10)?,
+        origin: origin_col(r, 12)?,
+        pile: r.get::<_, Option<String>>(13)?.as_deref().and_then(TargetPile::parse),
         person_ids,
     })
 }
 
 /// The selection row of `id`, if any.
 pub fn selection(conn: &Connection, id: ImageId) -> AppResult<Option<ImageSelection>> {
-    Ok(conn
-        .prepare_cached(&format!("{SELECTION_SQL} WHERE s.image_id = ?1"))?
-        .query_row([id], selection_from_row)
-        .optional()?)
+    Ok(conn.prepare_cached(&selection_sql("WHERE s.image_id = ?1"))?.query_row([id], selection_from_row).optional()?)
 }
 
 /// `get_image_selections`: rows of `ids` in the given order; ids without a row are omitted
@@ -786,9 +951,8 @@ fn ensure_image(conn: &Connection, id: ImageId) -> AppResult<()> {
 }
 
 fn alternatives_of(conn: &Connection, delivered: ImageId) -> AppResult<Vec<ImageSelection>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "{SELECTION_SQL} WHERE s.alternative_of = ?1 AND s.choice = 'alternative'
-         ORDER BY s.rank IS NULL, s.rank, s.image_id"
+    let mut stmt = conn.prepare_cached(&selection_sql(
+        "WHERE s.alternative_of = ?1 AND s.choice = 'alternative' ORDER BY s.rank IS NULL, s.rank, s.image_id",
     ))?;
     let rows = stmt.query_map([delivered], selection_from_row)?.collect::<Result<_, _>>()?;
     Ok(rows)
@@ -828,13 +992,35 @@ pub fn covered_by(conn: &Connection, id: ImageId) -> AppResult<Option<CoveredBy>
     let Some(s) = selection(conn, id)? else { return Ok(None) };
     let Some(cover) = s.covered_by.filter(|_| s.choice != TargetChoice::Deliver) else { return Ok(None) };
     let Some(c) = selection(conn, cover)?.filter(|c| c.choice == TargetChoice::Deliver) else { return Ok(None) };
+    let similarity = s.covered_similarity.unwrap_or(0.0);
+    let same_moment = s.moment_id.is_some() && s.moment_id == c.moment_id;
+    let tier = SimilarityTier::of(similarity, same_moment);
+    let name = file_stem(conn, cover)?;
     Ok(Some(CoveredBy {
         image_id: id,
         covered_by_id: cover,
-        similarity: s.covered_similarity.unwrap_or(0.0),
-        same_moment: s.moment_id.is_some() && s.moment_id == c.moment_id,
-        text: format!("Already kept a similar one: {}", file_stem(conn, cover)?),
+        text: covered_text(tier, &name, c.origin),
+        covered_by_name: name,
+        similarity,
+        tier,
+        same_moment,
+        covered_by_origin: c.origin,
     }))
+}
+
+/// `CoveredBy.text`: "Almost identical to DSC0412 (kept)", "Similar to …", "Same moment as …",
+/// "Looks like DSC0412 (kept, another moment)"; "kept" -> "you added it" for the user's photos.
+pub fn covered_text(tier: SimilarityTier, name: &str, origin: ChoiceOrigin) -> String {
+    let who = match origin {
+        ChoiceOrigin::User => "you added it",
+        ChoiceOrigin::Engine => "kept",
+    };
+    match tier {
+        SimilarityTier::NearIdentical => format!("Almost identical to {name} ({who})"),
+        SimilarityTier::VerySimilar => format!("Similar to {name} ({who})"),
+        SimilarityTier::SameMoment => format!("Same moment as {name} ({who})"),
+        SimilarityTier::AnotherMoment => format!("Looks like {name} ({who}, another moment)"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,27 +1068,123 @@ pub fn overlay_project(conn: &Connection, project_id: ProjectId) -> AppResult<()
     Ok(())
 }
 
+/// What [`apply`] does to one photo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyStep {
+    /// The user's flag: never touched.
+    UserFlag,
+    Unchanged,
+    /// Write this flag (origin `auto`).
+    Write(PickFlag),
+}
+
+/// Per photo of the project's selection: (image, step, would be rejected with `rejects: true`).
+fn apply_steps(
+    conn: &Connection,
+    project_id: ProjectId,
+    opts: TargetApplyOptions,
+) -> AppResult<Vec<(ImageId, ApplyStep, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.pick, i.pick_origin, q.suggested_pick FROM target_selection s
+         JOIN images i ON i.id = s.image_id LEFT JOIN quality_scores q ON q.image_id = i.id
+         WHERE s.project_id = ?1 ORDER BY i.id",
+    )?;
+    let rows = stmt.query_map([project_id], |r| {
+        Ok((
+            r.get::<_, ImageId>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, pick, origin, suggested) = row?;
+        let pick = PickFlag::parse(&pick).unwrap_or(PickFlag::Unflagged);
+        // Same rule as `ImageQuery.pickOrigin = user`: flagged and not by Sieve.
+        if pick != PickFlag::Unflagged && origin.as_deref() != Some(PickOrigin::Auto.as_str()) {
+            out.push((id, ApplyStep::UserFlag, false));
+            continue;
+        }
+        let Some(suggested) = suggested.as_deref().and_then(PickFlag::parse) else {
+            out.push((id, ApplyStep::Unchanged, false));
+            continue;
+        };
+        let rejectable = suggested == PickFlag::Reject && pick != PickFlag::Reject;
+        let next = match suggested {
+            PickFlag::Reject if !opts.rejects && pick != PickFlag::Reject => PickFlag::Unflagged,
+            s => s,
+        };
+        let step = if next == pick { ApplyStep::Unchanged } else { ApplyStep::Write(next) };
+        out.push((id, step, rejectable));
+    }
+    Ok(out)
+}
+
+fn tally(steps: &[(ImageId, ApplyStep, bool)]) -> TargetApplyPlan {
+    let mut p = TargetApplyPlan { total: steps.len() as u32, ..TargetApplyPlan::default() };
+    for &(_, step, rejectable) in steps {
+        if rejectable {
+            p.rejectable += 1;
+        }
+        match step {
+            ApplyStep::UserFlag => p.user_flagged += 1,
+            ApplyStep::Unchanged => p.unchanged += 1,
+            ApplyStep::Write(PickFlag::Pick) => p.picks += 1,
+            ApplyStep::Write(PickFlag::Reject) => p.rejects += 1,
+            ApplyStep::Write(PickFlag::Unflagged) => p.unflags += 1,
+        }
+    }
+    p
+}
+
+/// `plan_target_apply`: what [`apply`] with `opts` would do now (nothing is written).
+/// Unknown project -> `not_found`.
+pub fn plan_apply(conn: &Connection, project_id: ProjectId, opts: TargetApplyOptions) -> AppResult<TargetApplyPlan> {
+    ensure_project(conn, project_id)?;
+    Ok(tally(&apply_steps(conn, project_id, opts)?))
+}
+
 /// `apply_target_selection`: writes the effective suggestion to the flags of the project's
 /// photos that have a selection row and are unflagged or flagged by Sieve (`pick_origin =
-/// 'auto'`); changed flags get origin `auto`. Stars are never touched. `applied` = flags
-/// changed, `skipped` = the other selection rows. Stamps `target_runs.applied_at`. Unknown
-/// project -> `not_found`.
-pub fn apply(conn: &mut Connection, project_id: ProjectId) -> AppResult<ApplySuggestionsResult> {
+/// 'auto'`); changed flags get origin `auto`. With `rejects: false` a `reject` suggestion is
+/// not written (a Sieve pick on such a photo is cleared, a Sieve reject stays). The user's
+/// flags and all stars are never touched. Returns the counts (same as [`plan_apply`]) and the
+/// flags before (for the Cull undo stack). Stamps `target_runs.applied_at`. Unknown project
+/// -> `not_found`.
+pub fn apply(conn: &mut Connection, project_id: ProjectId, opts: TargetApplyOptions) -> AppResult<TargetApplyResult> {
     ensure_project(conn, project_id)?;
     let tx = conn.savepoint()?;
-    let total: u32 =
-        tx.query_row("SELECT COUNT(*) FROM target_selection WHERE project_id = ?1", [project_id], |r| r.get(0))?;
-    let applied = tx.execute(
-        "UPDATE images SET pick = (SELECT q.suggested_pick FROM quality_scores q WHERE q.image_id = images.id),
-                           pick_origin = 'auto'
-         WHERE id IN (SELECT image_id FROM target_selection WHERE project_id = ?1)
-           AND (pick = 'unflagged' OR pick_origin = 'auto')
-           AND EXISTS (SELECT 1 FROM quality_scores q WHERE q.image_id = images.id AND q.suggested_pick <> images.pick)",
-        [project_id],
-    )? as u32;
-    tx.execute("UPDATE target_runs SET applied_at = ?2 WHERE project_id = ?1", params![project_id, now_ms()])?;
+    let steps = apply_steps(&tx, project_id, opts)?;
+    let plan = tally(&steps);
+    let writes: Vec<(ImageId, PickFlag)> = steps
+        .iter()
+        .filter_map(|&(id, step, _)| match step {
+            ApplyStep::Write(f) => Some((id, f)),
+            _ => None,
+        })
+        .collect();
+    let changed: Vec<ImageId> = writes.iter().map(|w| w.0).collect();
+    let previous = repo::cull_snapshot(&tx, &changed)?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET pick = ?2, pick_origin = 'auto' WHERE id = ?1")?;
+        for &(id, flag) in &writes {
+            stmt.execute(params![id, flag.as_str()])?;
+        }
+    }
+    let applied_at_ms = now_ms();
+    tx.execute("UPDATE target_runs SET applied_at = ?2 WHERE project_id = ?1", params![project_id, applied_at_ms])?;
     tx.commit()?;
-    Ok(ApplySuggestionsResult { applied, skipped: total - applied })
+    Ok(TargetApplyResult {
+        picks: plan.picks,
+        rejects: plan.rejects,
+        unflags: plan.unflags,
+        unchanged: plan.unchanged,
+        user_flagged: plan.user_flagged,
+        changed,
+        previous,
+        applied_at_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -924,18 +1206,39 @@ fn row0(conn: &Connection, id: ImageId) -> AppResult<Row0> {
 }
 
 fn snapshot(conn: &Connection, id: ImageId) -> AppResult<TargetSnapshot> {
-    let (choice, alternative_of, rank, covered_by, locked) = conn
+    let mut s = conn
         .prepare_cached(
-            "SELECT choice, alternative_of, rank, covered_by, locked FROM target_selection WHERE image_id = ?1",
+            "SELECT choice, alternative_of, rank, covered_by, covered_similarity, locked, origin, reasons_json
+             FROM target_selection WHERE image_id = ?1",
         )?
-        .query_row([id], |r| Ok((choice_col(r, 0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
-    let cull = repo::cull_snapshot(conn, &[id])?.remove(0);
-    Ok(TargetSnapshot { image_id: id, choice, alternative_of, rank, covered_by, locked, cull })
+        .query_row([id], |r| {
+            Ok(TargetSnapshot {
+                image_id: id,
+                choice: choice_col(r, 0)?,
+                alternative_of: r.get(1)?,
+                rank: r.get(2)?,
+                covered_by: r.get(3)?,
+                covered_similarity: r.get::<_, Option<f64>>(4)?.map(|v| v as f32),
+                locked: r.get(5)?,
+                origin: origin_col(r, 6)?,
+                reasons: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+                cull: crate::ipc::types::CullSnapshot {
+                    image_id: id,
+                    rating: 0,
+                    pick: PickFlag::Unflagged,
+                    color_label: None,
+                    pick_origin: None,
+                },
+            })
+        })?;
+    s.cull = repo::cull_snapshot(conn, &[id])?.remove(0);
+    Ok(s)
 }
 
 /// Ids an edit of `ids` may touch: themselves, their parents' alternatives, their own
-/// alternatives and the rows they cover.
-fn affected(conn: &Connection, ids: &[ImageId]) -> AppResult<BTreeSet<ImageId>> {
+/// alternatives and the rows they cover, plus every row of those rows' moments (covers are
+/// recomputed per moment). Returns the ids and the moments.
+fn affected(conn: &Connection, ids: &[ImageId]) -> AppResult<(BTreeSet<ImageId>, BTreeSet<MomentId>)> {
     let mut out: BTreeSet<ImageId> = ids.iter().copied().collect();
     let mut stmt = conn.prepare_cached(
         "SELECT image_id FROM target_selection WHERE alternative_of = ?1 OR covered_by = ?1
@@ -947,7 +1250,14 @@ fn affected(conn: &Connection, ids: &[ImageId]) -> AppResult<BTreeSet<ImageId>> 
             out.insert(r?);
         }
     }
-    Ok(out)
+    let moments = moments_of(conn, out.iter().copied())?;
+    let mut members = conn.prepare_cached("SELECT image_id FROM target_selection WHERE moment_id = ?1")?;
+    for &m in &moments {
+        for r in members.query_map([m], |r| r.get::<_, ImageId>(0))? {
+            out.insert(r?);
+        }
+    }
+    Ok((out, moments))
 }
 
 /// Prepends a `user_choice` reason (replacing an older one).
@@ -980,7 +1290,8 @@ fn compact(conn: &Connection, parent: ImageId) -> AppResult<()> {
     Ok(())
 }
 
-/// Moves `id` (any choice) to `choice` (not `alternative`), locked. Leaving the delivery set:
+/// Moves `id` (any choice) to `choice` (not `alternative`), locked (origin `user` when the
+/// choice changes). Leaving the delivery set:
 /// its alternatives become `not_sure` and rows it covered lose the link. Leaving an
 /// alternative strip: the strip is re-ranked.
 fn move_to(conn: &Connection, id: ImageId, choice: TargetChoice) -> AppResult<()> {
@@ -998,6 +1309,7 @@ fn move_to(conn: &Connection, id: ImageId, choice: TargetChoice) -> AppResult<()
     }
     conn.execute(
         "UPDATE target_selection SET choice = ?2, alternative_of = NULL, rank = NULL, locked = 1, updated_at = ?3,
+             origin = CASE WHEN choice IS NOT ?2 THEN 'user' ELSE origin END,
              covered_by = CASE WHEN ?2 = 'deliver' THEN NULL ELSE covered_by END,
              covered_similarity = CASE WHEN ?2 = 'deliver' THEN NULL ELSE covered_similarity END
          WHERE image_id = ?1",
@@ -1034,18 +1346,24 @@ fn edit(
         project = Some(p);
     }
     let project = project.ok_or_else(|| AppError::invalid("no photos given"))?;
-    let touched = affected(&tx, ids)?;
+    let (touched, moments) = affected(&tx, ids)?;
     let before: Vec<TargetSnapshot> = touched.iter().map(|&id| snapshot(&tx, id)).collect::<AppResult<_>>()?;
     let mut flags_changed = Vec::new();
     f(&tx, &mut flags_changed)?;
+    // The edited photos may have changed moment membership of the delivery set (and a swap
+    // may bring in a photo of another moment).
+    let mut moments = moments;
+    moments.extend(moments_of(&tx, ids.iter().copied())?);
+    refresh_covers(&tx, &moments)?;
     let all: Vec<ImageId> = touched.iter().copied().collect();
     overlay_suggestions(&tx, &all)?;
     let mut changed = Vec::new();
     let mut previous = Vec::new();
     for b in before {
         let now = snapshot(&tx, b.image_id)?;
-        let row_changed = (now.choice, now.alternative_of, now.rank, now.covered_by, now.locked)
-            != (b.choice, b.alternative_of, b.rank, b.covered_by, b.locked);
+        let row_changed = (now.choice, now.alternative_of, now.rank, now.covered_by, now.locked, now.origin)
+            != (b.choice, b.alternative_of, b.rank, b.covered_by, b.locked, b.origin)
+            || now.covered_similarity != b.covered_similarity;
         if row_changed || now.cull != b.cull || ids.contains(&b.image_id) {
             if let Some(s) = selection(&tx, b.image_id)? {
                 changed.push(s);
@@ -1094,7 +1412,7 @@ pub fn swap(
         )?;
         tx.execute(
             "UPDATE target_selection SET choice = 'alternative', alternative_of = ?2, rank = 1, locked = 1,
-                 covered_by = ?2, covered_similarity = NULL, updated_at = ?3 WHERE image_id = ?1",
+                 origin = 'user', covered_by = ?2, covered_similarity = NULL, updated_at = ?3 WHERE image_id = ?1",
             params![delivered_id, alternative_id, now],
         )?;
         compact(tx, alternative_id)?;
@@ -1129,8 +1447,10 @@ pub fn add(conn: &mut Connection, id: ImageId) -> AppResult<crate::ipc::types::T
 }
 
 /// `set_target_choice`: moves `ids` to `choice` (`deliver`, `not_sure`, `set_aside`; an
-/// `alternative` needs a parent -> `invalid_argument`), locked. Joining the delivery set picks
-/// the photo; leaving it unflags a pick (the user's); its alternatives become `not_sure`.
+/// `alternative` needs a parent -> `invalid_argument`), locked. The flag follows as the user's
+/// (v20.1 also when the choice is unchanged, e.g. Keep): `deliver` picks the photo, the other
+/// choices unflag a pick (never reject). Leaving the delivery set: its alternatives become
+/// `not_sure`.
 pub fn set_choice(
     conn: &mut Connection,
     ids: &[ImageId],
@@ -1144,16 +1464,17 @@ pub fn set_choice(
         for &id in &ids {
             let was = row0(tx, id)?.choice;
             if was == choice {
+                // Keep / confirm: lock (origin and reasons unchanged); the flag still follows.
                 tx.execute("UPDATE target_selection SET locked = 1 WHERE image_id = ?1", [id])?;
-                continue;
+            } else {
+                move_to(tx, id, choice)?;
+                let text = match choice {
+                    TargetChoice::Deliver => "You added this",
+                    TargetChoice::NotSure => "You marked this not sure",
+                    _ => "You set this aside",
+                };
+                set_user_reason(tx, id, text.to_owned(), None)?;
             }
-            move_to(tx, id, choice)?;
-            let text = match choice {
-                TargetChoice::Deliver => "You added this",
-                TargetChoice::NotSure => "You marked this not sure",
-                _ => "You set this aside",
-            };
-            set_user_reason(tx, id, text.to_owned(), None)?;
             let pick: String = tx.query_row("SELECT pick FROM images WHERE id = ?1", [id], |r| r.get(0))?;
             let next = match choice {
                 TargetChoice::Deliver => Some(PickFlag::Pick),
@@ -1178,13 +1499,15 @@ pub fn restore(conn: &mut Connection, snapshots: &[TargetSnapshot]) -> AppResult
     {
         let mut stmt = tx.prepare_cached(
             "UPDATE target_selection SET choice = ?2, alternative_of = ?3, rank = ?4, covered_by = ?5, locked = ?6,
-                 updated_at = ?7
+                 updated_at = ?7, covered_similarity = ?8, origin = ?9, reasons_json = ?10
              WHERE image_id = ?1 AND (choice IS NOT ?2 OR alternative_of IS NOT ?3 OR rank IS NOT ?4
-                                      OR covered_by IS NOT ?5 OR locked IS NOT ?6)",
+                                      OR covered_by IS NOT ?5 OR locked IS NOT ?6 OR covered_similarity IS NOT ?8
+                                      OR origin IS NOT ?9 OR reasons_json IS NOT ?10)",
         )?;
         for s in snapshots {
             row0(&tx, s.image_id)?;
             let rank = s.rank.map(|r| r.max(1));
+            let sim = s.covered_similarity.filter(|v| v.is_finite()).map(|v| v as f64);
             if stmt.execute(params![
                 s.image_id,
                 s.choice.as_str(),
@@ -1192,7 +1515,10 @@ pub fn restore(conn: &mut Connection, snapshots: &[TargetSnapshot]) -> AppResult
                 rank,
                 s.covered_by,
                 s.locked,
-                now_ms()
+                now_ms(),
+                sim,
+                s.origin.as_str(),
+                serde_json::to_string(&s.reasons)?
             ])? > 0
             {
                 changed.insert(s.image_id);
@@ -1257,7 +1583,32 @@ pub fn note_user_flags(conn: &mut Connection, ids: &[ImageId], pick: PickFlag) -
         set_user_reason(&tx, id, text.to_owned(), None)?;
         changed.push(id);
     }
+    if !changed.is_empty() {
+        let moments = moments_of(&tx, changed.iter().copied())?;
+        refresh_covers(&tx, &moments)?;
+    }
     overlay_suggestions(&tx, ids)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// `lock_target_choices`: locks the selection rows of `ids` as they are (choice, origin,
+/// reasons and flags unchanged), so a re-run keeps them, e.g. the picks the user reviewed.
+/// Ids without a row are ignored; unknown image -> `not_found`. Returns the ids newly locked.
+pub fn lock(conn: &mut Connection, ids: &[ImageId]) -> AppResult<Vec<ImageId>> {
+    let tx = conn.savepoint()?;
+    let mut changed = Vec::new();
+    {
+        let mut stmt = tx.prepare_cached(
+            "UPDATE target_selection SET locked = 1, updated_at = ?2 WHERE image_id = ?1 AND locked = 0",
+        )?;
+        for &id in ids {
+            ensure_image(&tx, id)?;
+            if stmt.execute(params![id, now_ms()])? > 0 && !changed.contains(&id) {
+                changed.push(id);
+            }
+        }
+    }
     tx.commit()?;
     Ok(changed)
 }
@@ -1409,10 +1760,7 @@ mod tests {
         assert!(alternatives(&conn, 5).unwrap().delivered.is_none());
 
         let cov = covered_by(&conn, 5).unwrap().unwrap();
-        assert_eq!(
-            (cov.covered_by_id, cov.same_moment, cov.text.as_str()),
-            (4, true, "Already kept a similar one: DSC0004")
-        );
+        assert_eq!((cov.covered_by_id, cov.same_moment, cov.text.as_str()), (4, true, "Similar to DSC0004 (kept)"));
         assert!(covered_by(&conn, 1).unwrap().is_none());
 
         // Grid filter.
@@ -1540,13 +1888,174 @@ mod tests {
             ],
         )
         .unwrap();
-        let r = apply(&mut conn, 1).unwrap();
+        let plan = plan_apply(&conn, 1, TargetApplyOptions::default()).unwrap();
+        let r = apply(&mut conn, 1, TargetApplyOptions::default()).unwrap();
         assert_eq!(flag(&conn, 2), ("pick".into(), "auto".into()));
         assert_eq!(flag(&conn, 5).0, "unflagged", "Sieve's own stale pick follows the selection");
         assert_eq!(flag(&conn, 4), ("reject".into(), "user".into()));
         assert_eq!(flag(&conn, 6), ("pick".into(), "user".into()));
-        assert_eq!((r.applied, r.skipped), (2, 2));
+        assert_eq!((r.picks, r.rejects, r.unflags, r.unchanged, r.user_flagged), (1, 0, 1, 0, 2));
+        assert_eq!((plan.picks, plan.unflags, plan.user_flagged, plan.total), (1, 1, 2, 4));
+        assert_eq!(r.changed, vec![2, 5]);
+        assert_eq!(
+            r.previous.iter().map(|s| (s.image_id, s.pick)).collect::<Vec<_>>(),
+            [(2, PickFlag::Unflagged), (5, PickFlag::Pick)]
+        );
         assert!(get_run(&conn, 1, false).unwrap().is_none(), "apply without a run row stamps nothing");
+    }
+
+    /// [`store`] plus frame similarities of moment 1 (photo 3 is nearest to 5 and 2).
+    fn store_with_pairs(conn: &mut Connection) {
+        store_similarities(
+            conn,
+            1,
+            &[
+                (5, 4, 0.8),
+                (3, 5, 0.95),
+                (5, 1, 0.5),
+                (2, 1, 0.9),
+                (3, 1, 0.85),
+                (2, 3, 0.92),
+                (2, 4, 0.3),
+                (3, 4, 0.3),
+                (1, 4, 0.2),
+                (5, 2, 0.6),
+                (1, 7, 0.9), // other project: skipped
+            ],
+        )
+        .unwrap();
+        store(conn);
+    }
+
+    #[test]
+    fn covered_by_follows_user_edits_with_tier_and_origin() {
+        let mut conn = setup();
+        store_with_pairs(&mut conn);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM target_similarity", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 10);
+        let cov = covered_by(&conn, 5).unwrap().unwrap();
+        assert_eq!(
+            (cov.covered_by_id, cov.tier, cov.covered_by_origin),
+            (4, SimilarityTier::VerySimilar, ChoiceOrigin::Engine)
+        );
+        assert_eq!(cov.text, "Similar to DSC0004 (kept)");
+        assert_eq!(selection(&conn, 5).unwrap().unwrap().covered_tier, Some(SimilarityTier::VerySimilar));
+
+        // The user adds 3: 5 and 2 are now nearest to it (the user's photo).
+        let r = add(&mut conn, 3).unwrap();
+        let cov = covered_by(&conn, 5).unwrap().unwrap();
+        assert_eq!((cov.covered_by_id, cov.similarity, cov.tier), (3, 0.95, SimilarityTier::NearIdentical));
+        assert_eq!((cov.covered_by_origin, cov.covered_by_name.as_str()), (ChoiceOrigin::User, "DSC0003"));
+        assert_eq!(cov.text, "Almost identical to DSC0003 (you added it)");
+        assert_eq!(selection(&conn, 2).unwrap().unwrap().covered_by, Some(3));
+        assert_eq!(selection(&conn, 3).unwrap().unwrap().origin, ChoiceOrigin::User);
+        assert!(r.changed.iter().any(|s| s.image_id == 5 && s.covered_by == Some(3)), "siblings reported");
+        let m = &list_moments(&conn, 1).unwrap()[0];
+        assert_eq!((m.delivered_ids.clone(), m.user_delivered_ids.clone()), (vec![1, 3, 4], vec![3]));
+
+        // Undo restores covers, origin and reasons exactly.
+        restore(&mut conn, &r.previous).unwrap();
+        let five = selection(&conn, 5).unwrap().unwrap();
+        assert_eq!((five.covered_by, five.covered_similarity), (Some(4), Some(0.8)));
+        let three = selection(&conn, 3).unwrap().unwrap();
+        assert_eq!(
+            (three.choice, three.origin, three.reasons.len()),
+            (TargetChoice::Alternative, ChoiceOrigin::Engine, 0)
+        );
+
+        // Swap 4 out for 5: 4 becomes 5's alternative, covered by 5 at the stored similarity.
+        swap(&mut conn, 4, 5).unwrap();
+        let four = selection(&conn, 4).unwrap().unwrap();
+        assert_eq!((four.covered_by, four.covered_similarity), (Some(5), Some(0.8)));
+        // The user rejects 1 in the grid: its rows are re-covered within the moment.
+        note_user_flags(&mut conn, &[1], PickFlag::Reject).unwrap();
+        assert_eq!(selection(&conn, 1).unwrap().unwrap().covered_by, Some(5));
+        assert_eq!(selection(&conn, 2).unwrap().unwrap().covered_by, Some(5));
+
+        // A cover in another moment survives a refresh without pairs.
+        conn.execute("UPDATE target_selection SET covered_by = 5, covered_similarity = 0.5 WHERE image_id = 6", [])
+            .unwrap();
+        refresh_covers(&conn, &moments_of(&conn, [5]).unwrap()).unwrap();
+        let cov = covered_by(&conn, 6).unwrap().unwrap();
+        assert_eq!(
+            (cov.tier, cov.text.as_str()),
+            (SimilarityTier::AnotherMoment, "Looks like DSC0005 (you added it, another moment)")
+        );
+    }
+
+    #[test]
+    fn piles_reason_filter_moment_sort_and_lock() {
+        let mut conn = setup();
+        store_with_pairs(&mut conn);
+        let c = counts(&conn, 1).unwrap();
+        assert_eq!(c.piles, crate::ipc::types::TargetPileCounts { not_sure: 1, similar: 0, weaker: 0, defects: 1 });
+        assert_eq!(selection(&conn, 6).unwrap().unwrap().pile, Some(TargetPile::Defects));
+        assert_eq!(selection(&conn, 1).unwrap().unwrap().pile, None);
+        // 5 set aside: covered at 0.8 -> similar.
+        set_choice(&mut conn, &[5], TargetChoice::SetAside).unwrap();
+        assert_eq!(counts(&conn, 1).unwrap().piles.similar, 1);
+        let q = |piles: Vec<TargetPile>, kinds: Vec<TargetReasonKind>| ImageQuery {
+            project_id: Some(1),
+            target_piles: piles,
+            target_reason_kinds: kinds,
+            ..ImageQuery::default()
+        };
+        assert_eq!(
+            repo::list_image_ids(&conn, &q(vec![TargetPile::Similar, TargetPile::Defects], vec![])).unwrap(),
+            vec![5, 6]
+        );
+        assert_eq!(repo::list_image_ids(&conn, &q(vec![], vec![TargetReasonKind::UserChoice])).unwrap(), vec![5]);
+
+        // By moment, then score: moment 1 rows (scores) first, then 6 (no moment).
+        conn.execute("UPDATE target_selection SET score = image_id / 10.0 WHERE image_id IN (2, 3)", []).unwrap();
+        conn.execute("UPDATE target_selection SET score = 0.1 WHERE image_id IN (1, 4, 5)", []).unwrap();
+        let sorted = ImageQuery {
+            project_id: Some(1),
+            sort: crate::ipc::types::ImageSort::TargetMoment,
+            ..ImageQuery::default()
+        };
+        assert_eq!(repo::list_image_ids(&conn, &sorted).unwrap(), vec![3, 2, 1, 4, 5, 6]);
+
+        // Lock without changing anything.
+        assert_eq!(lock(&mut conn, &[1, 4, 7]).unwrap(), vec![1, 4]);
+        assert!(lock(&mut conn, &[1]).unwrap().is_empty());
+        assert!(lock(&mut conn, &[999]).is_err());
+        let one = selection(&conn, 1).unwrap().unwrap();
+        assert_eq!((one.locked, one.origin, one.choice), (true, ChoiceOrigin::Engine, TargetChoice::Deliver));
+        assert_eq!(flag(&conn, 1).0, "unflagged");
+
+        // Keep (same choice) flags the photo at once.
+        let r = set_choice(&mut conn, &[1], TargetChoice::Deliver).unwrap();
+        assert_eq!((flag(&conn, 1), r.flags_changed), (("pick".into(), "user".into()), vec![1]));
+    }
+
+    #[test]
+    fn apply_plan_counts_and_rejects_option() {
+        let mut conn = setup();
+        store(&mut conn);
+        // 1, 4 delivered -> picks; 6 confident defect -> reject; 2 has a stale auto pick.
+        conn.execute("UPDATE images SET pick = 'pick', pick_origin = 'auto' WHERE id = 2", []).unwrap();
+        conn.execute("UPDATE images SET pick = 'pick', pick_origin = 'user' WHERE id = 3", []).unwrap();
+        let no = TargetApplyOptions { rejects: false };
+        let plan = plan_apply(&conn, 1, no).unwrap();
+        assert_eq!(
+            (plan.total, plan.picks, plan.rejects, plan.rejectable, plan.unflags, plan.unchanged, plan.user_flagged),
+            (6, 2, 0, 1, 1, 2, 1)
+        );
+        let yes = plan_apply(&conn, 1, TargetApplyOptions::default()).unwrap();
+        assert_eq!((yes.rejects, yes.unchanged), (1, 1));
+        let r = apply(&mut conn, 1, no).unwrap();
+        assert_eq!((r.picks, r.rejects, r.unflags), (2, 0, 1));
+        assert_eq!(flag(&conn, 6).0, "unflagged");
+        // Undo with the generic cull restore.
+        repo::restore_cull_snapshot(&mut conn, &r.previous).unwrap();
+        assert_eq!(flag(&conn, 2), ("pick".into(), "auto".into()));
+        assert_eq!(flag(&conn, 1).0, "unflagged");
+        let r = apply(&mut conn, 1, TargetApplyOptions::default()).unwrap();
+        assert_eq!((r.picks, r.rejects, r.unflags, r.user_flagged), (2, 1, 1, 1));
+        assert_eq!(flag(&conn, 6), ("reject".into(), "auto".into()));
+        assert_eq!(plan_apply(&conn, 1, TargetApplyOptions::default()).unwrap().unchanged, 5);
+        assert!(plan_apply(&conn, 99, no).is_err());
     }
 
     #[test]

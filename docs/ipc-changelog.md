@@ -972,6 +972,73 @@ Who implements what
 - rust-engine-dev: nothing required. New writers of `images.pick` should keep `pick_origin` rules; a new writer of
   `quality_scores` must also write `scored_pick` and call `db::target::overlay_suggestions`.
 
+## v20.1 — 2026-10-10 (Phase 9 UX review: honest, undoable Apply; covered-by after edits; second-look piles; review lock)
+
+From `docs/ux-review-9.md` [ARCH] items P0-1, P0-2, P0-3, P1-4. Schema v20 (`migrations/0020_target_review.sql`):
+`target_selection.origin` (`engine | user`, backfilled `user` for locked rows whose first reason is `user_choice`) and
+`target_similarity (image_a < image_b, similarity)`. `src/ipc/bindings.ts` regenerated. Flag model recorded in
+decisions.md (2026-10-10, "v20.1 flag model").
+
+BREAKING
+- `apply_target_selection(projectId, opts: TargetApplyOptions)` -> `TargetApplyResult` (was `(projectId) ->
+  ApplySuggestionsResult`). `opts.rejects` (UI default `true`, a checkbox): also reject the confident defects; with
+  `false` they are left alone (a stale Sieve pick on them is cleared). Result: `picks`, `rejects`, `unflags`,
+  `unchanged`, `userFlagged` (counted separately: fixes "Flagged 815 as Picked"), `changed`, `previous:
+  CullSnapshot[]` (undo with `restore_cull_snapshot`; record on the Cull undo stack), `appliedAtMs`.
+- `set_target_choice` with the photo's current choice (Keep) now also writes the flag as the user's (`deliver` ->
+  pick; other choices unflag a pick), like every other target edit.
+- `TargetSnapshot` gains `coveredSimilarity`, `origin`, `reasons` (restored too: an undone add loses "You added
+  this"). `CoveredBy.text` wording changed (below).
+
+New commands
+| Command | Args | Returns |
+|---|---|---|
+| `plan_target_apply` | `projectId, opts: TargetApplyOptions` | `TargetApplyPlan {total, picks, rejects, rejectable, unflags, unchanged, userFlagged}` (dry run, same code as apply; `rejectable` = what `rejects: true` would reject, for the checkbox label) |
+| `lock_target_choices` | `ids` | `number[]` newly locked (no flag / choice / reason change, not undoable; ids without a row ignored; unknown -> `not_found`) |
+
+New types / fields
+- `ChoiceOrigin` (`engine | user`): who made the current choice (`user` when a target edit or the user's own flag
+  changed it; a lock without change keeps it). `ImageSelection.origin`; `Moment.userDeliveredIds` (subset of
+  `deliveredIds`, capture order); `CoveredBy.coveredByOrigin`.
+- `SimilarityTier` (`near_identical` >= 0.9, `very_similar` >= 0.7, `same_moment`, `another_moment`; constants
+  `SIMILARITY_NEAR_IDENTICAL` / `SIMILARITY_VERY_SIMILAR`): `CoveredBy.tier`, `ImageSelection.coveredTier`.
+  `CoveredBy.coveredByName` (file stem). `CoveredBy.text`: "Almost identical to DSC0412 (kept)", "Similar to DSC0412
+  (kept)", "Same moment as DSC0412 (kept)", "Looks like DSC0412 (kept, another moment)"; "kept" -> "you added it"
+  when `coveredByOrigin` is `user`.
+- `TargetPile` (`not_sure | similar | weaker | defects`) + `TargetPileCounts`: `ImageSelection.pile` (not sure / set
+  aside rows only), `TargetCounts.piles` (sums to `notSure + setAside`). Rules: not sure = choice `not_sure`; defects
+  = set aside and Apply would reject it (effective suggestion `reject`) or the user rejected it; similar = set aside
+  with first reason `near_duplicate` / `not_best_of_setup` or covered at >= 0.7; weaker = the rest.
+- `ImageQuery.targetReasonKinds?: TargetReasonKind[]` (first reason), `ImageQuery.targetPiles?: TargetPile[]` (both
+  `#[serde(default)]`, honoured wherever `targetChoices` is). `ImageSort` gains `target_moment`: by moment (start
+  time, id), then selection `score` desc, then capture order; photos without a moment last; `sortDescending`
+  reverses the moment order only.
+
+Semantics
+- `covered_by` is recomputed after `add_alternative` / `swap_alternative` / `set_target_choice` / `set_pick` (via
+  `note_user_flags`) for every row of the affected moments (nearest delivered frame of the same moment from the stored
+  similarities, ties: lower id; without one, a still-delivered cover from another moment is kept, else cleared) and
+  for locked rows' moments after a run. Edits snapshot whole moments (`TargetEditResult.previous` / `changed` include
+  re-covered siblings), so `restore_target_snapshot` puts covers back exactly. Cross-moment covers are not searched
+  again (no cross-moment pairs stored).
+- Catalogs with a run from before v20.1 have no stored similarities: covers then only drop when the covering photo
+  leaves the delivery set, until the next run.
+
+Who updates what
+- architect (done): types, schema v20, commands + registration, `db::target` (`plan_apply`, `apply`, `lock`,
+  `store_similarities`, `refresh_covers`, `PILE_SQL`, origin), `repo` filters + sort, `ml::selection::
+  moment_similarities` + call in `run_pipeline`, Rust tests, bindings, mock (`src/testing/mockTarget.ts`, mirrors all
+  of the above; also: photos the user rejected are never delivered, backs of heads are set aside without a cover,
+  half of the not-sure "other" frames have no cover), `ApplyDialog` in `TargetView.tsx` (plan counts, rejects
+  checkbox, XMP line, Undo button; `TargetView` prop `recordApply` wired in `App.tsx` to the Cull undo stack),
+  specs `ipc-v20-mock.spec.ts` (v20.1 test) and the apply test in `target-cull.spec.ts`.
+- frontend-dev: Second look piles (`counts.piles`, `ImageQuery.targetPiles` + `sort: "target_moment"`, default pile
+  `["not_sure"]`); covered-by caption from `CoveredBy.text` / `tier` / `coveredByOrigin` and the moment strip from
+  `Moment.userDeliveredIds`; before a re-run call `lockTargetChoices(reviewedDeliveredIds)` (not
+  `setTargetChoice`); Keep now writes the Picked flag; copy changes in SetupStep tooltip and Help (see decisions.md).
+- vision-ml-dev: nothing required. `moment_similarities` uses `moments::similarity`; if the engine's "covered by"
+  similarity ever differs from that function, store the engine's own values instead.
+
 ## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
 
 Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.

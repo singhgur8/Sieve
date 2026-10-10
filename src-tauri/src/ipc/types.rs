@@ -2529,6 +2529,11 @@ string_enum! {
         Quality => "quality",
         /// Most stars first; ties in capture order.
         Rating => "rating",
+        /// v20.1, Pick the best N: by target-run moment (moment start time, then moment id),
+        /// within a moment by selection `score` (best first), then capture order. Photos
+        /// without a moment come last, in capture order. Descending reverses the moment order
+        /// only (the best frame of each moment stays first).
+        TargetMoment => "target_moment",
     }
 }
 
@@ -2587,6 +2592,14 @@ pub struct ImageQuery {
     /// without a selection row never match), e.g. `["not_sure", "set_aside"]` for pass 2.
     #[serde(default)]
     pub target_choices: Vec<TargetChoice>,
+    /// v20.1: only photos whose first selection reason (`ImageSelection.reasons[0].kind`) is
+    /// one of these (empty = no constraint; photos without a selection row never match).
+    #[serde(default)]
+    pub target_reason_kinds: Vec<TargetReasonKind>,
+    /// v20.1: only photos in one of these second-look piles (`ImageSelection.pile`; empty =
+    /// no constraint), e.g. `["not_sure"]` for the Second look's default pile.
+    #[serde(default)]
+    pub target_piles: Vec<TargetPile>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2620,6 +2633,8 @@ impl Default for ImageQuery {
             metadata: MetadataFilter::default(),
             suggested: None,
             target_choices: Vec::new(),
+            target_reason_kinds: Vec::new(),
+            target_piles: Vec::new(),
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,

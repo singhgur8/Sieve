@@ -209,6 +209,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::set_target_choice,
             commands::restore_target_snapshot,
             commands::apply_target_selection,
+            commands::plan_target_apply,
+            commands::lock_target_choices,
         ])
         .events(collect_events![
             ImportProgress,

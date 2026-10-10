@@ -1800,6 +1800,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               }}
               onShowInGrid={showTargetChoices}
               onContinueEdit={() => goStep("edit")}
+              recordApply={(previous) => {
+                const entry = cull.record("Apply Pick the best N", previous);
+                return () => cull.undoEntry(entry);
+              }}
               notify={setNotice}
               onError={reportError}
             />

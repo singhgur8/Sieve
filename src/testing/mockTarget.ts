@@ -1,9 +1,14 @@
-// Mock of the target-count culling commands (IPC v20) for `src/testing/mockBackend.ts`.
+// Mock of the target-count culling commands (IPC v20 / v20.1) for `src/testing/mockBackend.ts`.
 // Mirrors `db::target` (storage + user edits) with synthetic engine output:
 // - people: a couple (main, suggested) + 4 recurring people to ask about ("Is this person important?");
 // - moments of every shot type (couple / group / detail / candid / other) over project 1's photos;
-// - a selection with delivered photos, ranked alternatives, not sure / set aside and "covered by" (not-sure candids with
-//   no visible face have none: nothing similar is kept, so the second look also shows the plain keep / skip case).
+// - a selection with delivered photos, ranked alternatives, not sure / set aside and "covered by". Candids without a
+//   visible face (back of the head) are set aside without a cover, like the engine; half of the not-sure "other"
+//   frames have no cover either (nothing similar kept: the second look's plain keep / skip case). Photos the user
+//   rejected are never delivered.
+// - v20.1: frame similarities per moment (deterministic `pairSim`), so `coveredBy` is recomputed within the moment after
+//   every edit (tiers + origin), second-look piles, `plan_target_apply` / `apply_target_selection(opts)` with
+//   snapshots, `lock_target_choices`, `ImageQuery.targetReasonKinds` / `targetPiles` / sort `target_moment`.
 // Switches (URL of the mock page): `?target=1` starts with a finished run on project 1 (open people
 // questions); without it there is no run until `run_target_selection` (which builds the same data after
 // `window.__mockTargetDelay` ms, default 300, reporting `activity-event` kind `target_selection` and one
@@ -12,11 +17,12 @@ import { emit } from "@tauri-apps/api/event";
 import type {
   ActivityEvent,
   Alternatives,
-  ApplySuggestionsResult,
+  ChoiceOrigin,
   CoveredBy,
   CullSnapshot,
   FaceInfo,
   FaceSample,
+  ImageQuery,
   ImageSelection,
   Moment,
   PeopleOverview,
@@ -25,9 +31,14 @@ import type {
   PickFlag,
   RawImageEntry,
   ShotType,
+  SimilarityTier,
+  TargetApplyOptions,
+  TargetApplyPlan,
+  TargetApplyResult,
   TargetChoice,
   TargetCounts,
   TargetEditResult,
+  TargetPile,
   TargetReason,
   TargetRun,
   TargetRunFinished,
@@ -55,16 +66,37 @@ export interface MockTargetContext {
 /** Returned by `handle` for commands it does not know. */
 export const NOT_TARGET = Symbol("not-target");
 
-type Row = Omit<ImageSelection, "personIds"> & { projectId: number };
+type Row = Omit<ImageSelection, "personIds" | "coveredTier" | "pile"> & { projectId: number };
 
 const SHOT_PATTERN: ShotType[] = ["couple", "couple", "group", "detail", "candid", "couple", "other", "group", "candid", "detail"];
 const MOMENT_SIZE = 8;
+/** Similarity of a cover in another moment (no stored pair). */
+const CROSS_MOMENT_SIM = 0.5;
+
+/** Deterministic similarity of two frames of the same moment (stands in for the stored `target_similarity`). */
+export const pairSim = (a: number, b: number) => {
+  const [x, y] = a < b ? [a, b] : [b, a];
+  return Math.round((0.97 - ((x * 7 + y * 13) % 43) / 100) * 1000) / 1000;
+};
+
+/** Rust `SimilarityTier::of`. */
+const tierOf = (similarity: number, sameMoment: boolean): SimilarityTier =>
+  !sameMoment ? "another_moment" : similarity >= 0.9 ? "near_identical" : similarity >= 0.7 ? "very_similar" : "same_moment";
+
+/** Rust `db::target::covered_text`. */
+const coveredText = (tier: SimilarityTier, name: string, origin: ChoiceOrigin) => {
+  const who = origin === "user" ? "you added it" : "kept";
+  if (tier === "near_identical") return `Almost identical to ${name} (${who})`;
+  if (tier === "very_similar") return `Similar to ${name} (${who})`;
+  if (tier === "same_moment") return `Same moment as ${name} (${who})`;
+  return `Looks like ${name} (${who}, another moment)`;
+};
 
 export function createMockTarget(ctx: MockTargetContext) {
   const params = new URLSearchParams(typeof location === "undefined" ? "" : location.search);
   const sel = new Map<number, Row>();
   const people = new Map<number, Person & { samplesRef: [number, number][] }>();
-  const moments = new Map<number, Omit<Moment, "imageIds" | "deliveredIds">>();
+  const moments = new Map<number, Omit<Moment, "imageIds" | "deliveredIds" | "userDeliveredIds">>();
   const runs = new Map<number, TargetRun>();
   /** The scorer's own suggestion (`quality_scores.scored_pick`), kept before the overlay. */
   const scored = new Map<number, PickFlag>();
@@ -79,10 +111,27 @@ export function createMockTarget(ctx: MockTargetContext) {
     const m = r.momentId != null ? moments.get(r.momentId) : undefined;
     return ctx.faces(r.imageId).length ? [...(m?.personIds ?? [])] : [];
   };
+  const userFlag = (id: number): PickFlag | null => {
+    const e = ctx.byId.get(id);
+    return e && e.pick !== "unflagged" && e.pickOrigin !== "auto" ? e.pick : null;
+  };
+
+  /** Rust `db::target::PILE_SQL`. */
+  const pileOf = (r: Row): TargetPile | null => {
+    if (r.choice === "not_sure") return "not_sure";
+    if (r.choice !== "set_aside") return null;
+    const e = ctx.byId.get(r.imageId);
+    if (e?.pick === "reject" || e?.quality?.suggestedPick === "reject") return "defects";
+    const k = r.reasons[0]?.kind;
+    if (k === "near_duplicate" || k === "not_best_of_setup" || (r.coveredBy != null && (r.coveredSimilarity ?? 0) >= 0.7)) return "similar";
+    return "weaker";
+  };
   const dto = (r: Row): ImageSelection => {
     const { projectId: _p, ...rest } = r;
     void _p;
-    return { ...rest, reasons: [...r.reasons], personIds: personIdsOf(r) };
+    const cover = r.coveredBy != null ? sel.get(r.coveredBy) : undefined;
+    const coveredTier = r.coveredBy == null ? null : tierOf(r.coveredSimilarity ?? 0, r.momentId != null && r.momentId === cover?.momentId);
+    return { ...rest, reasons: [...r.reasons], coveredTier, pile: pileOf(r), personIds: personIdsOf(r) };
   };
 
   // ---- overlay (Rust `db::target::OVERLAY_SQL`) ----
@@ -99,7 +148,16 @@ export function createMockTarget(ctx: MockTargetContext) {
   }
 
   function counts(projectId: number): TargetCounts {
-    const c: TargetCounts = { total: 0, deliver: 0, alternative: 0, notSure: 0, setAside: 0, locked: 0, perShotType: [] };
+    const c: TargetCounts = {
+      total: 0,
+      deliver: 0,
+      alternative: 0,
+      notSure: 0,
+      setAside: 0,
+      locked: 0,
+      perShotType: [],
+      piles: { notSure: 0, similar: 0, weaker: 0, defects: 0 },
+    };
     const per = new Map<ShotType, { total: number; deliver: number }>();
     for (const r of sel.values()) {
       if (r.projectId !== projectId) continue;
@@ -109,6 +167,9 @@ export function createMockTarget(ctx: MockTargetContext) {
       else if (r.choice === "alternative") c.alternative++;
       else if (r.choice === "not_sure") c.notSure++;
       else c.setAside++;
+      const pile = pileOf(r);
+      if (pile === "not_sure") c.piles.notSure++;
+      else if (pile) c.piles[pile]++;
       if (r.shotType) {
         const p = per.get(r.shotType) ?? { total: 0, deliver: 0 };
         p.total++;
@@ -184,6 +245,33 @@ export function createMockTarget(ctx: MockTargetContext) {
     });
   }
 
+  /** Most similar delivered frame of the same moment (ties: lower id), Rust `refresh_covers`. */
+  const nearestDelivered = (id: number, members: Row[]): [number, number] | null => {
+    let best: [number, number] | null = null;
+    for (const d of [...members].sort((a, b) => a.imageId - b.imageId)) {
+      if (d.choice !== "deliver" || d.imageId === id) continue;
+      const s = pairSim(id, d.imageId);
+      if (!best || s > best[1]) best = [d.imageId, s];
+    }
+    return best;
+  };
+
+  /** Rust `db::target::refresh_covers`: every pair of a moment has a similarity in the mock. */
+  function refreshCovers(momentIds: Iterable<number>) {
+    for (const m of new Set(momentIds)) {
+      const members = [...sel.values()].filter((r) => r.momentId === m);
+      for (const r of members) {
+        if (r.choice === "deliver") {
+          Object.assign(r, { coveredBy: null, coveredSimilarity: null });
+          continue;
+        }
+        const best = nearestDelivered(r.imageId, members);
+        if (best) Object.assign(r, { coveredBy: best[0], coveredSimilarity: best[1] });
+        else if (r.coveredBy == null || sel.get(r.coveredBy)?.choice !== "deliver") Object.assign(r, { coveredBy: null, coveredSimilarity: null });
+      }
+    }
+  }
+
   function buildSelection(projectId: number, settings: TargetRunSettings) {
     const photos = projectRows(projectId);
     buildPeople(projectId, photos);
@@ -202,28 +290,35 @@ export function createMockTarget(ctx: MockTargetContext) {
       const ranked = [...chunk].sort((a, b) => (b.quality?.overall ?? 0) - (a.quality?.overall ?? 0) || a.id - b.id);
       const deliverN = shot === "couple" ? 3 : shot === "candid" ? 2 : shot === "other" ? 0 : 1;
       const scorer = (r: RawImageEntry) => scored.get(r.id) ?? r.quality?.suggestedPick;
-      const delivered = new Set(ids(ranked.filter((r) => scorer(r) !== "reject" && !locked.has(r.id)).slice(0, deliverN)));
+      // The engine never delivers a confident defect or a photo the user rejected (`Forced::UserReject`).
+      const eligible = (r: RawImageEntry) => scorer(r) !== "reject" && userFlag(r.id) !== "reject" && !locked.has(r.id);
+      const delivered = new Set(ids(ranked.filter(eligible).slice(0, deliverN)));
       for (const r of chunk) if (locked.get(r.id)?.choice === "deliver") delivered.add(r.id);
       moments.set(momentId, { id: momentId, projectId, shotType: shot, startedAtMs: chunk[0].capture.capturedAtMs ?? null, endedAtMs: chunk[chunk.length - 1].capture.capturedAtMs ?? null, personIds, representativeId: ranked[0]?.id ?? null });
       const boost = personIds.some((p) => important.has(p));
-      const nearestDelivered = (id: number) => {
-        const d = [...delivered];
-        if (!d.length) return lastDelivered;
-        return d.reduce((best, x) => (Math.abs(x - id) < Math.abs(best - id) ? x : best), d[0]);
+      const coverOf = (id: number): [number, number] | null => {
+        let best: [number, number] | null = null;
+        for (const d of [...delivered].sort((a, b) => a - b)) {
+          const s = pairSim(id, d);
+          if (!best || s > best[1]) best = [d, s];
+        }
+        return best ?? (lastDelivered != null ? [lastDelivered, CROSS_MOMENT_SIM] : null);
       };
       const altCount = new Map<number, number>();
       ranked.forEach((r, idx) => {
         const old = locked.get(r.id);
         const score = Math.min(1, (r.quality?.overall ?? 0) * (boost ? 1.15 : 1));
-        const cover = delivered.has(r.id) ? null : nearestDelivered(r.id);
-        const similarity = cover == null ? null : Math.round((0.95 - ((idx * 7) % 30) / 100) * 100) / 100;
         if (old) {
           sel.set(r.id, { ...old, momentId, shotType: shot, score });
           return;
         }
+        const c = delivered.has(r.id) ? null : coverOf(r.id);
+        const cover = c?.[0] ?? null;
+        let similarity = c?.[1] ?? null;
         let choice: TargetChoice;
         let alternativeOf: number | null = null;
         let rank: number | null = null;
+        let covered = cover != null;
         const reasons: TargetReason[] = [];
         if (delivered.has(r.id)) {
           choice = "deliver";
@@ -231,6 +326,9 @@ export function createMockTarget(ctx: MockTargetContext) {
           const text = shot === "couple" ? "A different pose of the couple" : shot === "group" ? "Best of this group setup: everyone is looking" : shot === "detail" ? "Best of this detail: sharp on the object" : "Faces clearly visible";
           reasons.push(reason(kind, text));
           if (boost) reasons.push(reason("important_person", shot === "couple" ? "Shows the couple" : "Shows people you marked important"));
+        } else if (userFlag(r.id) === "reject") {
+          choice = "set_aside";
+          reasons.push(reason("user_choice", "You rejected this photo"));
         } else if (scorer(r) === "reject") {
           choice = "set_aside";
           reasons.push(reason("defect", r.quality?.reasons[0]?.text ?? "Eyes closed"));
@@ -240,18 +338,44 @@ export function createMockTarget(ctx: MockTargetContext) {
           rank = (altCount.get(cover) ?? 0) + 1;
           altCount.set(cover, rank);
           reasons.push(reason(shot === "group" ? "not_best_of_setup" : "near_duplicate", shot === "group" ? `Same group setup as ${stem(cover)}; fewer people looking` : `Almost the same as ${stem(cover)}`, cover));
-        } else if (shot === "candid" || shot === "other") {
+        } else if (shot === "candid" && idx % 2 === 0) {
           choice = "not_sure";
-          reasons.push(shot === "other" ? reason("below_target", "Good, but the target was reached by better frames") : reason("no_visible_face", "Back of the head: no visible face"));
+          reasons.push(reason("other", "Possible creative blur: your call"));
+        } else if (shot === "candid") {
+          // Back of the head: set aside, nothing similar kept (engine: `no_visible_face`).
+          choice = "set_aside";
+          reasons.push(reason("no_visible_face", "Back of the head: no visible face"));
+          covered = false;
+        } else if (shot === "other") {
+          choice = "not_sure";
+          reasons.push(reason("below_target", "Close call: just missed the target"));
+          covered = covered && idx % 2 === 0;
         } else {
           choice = "set_aside";
           reasons.push(shot === "detail" ? reason("detail_out_of_focus", "Focus is not on the object") : reason("near_duplicate", `Almost the same as ${stem(cover ?? r.id)}`, cover));
         }
-        sel.set(r.id, { imageId: r.id, projectId, choice, momentId, shotType: shot, alternativeOf, rank, coveredBy: choice === "deliver" || reasons[0]?.kind === "no_visible_face" ? null : cover, coveredSimilarity: choice === "deliver" || reasons[0]?.kind === "no_visible_face" ? null : similarity, score, reasons, locked: false });
+        if (!covered || choice === "deliver") similarity = null;
+        sel.set(r.id, {
+          imageId: r.id,
+          projectId,
+          choice,
+          momentId,
+          shotType: shot,
+          alternativeOf,
+          rank,
+          coveredBy: covered && choice !== "deliver" ? cover : null,
+          coveredSimilarity: similarity,
+          score,
+          reasons,
+          locked: false,
+          origin: "engine",
+        });
       });
       const d = [...delivered];
       if (d.length) lastDelivered = d[d.length - 1];
     }
+    // Locked rows kept their cover from before the run.
+    refreshCovers(new Set([...locked.values()].map((r) => sel.get(r.imageId)?.momentId).filter((m): m is number => m != null)));
     overlay(ids(photos));
     const c = counts(projectId);
     const shootType = settings.shootType ?? (ctx.requireProject(projectId).shootType as TargetRunSettings["shootType"]);
@@ -262,7 +386,7 @@ export function createMockTarget(ctx: MockTargetContext) {
       startedAtMs: Date.now() - 1000,
       finishedAtMs: Date.now(),
       appliedAtMs: runs.get(projectId)?.appliedAtMs ?? null,
-      message: `Picked ${c.deliver} of ${c.total} photos`,
+      message: `Picked ${c.deliver.toLocaleString("en-US")} of ${c.total.toLocaleString("en-US")} photos`,
       modelVersion: "mock-identity@1+mock-selection@1",
       counts: c,
       peopleQuestions: 0,
@@ -284,7 +408,18 @@ export function createMockTarget(ctx: MockTargetContext) {
   };
   const snap = (id: number): TargetSnapshot => {
     const r = sel.get(id)!;
-    return { imageId: id, choice: r.choice, alternativeOf: r.alternativeOf, rank: r.rank, coveredBy: r.coveredBy, locked: r.locked, cull: cullOf(id) };
+    return {
+      imageId: id,
+      choice: r.choice,
+      alternativeOf: r.alternativeOf,
+      rank: r.rank,
+      coveredBy: r.coveredBy,
+      coveredSimilarity: r.coveredSimilarity,
+      locked: r.locked,
+      origin: r.origin,
+      reasons: r.reasons.map((x) => ({ ...x })),
+      cull: cullOf(id),
+    };
   };
   const compact = (parent: number) => {
     [...sel.values()]
@@ -304,6 +439,7 @@ export function createMockTarget(ctx: MockTargetContext) {
       }
     }
     const parent = r.choice === "alternative" ? r.alternativeOf : null;
+    if (r.choice !== choice) r.origin = "user";
     Object.assign(r, { choice, alternativeOf: null, rank: null, locked: true });
     if (choice === "deliver") Object.assign(r, { coveredBy: null, coveredSimilarity: null });
     if (parent != null) compact(parent);
@@ -315,6 +451,7 @@ export function createMockTarget(ctx: MockTargetContext) {
     e.pickOrigin = pick === "unflagged" ? null : "user";
     return true;
   };
+  const momentsOf = (ids: Iterable<number>) => new Set([...ids].map((id) => sel.get(id)?.momentId).filter((m): m is number => m != null));
   function edit(ids: number[], f: (flags: number[]) => void): TargetEditResult {
     ctx.guardWrite();
     if (!ids.length) throw { kind: "invalid_argument", message: "no photos given" };
@@ -325,9 +462,13 @@ export function createMockTarget(ctx: MockTargetContext) {
       const parent = sel.get(id)!.alternativeOf;
       for (const r of sel.values()) if (r.alternativeOf === id || r.coveredBy === id || (parent != null && r.alternativeOf === parent)) touched.add(r.imageId);
     }
+    const ms = momentsOf(touched);
+    for (const r of sel.values()) if (r.momentId != null && ms.has(r.momentId)) touched.add(r.imageId);
     const before = [...touched].sort((a, b) => a - b).map(snap);
     const flags: number[] = [];
     f(flags);
+    for (const m of momentsOf(ids)) ms.add(m);
+    refreshCovers(ms);
     overlay(touched);
     const changed: ImageSelection[] = [];
     const previous: TargetSnapshot[] = [];
@@ -342,6 +483,7 @@ export function createMockTarget(ctx: MockTargetContext) {
   }
 
   function noteUserFlags(ids: number[], pick: PickFlag) {
+    const changed: number[] = [];
     for (const id of ids) {
       const r = sel.get(id);
       if (!r) continue;
@@ -352,9 +494,51 @@ export function createMockTarget(ctx: MockTargetContext) {
       }
       moveTo(id, target);
       userReason(r, pick === "pick" ? "You picked this" : pick === "reject" ? "You rejected this" : "You removed the flag");
+      changed.push(id);
     }
+    refreshCovers(momentsOf(changed));
     overlay(ids);
   }
+
+  // ---- apply (Rust `db::target::{apply_steps, plan_apply, apply}`) ----
+  type Step = { id: number; step: "user" | "same" | PickFlag; rejectable: boolean };
+  function applySteps(projectId: number, opts: TargetApplyOptions): Step[] {
+    const out: Step[] = [];
+    for (const r of [...sel.values()].sort((a, b) => a.imageId - b.imageId)) {
+      if (r.projectId !== projectId) continue;
+      const e = ctx.byId.get(r.imageId)!;
+      if (e.pick !== "unflagged" && e.pickOrigin !== "auto") {
+        out.push({ id: r.imageId, step: "user", rejectable: false });
+        continue;
+      }
+      const suggested = e.quality?.suggestedPick;
+      if (!suggested) {
+        out.push({ id: r.imageId, step: "same", rejectable: false });
+        continue;
+      }
+      const rejectable = suggested === "reject" && e.pick !== "reject";
+      const next: PickFlag = suggested === "reject" && !opts.rejects && e.pick !== "reject" ? "unflagged" : suggested;
+      out.push({ id: r.imageId, step: next === e.pick ? "same" : next, rejectable });
+    }
+    return out;
+  }
+  function tally(steps: Step[]): TargetApplyPlan {
+    const p: TargetApplyPlan = { total: steps.length, picks: 0, rejects: 0, rejectable: 0, unflags: 0, unchanged: 0, userFlagged: 0 };
+    for (const s of steps) {
+      if (s.rejectable) p.rejectable++;
+      if (s.step === "user") p.userFlagged++;
+      else if (s.step === "same") p.unchanged++;
+      else if (s.step === "pick") p.picks++;
+      else if (s.step === "reject") p.rejects++;
+      else p.unflags++;
+    }
+    return p;
+  }
+  const applyOpts = (a: Record<string, unknown>): TargetApplyOptions => {
+    const o = a.opts as TargetApplyOptions | undefined;
+    if (!o || typeof o.rejects !== "boolean") throw { kind: "invalid_argument", message: "invalid args: missing field `opts`" };
+    return o;
+  };
 
   function startRun(projectId: number, settings: TargetRunSettings): TargetRun {
     ctx.guardWrite();
@@ -448,7 +632,8 @@ export function createMockTarget(ctx: MockTargetContext) {
           .sort((a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0) || a.id - b.id)
           .map((m): Moment => {
             const members = [...sel.values()].filter((r) => r.momentId === m.id).sort((a, b) => time(a.imageId) - time(b.imageId) || a.imageId - b.imageId);
-            return { ...m, imageIds: members.map((r) => r.imageId), deliveredIds: members.filter((r) => r.choice === "deliver").map((r) => r.imageId) };
+            const delivered = members.filter((r) => r.choice === "deliver");
+            return { ...m, imageIds: members.map((r) => r.imageId), deliveredIds: delivered.map((r) => r.imageId), userDeliveredIds: delivered.filter((r) => r.origin === "user").map((r) => r.imageId) };
           })
           .filter((m) => m.imageIds.length > 0);
       }
@@ -475,7 +660,11 @@ export function createMockTarget(ctx: MockTargetContext) {
         if (!r || r.choice === "deliver" || r.coveredBy == null) return null;
         const c = sel.get(r.coveredBy);
         if (!c || c.choice !== "deliver") return null;
-        return { imageId: id, coveredById: c.imageId, similarity: r.coveredSimilarity ?? 0, sameMoment: r.momentId != null && r.momentId === c.momentId, text: `Already kept a similar one: ${stem(c.imageId)}` } satisfies CoveredBy;
+        const similarity = r.coveredSimilarity ?? 0;
+        const sameMoment = r.momentId != null && r.momentId === c.momentId;
+        const tier = tierOf(similarity, sameMoment);
+        const name = stem(c.imageId);
+        return { imageId: id, coveredById: c.imageId, coveredByName: name, similarity, tier, sameMoment, coveredByOrigin: c.origin, text: coveredText(tier, name, c.origin) } satisfies CoveredBy;
       }
       case "swap_alternative": {
         const d = args.deliveredId as number;
@@ -489,7 +678,7 @@ export function createMockTarget(ctx: MockTargetContext) {
             if (r.choice === "alternative" && r.alternativeOf === d) Object.assign(r, { alternativeOf: a, rank: (r.rank ?? 0) + 1 });
             if (r.coveredBy === d && r.imageId !== a) r.coveredBy = a;
           }
-          Object.assign(sel.get(d)!, { choice: "alternative", alternativeOf: a, rank: 1, locked: true, coveredBy: a, coveredSimilarity: null });
+          Object.assign(sel.get(d)!, { choice: "alternative", alternativeOf: a, rank: 1, locked: true, origin: "user", coveredBy: a, coveredSimilarity: null });
           compact(a);
           userReason(sel.get(a)!, `You swapped this in for ${stem(d)}`, d);
           userReason(sel.get(d)!, `You swapped this out for ${stem(a)}`, a);
@@ -513,12 +702,12 @@ export function createMockTarget(ctx: MockTargetContext) {
         return edit(ids, (flags) => {
           for (const id of ids) {
             const r = requireRow(id);
-            if (r.choice === choice) {
-              r.locked = true;
-              continue;
+            if (r.choice === choice) r.locked = true;
+            else {
+              moveTo(id, choice);
+              userReason(r, choice === "deliver" ? "You added this" : choice === "not_sure" ? "You marked this not sure" : "You set this aside");
             }
-            moveTo(id, choice);
-            userReason(r, choice === "deliver" ? "You added this" : choice === "not_sure" ? "You marked this not sure" : "You set this aside");
+            // v20.1: the flag follows also when the choice is unchanged (Keep).
             const pick = ctx.byId.get(id)!.pick;
             const next: PickFlag | null = choice === "deliver" ? "pick" : pick === "pick" ? "unflagged" : null;
             if (next && writeUserFlag(id, next)) flags.push(id);
@@ -530,11 +719,21 @@ export function createMockTarget(ctx: MockTargetContext) {
         const snaps = (args.snapshots as TargetSnapshot[]) ?? [];
         for (const s of snaps) requireRow(s.imageId);
         const changed = new Set<number>();
+        const key = (r: Row) => JSON.stringify([r.choice, r.alternativeOf, r.rank, r.coveredBy, r.coveredSimilarity, r.locked, r.origin, r.reasons]);
         for (const s of snaps) {
           const r = sel.get(s.imageId)!;
-          const before = JSON.stringify([r.choice, r.alternativeOf, r.rank, r.coveredBy, r.locked]);
-          Object.assign(r, { choice: s.choice, alternativeOf: s.alternativeOf, rank: s.rank, coveredBy: s.coveredBy, locked: s.locked });
-          if (JSON.stringify([r.choice, r.alternativeOf, r.rank, r.coveredBy, r.locked]) !== before) changed.add(s.imageId);
+          const before = key(r);
+          Object.assign(r, {
+            choice: s.choice,
+            alternativeOf: s.alternativeOf,
+            rank: s.rank,
+            coveredBy: s.coveredBy,
+            coveredSimilarity: s.coveredSimilarity,
+            locked: s.locked,
+            origin: s.origin,
+            reasons: s.reasons.map((x) => ({ ...x })),
+          });
+          if (key(r) !== before) changed.add(s.imageId);
           const e = ctx.byId.get(s.imageId)!;
           const c = s.cull;
           if (e.pick !== c.pick || e.rating !== c.rating || e.colorLabel !== c.colorLabel || (c.pick !== "unflagged" && e.pickOrigin !== (c.pickOrigin ?? "user"))) changed.add(s.imageId);
@@ -543,33 +742,93 @@ export function createMockTarget(ctx: MockTargetContext) {
         overlay(snaps.map((s) => s.imageId));
         return [...changed].sort((a, b) => a - b);
       }
+      case "lock_target_choices": {
+        ctx.guardWrite();
+        const ids = (args.ids as number[]) ?? [];
+        for (const i of ids) if (!ctx.byId.get(i)) throw { kind: "not_found", message: `image ${i}` };
+        const out: number[] = [];
+        for (const i of ids) {
+          const r = sel.get(i);
+          if (r && !r.locked) {
+            r.locked = true;
+            out.push(i);
+          }
+        }
+        return out;
+      }
+      case "plan_target_apply": {
+        const projectId = args.projectId as number;
+        ctx.requireProject(projectId);
+        return tally(applySteps(projectId, applyOpts(args)));
+      }
       case "apply_target_selection": {
         ctx.guardWrite();
         const projectId = args.projectId as number;
         ctx.requireProject(projectId);
-        let applied = 0;
-        let total = 0;
-        for (const r of sel.values()) {
-          if (r.projectId !== projectId) continue;
-          total++;
-          const e = ctx.byId.get(r.imageId)!;
-          if (!e.quality || !(e.pick === "unflagged" || e.pickOrigin === "auto")) continue;
-          if (e.pick === e.quality.suggestedPick) continue;
-          e.pick = e.quality.suggestedPick;
+        const steps = applySteps(projectId, applyOpts(args));
+        const plan = tally(steps);
+        const writes = steps.filter((s) => s.step !== "user" && s.step !== "same");
+        const previous = writes.map((s) => cullOf(s.id));
+        for (const s of writes) {
+          const e = ctx.byId.get(s.id)!;
+          e.pick = s.step as PickFlag;
           e.pickOrigin = e.pick === "unflagged" ? null : "auto";
-          applied++;
         }
+        const appliedAtMs = Date.now();
         const run = runs.get(projectId);
-        if (run) run.appliedAtMs = Date.now();
-        return { applied, skipped: total - applied } satisfies ApplySuggestionsResult;
+        if (run) run.appliedAtMs = appliedAtMs;
+        return {
+          picks: plan.picks,
+          rejects: plan.rejects,
+          unflags: plan.unflags,
+          unchanged: plan.unchanged,
+          userFlagged: plan.userFlagged,
+          changed: writes.map((s) => s.id),
+          previous,
+          appliedAtMs,
+        } satisfies TargetApplyResult;
       }
       default:
         return NOT_TARGET;
     }
   }
 
-  /** `ImageQuery.targetChoices` (Rust `db::target::choices_clause`). */
-  const choiceOk = (id: number, choices: TargetChoice[] | null | undefined) => !choices?.length || choices.includes(sel.get(id)?.choice as TargetChoice);
+  /** `ImageQuery.targetChoices` / `targetReasonKinds` / `targetPiles` (Rust `repo::query_filter`). */
+  const queryOk = (id: number, q: Pick<ImageQuery, "targetChoices" | "targetReasonKinds" | "targetPiles">) => {
+    const r = sel.get(id);
+    if (q.targetChoices?.length && !(r && q.targetChoices.includes(r.choice))) return false;
+    if (q.targetReasonKinds?.length && !(r?.reasons[0] && q.targetReasonKinds.includes(r.reasons[0].kind))) return false;
+    if (q.targetPiles?.length) {
+      const pile = r ? pileOf(r) : null;
+      if (!pile || !q.targetPiles.includes(pile)) return false;
+    }
+    return true;
+  };
+  /** Kept for callers of v20: `ImageQuery.targetChoices` only. */
+  const choiceOk = (id: number, choices: TargetChoice[] | null | undefined) => queryOk(id, { targetChoices: choices ?? [] });
 
-  return { handle, noteUserFlags, choiceOk };
+  /** Sort `target_moment` (Rust `repo::sort_rows`): moment start, moment id, score desc, then capture order. */
+  function sortByMoment(ids: number[], descending: boolean): number[] {
+    const key = (id: number) => {
+      const r = sel.get(id);
+      const m = r?.momentId != null ? moments.get(r.momentId) : undefined;
+      return { m, score: r?.score ?? 0, t: ctx.byId.get(id)?.capture.capturedAtMs ?? null, name: ctx.byId.get(id)?.fileName ?? "" };
+    };
+    return [...ids].sort((a, b) => {
+      const x = key(a);
+      const y = key(b);
+      if (!x.m || !y.m) {
+        if (x.m || y.m) return x.m ? -1 : 1;
+      } else {
+        const mx = x.m.startedAtMs;
+        const my = y.m.startedAtMs;
+        let c = (mx == null ? 1 : 0) - (my == null ? 1 : 0) || (mx ?? 0) - (my ?? 0) || x.m.id - y.m.id;
+        if (descending) c = -c;
+        if (c) return c;
+      }
+      return y.score - x.score || (x.t == null ? 1 : 0) - (y.t == null ? 1 : 0) || (x.t ?? 0) - (y.t ?? 0) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0) || a - b;
+    });
+  }
+
+  return { handle, noteUserFlags, choiceOk, queryOk, sortByMoment };
 }

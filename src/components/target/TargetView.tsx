@@ -3,7 +3,20 @@
 // It owns the keyboard while open (keys come from the keymap rows of group "Pick the best N").
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronRight, Flag, Undo2, X } from "lucide-react";
-import { commands, unwrap, type KeeperRule, type ShootType, type TargetChoice, type TargetEditResult, type TargetRun, type TargetSnapshot } from "../../ipc";
+import {
+  commands,
+  unwrap,
+  type CullSnapshot,
+  type KeeperRule,
+  type ShootType,
+  type TargetApplyOptions,
+  type TargetApplyPlan,
+  type TargetApplyResult,
+  type TargetChoice,
+  type TargetEditResult,
+  type TargetRun,
+  type TargetSnapshot,
+} from "../../ipc";
 import { useEntries } from "../../hooks/useTarget";
 import { useKeyboard } from "../../hooks/useKeyboard";
 import { hint, matchTargetKey, type TargetStage } from "../../lib/keymap";
@@ -37,6 +50,8 @@ interface Props {
   onClose: () => void;
   onShowInGrid: (choices: TargetChoice[]) => void;
   onContinueEdit: () => void;
+  /** v20.1: puts an apply on the Cull undo stack ("Apply Pick the best N"); returns its undo. */
+  recordApply?: (previous: CullSnapshot[]) => () => Promise<void>;
   notify: (msg: string) => void;
   onError: (e: unknown) => void;
 }
@@ -201,15 +216,35 @@ export function TargetView(p: Props) {
 
       {applyOpen && run && (
         <ApplyDialog
-          run={run}
           keeperRule={p.keeperRule}
           onClose={() => setApplyOpen(false)}
-          onApply={async () => {
+          onPlan={async (opts) => {
             try {
-              const r = await unwrap(commands.applyTargetSelection(p.projectId));
+              return await unwrap(commands.planTargetApply(p.projectId, opts));
+            } catch (e) {
+              p.onError(e);
+              return null;
+            }
+          }}
+          onApply={async (opts) => {
+            try {
+              const r = await unwrap(commands.applyTargetSelection(p.projectId, opts));
+              const undoApply = r.previous.length > 0 ? p.recordApply?.(r.previous) : undefined;
               await p.refreshRun();
               p.onChanged();
-              return r;
+              const undo = async () => {
+                try {
+                  if (undoApply) await undoApply();
+                  else await unwrap(commands.restoreCullSnapshot(r.previous));
+                  await p.refreshRun();
+                  p.onChanged();
+                  return true;
+                } catch (e) {
+                  p.onError(e);
+                  return false;
+                }
+              };
+              return { result: r, undo };
             } catch (e) {
               p.onError(e);
               return null;
@@ -226,47 +261,92 @@ export function TargetView(p: Props) {
   );
 }
 
+/** The Apply step (v20.1): exact counts from `plan_target_apply`, an optional reject of clear defects, one-step undo. */
 function ApplyDialog({
-  run,
   keeperRule,
   onClose,
+  onPlan,
   onApply,
   onKeeperRule,
   onContinueEdit,
 }: {
-  run: TargetRun;
   keeperRule: KeeperRule | null;
   onClose: () => void;
-  onApply: () => Promise<{ applied: number; skipped: number } | null>;
+  onPlan: (opts: TargetApplyOptions) => Promise<TargetApplyPlan | null>;
+  onApply: (opts: TargetApplyOptions) => Promise<{ result: TargetApplyResult; undo: () => Promise<boolean> } | null>;
   onKeeperRule: (r: KeeperRule) => Promise<void>;
   onContinueEdit: () => void;
 }) {
-  const [result, setResult] = useState<{ applied: number; skipped: number } | null>(null);
+  const [rejects, setRejects] = useState(true);
+  const [plan, setPlan] = useState<TargetApplyPlan | null>(null);
+  const [applied, setApplied] = useState<{ result: TargetApplyResult; undo: () => Promise<boolean> } | null>(null);
+  const [undone, setUndone] = useState(false);
   const [busy, setBusy] = useState(false);
   const [ruleSet, setRuleSet] = useState(false);
-  const offer = !usesPicks(keeperRule) && !ruleSet;
+  const offer = !usesPicks(keeperRule) && !ruleSet && !undone;
+  useEffect(() => {
+    let live = true;
+    setPlan(null);
+    void onPlan({ rejects }).then((r) => {
+      if (live) setPlan(r);
+    });
+    return () => {
+      live = false;
+    };
+  }, [rejects]); // eslint-disable-line react-hooks/exhaustive-deps
+  const writes = plan ? plan.picks + plan.rejects + plan.unflags : 0;
+  const result = applied?.result;
   return (
-    <Dialog label="Apply the picks" testid="target-apply-dialog" className="w-[30rem] rounded-xl border border-neutral-700 bg-neutral-900 p-5 text-sm text-neutral-200 shadow-2xl" onCancel={onClose}>
+    <Dialog label="Apply the picks" testid="target-apply-dialog" className="w-[32rem] rounded-xl border border-neutral-700 bg-neutral-900 p-5 text-sm text-neutral-200 shadow-2xl" onCancel={onClose}>
       {!result ? (
         <>
           <h2 className="text-base font-semibold text-neutral-50">Apply the picks?</h2>
-          <p className="mt-2 text-neutral-300" data-testid="target-apply-text">
-            This marks the {num(run.counts.deliver)} picked photos as Picked in the catalog and in their XMP sidecars. Photos you flagged or starred yourself are never changed, and nothing is rejected or deleted.
+          <div className="mt-2 space-y-1.5 text-neutral-300" data-testid="target-apply-text" data-loading={plan == null}>
+            {plan == null ? (
+              <p>Counting…</p>
+            ) : (
+              <>
+                <p data-testid="target-apply-picks" data-n={plan.picks}>
+                  • <b className="text-neutral-50">{num(plan.picks)}</b> {plan.picks === 1 ? "photo gets" : "photos get"} the Picked flag.
+                </p>
+                {plan.unflags > 0 && (
+                  <p data-testid="target-apply-unflags" data-n={plan.unflags}>
+                    • {plural(plan.unflags, "photo")} {plan.unflags === 1 ? "loses" : "lose"} an earlier Sieve flag.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+          <label className="mt-2 flex items-start gap-2 text-neutral-300" title="Reject the photos Sieve is confident are defects (closed eyes, missed focus, blur). Untick to leave them unflagged">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              data-testid="target-apply-rejects"
+              checked={rejects}
+              title="Also reject the photos with clear defects"
+              onChange={(e) => setRejects(e.target.checked)}
+            />
+            <span data-testid="target-apply-rejects-label" data-n={plan?.rejectable ?? ""}>
+              Also reject <b className="text-neutral-50">{plan ? num(plan.rejectable) : "…"}</b> {plan?.rejectable === 1 ? "photo" : "photos"} with clear defects (closed eyes, missed focus, blur).
+            </span>
+          </label>
+          <p className="mt-3 text-xs text-neutral-400" data-testid="target-apply-note">
+            Your own flags{plan && plan.userFlagged > 0 ? ` (${num(plan.userFlagged)})` : ""} and all stars stay as they are. Flags go to the catalog and to the XMP sidecars next to your RAWs, where Lightroom reads them. You can undo it.
           </p>
           <div className="mt-4 flex justify-end gap-2">
             <ActionButton testid="target-apply-cancel" label="Cancel" keys={["Esc"]} title="Close without writing anything" onClick={onClose} />
             <ActionButton
               testid="target-apply-confirm"
-              label="Apply"
+              label={plan == null ? "Apply" : writes === 0 ? "Nothing to change" : `Apply to ${plural(writes, "photo")}`}
               keys={[]}
               tone="primary"
-              disabled={busy}
-              title="Write the pick flags now"
+              disabled={busy || plan == null || writes === 0}
+              title="Write these flags now (catalog and XMP sidecars)"
               onClick={async () => {
                 setBusy(true);
-                const r = await onApply();
+                const r = await onApply({ rejects });
                 setBusy(false);
-                if (r) setResult(r);
+                if (r) setApplied(r);
               }}
             />
           </div>
@@ -274,10 +354,12 @@ function ApplyDialog({
       ) : (
         <>
           <h2 className="flex items-center gap-2 text-base font-semibold text-neutral-50">
-            <Check className="size-4 text-emerald-400" /> Picks applied
+            {undone ? <Undo2 className="size-4 text-neutral-300" /> : <Check className="size-4 text-emerald-400" />} {undone ? "Apply undone" : "Picks applied"}
           </h2>
-          <p className="mt-2 text-neutral-300" data-testid="target-apply-result">
-            Flagged {plural(result.applied, "photo")} as Picked{result.skipped > 0 ? `; ${num(result.skipped)} left as they were (your own flags, or already right)` : ""}.
+          <p className="mt-2 text-neutral-300" data-testid="target-apply-result" data-picks={result.picks} data-rejects={result.rejects} data-unflags={result.unflags}>
+            {undone
+              ? "The flags are back as they were before the apply."
+              : `Picked ${num(result.picks)} · Rejected ${num(result.rejects)} · Unflagged ${num(result.unflags)}. ${plural(result.unchanged + result.userFlagged, "photo")} left as they were.`}
           </p>
           {offer && (
             <div className="mt-3 rounded-lg border border-sky-900 bg-sky-950/60 p-3" data-testid="target-keeper-offer">
@@ -301,12 +383,27 @@ function ApplyDialog({
               </div>
             </div>
           )}
-          {!offer && usesPicks(keeperRule) && (
+          {!offer && !undone && usesPicks(keeperRule) && (
             <p className="mt-3 text-xs text-emerald-300" data-testid="target-keeper-done">
               Keepers are now the picks.
             </p>
           )}
           <div className="mt-4 flex justify-end gap-2">
+            {!undone && result.changed.length > 0 && (
+              <ActionButton
+                testid="target-apply-undo"
+                label="Undo"
+                keys={[]}
+                disabled={busy}
+                title="Put every flag this apply changed back as it was (also on the Cull undo stack: Cmd+Z in the grid)"
+                onClick={async () => {
+                  setBusy(true);
+                  const ok = await applied!.undo();
+                  setBusy(false);
+                  if (ok) setUndone(true);
+                }}
+              />
+            )}
             <ActionButton testid="target-apply-close" label="Close" keys={["Esc"]} title="Back to Pick the best N" onClick={onClose} />
             <ActionButton testid="target-continue-edit" label="Continue to Edit" keys={[]} tone="good" title="Group the keepers into scenes and edit one photo per scene" onClick={onContinueEdit} />
           </div>
