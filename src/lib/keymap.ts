@@ -103,7 +103,19 @@ export type ActionId =
   | "help"
   | "capsAdvance"
   | "dialogConfirm"
-  | "dialogCancel";
+  | "dialogCancel"
+  | "targetPrev"
+  | "targetNext"
+  | "targetKeep"
+  | "targetReject"
+  | "targetCycle"
+  | "targetSwap"
+  | "targetAdd"
+  | "targetSkip"
+  | "targetYes"
+  | "targetNo"
+  | "targetUndo"
+  | "targetClose";
 
 export interface Chord {
   /** `KeyboardEvent.key` (case-insensitive for letters). */
@@ -144,6 +156,8 @@ export interface KeyContext {
 
 const c = (key: string, o: Omit<Chord, "key"> = {}): Chord => ({ key, ...o });
 const digits = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => c(String(from + i)));
+
+const TARGET_GROUP = "Pick the best N";
 
 export const KEYMAP: KeyDef[] = [
   // ---- crop tool (must come before the culling keys: X swaps the orientation, A locks the aspect, only while cropping) ----
@@ -262,7 +276,39 @@ export const KEYMAP: KeyDef[] = [
   { id: "help", group: "App", label: "Help & FAQ", chords: [c("F1"), c("?", { mod: true, shift: "any" })], modes: ALL, display: ["F1", "Cmd+?"], where: "Everywhere" },
   { id: "dialogConfirm", group: "Dialogs", label: "Confirm (Export: Cmd+Enter)", chords: [], modes: ALL, display: ["Enter"], where: "Topmost dialog", external: true },
   { id: "dialogCancel", group: "Dialogs", label: "Cancel / close", chords: [], modes: ALL, display: ["Esc"], where: "Topmost dialog", external: true },
+
+  // ---- Pick the best N (Cull step overlay: its own key handler reads these rows through `matchTargetKey`; documented here
+  // so the cheat sheet and tooltips share them). Keys are local to the overlay, so Z / X / S / A never clash with the Library. ----
+  { id: "targetPrev", group: TARGET_GROUP, label: "Previous photo (People: previous person)", chords: [c("ArrowLeft")], modes: ALL, display: ["Left"], where: "Pick the best N", external: true },
+  { id: "targetNext", group: TARGET_GROUP, label: "Next photo (People: next person)", chords: [c("ArrowRight")], modes: ALL, display: ["Right"], where: "Pick the best N", external: true },
+  { id: "targetKeep", group: TARGET_GROUP, label: "Keep: add this photo to the delivery set (Review picks: confirm it)", chords: [c("z"), c("p")], modes: ALL, display: ["Z", "P"], where: "Review picks, Second look", external: true },
+  { id: "targetReject", group: TARGET_GROUP, label: "Reject: move this photo to Set aside", chords: [c("x")], modes: ALL, display: ["X"], where: "Review picks", external: true },
+  { id: "targetCycle", group: TARGET_GROUP, label: "Cycle the alternatives of this moment (Shift+Tab / Up: backwards)", chords: [c("Tab", { shift: "any" }), c("ArrowDown"), c("ArrowUp")], modes: ALL, display: ["Tab", "Up / Down"], where: "Review picks", external: true },
+  { id: "targetSwap", group: TARGET_GROUP, label: "Swap: use the shown alternative instead of the pick (Second look: keep this instead of the similar one)", chords: [c("s"), c("Enter")], modes: ALL, display: ["S", "Enter"], where: "Review picks, Second look", external: true },
+  { id: "targetAdd", group: TARGET_GROUP, label: "Add this alternative too (Second look: add both; keep when nothing similar is kept)", chords: [c("a")], modes: ALL, display: ["A"], where: "Review picks, Second look", external: true },
+  { id: "targetSkip", group: TARGET_GROUP, label: "Skip: leave it as it is and go on", chords: [c(" "), c("n")], modes: ALL, display: ["Space", "N"], where: "Second look", external: true },
+  { id: "targetYes", group: TARGET_GROUP, label: "Yes: this person is important (or the couple is right)", chords: [c("y"), c("Enter")], modes: ALL, display: ["Y", "Enter"], where: "People", external: true },
+  { id: "targetNo", group: TARGET_GROUP, label: "No: not important", chords: [c("n")], modes: ALL, display: ["N"], where: "People", external: true },
+  { id: "targetUndo", group: TARGET_GROUP, label: "Undo the last change", chords: [c("z", { mod: true })], modes: ALL, display: ["Cmd+Z"], where: "Pick the best N", external: true },
+  { id: "targetClose", group: TARGET_GROUP, label: "Back to the grid", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Pick the best N", external: true },
 ];
+
+/** Keys of the "Pick the best N" overlay, by stage (the overlay passes its stage; `null` = the key does not apply there). */
+export type TargetStage = "setup" | "people" | "review" | "second";
+const TARGET_KEYS: Record<TargetStage, ActionId[]> = {
+  setup: ["targetClose"],
+  people: ["targetPrev", "targetNext", "targetYes", "targetNo", "targetUndo", "targetClose"],
+  review: ["targetPrev", "targetNext", "targetKeep", "targetReject", "targetCycle", "targetSwap", "targetAdd", "targetUndo", "targetClose"],
+  second: ["targetPrev", "targetNext", "targetKeep", "targetSwap", "targetAdd", "targetSkip", "targetUndo", "targetClose"],
+};
+
+/** The overlay action triggered by `e` in `stage`, if any. */
+export function matchTargetKey(e: KeyboardEvent, stage: TargetStage): ActionId | null {
+  for (const id of TARGET_KEYS[stage]) {
+    for (const d of KEYMAP) if (d.id === id && d.chords.some((ch) => chordMatches(ch, e))) return id;
+  }
+  return null;
+}
 
 function chordMatches(ch: Chord, e: KeyboardEvent): boolean {
   const mod = e.metaKey || e.ctrlKey;

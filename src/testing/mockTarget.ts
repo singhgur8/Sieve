@@ -2,7 +2,8 @@
 // Mirrors `db::target` (storage + user edits) with synthetic engine output:
 // - people: a couple (main, suggested) + 4 recurring people to ask about ("Is this person important?");
 // - moments of every shot type (couple / group / detail / candid / other) over project 1's photos;
-// - a selection with delivered photos, ranked alternatives, not sure / set aside and "covered by".
+// - a selection with delivered photos, ranked alternatives, not sure / set aside and "covered by" (not-sure candids with
+//   no visible face have none: nothing similar is kept, so the second look also shows the plain keep / skip case).
 // Switches (URL of the mock page): `?target=1` starts with a finished run on project 1 (open people
 // questions); without it there is no run until `run_target_selection` (which builds the same data after
 // `window.__mockTargetDelay` ms, default 300, reporting `activity-event` kind `target_selection` and one
@@ -246,7 +247,7 @@ export function createMockTarget(ctx: MockTargetContext) {
           choice = "set_aside";
           reasons.push(shot === "detail" ? reason("detail_out_of_focus", "Focus is not on the object") : reason("near_duplicate", `Almost the same as ${stem(cover ?? r.id)}`, cover));
         }
-        sel.set(r.id, { imageId: r.id, projectId, choice, momentId, shotType: shot, alternativeOf, rank, coveredBy: choice === "deliver" ? null : cover, coveredSimilarity: choice === "deliver" ? null : similarity, score, reasons, locked: false });
+        sel.set(r.id, { imageId: r.id, projectId, choice, momentId, shotType: shot, alternativeOf, rank, coveredBy: choice === "deliver" || reasons[0]?.kind === "no_visible_face" ? null : cover, coveredSimilarity: choice === "deliver" || reasons[0]?.kind === "no_visible_face" ? null : similarity, score, reasons, locked: false });
       });
       const d = [...delivered];
       if (d.length) lastDelivered = d[d.length - 1];

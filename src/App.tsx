@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type SuggestionKinds, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type SuggestionKinds, type TargetChoice, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -45,6 +45,9 @@ import { HelpPanel } from "./components/HelpPanel";
 import { openHelp, useHelpState } from "./lib/helpStore";
 import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
+import { TargetView, type Stage as TargetStage } from "./components/target/TargetView";
+import { hasTargetRun, TargetButton, TargetOffer } from "./components/target/TargetEntry";
+import { useTargetRun } from "./hooks/useTarget";
 import { PhotoInfoPanel } from "./components/PhotoInfoPanel";
 import { CaptureTimeDialog } from "./components/CaptureTimeDialog";
 import { formatOffset } from "./lib/captureTime";
@@ -101,6 +104,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // Edit step overview (the plan) replaces the grid while open; a project that was left in the Edit step reopens on it.
   const [planOpen, setPlanOpen] = useState(projectProp?.workflowStep === "edit");
   const [planFocus, setPlanFocus] = useState<number | null>(null);
+  // "Pick the best N" (target-count culling) overlay of the Cull step; the value is the stage it opened on.
+  const [targetOpen, setTargetOpen] = useState<TargetStage | null>(null);
   // Review mode after an apply: N walks the frames that need a look.
   const [reviewScene, setReviewScene] = useState<number | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
@@ -159,12 +164,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // Cull summary (picked / unflagged / rejected / keepers): follows culling changes, analysis and the keeper rule.
   const analysisRunning = status.analysis?.running ?? false;
   const cullSum = useCullSummary(projectId, [rawLib.epoch, analysisRunning, status.catalog?.keeperRule]);
+  const target = useTargetRun(projectId);
   const burstSizes = useBurstSizes(query.folderId, projectId, analysisRunning);
   const matchScene: Scene | undefined = matchOpen != null ? scenes.scenes.find((s) => s.id === matchOpen) : undefined;
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
+    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || (query.targetChoices?.length ?? 0) > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -754,6 +760,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const goStepNow = useCallback(
     (s: WorkflowStep) => {
       if (projectId == null) return;
+      setTargetOpen(null);
       if (s === "cull") {
         void setStep("cull");
         setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
@@ -1159,10 +1166,40 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     } else setScenesOpen(true);
   }, [scenesOpen]);
 
+  // ---- Pick the best N ----
+  const openTarget = useCallback(
+    (stage?: TargetStage) => {
+      setPlanOpen(false);
+      setMode("grid");
+      setCmp(null);
+      setTargetOpen(stage ?? (hasTargetRun(target.run) ? "review" : "setup"));
+    },
+    [target.run],
+  );
+  const targetChanged = useCallback(() => {
+    void rawLib.refreshAll().catch(reportError);
+    void rawLib.reload();
+    cullSum.refresh();
+    status.refreshXmp();
+    void refreshProject();
+  }, [rawLib, cullSum.refresh, status.refreshXmp, refreshProject, reportError]); // eslint-disable-line react-hooks/exhaustive-deps
+  const showTargetChoices = useCallback((choices: TargetChoice[]) => {
+    setTargetOpen(null);
+    setFiltersOpen(true);
+    setQuery((q) => ({ ...q, targetChoices: choices, keepersOnly: false, picks: [], pickOrigin: null, suggested: null }));
+  }, []);
+
   // ---- keyboard: one handler driven by the shared keymap ----
   const LEAVES_CROP = ["stepCull", "stepEdit", "stepExport", "nextScene", "prevScene", "navH", "navV", "gridJump", "toggleLoupe", "devToLoupe", "toGrid", "escape", "develop", "compare", "filterBar", "gridLoupe", "export", "import", "saveXmp", "copy"];
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
+    if (targetOpen) {
+      // Pick the best N has its own keys; only the help and step shortcuts stay global.
+      const d = matchKey(e, "grid");
+      if (!d || !["cheatSheet", "help", "stepEdit", "stepExport", "stepCull"].includes(d.id)) return;
+      e.preventDefault();
+      return runKey(d, e);
+    }
     const inPlan = planOpen && projectId != null && step === "edit";
     if (inPlan && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       // Plan: Up / Down move the row focus, Enter / D open the representative.
@@ -1619,7 +1656,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       {project && <StyleDialogs wf={wf} fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`} />}
       {(explainOpen || explainerDue) && <XmpExplainer autoSync={status.catalog?.xmpAutoSync ?? false} onClose={closeExplainer} />}
-      {cheatOpen && <CheatSheet mode={mode} editStep={projectId != null && step === "edit" && (planOpen || mode === "develop")} onClose={() => setCheatOpen(false)} />}
+      {cheatOpen && <CheatSheet mode={mode} target={targetOpen != null} editStep={projectId != null && step === "edit" && (planOpen || mode === "develop")} onClose={() => setCheatOpen(false)} />}
       {analysisBarShown && status.analysis && (
         <AnalysisBar a={status.analysis} onCancel={() => void run(() => unwrap(commands.cancelAnalysis()))} onDismiss={() => status.setAnalysis(null)} />
       )}
@@ -1633,7 +1670,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           </button>
         </div>
       )}
-      {planOpen ? null : mode === "grid" ? (
+      {planOpen || targetOpen ? null : mode === "grid" ? (
         catalogEmpty ? null : (
         <>
           {filtersOpen ? (
@@ -1677,6 +1714,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             }
             trailing={
               project && step === "cull" ? (
+                <>
+                <TargetButton run={target.run} onOpen={() => openTarget()} />
                 <button
                   className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600"
                   data-testid="continue-edit"
@@ -1685,10 +1724,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 >
                   Continue to Edit{project.keeperCount > 0 ? ` · ${project.keeperCount} keepers` : ""} <ChevronRight className="size-3.5" />
                 </button>
+                </>
               ) : undefined
             }
             filters={filtersOpen ? <FilterExtras query={uiQuery} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
+          {project && step === "cull" && cullSum.summary && target.loaded && !hasTargetRun(target.run) && target.run?.state !== "running" && cullSum.summary.picked + cullSum.summary.rejected === 0 && (
+            <TargetOffer projectId={project.id} photoCount={project.photoCount} onOpen={() => openTarget("setup")} />
+          )}
           {project && step === "cull" && cullSum.summary && (
             <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} strictness={project.rejectStrictness} onStrictness={(v) => void changeRejectStrictness(v)} />
           )}
@@ -1738,6 +1781,29 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               if (list.length > 0) editAllInScene(list, active != null && list.includes(active) ? active : list[0]);
             }}
           />
+        )}
+        {targetOpen && project && step === "cull" && (
+          <ErrorBoundary view="Pick the best N" overlay onExit={() => setTargetOpen(null)}>
+            <TargetView
+              projectId={project.id}
+              shootType={project.shootType}
+              photoCount={project.photoCount}
+              run={target.run}
+              refreshRun={target.refresh}
+              initialStage={targetOpen}
+              keeperRule={status.catalog?.keeperRule ?? null}
+              onKeeperRule={changeKeeperRule}
+              onChanged={targetChanged}
+              onClose={() => {
+                setTargetOpen(null);
+                targetChanged();
+              }}
+              onShowInGrid={showTargetChoices}
+              onContinueEdit={() => goStep("edit")}
+              notify={setNotice}
+              onError={reportError}
+            />
+          </ErrorBoundary>
         )}
         {planOpen && project && step === "edit" && (
           <ErrorBoundary view="Plan" overlay onExit={() => setPlanOpen(false)}>

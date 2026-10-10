@@ -16,25 +16,26 @@ const EDIT_FIRST: Record<"develop" | "library", string[]> = {
 };
 
 /** Groups ordered so the ones for the current module come first. */
-function ordered(mode: Mode, editStep: boolean) {
-  const first = (editStep ? EDIT_FIRST : FIRST)[mode === "develop" ? "develop" : "library"];
-  const all = keymapGroups();
+function ordered(mode: Mode, editStep: boolean, target: boolean, q: string) {
+  const first = target ? ["Pick the best N", "Culling"] : (editStep ? EDIT_FIRST : FIRST)[mode === "develop" ? "develop" : "library"];
+  // The Pick the best N keys lead while that view is open; in Develop (where they do not apply) they stay out of the way unless searched.
+  const all = keymapGroups().filter((g) => g.group !== "Pick the best N" || target || mode !== "develop" || q !== "");
   return [...first.map((n) => all.find((g) => g.group === n)).filter((g): g is (typeof all)[number] => !!g), ...all.filter((g) => !first.includes(g.group))];
 }
 
-export function CheatSheet({ onClose, mode = "grid", editStep = false }: { onClose: () => void; mode?: Mode; editStep?: boolean }) {
+export function CheatSheet({ onClose, mode = "grid", editStep = false, target = false }: { onClose: () => void; mode?: Mode; editStep?: boolean; target?: boolean }) {
   const [filter, setFilter] = useState("");
   const [more, setMore] = useState(false);
   const cols = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
   const q = filter.trim().toLowerCase();
   const groups = useMemo(() => {
-    const all = ordered(mode, editStep);
+    const all = ordered(mode, editStep, target, q);
     if (!q) return all;
     return all
       .map((g) => ({ ...g, items: g.items.filter((d) => `${d.label} ${d.where} ${g.group} ${d.display.join(" ")}`.toLowerCase().includes(q)) }))
       .filter((g) => g.items.length > 0);
-  }, [mode, editStep, q]);
+  }, [mode, editStep, target, q]);
 
   const measure = () => {
     const el = cols.current;
@@ -72,7 +73,7 @@ export function CheatSheet({ onClose, mode = "grid", editStep = false }: { onClo
     >
       <header className="flex items-center justify-between gap-3 border-b border-neutral-800 px-4 py-2.5">
         <h2 className="shrink-0 font-semibold">
-          Keyboard shortcuts <span className="ml-2 text-xs font-normal text-neutral-400" data-testid="cheat-subtitle">Showing {editStep ? "Edit step" : mode === "develop" ? "Develop" : "Library"} first</span>
+          Keyboard shortcuts <span className="ml-2 text-xs font-normal text-neutral-400" data-testid="cheat-subtitle">Showing {target ? "Pick the best N" : editStep ? "Edit step" : mode === "develop" ? "Develop" : "Library"} first</span>
         </h2>
         <button
           onClick={() => {

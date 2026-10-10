@@ -151,6 +151,26 @@ export const HELP: HelpEntry[] = [
     ],
   },
   {
+    id: "pick-best-n",
+    title: "Pick the best N",
+    keywords: "target count deliver delivery set best pick alternatives people couple important second look swap add moment candid group detail",
+    blocks: [
+      { p: "Instead of flagging every photo, tell Sieve how many you want to deliver (for example 800). It picks the delivery set, and you review only the picks and the borderline photos. The count is a guideline, not a limit. Open it with \"Pick the best N\" in the Cull toolbar." },
+      {
+        ul: [
+          "Pick: enter the count and the shoot type (remembered per shoot type) and run it. The summary shows how many were picked per kind of shot (couple, group, detail, candid), how many are Not sure and how many are Set aside.",
+          "People: Sieve shows who it thinks the couple is (confirm or change who), then asks \"Is this person important?\" for other recurring people. Y means yes, N means no, the arrow keys move between people. Then \"Re-run with these people\". A re-run keeps every keep, reject and swap you made.",
+          "Review picks: one picked photo at a time with a strip of alternatives from the same moment, each with a reason. Left / Right move, Z keeps, X rejects (moves it to Set aside), Tab (or Up / Down) cycles the alternatives, S or Enter swaps the shown alternative in, A adds it too. The counter shows how many picks you have looked at.",
+          "Second look: the Not sure and Set aside photos, fast. Each shows the similar photo that is already kept. Space skips (the default, it moves on by itself), S keeps this one instead of the kept one, A adds both. When nothing similar is kept, A or Z keeps the photo.",
+          "Cmd+Z undoes every change made here. Nothing is deleted or rejected by the selection itself.",
+          "Apply flags writes Picked to the delivery set (flags and XMP sidecars). Photos you flagged or starred yourself are never changed. Afterwards Sieve offers to set the keeper rule to \"Picks, 1★+\" so the picks become the keepers that Edit and Export work on.",
+          "In the grid, Show in grid (or the Best N chip in the filter bar) lists the picks, or the Not sure and Set aside photos.",
+        ],
+      },
+      { shortcuts: true },
+    ],
+  },
+  {
     id: "auto-advance",
     title: "Auto-advance and Caps Lock",
     keywords: "auto advance next photo caps lock",
