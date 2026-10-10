@@ -407,7 +407,7 @@ Model (orchestrator decision 2026-10-10, see decisions.md):
   user already edited are skipped unless "replace" is chosen. One undo for the whole batch.
 - Output is Lightroom-native: everything lands in the XMP sidecars as `crs:` settings so Lightroom renders the same
   look and the user finishes there (Read Metadata from Files / import).
-- [ ] **Contract v21** (architect): baseline edit run (preset id, anchor id, scope, skip / replace) as a background job
+- [x] **Contract v21** (architect): baseline edit run (preset id, anchor id, scope, skip / replace) as a background job
   with activity events; preview command (before / after for a sample of N photos spread across scenes, without
   writing); apply with one batch undo snapshot; per-photo result (applied / skipped (edited) / flagged (low-key,
   silhouette, auto failed) with reason); the look / light key partition as a single documented table in Rust;
