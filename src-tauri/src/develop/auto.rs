@@ -124,6 +124,8 @@ struct Stats {
     chroma: Vec<f32>,
     /// Pixel is skin (inside a face box, else skin-coloured).
     skin: Vec<bool>,
+    /// Render width (pixels are row-major).
+    width: usize,
 }
 
 impl Stats {
@@ -143,6 +145,7 @@ impl Stats {
             luma: Vec::with_capacity(n),
             chroma: Vec::with_capacity(n),
             skin: vec![false; n],
+            width: w,
         };
         for px in img.rgb.as_chunks::<3>().0 {
             let (r, g, b) = (lin[px[0] as usize], lin[px[1] as usize], lin[px[2] as usize]);
@@ -259,6 +262,37 @@ impl Stats {
         (self.l.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / n).sqrt()
     }
 
+    /// Summary for the baseline's low-key / silhouette detection ([`FrameStats`]).
+    /// `faces_known`: the skin mask is face boxes (not estimated skin).
+    fn frame_stats(&self, faces_known: bool) -> FrameStats {
+        let n = self.l.len().max(1);
+        let w = self.width.max(1);
+        let h = self.l.len() / w;
+        let (mut centre, mut nc, mut border, mut nb) = (0.0f64, 0usize, 0.0f64, 0usize);
+        for (i, &l) in self.l.iter().enumerate() {
+            let (x, y) = (i % w, i / w);
+            let inner = x >= w / 4 && x < w - w / 4 && y >= h / 4 && y < h - h / 4;
+            if inner {
+                centre += f64::from(l);
+                nc += 1;
+            } else {
+                border += f64::from(l);
+                nb += 1;
+            }
+        }
+        FrameStats {
+            mean_l: self.l.iter().sum::<f32>() / n as f32,
+            key: self.key(),
+            dark: self.frac(|l| l < 20.0),
+            mid: self.frac(|l| (20.0..=70.0).contains(&l)),
+            bright: self.frac(|l| l > 70.0),
+            white_p995: f32::from(self.white_p995()) / 255.0,
+            face_l: if faces_known { self.skin_mean_l() } else { None },
+            centre_l: if nc > 0 { (centre / nc as f64) as f32 } else { 0.0 },
+            border_l: if nb > 0 { (border / nb as f64) as f32 } else { 0.0 },
+        }
+    }
+
     /// Mean chroma of non-skin mid-tone pixels.
     fn mean_chroma(&self) -> f32 {
         let (mut s, mut n) = (0.0f64, 0usize);
@@ -274,6 +308,29 @@ impl Stats {
             (s / n as f64) as f32
         }
     }
+}
+
+/// Tonal summary of a frame as the camera exposed it (every Auto slider at 0, the given look
+/// and white balance), measured on the uncropped measurement render. Used by the baseline
+/// edit's low-key / silhouette detection (`develop::baseline::low_key`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrameStats {
+    /// Mean L*.
+    pub mean_l: f32,
+    /// Tonal key (mean of median and mean L*), what Auto exposure aims at.
+    pub key: f32,
+    /// Share of pixels with L* < 20 / 20..=70 / > 70.
+    pub dark: f32,
+    pub mid: f32,
+    pub bright: f32,
+    /// 99.5th percentile of the brightest channel, 0..=1 (highlights near 1 = the exposure
+    /// was set for them).
+    pub white_p995: f32,
+    /// Mean L* of the face centres when face boxes are known (`None`: no faces / unknown).
+    pub face_l: Option<f32>,
+    /// Mean L* of the central half (by width and height) and of the ring around it.
+    pub centre_l: f32,
+    pub border_l: f32,
 }
 
 /// Skin mask of a photo without face boxes, from the render with every Auto slider at 0:
@@ -600,6 +657,62 @@ pub fn auto_tone_with_faces(
     auto_tone_opts(cache, src, adjustments, keys, faces, AutoParams::default())
 }
 
+/// The light sliders of Auto (Basic Auto minus Vibrance / Saturation, which are look keys of a
+/// preset / baseline): what [`auto_light`] solves.
+pub const AUTO_LIGHT_FIELDS: &[AdjustmentField] = &[
+    AdjustmentField::Exposure,
+    AdjustmentField::Contrast,
+    AdjustmentField::Highlights,
+    AdjustmentField::Shadows,
+    AdjustmentField::Whites,
+    AdjustmentField::Blacks,
+];
+
+/// Result of [`auto_light`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoLight {
+    /// [`AUTO_LIGHT_FIELDS`] set (vibrance / saturation `None`).
+    pub tone: AutoToneValues,
+    /// Auto white balance; `None` when it could not be estimated (too few neutral pixels): the
+    /// tone was then measured under `adjustments`' own white balance.
+    pub white_balance: Option<WhiteBalanceValues>,
+    /// The frame as exposed (every Auto slider at 0) under that white balance.
+    pub frame: FrameStats,
+}
+
+/// **The** light-only Auto (v21; one function for Develop's Auto on a baseline anchor and the
+/// baseline's `LightMeter`, so "Auto, then nudge" starts the anchor's offset from exactly 0):
+/// 1. auto white balance of `adjustments` ([`auto_white_balance`]; depends only on the
+///    source and the profile, not on the current white balance);
+/// 2. auto tone of the [`AUTO_LIGHT_FIELDS`] on `adjustments` with that white balance set
+///    (custom), faces as given (callers resolve them with [`resolve_faces`]).
+///
+/// Equivalent IPC sequence: `auto_white_balance(id, cur)` = `w`, then
+/// `auto_tone(id, {...cur, whiteBalance: custom w}, AUTO_LIGHT_FIELDS)` (the `auto_tone`
+/// command resolves faces the same way). Vibrance / saturation are never touched. Decode
+/// errors propagate; a white balance that cannot be estimated is `None`, not an error.
+pub fn auto_light(
+    cache: &DevelopCache,
+    src: &SourceImage,
+    adjustments: &ParametricAdjustments,
+    faces: Option<&[NormRect]>,
+) -> AppResult<AutoLight> {
+    let white_balance = match auto_white_balance(cache, src, adjustments) {
+        Ok(wb) => Some(wb),
+        Err(e) if e.kind == crate::ipc::error::ErrorKind::InvalidArgument => None,
+        Err(e) => return Err(e),
+    };
+    let probe = match white_balance {
+        Some(wb) => ParametricAdjustments {
+            white_balance: crate::ipc::types::WhiteBalance::Custom { temperature_k: wb.temperature_k, tint: wb.tint },
+            ..adjustments.clone()
+        },
+        None => adjustments.clone(),
+    };
+    let (tone, frame) = auto_tone_measured(cache, src, &probe, AUTO_LIGHT_FIELDS, faces, AutoParams::default())?;
+    Ok(AutoLight { tone, white_balance, frame })
+}
+
 /// [`auto_tone_with_faces`] with explicit parameters.
 pub fn auto_tone_opts(
     cache: &DevelopCache,
@@ -609,6 +722,19 @@ pub fn auto_tone_opts(
     faces: Option<&[NormRect]>,
     targets: AutoParams,
 ) -> AppResult<AutoToneValues> {
+    auto_tone_measured(cache, src, adjustments, keys, faces, targets).map(|(v, _)| v)
+}
+
+/// [`auto_tone_opts`] plus the [`FrameStats`] of its first measurement (every Auto slider at 0:
+/// the frame as exposed), at no extra render.
+pub fn auto_tone_measured(
+    cache: &DevelopCache,
+    src: &SourceImage,
+    adjustments: &ParametricAdjustments,
+    keys: &[AdjustmentField],
+    faces: Option<&[NormRect]>,
+    targets: AutoParams,
+) -> AppResult<(AutoToneValues, FrameStats)> {
     let want = |k: AdjustmentField| keys.contains(&k);
     use AdjustmentField as F;
     // Stages 1-2 on the settings with every Auto slider at 0: a slider's Auto value does not
@@ -619,6 +745,7 @@ pub fn auto_tone_opts(
     (work.whites, work.blacks, work.vibrance, work.saturation) = (0.0, 0.0, 0.0, 0.0);
     let mut stats = probe.measure(&work)?;
     let has_faces = faces.is_some_and(|f| !f.is_empty()) && stats.has_skin();
+    let frame = stats.frame_stats(has_faces);
     solve_exposure(&mut probe, &mut work, &mut stats, has_faces, &targets)?;
     let features = stats.features(has_faces);
     let mut x = [0.0f32; 1 + 1 + N_FEATURES];
@@ -679,7 +806,7 @@ pub fn auto_tone_opts(
     }
 
     let pick = |k: AdjustmentField, v: f32| want(k).then_some(v);
-    Ok(AutoToneValues {
+    let values = AutoToneValues {
         exposure: pick(F::Exposure, round_to(adj.exposure.clamp(-5.0, 5.0), 0.05)),
         contrast: pick(F::Contrast, adj.contrast.clamp(-100.0, 100.0).round()),
         highlights: pick(F::Highlights, adj.highlights.clamp(-100.0, 100.0).round()),
@@ -688,7 +815,8 @@ pub fn auto_tone_opts(
         blacks: pick(F::Blacks, adj.blacks.clamp(-100.0, 100.0).round()),
         vibrance: pick(F::Vibrance, adj.vibrance.clamp(-100.0, 100.0).round()),
         saturation: pick(F::Saturation, adj.saturation.clamp(-100.0, 100.0).round()),
-    })
+    };
+    Ok((values, frame))
 }
 
 /// Share of skin pixels (face boxes, else skin-coloured) with a channel >= 250 in the render
@@ -779,12 +907,29 @@ pub fn grey_world_multipliers(pixels: &[u16], width: u32, height: u32, start: [f
 /// (as-shot multipliers, G = 1), average the camera values of unclipped, not-too-dark pixels
 /// whose white-balanced log-chroma is within a shrinking radius of neutral, excluding
 /// skin-like chroma, weighting by brightness. `None` when too few neutral pixels exist.
+///
+/// When the as-shot start leaves a warm cast (tungsten light the camera kept warm), the
+/// neutrals themselves look skin-like and the skin exclusion leaves too few candidates: only
+/// then (where the guarded pass finds nothing) a second pass runs without the skin exclusion
+/// (v21, baseline edit; results of frames the guarded pass handles are unchanged).
 pub fn grey_world_multipliers_opts(
     pixels: &[u16],
     width: u32,
     height: u32,
     start: [f32; 3],
     opts: WbOptions,
+) -> Option<[f32; 3]> {
+    grey_world_pass(pixels, width, height, start, opts, true)
+        .or_else(|| grey_world_pass(pixels, width, height, start, opts, false))
+}
+
+fn grey_world_pass(
+    pixels: &[u16],
+    width: u32,
+    height: u32,
+    start: [f32; 3],
+    opts: WbOptions,
+    skin_guard: bool,
 ) -> Option<[f32; 3]> {
     let n = (width as usize) * (height as usize);
     if n == 0 || pixels.len() < n * 3 {
@@ -813,7 +958,7 @@ pub fn grey_world_multipliers_opts(
                 let r = (w[0] / w[1]).ln();
                 let b = (w[2] / w[1]).ln();
                 // Skin-like (warm: red up, blue down) is never evidence of the illuminant.
-                let skin = r > 0.1 && b < -0.1 && r < 0.75 && b > -0.8 && (r - b) > 0.3;
+                let skin = skin_guard && r > 0.1 && b < -0.1 && r < 0.75 && b > -0.8 && (r - b) > 0.3;
                 let sky = opts.exclude_blue && r < -0.08 && b > 0.08 && (b - r) > 0.25;
                 if skin || sky || r * r + b * b > t * t {
                     continue;
