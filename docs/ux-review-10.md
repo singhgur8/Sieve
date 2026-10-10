@@ -326,3 +326,115 @@ Edit 42 photos → Finish in Lightroom (→ Save now when auto-save is off). Tha
   text, the grid's needs-a-look strip with grouped reasons and the per-photo reason, and the `Baseline: needs a look`
   filter chip.
 - Every control has a tooltip.
+
+## Re-check 1 (2026-10-10)
+
+Branch `phase-10-baseline-edit` at 93cd1de (frontend fixes 120baa1, IPC v21.1 + the real baseline engine merged).
+Evidence: mock backend (`vite --port 1469`), throwaway Playwright walks at 1280×800 and 1440×900 on `?baseline=presets`,
+`anchor` and `1`: Plan → Cmd+Alt+B → preset (keyboard) → Enter → Enter → Develop → +0.3 EV → Cmd+Alt+B → step 4 (hold `\`,
+lightbox, Before / after) → Cmd+Enter → result → Plan → Show the 7 → D → fix one flagged photo → Cmd+Enter ×N → Cmd+Alt+B →
+Cmd+Z → Undo the rest → Plan; plus Finish, Cmd+Z in the Plan, reopen after undo, cheat sheet, anchor "Show all", preset
+replace confirm. `tests/ui/baseline-edit.spec.ts`: 27/27 pass. Screenshots were deleted afterwards.
+The engine stub note no longer shows (`engineVersion` is not `baseline-stub` any more), so the "nudged the same way" /
+"matching values in a burst" copy is now backed by the engine.
+
+**Summary: every P0 and P1 is fixed except one new P1 inside P1-7 (Cmd+Enter does nothing after you fix a flagged photo).
+The three skips are acceptable. There are 8 new P2s.**
+
+### Verdict per item
+
+| Item | Verdict | Evidence / note |
+|---|---|---|
+| P0-1 anchor offset / Auto wipes colour | **Fixed** | Soft Film → Develop: the bar reads "Your light vs Auto: same as Auto", and history shows "Preset: Soft Film" then "Baseline: start from Auto". Warm Matte opens at "+0.2 EV" (the preset's own exposure, as specced). +0.3 EV gives "+0.5 EV". Auto in Develop has the light-only tooltip and keeps Vibrance / Saturation. [ARCH] `auto_light` is shared by Develop's Auto and the meter, so Auto now reads "same as Auto". New P2-N6 below. |
+| P0-2 old scene flow contradicts the baseline | **Fixed** (fix 5 skipped, see below) | Step 3: the scene bar shows only the navigator, "Edited · representative" and Plan, with no Apply / Auto edit. After the run the header reads "Baseline: 42 of 43 keepers · 7 need a look". Rows show "On baseline · N need a look", `Review N` and `Edit ▸`, with no `Apply to N` and no `Apply 3 edited scenes`. The `On baseline 3` tab is there, the step pill reads "Edit · baseline ✓" and the header CTA is `Continue to Export`. The refined-representative amber row is covered by the spec test. |
+| P0-2 fix 5 skipped (Auto edit N remaining into ⋯) | **Skip accepted, now P2** | At 1280 on a fresh project the green `Start baseline edit` is the largest, highest-contrast control, directly under the header. The amber header button is small, and after a run it is gone. It still competes a little, so it stays a P2 (unchanged spec). |
+| P1-1 copy | **Fixed** | Step 4 summary, the bar tooltip, help (six reasons; "never changed" list), and Finish section 3 match the spec. No "keeps its own exposure" anywhere. |
+| P1-2 undo | **Fixed** | Cmd+Z in the Plan: the banner shows "Undone. The photos are back to how they were." with `Run again`. Reopening shows `Undone` disabled. The finish toast has `Undo`. Cmd+Z in the view undoes the baseline, or says why not. After fixing one photo, `Undo baseline` is disabled with the amber line "You changed 1 photo after the baseline (DSC00011.ARW). Undo the rest puts the other 41 back…", and `Undo the rest (41)` restores 41 and keeps 1 (`keepLaterEdits`). Copy leftovers: P2-N5. |
+| P1-3 Finish in Lightroom | **Fixed** | Folder in mono + Reveal in Finder + Copy path. The "Develop Settings: None" line, "…and confirm. This replaces any changes…", and "(Save, Cmd+S)" are visible. LUT and imported-profile warnings are conditional (spec test). Multi-folder gap: P2-N8. |
+| P1-4 Cmd+Alt+B in step 3 | **Fixed** | Goes to step 4 at both sizes. |
+| P1-5 preview | **Fixed** | Pinned "Anchor · your edit" tile with an emerald ring. `After only` is the default and groups by scene. Holding `\` flips every tile to Before. Click opens a fit-size Before \| After lightbox with ←/→ and "2 of 12"; Esc closes only the lightbox. The flagged reason is shown under the tile, and `Show 24 more` is there. |
+| P1-6 preset stacking | **Fixed** | Tiles render with the look reset. Changing Soft Film → Warm Matte after a colour edit shows the amber confirm "Replace Soft Film and your colour changes on DSC00001.ARW with Warm Matte? Your light and white balance stay." with Replace / Cancel. |
+| P1-7 flagged review | **Partly fixed: new P1-7a open** | Slim amber bar "Baseline · Needs a look: 7 of 7 left · Back to the result (Cmd+Alt+B)". `Looks good` and `Next to review ›` have titles. Cmd+Enter walks untouched photos to "All 7 checked" + `Back to the baseline`. The Apply split button is hidden on representatives that are on the baseline and grey elsewhere. **But see P1-7a.** |
+| P2-1 "0.0 EV" | Fixed | Rounds first. |
+| P2-2 result labels | Fixed | `Look fine 35 · Need a look 7 · Skipped (already edited) 0`. |
+| P2-3 "#76" names | Fixed | File names show in the flagged list at both sizes. |
+| P2-4 rerun Cancel | Fixed | `Cancel` next to `Edit N photos` while rerunning. |
+| P2-5 "Preset none" after reload | Fixed | Filled from the run / the anchor's `appliedPresetId`. |
+| P2-6 preset tiles | **Partly fixed; the skip of the large pane is accepted** | Tiles are 220 px (4 per row at 1440). Without a large pane the 3-preset library still leaves most of the screen empty, which is acceptable for a one-time choice. Arrow keys work **only once**: see P2-N7. |
+| P2-7 anchor choices | Fixed | `Show all keepers (43)` / `One per scene`, paged by 120. |
+| P2-8 cheat sheet / in-view keys | Fixed (rows-merged skip accepted) | Cmd+Alt+B is first in Workflow. Enter / Cmd+Enter / Cmd+Z / `\` are implemented and listed in a "Baseline edit" group at the end of the sheet (reachable by the filter). |
+| P2-9 Plan banner when done | Fixed | "42 edited · 7 need a look · N checked" + `Finish in Lightroom →` + `Open baseline edit`. |
+| P2-10 "already edited" | Fixed | Legend "(yours, Auto edit, Apply to scene or a sidecar)", `Skip them (0)` / `Replace their edit (0)`. |
+| P2-11 window title | Fixed | `ceremony · Baseline edit · Sieve`. |
+| P2-12 mock fidelity | Fixed | Presets are listed once. |
+
+### New P1
+
+#### P1-7a Cmd+Enter is dead on a flagged photo you just fixed (the normal review path)
+- **Where**: `App.tsx` `case "baselineLooksGood"` (`if (!wf.needsReviewSet.has(active)) return setNotice("This photo is not marked as needing a look")`),
+  `EditContextBar.tsx` (needs-a-look chip).
+- **What** (reproduced at 1280 and 1440): `?baseline=1` → Show the 7 → D on DSC00011 → Exposure +1.20. Any edit clears the
+  photo's needs-a-look mark: the review bar drops to "6 of 7 left". The chip and `Looks good` disappear, and the context bar
+  now reads "Not the representative · Make it the representative (Shift+A)". Pressing Cmd+Enter (12 times in the walk) only
+  shows the toast "This photo is not marked as needing a look". The photo does not change and the user is stuck until they
+  find `N` or the filmstrip. Fixing a photo and moving on is the point of the review: 7 flagged photos, most of which
+  get a touch-up.
+- **Fix**:
+  1. In `baselineLooksGood`: if the active photo is **not** in `needsReviewSet`, do not refuse. Go to the next photo in
+     `needsReviewIds` after it in keeper order (wrap to the first). If none are left, show the existing toast
+     `All N checked` with `Back to the baseline`. Show "This photo is not marked as needing a look" only when the
+     baseline-flagged filter is off **and** nothing is left to review.
+  2. When an edit clears the mark on a photo the baseline flagged (the photo is in `getBaselineResults(..., ["flagged"])`
+     and no longer in `needsReviewSet`), keep a chip in the context bar instead of falling back to the representative
+     hint: emerald `Fixed · was: dark on purpose` (title "You changed this photo, so it no longer needs a look"), followed by
+     `Next to review ›` with the title "Next photo that needs a look (Cmd+Enter or N)".
+- **Acceptance**: `?baseline=1` → Show the 7 → D → change Exposure → the chip reads "Fixed · was: …". Cmd+Enter → the
+  next flagged photo opens and the review bar reads "6 of 7 left". Cmd+Enter ×6 → "All 7 checked".
+
+### New P2
+- **N1 Two "finished" notices at once.** After a run, the centre toast "Edited 42 photos · 7 need a look [Undo]" and the
+  activity corner "Edited 42 photos; 7 need a look" show the same news at the same time (1280 result screen). Fix: do
+  not pop the corner activity notice for `baseline_edit` when the run finishes in the foreground. Keep it only in the
+  activity list.
+- **N2 The finish toast covers the review controls.** The persistent toast with Undo sits top-centre in Develop, over the
+  context bar, right on `Looks good` / `Next to review ›` when the user goes straight to Show the 7 → D. Fix: dismiss
+  the baseline finish toast when the user opens the flagged filter (its Undo stays in the result and on Cmd+Z). Or, in
+  Develop, place toasts below the context bars (top offset = bars' height + 8 px).
+- **N3 A flagged representative shows no reason.** On DSC00055 (flagged, representative of scene 2) the context bar
+  shows "On baseline · representative" and no reason chip or `Looks good`. Only the slim bar's count says it needs a
+  look. Fix: when the active photo is in `needsReviewSet`, render the amber needs-a-look chip + `Looks good` even on a
+  representative. Move the "representative" fact to the chip's title.
+- **N4 `Auto edit (my style)` is live in the flagged review.** It runs over the whole scene and replaces the baseline light
+  there, as Apply did. Fix: while `flaggedReview`, hide it, the same way it is hidden under the Baseline bar.
+- **N5 Undo copy leftovers.** (a) Cmd+Z in the view with a later edit toasts "Later edits on 1 photo. Undo those first",
+  while the screen offers `Undo the rest (41)`. Change it to "You changed 1 photo after the baseline. Use Undo the rest (41)
+  to put the others back". (b) After `Undo the rest`, the result and the banner say "Undone. The photos are back to how
+  they were." but one photo kept its change. When `keptIds` is non-empty, use "Undone for 41 photos. DSC00011.ARW keeps
+  your change." (c) An undone result still shows the `Look fine 35 · Need a look 7` chips. Hide them when undone.
+  (d) `Undo the rest` and `Show the N that need a look` are both amber side by side. Make `Undo the rest` neutral grey:
+  the amber explanation line already carries the warning.
+- **N6 Start from Auto drops the preset's own light.** Warm Matte opens at "+0.2 EV" (Auto + the preset's exposure), but
+  `Start from Auto` (`autoLight(START_LABEL)`) sets plain Auto, so it reads "same as Auto" and loses the +0.2 the user
+  picked the preset for. Fix: have `Start from Auto` re-run `startLight(auto, session.presetLight, …)` (the same values as
+  on entry). Tooltip: "Set exposure … white balance to Auto for this photo, plus the preset's own light. The preset's colours
+  stay". Develop's `Auto` stays plain Auto.
+- **N7 Preset arrow keys work once.** After clicking a tile, → selects the next preset, but focus drops to `<body>` (the
+  tile re-renders), so the next ←/→ does nothing. Fix: keep keys stable and, after `onPick`, focus the tile with
+  `data-selected="true"` in an effect. Or handle the arrows on the view's window listener in step 1 instead of on the grid
+  `onKeyDown`.
+- **N8 Finish shows only the first folder.** `FinishStep` uses `folders[0]`. For a project with several folders, list each
+  path (one line each, with its own Reveal / Copy), headed "The sidecars are in these folders:".
+
+### Keyboard map changes since the review
+| Action | Before | Now | Note |
+|---|---|---|---|
+| Cmd+Alt+B in step 3 | step 1 | step 4 | P1-4 fixed. |
+| Cmd+Z in the Baseline view | nothing | undo the baseline / reason toast | Fix the reason copy (N5a). |
+| Enter / Cmd+Enter in the view | – | next step / Edit N photos, Finish | Works. |
+| Hold `\` in step 4 | – | Before | Works. |
+| Cmd+Enter in the flagged review | – | Looks good, next | Dead after an edit (P1-7a). |
+| ←/→ on preset tiles | – | move + select | Works once (N7). |
+
+### Open P0 / P1 after Re-check 1
+- **P1-7a** Cmd+Enter is dead on a flagged photo you just fixed (frontend-dev, `App.tsx` `baselineLooksGood` + `EditContextBar`).
+- No open P0. Nothing needs the architect.
