@@ -1019,7 +1019,10 @@ v20.1 (UX review 9, schema v20 `0020_target_review.sql`):
   {rejects})` (same `apply_steps` code): picks / rejects / rejectable / unflags / unchanged / userFlagged. With
   `rejects: false` a reject suggestion is not written (a Sieve pick on that photo is cleared). The result carries the
   `CullSnapshot`s of the changed flags; the UI records them on the Cull undo stack ("Apply Pick the best N",
-  `restore_cull_snapshot`). Selection rows are not changed by apply; `applied_at` stays after an undo.
+  `restore_target_apply`). Selection rows are not changed by apply. v20.2: the result also carries
+  `previousAppliedAtMs`; `restore_target_apply(projectId, snapshots, appliedAtMs)` writes the flags back and sets
+  `target_runs.applied_at` in one transaction (undo: the previous stamp, NULL after a first apply; redo: the apply's
+  stamp), so an undone apply reads "not applied yet" again.
 - **Covered by**: every run stores the visual similarity of every pair of frames in the same moment
   (`target_similarity`, `ml::selection::moment_similarities`; moments over 300 frames keep pairs >= 0.3).
   `db::target::refresh_covers` recomputes `covered_by` for whole moments after every edit (`edit`, `note_user_flags`,

@@ -183,6 +183,34 @@ test.describe("IPC v20 mock contract", () => {
     await expect(inv(page, "apply_target_selection", { projectId: 1 })).rejects.toBeTruthy();
   });
 
+  test("v20.2: restore_target_apply puts the flags and the run's applied stamp back (undo / redo)", async ({ page }) => {
+    await openHome(page, 201, "&target=answered");
+    type Run1 = { appliedAtMs: number | null };
+    type Res = { changed: number[]; previous: { imageId: number; pick: string }[]; appliedAtMs: number; previousAppliedAtMs: number | null };
+    const stamp = async () => (await inv<Run1>(page, "get_target_run", { projectId: 1 })).appliedAtMs;
+    expect(await stamp()).toBeNull();
+    const first = await inv<Res>(page, "apply_target_selection", { projectId: 1, opts: { rejects: true } });
+    expect(first.previousAppliedAtMs).toBeNull();
+    expect(await stamp()).toBe(first.appliedAtMs);
+    const after = await inv<{ imageId: number }[]>(page, "get_cull_snapshot", { ids: first.changed });
+    // Undo: flags back, never applied.
+    const changed = await inv<number[]>(page, "restore_target_apply", { projectId: 1, snapshots: first.previous, appliedAtMs: first.previousAppliedAtMs });
+    expect(changed.sort((a, b) => a - b)).toEqual([...first.changed].sort((a, b) => a - b));
+    expect(await stamp()).toBeNull();
+    const back = await inv<Entry[]>(page, "get_images", { ids: first.changed });
+    expect(back.map((e) => e.pick)).toEqual(first.previous.map((s) => s.pick));
+    // Redo: the apply's flags and stamp again; a second apply reports the first stamp as its previous one.
+    await inv(page, "restore_target_apply", { projectId: 1, snapshots: after, appliedAtMs: first.appliedAtMs });
+    expect(await stamp()).toBe(first.appliedAtMs);
+    await inv(page, "restore_target_apply", { projectId: 1, snapshots: first.previous, appliedAtMs: first.appliedAtMs });
+    const second = await inv<Res>(page, "apply_target_selection", { projectId: 1, opts: { rejects: true } });
+    expect(second.previousAppliedAtMs).toBe(first.appliedAtMs);
+    // Unknown project / image: an error and nothing written.
+    await expect(inv(page, "restore_target_apply", { projectId: 99, snapshots: [], appliedAtMs: null })).rejects.toBeTruthy();
+    await expect(inv(page, "restore_target_apply", { projectId: 1, snapshots: [{ ...first.previous[0], imageId: 999999 }], appliedAtMs: null })).rejects.toBeTruthy();
+    expect(await stamp()).toBe(second.appliedAtMs);
+  });
+
   test("run_target_selection without a run: running, then finished with a selection", async ({ page }) => {
     await openHome(page, 201);
     expect(await inv(page, "get_target_run", { projectId: 1 })).toBeNull();

@@ -23,6 +23,9 @@
 //! (dry run: `plan_target_apply`) and returns `CullSnapshot`s for one-step undo. `covered_by`
 //! is recomputed within the moment after every edit (frame similarities stored per run),
 //! with a similarity tier and who delivered the covering photo.
+//!
+//! v20.2: undo / redo of an apply goes through `restore_target_apply`, which also restores
+//! the run's `applied_at` (`TargetApplyResult.previous_applied_at_ms`).
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -541,8 +544,12 @@ pub struct TargetApplyResult {
     /// Images whose flag changed (refetch with `get_images`).
     pub changed: Vec<ImageId>,
     /// Their flags before the apply: push on the Cull undo stack ("Apply Pick the best N") and
-    /// undo with `restore_cull_snapshot(previous)` (apply does not change selection rows).
+    /// undo with `restore_target_apply(projectId, previous, previousAppliedAtMs)` (v20.2; apply
+    /// does not change selection rows).
     pub previous: Vec<CullSnapshot>,
     /// `TargetRun.appliedAtMs` now.
     pub applied_at_ms: i64,
+    /// `TargetRun.appliedAtMs` before this apply (`None`: never applied). Undo restores it, so
+    /// the run reads "not applied yet" again (IPC v20.2).
+    pub previous_applied_at_ms: Option<i64>,
 }

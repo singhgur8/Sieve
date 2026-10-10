@@ -2976,8 +2976,8 @@ pub async fn plan_target_apply(
 /// the scorer's suggestion without its pick (confident-defect rejects only with
 /// `opts.rejects`), for photos that are unflagged or flagged by Sieve (origin `auto`); the
 /// user's flags (incl. target edits) and all stars are left alone. Flags go to the catalog and
-/// the XMP sidecars (auto-sync notified). Undo: `restore_cull_snapshot(result.previous)`.
-/// Unknown project -> `not_found`.
+/// the XMP sidecars (auto-sync notified). Undo: `restore_target_apply(projectId,
+/// result.previous, result.previousAppliedAtMs)` (v20.2). Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_target_selection(
@@ -2992,6 +2992,29 @@ pub async fn apply_target_selection(
         xmp.notify(&app);
     }
     Ok(result)
+}
+
+/// Undo / redo of `apply_target_selection` (v20.2): writes `snapshots` back like
+/// `restore_cull_snapshot` and sets the run's `appliedAtMs` to `applied_at_ms` (undo:
+/// `result.previousAppliedAtMs`, `null` after a first apply; redo: `result.appliedAtMs`), in
+/// one transaction. Unknown project / image -> `not_found`, rating > 5 -> `invalid_argument`,
+/// nothing written. Changed images become XMP-dirty (auto-sync notified). Returns the ids
+/// whose flags changed.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_target_apply(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    project_id: ProjectId,
+    snapshots: Vec<CullSnapshot>,
+    applied_at_ms: Option<i64>,
+) -> AppResult<Vec<ImageId>> {
+    let changed = catalog.run(move |c| target::restore_apply(c, project_id, &snapshots, applied_at_ms)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(changed)
 }
 
 /// Locks the selection rows of `ids` as they are (no flag, choice or reason change; not an

@@ -6,7 +6,6 @@ import { Check, ChevronRight, Flag, Undo2, X } from "lucide-react";
 import {
   commands,
   unwrap,
-  type CullSnapshot,
   type KeeperRule,
   type ShootType,
   type TargetApplyOptions,
@@ -53,7 +52,7 @@ interface Props {
   onShowInGrid: (choices: TargetChoice[]) => void;
   onContinueEdit: () => void;
   /** v20.1: puts an apply on the Cull undo stack ("Apply Pick the best N"); returns its undo. */
-  recordApply?: (previous: CullSnapshot[]) => () => Promise<void>;
+  recordApply?: (result: TargetApplyResult) => () => Promise<void>;
   notify: (msg: string) => void;
   onError: (e: unknown) => void;
 }
@@ -242,13 +241,13 @@ export function TargetView(p: Props) {
           onApply={async (opts) => {
             try {
               const r = await unwrap(commands.applyTargetSelection(p.projectId, opts));
-              const undoApply = r.previous.length > 0 ? p.recordApply?.(r.previous) : undefined;
+              const undoApply = r.previous.length > 0 ? p.recordApply?.(r) : undefined;
               await p.refreshRun();
               p.onChanged();
               const undo = async () => {
                 try {
                   if (undoApply) await undoApply();
-                  else await unwrap(commands.restoreCullSnapshot(r.previous));
+                  else await unwrap(commands.restoreTargetApply(p.projectId, r.previous, r.previousAppliedAtMs));
                   await p.refreshRun();
                   p.onChanged();
                   return true;

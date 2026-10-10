@@ -144,9 +144,9 @@ export function Windowed({ count, focusRow, renderRow, testid, onWidth, rowH = 1
   useEffect(() => {
     const el = ref.current;
     if (!el || focusRow < 0) return;
-    const top = focusRow * rowH;
-    if (top < el.scrollTop) el.scrollTop = top;
-    else if (top + rowH > el.scrollTop + el.clientHeight) el.scrollTop = top + rowH - el.clientHeight;
+    // N3-3: a move to another row puts the focused row one row below the list top (one row of context above, the next
+    // rows visible below) instead of pinning it to the bottom edge. Moves inside a row do not change `focusRow`.
+    el.scrollTop = Math.max(0, focusRow * rowH - rowH);
   }, [focusRow, rowH]);
   const first = Math.max(0, Math.floor(view.top / rowH) - 2);
   const last = Math.min(count - 1, Math.ceil((view.top + view.h) / rowH) + 2);

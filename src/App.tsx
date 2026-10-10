@@ -384,7 +384,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     },
     [lib, reportError, membershipSensitive, status],
   );
-  const cull = useCullUndo({ getEntry: lib.getEntry, onRestored, toast: setNotice, onError: reportError });
+  const refreshTargetRun = target.refresh;
+  const onTargetRestored = useCallback(() => void refreshTargetRun(), [refreshTargetRun]);
+  const cull = useCullUndo({ getEntry: lib.getEntry, onRestored, onTargetRestored, toast: setNotice, onError: reportError });
 
   const advanceIf = useCallback(
     (t: number[], force: boolean) => {
@@ -1810,8 +1812,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               }}
               onShowInGrid={showTargetChoices}
               onContinueEdit={() => goStep("edit")}
-              recordApply={(previous) => {
-                const entry = cull.record("Apply Pick the best N", previous);
+              recordApply={(r) => {
+                const entry = cull.record("Apply Pick the best N", r.previous, { projectId: project.id, appliedAtMs: r.previousAppliedAtMs, otherAppliedAtMs: r.appliedAtMs });
                 return () => cull.undoEntry(entry);
               }}
               notify={(m) => void push(m, { ttl: 3000 })}

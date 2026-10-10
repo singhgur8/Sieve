@@ -1925,30 +1925,35 @@ pub fn cull_snapshot(conn: &Connection, ids: &[ImageId]) -> AppResult<Vec<CullSn
 /// `invalid_argument`; unknown ids -> `not_found`. Changed images become `xmp_dirty`
 /// through the usual triggers. Returns the ids whose values actually changed.
 pub fn restore_cull_snapshot(conn: &mut Connection, snapshots: &[CullSnapshot]) -> AppResult<Vec<ImageId>> {
+    let tx = conn.savepoint()?;
+    let changed = write_cull_snapshot(&tx, snapshots)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// Body of [`restore_cull_snapshot`] for callers that already hold a transaction (the caller
+/// commits, or rolls back on error).
+pub fn write_cull_snapshot(conn: &Connection, snapshots: &[CullSnapshot]) -> AppResult<Vec<ImageId>> {
     if let Some(s) = snapshots.iter().find(|s| s.rating > 5) {
         return Err(AppError::invalid(format!("rating {} is outside 0..=5", s.rating)));
     }
-    let tx = conn.savepoint()?;
     let mut changed = Vec::new();
-    {
-        // `pick_origin` is restored with the flag (v16); it only matters for flagged images.
-        let mut stmt = tx.prepare(
-            "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4, pick_origin = ?5
-             WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4
-                                OR (?3 <> 'unflagged' AND pick_origin IS NOT ?5))",
-        )?;
-        for s in snapshots {
-            ensure_image(&tx, s.image_id)?;
-            let label = s.color_label.map(|l| l.as_str());
-            let origin = s.pick_origin.unwrap_or(PickOrigin::User).as_str();
-            if stmt.execute(params![s.image_id, s.rating, s.pick.as_str(), label, origin])? > 0
-                && !changed.contains(&s.image_id)
-            {
-                changed.push(s.image_id);
-            }
+    // `pick_origin` is restored with the flag (v16); it only matters for flagged images.
+    let mut stmt = conn.prepare_cached(
+        "UPDATE images SET rating = ?2, pick = ?3, color_label = ?4, pick_origin = ?5
+         WHERE id = ?1 AND (rating IS NOT ?2 OR pick IS NOT ?3 OR color_label IS NOT ?4
+                            OR (?3 <> 'unflagged' AND pick_origin IS NOT ?5))",
+    )?;
+    for s in snapshots {
+        ensure_image(conn, s.image_id)?;
+        let label = s.color_label.map(|l| l.as_str());
+        let origin = s.pick_origin.unwrap_or(PickOrigin::User).as_str();
+        if stmt.execute(params![s.image_id, s.rating, s.pick.as_str(), label, origin])? > 0
+            && !changed.contains(&s.image_id)
+        {
+            changed.push(s.image_id);
         }
     }
-    tx.commit()?;
     Ok(changed)
 }
 

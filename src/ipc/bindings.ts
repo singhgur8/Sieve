@@ -1172,8 +1172,8 @@ export const commands = {
 	 *  the scorer's suggestion without its pick (confident-defect rejects only with
 	 *  `opts.rejects`), for photos that are unflagged or flagged by Sieve (origin `auto`); the
 	 *  user's flags (incl. target edits) and all stars are left alone. Flags go to the catalog and
-	 *  the XMP sidecars (auto-sync notified). Undo: `restore_cull_snapshot(result.previous)`.
-	 *  Unknown project -> `not_found`.
+	 *  the XMP sidecars (auto-sync notified). Undo: `restore_target_apply(projectId,
+	 *  result.previous, result.previousAppliedAtMs)` (v20.2). Unknown project -> `not_found`.
 	 */
 	applyTargetSelection: (projectId: number, opts: TargetApplyOptions) => typedError<TargetApplyResult, AppError>(__TAURI_INVOKE("apply_target_selection", { projectId, opts })),
 	/**
@@ -1182,6 +1182,15 @@ export const commands = {
 	 *  user's flags it would skip. Nothing is written. Unknown project -> `not_found`.
 	 */
 	planTargetApply: (projectId: number, opts: TargetApplyOptions) => typedError<TargetApplyPlan, AppError>(__TAURI_INVOKE("plan_target_apply", { projectId, opts })),
+	/**
+	 *  Undo / redo of `apply_target_selection` (v20.2): writes `snapshots` back like
+	 *  `restore_cull_snapshot` and sets the run's `appliedAtMs` to `applied_at_ms` (undo:
+	 *  `result.previousAppliedAtMs`, `null` after a first apply; redo: `result.appliedAtMs`), in
+	 *  one transaction. Unknown project / image -> `not_found`, rating > 5 -> `invalid_argument`,
+	 *  nothing written. Changed images become XMP-dirty (auto-sync notified). Returns the ids
+	 *  whose flags changed.
+	 */
+	restoreTargetApply: (projectId: number, snapshots: CullSnapshot[], appliedAtMs: number | null) => typedError<number[], AppError>(__TAURI_INVOKE("restore_target_apply", { projectId, snapshots, appliedAtMs })),
 	/**
 	 *  Locks the selection rows of `ids` as they are (no flag, choice or reason change; not an
 	 *  undoable edit), so a re-run keeps them: call it with the delivered photos the user reviewed
@@ -5245,11 +5254,17 @@ export type TargetApplyResult = {
 	changed: number[],
 	/**
 	 *  Their flags before the apply: push on the Cull undo stack ("Apply Pick the best N") and
-	 *  undo with `restore_cull_snapshot(previous)` (apply does not change selection rows).
+	 *  undo with `restore_target_apply(projectId, previous, previousAppliedAtMs)` (v20.2; apply
+	 *  does not change selection rows).
 	 */
 	previous: CullSnapshot[],
 	/**  `TargetRun.appliedAtMs` now. */
 	appliedAtMs: number,
+	/**
+	 *  `TargetRun.appliedAtMs` before this apply (`None`: never applied). Undo restores it, so
+	 *  the run reads "not applied yet" again (IPC v20.2).
+	 */
+	previousAppliedAtMs: number | null,
 };
 
 /**  Choice of the selection for one photo (IPC v20). */

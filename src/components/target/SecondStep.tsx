@@ -363,9 +363,15 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
       if (pile === "not_sure" && cross && cov) return noteFlash(`${cov.coveredByName} is the pick of another moment. A keeps this one too`), false;
       const other = swapWith();
       if (other == null || other === target) return noteFlash(), false;
-      entries.need([other]);
-      const r = await ctx.edit(`Swap ${stemOf(entries.get(other), other)} for ${stemOf(targetEntry, target)}`, unwrap(commands.swapAlternative(other, target)), target);
-      if (r) ctx.notify(`Kept ${stemOf(targetEntry, target)} instead of ${stemOf(entries.get(other), other)}. Cmd+Z undoes it`);
+      // N3-2: the name of the photo swapped out, before the edit (which drops it from the entry cache): Not sure knows
+      // it from the covered-by caption; elsewhere fetch the entry when it is not cached yet.
+      let otherName = pile === "not_sure" && cov?.coveredById === other ? cov.coveredByName : null;
+      if (!otherName) {
+        const oe = entries.get(other) ?? (await unwrap(commands.getImages([other])).catch(() => [] as RawImageEntry[]))[0];
+        otherName = stemOf(oe, other);
+      }
+      const r = await ctx.edit(`Swap ${otherName} for ${stemOf(targetEntry, target)}`, unwrap(commands.swapAlternative(other, target)), target);
+      if (r) ctx.notify(`Kept ${stemOf(targetEntry, target)} instead of ${otherName}. Cmd+Z undoes it`);
       return !!r;
     });
   const hasKeptNear = pile === "not_sure" ? !!cov && !cross : target != null && !!momentOf.get(target)?.deliveredIds.length;

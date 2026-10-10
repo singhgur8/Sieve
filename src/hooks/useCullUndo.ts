@@ -12,6 +12,12 @@ export interface CullEntry {
   snaps: CullSnapshot[];
   /** When the change was made (ms), so Develop can undo the newest of culling vs adjustment. */
   at: number;
+  /**
+   * An "Apply Pick the best N" entry (v20.2): restored with `restore_target_apply`, which also sets the run's
+   * `appliedAtMs` to `appliedAtMs` (undo: the stamp before the apply, null = never applied). The opposite entry
+   * swaps `appliedAtMs` / `otherAppliedAtMs`, so redo stamps the run again.
+   */
+  targetApply?: { projectId: number; appliedAtMs: number | null; otherAppliedAtMs: number | null };
 }
 
 export const snapOf = (e: RawImageEntry): CullSnapshot => ({ imageId: e.id, rating: e.rating, pick: e.pick, colorLabel: e.colorLabel, pickOrigin: e.pickOrigin });
@@ -20,11 +26,13 @@ interface Deps {
   getEntry: (id: number) => RawImageEntry | undefined;
   /** Called with the ids that changed after a restore. */
   onRestored: (ids: number[]) => void;
+  /** Called after an "Apply Pick the best N" entry was undone / redone (the run's applied stamp changed). */
+  onTargetRestored?: () => void;
   toast: (msg: string) => void;
   onError: (e: unknown) => void;
 }
 
-export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
+export function useCullUndo({ getEntry, onRestored, onTargetRestored, toast, onError }: Deps) {
   const undoStack = useRef<CullEntry[]>([]);
   const redoStack = useRef<CullEntry[]>([]);
   const busy = useRef(false);
@@ -46,8 +54,8 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
   );
 
   /** Records a change made with `before` as the previous state. */
-  const record = useCallback((label: string, before: CullSnapshot[]): CullEntry => {
-    const entry: CullEntry = { label, ids: before.map((s) => s.imageId), snaps: before, at: Date.now() };
+  const record = useCallback((label: string, before: CullSnapshot[], targetApply?: CullEntry["targetApply"]): CullEntry => {
+    const entry: CullEntry = { label, ids: before.map((s) => s.imageId), snaps: before, at: Date.now(), targetApply };
     undoStack.current = [...undoStack.current, entry].slice(-MAX);
     redoStack.current = [];
     return entry;
@@ -59,8 +67,15 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
       busy.current = true;
       try {
         const current = await unwrap(commands.getCullSnapshot(entry.ids));
-        const changed = await unwrap(commands.restoreCullSnapshot(entry.snaps));
-        const opposite: CullEntry = { label: entry.label, ids: entry.ids, snaps: current, at: Date.now() };
+        const ta = entry.targetApply;
+        const changed = await unwrap(ta ? commands.restoreTargetApply(ta.projectId, entry.snaps, ta.appliedAtMs) : commands.restoreCullSnapshot(entry.snaps));
+        const opposite: CullEntry = {
+          label: entry.label,
+          ids: entry.ids,
+          snaps: current,
+          at: Date.now(),
+          targetApply: ta && { projectId: ta.projectId, appliedAtMs: ta.otherAppliedAtMs, otherAppliedAtMs: ta.appliedAtMs },
+        };
         if (from === "undo") {
           undoStack.current = undoStack.current.filter((x) => x !== entry);
           redoStack.current = [...redoStack.current, opposite].slice(-MAX);
@@ -69,6 +84,7 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
           undoStack.current = [...undoStack.current, opposite].slice(-MAX);
         }
         onRestored(changed);
+        if (ta) onTargetRestored?.();
         toast(`${from === "undo" ? "Undid" : "Redid"}: ${entry.label}`);
       } catch (e) {
         onError(e);
@@ -76,7 +92,7 @@ export function useCullUndo({ getEntry, onRestored, toast, onError }: Deps) {
         busy.current = false;
       }
     },
-    [onRestored, toast, onError],
+    [onRestored, onTargetRestored, toast, onError],
   );
 
   const undo = useCallback(async () => {

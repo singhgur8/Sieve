@@ -1,4 +1,4 @@
-// Mock of the target-count culling commands (IPC v20 / v20.1) for `src/testing/mockBackend.ts`.
+// Mock of the target-count culling commands (IPC v20 / v20.1 / v20.2) for `src/testing/mockBackend.ts`.
 // Mirrors `db::target` (storage + user edits) with synthetic engine output:
 // - people: a couple (main, suggested) + 4 recurring people to ask about ("Is this person important?");
 // - moments of every shot type (couple / group / detail / candid / other) over project 1's photos;
@@ -776,6 +776,7 @@ export function createMockTarget(ctx: MockTargetContext) {
         }
         const appliedAtMs = Date.now();
         const run = runs.get(projectId);
+        const previousAppliedAtMs = run?.appliedAtMs ?? null;
         if (run) run.appliedAtMs = appliedAtMs;
         return {
           picks: plan.picks,
@@ -786,7 +787,30 @@ export function createMockTarget(ctx: MockTargetContext) {
           changed: writes.map((s) => s.id),
           previous,
           appliedAtMs,
+          previousAppliedAtMs,
         } satisfies TargetApplyResult;
+      }
+      case "restore_target_apply": {
+        // v20.2: flags back (like `restore_cull_snapshot`) + the run's applied stamp, all or nothing.
+        ctx.guardWrite();
+        const projectId = args.projectId as number;
+        ctx.requireProject(projectId);
+        const snaps = (args.snapshots as CullSnapshot[]) ?? [];
+        for (const s of snaps) {
+          if (!ctx.byId.get(s.imageId)) throw { kind: "not_found", message: `image ${s.imageId}` };
+          if (s.rating > 5) throw { kind: "invalid_argument", message: `rating ${s.rating} is outside 0..=5` };
+        }
+        const changed: number[] = [];
+        for (const c of snaps) {
+          const e = ctx.byId.get(c.imageId)!;
+          const origin = c.pick === "unflagged" ? null : (c.pickOrigin ?? "user");
+          if (e.pick === c.pick && e.rating === c.rating && e.colorLabel === c.colorLabel && e.pickOrigin === origin) continue;
+          Object.assign(e, { pick: c.pick, rating: c.rating, colorLabel: c.colorLabel, pickOrigin: origin, xmp: { ...e.xmp, dirty: true } });
+          if (!changed.includes(c.imageId)) changed.push(c.imageId);
+        }
+        const run = runs.get(projectId);
+        if (run) run.appliedAtMs = (args.appliedAtMs as number | null) ?? null;
+        return changed;
       }
       default:
         return NOT_TARGET;

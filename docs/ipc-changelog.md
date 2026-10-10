@@ -1039,6 +1039,34 @@ Who updates what
 - vision-ml-dev: nothing required. `moment_similarities` uses `moments::similarity`; if the engine's "covered by"
   similarity ever differs from that function, store the engine's own values instead.
 
+## v20.2 — 2026-10-10 (Phase 9 UX re-check 3 N3-1: undoing an apply restores the run's applied stamp)
+
+Additive (one command, one field), no schema change. `src/ipc/bindings.ts` regenerated.
+
+- `TargetApplyResult.previousAppliedAtMs: number | null`: `TargetRun.appliedAtMs` before this apply (`null` = never
+  applied).
+- New `restore_target_apply(projectId, snapshots: CullSnapshot[], appliedAtMs: number | null) -> number[]` (TS
+  `commands.restoreTargetApply`): writes the flags back exactly like `restore_cull_snapshot` and sets
+  `target_runs.applied_at` to `appliedAtMs`, in one transaction (all or nothing: unknown project / image ->
+  `not_found`, rating > 5 -> `invalid_argument`). Changed images become XMP-dirty (auto-sync notified). Returns the
+  ids whose flags changed. Undo of an apply: `(projectId, result.previous, result.previousAppliedAtMs)`; redo:
+  `(projectId, <snapshot taken before the undo>, result.appliedAtMs)`.
+- `restore_cull_snapshot` is unchanged and no longer used for an apply. `repo::write_cull_snapshot` is its body for
+  callers inside a transaction.
+
+Who updates what
+- architect (done): command + registration, `db::target::restore_apply`, `apply` returns the previous stamp, Rust test
+  `restore_apply_resets_applied_at`, mock (`mockTarget.ts`), bindings. Frontend wiring (done here too):
+  `useCullUndo` entries carry `targetApply {projectId, appliedAtMs, otherAppliedAtMs}` and restore through
+  `restoreTargetApply` (the opposite entry swaps the stamps, so redo stamps the run again) and refresh the run
+  (`onTargetRestored`); `App.tsx` `recordApply(result)`; the Apply dialog's Undo uses the same command when nothing was
+  recorded. Specs: `ipc-v20-mock.spec.ts` (v20.2) and `target-cull.spec.ts` (N3-1).
+- Also in this change (frontend only, re-check 3 P2s): N3-2 swap toast names the replaced photo; N3-3 `Windowed` puts
+  the focused row one row below the list top on row moves; N3-4 the grid sub-header follows the grid focus; N3-5 undo
+  takes back the reviewed marks an action added in Review, and A in the grid keeps the ring on the added photo; N3-6
+  grid footer names Shift+→/↓.
+- rust-engine-dev, vision-ml-dev, frontend-dev: nothing further.
+
 ## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
 
 Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.

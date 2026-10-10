@@ -391,7 +391,10 @@ test.describe("Pick the best N", () => {
     // Undo restores every flag the apply wrote (the plan is back to where it was).
     await page.getByTestId("target-apply-undo").click();
     await expect(result).toContainText("back as they were");
-    expect(await calls(page, "restore_cull_snapshot")).toHaveLength(1);
+    const restored = await calls(page, "restore_target_apply");
+    expect(restored).toHaveLength(1);
+    expect(restored[0].args).toMatchObject({ projectId: 1, appliedAtMs: null }); // v20.2: a first apply -> not applied
+    expect(await calls(page, "restore_cull_snapshot")).toHaveLength(0);
     expect(await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } })).toEqual(planOn);
     await page.getByTestId("target-continue-edit").click();
     await expect(page.getByTestId("plan-view")).toBeVisible();
@@ -1326,5 +1329,147 @@ test.describe("Pick the best N: UX re-check 1", () => {
       for (const k of ["Shift+ArrowDown", "Shift+ArrowRight", "Shift+ArrowUp", "Shift+ArrowLeft"]) await page.keyboard.press(k);
       expect(await attr(page, "target-second", "data-current")).toBe(before);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// UX re-check 3 (docs/ux-review-9.md "Re-check 3"): N3-1 ... N3-6
+// ---------------------------------------------------------------------------------------------------------------------
+test.describe("Pick the best N: UX re-check 3", () => {
+  test("N3-1: undoing the apply (dialog Undo, then Cmd+Z in the Cull grid) puts the Best N row back to not applied", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 201, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+    const row = page.getByTestId("target-best-row");
+    const status = page.getByTestId("target-best-status");
+    await expect(status).toContainText("not applied yet");
+    await expect(row).toHaveAttribute("data-applied", "false");
+    type Plan = { picks: number; rejects: number; unflags: number };
+    const plan0 = await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } });
+    const appliedAt = async () => (await inv<{ appliedAtMs: number | null }>(page, "get_target_run", { projectId: 1 })).appliedAtMs;
+
+    // 1. Apply, then the dialog's Undo.
+    await page.getByTestId("target-best-apply").click();
+    await page.getByTestId("target-apply-confirm").click();
+    await expect(page.getByTestId("target-apply-result")).toBeVisible();
+    expect(await appliedAt()).not.toBeNull();
+    await page.getByTestId("target-apply-undo").click();
+    await expect(page.getByTestId("target-apply-result")).toContainText("back as they were");
+    expect(await appliedAt()).toBeNull();
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("target-view")).toHaveCount(0);
+    await expect(status).toContainText("not applied yet");
+    await expect(row).toHaveAttribute("data-applied", "false");
+    expect(await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } })).toEqual(plan0);
+
+    // 2. Apply again, close everything, Cmd+Z in the Cull grid.
+    await page.getByTestId("target-best-apply").click();
+    await page.getByTestId("target-apply-confirm").click();
+    await expect(page.getByTestId("target-apply-result")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("target-view")).toHaveCount(0);
+    await expect(row).toHaveAttribute("data-applied", "true");
+    await expect(status).toContainText("applied");
+    const stamp = await appliedAt();
+    await clearCalls(page);
+    await page.keyboard.press("Control+z");
+    await expect(page.getByTestId("notice")).toContainText("Undid: Apply Pick the best N");
+    await expect(row).toHaveAttribute("data-applied", "false");
+    await expect(status).toContainText("not applied yet");
+    expect(await appliedAt()).toBeNull();
+    expect((await calls(page, "restore_target_apply"))[0].args).toMatchObject({ projectId: 1, appliedAtMs: null });
+    expect(await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } })).toEqual(plan0);
+    // Redo stamps it again with the apply's time.
+    await page.keyboard.press("Control+Shift+z");
+    await expect(row).toHaveAttribute("data-applied", "true");
+    expect(await appliedAt()).toBe(stamp);
+  });
+
+  test("N3-2: a swap in Not sure names the kept photo it replaces, not its id", async ({ page }) => {
+    await openSecond(page, "&target=answered", 5000);
+    const ids = await notSureIds(page);
+    let at = -1;
+    let cov: Cov = null;
+    for (let i = 0; i < ids.length && at < 0; i++) {
+      const c = await inv<Cov>(page, "get_covered_by", { imageId: ids[i] });
+      if (c && c.sameMoment && c.similarity >= 0.7) [at, cov] = [i, c];
+    }
+    expect(at).toBeGreaterThanOrEqual(0);
+    await gotoNotSure(page, at);
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-current", String(ids[at]));
+    const name = (await inv<{ fileName: string }[]>(page, "get_images", { ids: [ids[at]] }))[0].fileName.replace(/\.[^.]+$/, "");
+    await page.keyboard.press("s");
+    await expect(page.getByTestId("notice")).toContainText(`Kept ${name} instead of ${cov!.coveredByName}`);
+    await expect(page.getByTestId("notice")).not.toContainText("#");
+  });
+
+  test("N3-3 / N3-4 / N3-6: the moment grid keeps the focused row near the top, the header follows the grid focus, the footer names Shift", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 5000, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "review");
+    await page.keyboard.press("g");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-view", "grid");
+    await expect(page.getByTestId("target-review-actions")).toContainText("Up / Down: moment · Shift+→/↓: accept row");
+    await expect(page.getByTestId("target-review-position")).toHaveCount(0);
+    const head = page.getByTestId("target-review-moment-no");
+    await expect(head).toContainText("Moment 1 of ");
+    for (let i = 0; i < 10; i++) await page.keyboard.press("Shift+ArrowRight");
+    await expect(head).toContainText("Moment 11 of ");
+    await page.waitForTimeout(200);
+    const f = page.locator('[data-testid^="target-grid-cell-"][data-focused="true"]');
+    await expect(f).toHaveCount(1);
+    const list = (await page.getByTestId("target-grid").boundingBox())!;
+    const rowBox = (await page.getByTestId("target-grid-row-10").boundingBox())!;
+    expect(rowBox.y - list.y).toBeGreaterThanOrEqual(-1);
+    expect(rowBox.y - list.y).toBeLessThanOrEqual(210);
+    const fb = (await f.boundingBox())!;
+    expect(fb.y + fb.height).toBeLessThanOrEqual(list.y + list.height + 1);
+    // Up goes back one row, still with a row of context above.
+    await page.keyboard.press("ArrowUp");
+    await expect(head).toContainText("Moment 10 of ");
+    await page.waitForTimeout(100);
+    const r9 = (await page.getByTestId("target-grid-row-9").boundingBox())!;
+    expect(r9.y - list.y).toBeLessThanOrEqual(210);
+    // The two-up view shows the photo position again.
+    await page.keyboard.press("g");
+    await expect(page.getByTestId("target-review-position")).toBeVisible();
+  });
+
+  test("N3-5: undoing a swap takes its reviewed marks away; A in the grid keeps the ring on the added photo", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    const first = await attr(page, "target-review", "data-current"); // opens at the first unreviewed pick
+    const reviewedSet = () => page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.review.1") ?? "[]") as number[]);
+    expect(await reviewedSet()).toEqual([]);
+    const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
+    await expect(strip.first()).toBeVisible();
+    const alt = Number((await strip.first().getAttribute("data-testid"))!.replace("target-alt-", ""));
+    await page.keyboard.press("s");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(alt));
+    expect((await reviewedSet()).sort()).toEqual([first, alt].sort());
+    await page.keyboard.press("Control+z");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(first));
+    await expect.poll(reviewedSet).toEqual([]);
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-reviewed", "0");
+
+    // Grid: A on an alternative keeps the focus on it once it sits among the picks.
+    await page.keyboard.press("g");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-view", "grid");
+    const altCell = page.locator('[data-testid^="target-grid-cell-"][data-kind="alt"]').first();
+    await expect(altCell).toBeVisible();
+    const altId = Number((await altCell.getAttribute("data-testid"))!.replace("target-grid-cell-", ""));
+    await altCell.click();
+    await expect(page.getByTestId(`target-grid-cell-${altId}`)).toHaveAttribute("data-focused", "true");
+    await page.keyboard.press("a");
+    await expect(page.getByTestId("notice")).toContainText("too");
+    const cell = page.getByTestId(`target-grid-cell-${altId}`);
+    await expect(cell).toHaveAttribute("data-kind", "pick");
+    await expect(cell).toHaveAttribute("data-focused", "true");
+    await expect(page.locator('[data-testid^="target-grid-cell-"][data-focused="true"]')).toHaveCount(1);
   });
 });

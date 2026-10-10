@@ -31,10 +31,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::db::{now_ms, repo};
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{
-    Alternatives, ChoiceOrigin, CoveredBy, ImageId, ImageSelection, Moment, MomentId, NormRect, PeopleOverview, Person,
-    PersonId, PersonRole, PickFlag, PickOrigin, ProjectId, ShootType, ShotType, ShotTypeCount, SimilarityTier,
-    TargetApplyOptions, TargetApplyPlan, TargetApplyResult, TargetChoice, TargetCounts, TargetPile, TargetReason,
-    TargetReasonKind, TargetRun, TargetRunSettings, TargetRunState, TargetSnapshot,
+    Alternatives, ChoiceOrigin, CoveredBy, CullSnapshot, ImageId, ImageSelection, Moment, MomentId, NormRect,
+    PeopleOverview, Person, PersonId, PersonRole, PickFlag, PickOrigin, ProjectId, ShootType, ShotType, ShotTypeCount,
+    SimilarityTier, TargetApplyOptions, TargetApplyPlan, TargetApplyResult, TargetChoice, TargetCounts, TargetPile,
+    TargetReason, TargetReasonKind, TargetRun, TargetRunSettings, TargetRunState, TargetSnapshot,
 };
 
 /// Faces shown per person (`Person.samples`).
@@ -1166,6 +1166,10 @@ pub fn apply(conn: &mut Connection, project_id: ProjectId, opts: TargetApplyOpti
         .collect();
     let changed: Vec<ImageId> = writes.iter().map(|w| w.0).collect();
     let previous = repo::cull_snapshot(&tx, &changed)?;
+    let previous_applied_at_ms: Option<i64> = tx
+        .query_row("SELECT applied_at FROM target_runs WHERE project_id = ?1", [project_id], |r| r.get(0))
+        .optional()?
+        .flatten();
     {
         let mut stmt = tx.prepare_cached("UPDATE images SET pick = ?2, pick_origin = 'auto' WHERE id = ?1")?;
         for &(id, flag) in &writes {
@@ -1184,7 +1188,27 @@ pub fn apply(conn: &mut Connection, project_id: ProjectId, opts: TargetApplyOpti
         changed,
         previous,
         applied_at_ms,
+        previous_applied_at_ms,
     })
+}
+
+/// `restore_target_apply` (v20.2): undo / redo of [`apply`]. Writes the flags back like
+/// `repo::restore_cull_snapshot` and sets `target_runs.applied_at` to `applied_at_ms` (undo:
+/// the result's `previous_applied_at_ms`, `None` for a first apply; redo: its
+/// `applied_at_ms`), in one transaction. Unknown project or image -> `not_found`, rating > 5
+/// -> `invalid_argument`, nothing written. Returns the ids whose flags changed.
+pub fn restore_apply(
+    conn: &mut Connection,
+    project_id: ProjectId,
+    snapshots: &[CullSnapshot],
+    applied_at_ms: Option<i64>,
+) -> AppResult<Vec<ImageId>> {
+    ensure_project(conn, project_id)?;
+    let tx = conn.savepoint()?;
+    let changed = repo::write_cull_snapshot(&tx, snapshots)?;
+    tx.execute("UPDATE target_runs SET applied_at = ?2 WHERE project_id = ?1", params![project_id, applied_at_ms])?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -2056,6 +2080,46 @@ mod tests {
         assert_eq!(flag(&conn, 6), ("reject".into(), "auto".into()));
         assert_eq!(plan_apply(&conn, 1, TargetApplyOptions::default()).unwrap().unchanged, 5);
         assert!(plan_apply(&conn, 99, no).is_err());
+    }
+
+    /// N3-1 (v20.2): undoing an apply restores the run's `applied_at` with the flags.
+    #[test]
+    fn restore_apply_resets_applied_at() {
+        let mut conn = setup();
+        store(&mut conn);
+        conn.execute(
+            "INSERT INTO target_runs (project_id, target_count, shoot_type, state, started_at) VALUES (1, 2, 'wedding', 'finished', 0)",
+            [],
+        )
+        .unwrap();
+        let applied = |conn: &Connection| get_run(conn, 1, false).unwrap().unwrap().applied_at_ms;
+        assert_eq!(applied(&conn), None);
+        let first = apply(&mut conn, 1, TargetApplyOptions::default()).unwrap();
+        assert_eq!(first.previous_applied_at_ms, None);
+        assert_eq!(applied(&conn), Some(first.applied_at_ms));
+        let before_plan = |conn: &Connection| plan_apply(conn, 1, TargetApplyOptions::default()).unwrap();
+        // Undo: flags back, run not applied.
+        let changed = restore_apply(&mut conn, 1, &first.previous, first.previous_applied_at_ms).unwrap();
+        assert_eq!(changed.len(), first.changed.len());
+        assert_eq!(applied(&conn), None);
+        assert_eq!(flag(&conn, 1).0, "unflagged");
+        let plan = before_plan(&conn);
+        assert_eq!((plan.picks, plan.rejects), (first.picks, first.rejects));
+        // Redo (snapshot of the applied flags + the apply's stamp), then a second apply keeps
+        // the first stamp as its previous one.
+        let after = repo::cull_snapshot(&conn, &first.changed).unwrap();
+        restore_apply(&mut conn, 1, &after, Some(first.applied_at_ms)).unwrap();
+        assert_eq!(applied(&conn), Some(first.applied_at_ms));
+        conn.execute("UPDATE images SET pick = 'unflagged' WHERE id = 1", []).unwrap();
+        let second = apply(&mut conn, 1, TargetApplyOptions::default()).unwrap();
+        assert_eq!(second.previous_applied_at_ms, Some(first.applied_at_ms));
+        restore_apply(&mut conn, 1, &second.previous, second.previous_applied_at_ms).unwrap();
+        assert_eq!(applied(&conn), Some(first.applied_at_ms));
+        // Unknown project / image: nothing written.
+        assert!(restore_apply(&mut conn, 99, &[], None).is_err());
+        let bad = vec![CullSnapshot { image_id: 999, ..first.previous[0].clone() }];
+        assert!(restore_apply(&mut conn, 1, &bad, None).is_err());
+        assert_eq!(applied(&conn), Some(first.applied_at_ms));
     }
 
     #[test]

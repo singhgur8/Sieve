@@ -40,6 +40,24 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
     },
     [projectId],
   );
+  const unmarkReviewed = useCallback(
+    (list: number[]) => {
+      setReviewed((s) => {
+        if (!list.some((i) => s.has(i))) return s;
+        const n = new Set(s);
+        list.forEach((i) => n.delete(i));
+        saveReviewed(projectId, "review", n);
+        return n;
+      });
+    },
+    [projectId],
+  );
+  // N3-5: the reviewed marks each undoable action added (ids that were not reviewed before), so its undo takes them away.
+  const actionMarks = useRef<{ at: number; ids: number[] }[]>([]);
+  const markFor = (at: number, ...ids: number[]) => {
+    actionMarks.current = [...actionMarks.current, { at, ids: [...new Set(ids)].filter((i) => !reviewed.has(i)) }].slice(-200);
+    markReviewed(...ids);
+  };
 
   const loadList = useCallback(
     async (prefer?: number | null) => {
@@ -88,7 +106,13 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
   // Undo moved here (P1-3): select the photo the undone action was made on once the list has it.
   useEffect(() => {
     if (ctx.focus && ctx.focus.stage === "review") {
-      pending.current = ctx.focus.id;
+      const id = ctx.focus.id;
+      const k = actionMarks.current.map((m) => m.at).lastIndexOf(id);
+      if (k >= 0) {
+        unmarkReviewed(actionMarks.current[k].ids);
+        actionMarks.current = actionMarks.current.filter((_, n) => n !== k);
+      }
+      pending.current = id;
       setPendTick((n) => n + 1);
       ctx.focusDone();
     }
@@ -205,14 +229,14 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
       if (cur == null) return;
       const r = await ctx.edit(`Keep ${stemOf(entry, cur)}`, unwrap(commands.setTargetChoice([cur], "deliver")), cur);
       if (r) {
-        markReviewed(cur);
+        markFor(cur, cur);
         go(1);
       }
     });
   const reject = () =>
     act(async () => {
       if (cur == null) return;
-      markReviewed(cur);
+      markFor(cur, cur);
       const r = await ctx.edit(`Set aside ${stemOf(entry, cur)}`, unwrap(commands.setTargetChoice([cur], "set_aside")), cur);
       if (r) ctx.notify(`Set aside ${stemOf(entry, cur)}. Cmd+Z undoes it`);
     });
@@ -222,7 +246,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
       if (!alt) return nudge();
       const r = await ctx.edit(`Swap ${stemOf(entry, cur)} for ${stemOf(altEntry, alt.imageId)}`, unwrap(commands.swapAlternative(cur, alt.imageId)), cur);
       if (r) {
-        markReviewed(alt.imageId, cur);
+        markFor(cur, alt.imageId, cur);
         idx.current = Math.max(0, at);
         setCur(alt.imageId);
         setAltIdx(0);
@@ -295,6 +319,15 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
   useEffect(() => {
     if (view === "grid" && rows[gRow]) needRow(rows[gRow]);
   });
+  const addedFocus = useRef<number | null>(null);
+  useEffect(() => {
+    const want = addedFocus.current;
+    if (want == null) return;
+    const r = rows.find((x) => x.picks.includes(want));
+    if (!r) return;
+    addedFocus.current = null;
+    setG({ key: r.key, col: r.picks.indexOf(want) });
+  }, [rows]);
   const focusRow = (n: number, col = 0) => {
     const r = rows[Math.max(0, Math.min(rows.length - 1, n))];
     if (r) setG({ key: r.key, col });
@@ -324,7 +357,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
     act(async () => {
       if (gid == null || !list.includes(gid)) return;
       const en = entries.get(gid);
-      markReviewed(gid);
+      markFor(gid, gid);
       const r = await ctx.edit(`Set aside ${stemOf(en, gid)}`, unwrap(commands.setTargetChoice([gid], "set_aside")), gid);
       if (r) ctx.notify(`Set aside ${stemOf(en, gid)}. Cmd+Z undoes it`);
     });
@@ -333,7 +366,10 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
       if (gid == null || list.includes(gid)) return;
       const en = entries.get(gid);
       const r = await ctx.edit(`Add ${stemOf(en, gid)}`, unwrap(commands.addAlternative(gid)), cur ?? undefined);
-      if (r) ctx.notify(`Added ${stemOf(en, gid)} too. Cmd+Z undoes it`);
+      if (r) {
+        addedFocus.current = gid; // N3-5: the ring stays on the added photo, which moves among the picks
+        ctx.notify(`Added ${stemOf(en, gid)} too. Cmd+Z undoes it`);
+      }
     });
   const gridNextMoment = () => {
     const r = rows[gRow];
@@ -443,11 +479,14 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
         <div className="h-1.5 w-48 overflow-hidden rounded bg-neutral-800" role="progressbar" aria-valuenow={pct} aria-label="Review progress">
           <div className="h-full bg-emerald-500" style={{ width: `${pct}%` }} />
         </div>
-        <span className="text-xs text-neutral-400" data-testid="target-review-position">
-          Photo {num(at + 1)} of {num(total)}
-        </span>
+        {view === "two" && (
+          <span className="text-xs text-neutral-400" data-testid="target-review-position">
+            Photo {num(at + 1)} of {num(total)}
+          </span>
+        )}
         <span className="text-xs text-neutral-400" data-testid="target-review-moment-no">
-          Moment {num(momentNo)} of {num(order.size)}
+          {/* N3-4: in the grid the position follows the grid focus */}
+          Moment {num(view === "grid" ? gRow + 1 : momentNo)} of {num(view === "grid" ? rows.length : order.size)}
         </span>
         <span className="ml-auto flex items-center gap-2">
           <button className="flex h-7 items-center gap-1.5 rounded bg-neutral-800 px-2 text-xs hover:bg-neutral-700" data-testid="target-show-picks" title="Close this view and show the picked photos in the grid" onClick={() => ctx.showInGrid(["deliver"])}>
@@ -648,7 +687,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
         <ActionButton testid="target-next-moment" label="Accept row" keys={["⇧→"]} title={`Looks good: mark every pick of this row reviewed and go to the next moment${hint("targetNextMoment")}`} onClick={gridNextMoment} />
         <ActionButton testid="target-open-cell" label="Open" keys={["Enter"]} title="Open the focused photo in the two-up view, where S swaps" onClick={openCell} />
         <ActionButton testid="target-grid-toggle" label="Two-up" keys={["G"]} tone="primary" title={`Back to the two-up view${hint("targetGrid")}`} onClick={openCell} />
-        <span className="ml-auto text-xs text-neutral-400">Arrows move · Up / Down: moment · ] / [: next / previous unreviewed</span>
+        <span className="ml-auto text-xs text-neutral-400">Arrows move · Up / Down: moment · Shift+→/↓: accept row · ] / [: next / previous unreviewed</span>
 </>
 ) : (
 <>
