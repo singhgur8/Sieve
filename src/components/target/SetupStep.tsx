@@ -1,5 +1,5 @@
 // Step 1 of "Pick the best N": target count + shoot type, a run with progress and cancel, and the summary of the result.
-import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Loader2, Sparkles, Users, X } from "lucide-react";
 import { commands, unwrap, type ShootType } from "../../ipc";
 import { useActivities } from "../../lib/activity";
@@ -27,6 +27,16 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
   useEffect(() => {
     if (run?.state === "running" || act) setStarting(false);
   }, [run?.state, act]);
+
+  // R1-8: the count field has focus when Setup opens, so B -> type -> Enter works.
+  const countRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const el = countRef.current;
+    if (el && !el.disabled) {
+      el.focus();
+      el.select();
+    }
+  }, []);
 
   const n = Number(count);
   const valid = Number.isInteger(n) && n >= 1 && n <= 100_000;
@@ -65,6 +75,7 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
         <label className="flex flex-col gap-1 text-xs text-neutral-300">
           How many photos do you want to deliver?
           <input
+            ref={countRef}
             type="number"
             min={1}
             max={100000}

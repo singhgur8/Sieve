@@ -1,5 +1,5 @@
 // Small parts shared by the steps of "Pick the best N".
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ImageOff, Loader2 } from "lucide-react";
 import type { ImageSelection, RawImageEntry, ShotType } from "../../ipc";
 import { previewSrc, thumbSrc } from "../../lib/entryImage";
@@ -124,3 +124,45 @@ export function ZoomPic({ entry, zoom, primary = false, className = "", testid }
     </div>
   );
 }
+
+/** Fixed-height rows, only the rows around the viewport are mounted (the piles hold hundreds of rows). */
+export function Windowed({ count, focusRow, renderRow, testid, onWidth, rowH = 176 }: { count: number; focusRow: number; renderRow: (i: number, width: number) => ReactNode; testid: string; onWidth?: (w: number) => void; rowH?: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState({ top: 0, h: 600, w: 900 });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => {
+      setView((v) => ({ ...v, h: el.clientHeight, w: el.clientWidth }));
+      onWidth?.(el.clientWidth);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || focusRow < 0) return;
+    const top = focusRow * rowH;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (top + rowH > el.scrollTop + el.clientHeight) el.scrollTop = top + rowH - el.clientHeight;
+  }, [focusRow, rowH]);
+  const first = Math.max(0, Math.floor(view.top / rowH) - 2);
+  const last = Math.min(count - 1, Math.ceil((view.top + view.h) / rowH) + 2);
+  const rows: ReactNode[] = [];
+  for (let i = first; i <= last; i++)
+    rows.push(
+      <div key={i} className="absolute left-0 right-0" style={{ top: i * rowH, height: rowH }}>
+        {renderRow(i, view.w)}
+      </div>,
+    );
+  return (
+    <div ref={ref} className="min-h-0 flex-1 overflow-y-auto" data-testid={testid} onScroll={(e) => setView((v) => ({ ...v, top: e.currentTarget.scrollTop }))}>
+      <div className="relative" style={{ height: count * rowH }}>
+        {rows}
+      </div>
+    </div>
+  );
+}
+

@@ -229,6 +229,7 @@ export function TargetView(p: Props) {
       {applyOpen && run && (
         <ApplyDialog
           keeperRule={p.keeperRule}
+          delivered={run.counts.deliver}
           onClose={() => setApplyOpen(false)}
           onPlan={async (opts) => {
             try {
@@ -276,6 +277,7 @@ export function TargetView(p: Props) {
 /** The Apply step (v20.1): exact counts from `plan_target_apply`, an optional reject of clear defects, one-step undo. */
 function ApplyDialog({
   keeperRule,
+  delivered,
   onClose,
   onPlan,
   onApply,
@@ -283,6 +285,8 @@ function ApplyDialog({
   onContinueEdit,
 }: {
   keeperRule: KeeperRule | null;
+  /** Photos in the delivery set now (the header count). */
+  delivered: number;
   onClose: () => void;
   onPlan: (opts: TargetApplyOptions) => Promise<TargetApplyPlan | null>;
   onApply: (opts: TargetApplyOptions) => Promise<{ result: TargetApplyResult; undo: () => Promise<boolean> } | null>;
@@ -319,7 +323,8 @@ function ApplyDialog({
             ) : (
               <>
                 <p data-testid="target-apply-picks" data-n={plan.picks}>
-                  • <b className="text-neutral-50">{num(plan.picks)}</b> {plan.picks === 1 ? "photo gets" : "photos get"} the Picked flag.
+                  • <b className="text-neutral-50">{num(plan.picks)}</b> {plan.picks === 1 ? "photo gets" : "photos get"} the Picked flag
+                  {delivered - plan.picks > 0 && <span data-testid="target-apply-already"> (the other {num(delivered - plan.picks)} {delivered - plan.picks === 1 ? "pick already has" : "picks already have"} it)</span>}.
                 </p>
                 {plan.unflags > 0 && (
                   <p data-testid="target-apply-unflags" data-n={plan.unflags}>

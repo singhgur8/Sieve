@@ -294,7 +294,7 @@ test.describe("Pick the best N", () => {
     const noCover = page.getByTestId("target-no-cover");
 
     // Skip (Space) advances on its own and counts as reviewed.
-    await expect(covered.or(noCover)).toBeVisible();
+    await expect(covered.or(noCover).or(page.getByTestId("target-cover-thumb"))).toBeVisible();
     const id0 = await cur();
     await page.keyboard.press(" ");
     await expect.poll(cur).not.toBe(id0);
@@ -303,7 +303,7 @@ test.describe("Pick the best N", () => {
     /** Steps with skip until a photo with (or without) a covered-by thumbnail shows. */
     const stepTo = async (withCover: boolean) => {
       for (let i = 0; i < n; i++) {
-        await expect(covered.or(noCover)).toBeVisible();
+        await expect(covered.or(noCover).or(page.getByTestId("target-cover-thumb"))).toBeVisible(); // a weak cover (R1-1) shows the small thumb instead
         if ((await covered.count()) > 0 === withCover) return;
         await page.keyboard.press(" ");
       }
@@ -848,7 +848,7 @@ test.describe("Pick the best N: UX review 9", () => {
     await expect(page.getByTestId("target-next-second")).toContainText(`Second look · ${c.notSure} not sure`);
   });
 
-  test("P1-11: toasts sit top-right under the header while the overlay is open, one at a time", async ({ page }) => {
+  test("P1-11: toasts sit bottom-right (R1-4) while the overlay is open, one at a time", async ({ page }) => {
     await openTarget(page, "&target=answered");
     await tab(page, "review");
     await page.keyboard.press("x");
@@ -856,8 +856,7 @@ test.describe("Pick the best N: UX review 9", () => {
     await expect(notice).toHaveCount(1);
     const bb = (await notice.boundingBox())!;
     const vp = page.viewportSize()!;
-    expect(bb.y).toBeGreaterThan(90);
-    expect(bb.y).toBeLessThan(160);
+    expect(bb.y + bb.height).toBeGreaterThan(vp.height - 100); // R1-4: bottom right, above the action bar
     expect(bb.x + bb.width).toBeGreaterThan(vp.width - 30);
     await page.keyboard.press("x");
     await expect(notice).toHaveCount(1); // the newest replaces the older one
@@ -880,4 +879,369 @@ test("P1-3: swap on photo 1, Cmd+Z returns to photo 1 (the swapped-in id is no l
   await expect.poll(async () => (await selOf(page, alt)).choice).toBe("alternative");
   await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(first));
   await expect(page.getByTestId("target-review")).toHaveAttribute("data-total", String(total));
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// UX re-check 1 (docs/ux-review-9.md "Re-check 1"): R1-1 ... R1-9, on the 5,000-photo mock
+// ---------------------------------------------------------------------------------------------------------------------
+type Cov = { tier: string; sameMoment: boolean; similarity: number; coveredById: number; coveredByName: string } | null;
+const notSureIds = (page: Page) =>
+  inv<number[]>(page, "list_image_ids", { query: { includeTags: [], excludeTags: [], tagMatch: "any", picks: [], minRating: null, maxRating: null, colorLabels: [], burstGroupId: null, sceneId: null, collapseBursts: false, folderId: null, projectId: 1, targetChoices: ["not_sure"], sort: "target_moment", sortDescending: false, offset: 0, limit: 100000 } });
+
+/** Moves the Not sure pile to the index-th photo. */
+async function gotoNotSure(page: Page, index: number) {
+  await page.keyboard.press("Home");
+  for (let i = 0; i < index; i++) await page.keyboard.press("ArrowRight");
+}
+
+test.describe("Pick the best N: UX re-check 1", () => {
+  test("R1-1: a weak cover from another moment gives the photo the full width, disables S and labels A Keep", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openSecond(page, "&target=answered", 5000);
+    const ids = await notSureIds(page);
+    let weak = -1;
+    let strong = -1;
+    for (let i = 0; i < ids.length && (weak < 0 || strong < 0); i++) {
+      const c = await inv<Cov>(page, "get_covered_by", { imageId: ids[i] });
+      if (c && c.tier === "another_moment" && c.similarity < 0.7 && weak < 0) weak = i;
+      if (c && c.sameMoment && strong < 0) strong = i;
+    }
+    expect(weak).toBeGreaterThanOrEqual(0);
+    await gotoNotSure(page, weak);
+    const id = ids[weak];
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-current", String(id));
+    const cov = (await inv<Cov>(page, "get_covered_by", { imageId: id }))!;
+    await expect(page.getByTestId("target-covered")).toHaveCount(0);
+    const pic = (await page.getByTestId("target-second-pic").boundingBox())!;
+    expect(pic.width).toBeGreaterThan(1280 - 60);
+    const thumb = page.getByTestId("target-cover-thumb");
+    await expect(thumb).toBeVisible();
+    await expect(page.getByTestId("target-cover-note")).toContainText(cov.coveredByName);
+    await expect(page.getByTestId("target-cover-note")).toContainText("another moment");
+    await expect(page.getByTestId("target-cover-note")).toContainText(`${Math.round(cov.similarity * 100)}%`);
+    const tb = (await thumb.locator("> div").boundingBox())!;
+    expect(Math.round(tb.width)).toBe(48);
+    expect(Math.round(tb.height)).toBe(32);
+    await shot(page, "t-30-weak-cover");
+
+    // A is "Keep" (not "Add both"); S is disabled and its key only flashes the hint.
+    await expect(page.getByTestId("target-second-keep")).toContainText("Keep");
+    await expect(page.getByTestId("target-second-add")).toHaveCount(0);
+    await expect(page.getByTestId("target-second-swap")).toBeDisabled();
+    const before = await selM(page, id);
+    await clearCalls(page);
+    await page.keyboard.press("s");
+    await expect(page.getByTestId("target-second-hint")).toContainText(`${cov.coveredByName} is the pick of another moment. A keeps this one too`);
+    expect(await calls(page, "swap_alternative")).toHaveLength(0);
+    expect((await selM(page, id)).choice).toBe(before.choice);
+    expect((await selM(page, cov.coveredById)).choice).toBe("deliver");
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-current", String(id));
+
+    // Clicking the thumb shows the two panes; clicking it again hides the kept photo.
+    await thumb.click();
+    await expect(page.getByTestId("target-covered")).toBeVisible();
+    await thumb.click();
+    await expect(page.getByTestId("target-covered")).toHaveCount(0);
+
+    // A same-moment cover still shows both panes, with the swap on.
+    if (strong >= 0) {
+      await gotoNotSure(page, strong);
+      await expect(page.getByTestId("target-covered")).toBeVisible();
+      await expect(page.getByTestId("target-cover-thumb")).toHaveCount(0);
+      await expect(page.getByTestId("target-second-swap")).toBeEnabled();
+    }
+  });
+
+  test("R1-2: the Review moment grid (G): rows per moment, Shift+Right accepts a row, Enter opens a cell in two-up", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 5000, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "review");
+    const root = page.getByTestId("target-review");
+    await expect(root).toHaveAttribute("data-view", "two");
+    await expect(page.getByTestId("target-showing")).toContainText("Showing");
+    await expect(page.getByTestId("target-grid-toggle")).toContainText("Moment grid");
+    const list = await deliverIds(page);
+    await page.keyboard.press("g");
+    await expect(root).toHaveAttribute("data-view", "grid");
+    await expect(page.getByTestId("target-grid-toggle")).toContainText("Two-up");
+    await expect(page.getByTestId("target-grid-row-0")).toBeVisible();
+    const focused = page.locator('[data-testid^="target-grid-cell-"][data-focused="true"]');
+    await expect(focused).toHaveCount(1);
+    await shot(page, "t-31-moment-grid");
+
+    // At 1280x800 at least 3 full rows are visible; the row header names the moment; cell sizes follow the spec.
+    const sc = (await page.getByTestId("target-grid").boundingBox())!;
+    const rowBoxes = await page.locator('[data-testid^="target-grid-row-"]').evaluateAll((els) => els.map((e) => e.getBoundingClientRect()).map((r) => ({ top: r.top, bottom: r.bottom })));
+    expect(rowBoxes.filter((r) => r.top >= sc.y - 1 && r.bottom <= sc.y + sc.height + 1).length).toBeGreaterThanOrEqual(3);
+    await expect(page.getByTestId("target-grid-head-0")).toContainText(/Moment 1 of \d+ · .*\d+ picked · \d+ alternatives?/);
+    const cell = (await page.locator('[data-testid^="target-grid-cell-"][data-kind="pick"]').first().boundingBox())!;
+    expect(Math.round(cell.width)).toBe(240);
+    expect(Math.round(cell.height)).toBe(160);
+    const altBox = await page.locator('[data-testid^="target-grid-cell-"][data-kind="alt"]').first().locator("> div").first().boundingBox();
+    if (altBox) {
+      expect(Math.round(altBox.width)).toBe(160);
+      expect(Math.round(altBox.height)).toBe(112);
+    }
+    // The focus is an outline, not a box-shadow ring.
+    expect(await focused.evaluate((e) => getComputedStyle(e).outlineStyle)).toBe("solid");
+
+    // Walk down to a row with 3 picks. Shift+Right marks all three reviewed and focuses the next row.
+    const rowOf = () => focused.evaluate((e) => Number(e.closest('[data-testid^="target-grid-row-"]')!.getAttribute("data-testid")!.replace("target-grid-row-", "")));
+    let guard = 0;
+    while (guard++ < 60 && !/ 3 picked/.test((await page.getByTestId(`target-grid-head-${await rowOf()}`).textContent()) ?? "")) await page.keyboard.press("ArrowDown");
+    const n = await rowOf();
+    await expect(page.getByTestId(`target-grid-head-${n}`)).toContainText("3 picked");
+    const done0 = await attr(page, "target-review", "data-reviewed");
+    const rowPickIds = await page.getByTestId(`target-grid-row-${n}`).locator('[data-kind="pick"]').evaluateAll((els) => els.map((e) => Number(e.getAttribute("data-testid")!.replace("target-grid-cell-", ""))));
+    expect(rowPickIds).toHaveLength(3);
+    const had = await page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.review.1") ?? "[]") as number[]);
+    const added = rowPickIds.filter((i) => !had.includes(i)).length;
+    await page.keyboard.press("Shift+ArrowRight");
+    await expect(root).toHaveAttribute("data-reviewed", String(done0 + added));
+    expect(await rowOf()).toBe(n + 1);
+    await expect(page.getByTestId(`target-grid-row-${n}`)).toHaveAttribute("data-reviewed", "true");
+
+    // Enter on a pick: back in two-up on that pick. G again; Right moves to the next cell; G opens it.
+    const pickId = Number((await focused.getAttribute("data-testid"))!.replace("target-grid-cell-", ""));
+    expect(list).toContain(pickId);
+    await page.keyboard.press("Enter");
+    await expect(root).toHaveAttribute("data-view", "two");
+    await expect(root).toHaveAttribute("data-current", String(pickId));
+    await page.keyboard.press("g");
+    await expect(root).toHaveAttribute("data-view", "grid");
+    await page.keyboard.press("ArrowRight");
+    const next = Number((await focused.getAttribute("data-testid"))!.replace("target-grid-cell-", ""));
+    const kind = await focused.getAttribute("data-kind");
+    await page.keyboard.press("g");
+    await expect(root).toHaveAttribute("data-view", "two");
+    if (kind === "pick") await expect(root).toHaveAttribute("data-current", String(next));
+    else await expect(page.getByTestId("target-alt-view")).toHaveAttribute("data-id", String(next));
+
+    // X sets the focused pick aside, A adds the focused alternative (grid keys).
+    await page.keyboard.press("g");
+    await expect(root).toHaveAttribute("data-view", "grid");
+    const total = await attr(page, "target-review", "data-total");
+    const victim = Number((await focused.getAttribute("data-testid"))!.replace("target-grid-cell-", ""));
+    if ((await focused.getAttribute("data-kind")) === "pick") {
+      await page.keyboard.press("x");
+      await expect.poll(async () => (await selOf(page, victim)).choice).toBe("set_aside");
+      await expect(root).toHaveAttribute("data-total", String(total - 1));
+    }
+    const altCell = page.locator('[data-testid^="target-grid-cell-"][data-kind="alt"]').first();
+    await expect(altCell).toBeVisible();
+    const altId = Number((await altCell.getAttribute("data-testid"))!.replace("target-grid-cell-", ""));
+    await altCell.click();
+    await page.keyboard.press("a");
+    await expect.poll(async () => (await selOf(page, altId)).choice).toBe("deliver");
+
+    // G toggles back to the two-up view.
+    await page.keyboard.press("g");
+    await expect(root).toHaveAttribute("data-view", "two");
+  });
+
+  test("R1-3: Similar pile focus outline, up to 3 kept tiles plus +N, you added, the amber line, nearest-kept label", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openSecond(page, "&target=answered", 5000);
+    await page.getByTestId("target-pile-similar").click();
+    await expect(page.getByTestId("target-similar")).toBeVisible();
+    // The focus outline of the first frame shows on all four sides (the frames row has padding for it).
+    const first = page.locator('[data-testid^="target-sim-frame-"][data-focused="true"]').first();
+    await expect(first).toBeVisible();
+    const style = await first.evaluate((e) => {
+      const s = getComputedStyle(e);
+      return { style: s.outlineStyle, width: s.outlineWidth, offset: s.outlineOffset, shadow: s.boxShadow };
+    });
+    expect(style).toMatchObject({ style: "solid", width: "2px", offset: "2px" });
+    expect(style.shadow).toBe("none");
+    const fb = (await first.boundingBox())!;
+    const box = (await first.locator("xpath=..").boundingBox())!;
+    expect(fb.x - 4).toBeGreaterThanOrEqual(box.x - 0.5);
+    expect(fb.y - 4).toBeGreaterThanOrEqual(box.y - 0.5);
+    expect(fb.y + fb.height + 4).toBeLessThanOrEqual(box.y + box.height + 0.5);
+    await shot(page, "t-32-similar-focus");
+
+    // A mounted row with 3 kept photos shows 3 tiles; one with at least two frames lets us add one.
+    const rowInfo = await page.locator('[data-testid^="target-sim-row-"]').evaluateAll((els) =>
+      els.map((e) => ({
+        n: Number(e.getAttribute("data-testid")!.replace("target-sim-row-", "")),
+        kept: Number(e.querySelector('[data-testid^="target-sim-kept-"]')?.getAttribute("data-count") ?? 0),
+        frames: e.querySelectorAll('[data-testid^="target-sim-frame-"]').length,
+        tiles: e.querySelectorAll('[data-testid="target-sim-kept-photo"]').length,
+      })),
+    );
+    const three = rowInfo.find((r) => r.kept === 3 && r.frames >= 2);
+    expect(three).toBeTruthy();
+    expect(three!.tiles).toBe(3);
+    const row = page.getByTestId(`target-sim-row-${three!.n}`);
+    // Nearest-kept label on rows with 2 or more kept photos.
+    await expect(row.locator('[data-testid="target-sim-pct"]').first()).toContainText(/\d+% · like DSC\d+/);
+
+    // A on the first frame of the row: the next frame of that row shows the amber add and the "you added" tile.
+    const frames = row.locator('[data-testid^="target-sim-frame-"]');
+    const f0 = Number((await frames.nth(0).getAttribute("data-testid"))!.replace("target-sim-frame-", ""));
+    const f1 = Number((await frames.nth(1).getAttribute("data-testid"))!.replace("target-sim-frame-", ""));
+    await frames.nth(0).click();
+    await expect(page.getByTestId("target-second-add")).toHaveCount(0); // nothing added yet: the plain button
+    await page.keyboard.press("a");
+    await expect.poll(async () => (await selM(page, f0)).choice).toBe("deliver");
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-current", String(f1));
+    const add = page.getByTestId("target-second-add");
+    await expect(add).toHaveAttribute("data-amber", "true");
+    await expect(add).toContainText("Add a 5th from this moment");
+    await expect(page.getByTestId("target-already-added")).toContainText(`You already added DSC${String(f0).padStart(5, "0")} from this moment`);
+    // 4 kept now: 3 tiles (the one you added first) and a "+1 more" tile that opens all of them.
+    const tiles = row.locator('[data-testid="target-sim-kept-photo"]');
+    await expect(tiles).toHaveCount(3);
+    await expect(tiles.first()).toHaveAttribute("data-added", "true");
+    await expect(tiles.first()).toContainText("you added");
+    const more = page.getByTestId(`target-sim-kept-more-${three!.n}`);
+    await expect(more).toContainText("+1 more");
+    await more.click();
+    await expect(page.getByTestId(`target-sim-kept-all-${three!.n}`).locator("> [data-id]")).toHaveCount(4);
+    await shot(page, "t-33-similar-added");
+  });
+
+  test("R1-4: toasts sit bottom right above the action bar and leave the sub-header buttons free", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    await page.keyboard.press("x");
+    const notice = page.getByTestId("notice");
+    await expect(notice).toHaveCount(1);
+    const bb = (await notice.boundingBox())!;
+    const vp = page.viewportSize()!;
+    expect(Math.round(vp.height - (bb.y + bb.height))).toBeGreaterThanOrEqual(60);
+    expect(Math.round(vp.height - (bb.y + bb.height))).toBeLessThanOrEqual(80);
+    expect(Math.round(vp.width - (bb.x + bb.width))).toBeLessThanOrEqual(16);
+    expect(bb.width).toBeLessThanOrEqual(361);
+    const sec = (await page.getByTestId("target-to-second").boundingBox())!;
+    expect(bb.y).toBeGreaterThan(sec.y + sec.height);
+    await shot(page, "t-34-toast");
+  });
+
+  test("R1-5: plural counts are formatted at scale (2,500 photos)", async ({ page }) => {
+    await openHome(page, 5000, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await page.getByTestId("target-apply").click();
+    await expect(page.getByTestId("target-apply-text")).toHaveAttribute("data-loading", "false");
+    const plan = await inv<{ picks: number; rejects: number; unchanged: number; userFlagged: number }>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } });
+    await page.getByTestId("target-apply-confirm").click();
+    const kept = plan.unchanged + plan.userFlagged;
+    const text = (await page.getByTestId("target-apply-result").textContent())!;
+    expect(text).toContain(`${kept.toLocaleString("en-US")} ${kept === 1 ? "photo" : "photos"} left as they were`);
+    expect(text).not.toMatch(/\d{4,} photos/);
+    expect(kept).toBeGreaterThanOrEqual(1000);
+  });
+
+  test("R1-5: the Already kept caption reads 92%, not 92 %", async ({ page }) => {
+    await openSecond(page);
+    const curId = () => attr(page, "target-second", "data-current");
+    await page.keyboard.press("Home");
+    let prev = await curId();
+    for (let i = 0; i < 16; i++) {
+      const before = await selM(page, prev);
+      await page.keyboard.press("a");
+      await expect.poll(curId).not.toBe(prev);
+      const now = await curId();
+      if ((await selM(page, now)).momentId === before.momentId && before.momentId != null) {
+        const caption = page.getByTestId("target-already-added");
+        await expect(caption).toBeVisible();
+        const txt = (await caption.textContent())!;
+        expect(txt).not.toMatch(/\d %/);
+        if (txt.includes("Already kept")) expect(txt).toMatch(/Already kept: DSC\d+ \(\d+%\)/);
+        return;
+      }
+      prev = now;
+    }
+    expect(false).toBe(true);
+  });
+
+  test("R1-6: the Apply dialog says how many picks already have the flag", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    const ids = await deliverIds(page);
+    await inv(page, "set_pick", { ids: ids.slice(0, 3), pick: "picked" });
+    await page.getByTestId("target-apply").click();
+    await expect(page.getByTestId("target-apply-text")).toHaveAttribute("data-loading", "false");
+    const picks = await attr(page, "target-apply-picks", "data-n");
+    const other = (await attr(page, "target-header-count", "data-deliver")) - picks; // the count the dialog gets: the header one
+    expect(other).toBeGreaterThan(0);
+    await expect(page.getByTestId("target-apply-already")).toContainText(`(the other ${other} ${other === 1 ? "pick already has" : "picks already have"} it)`);
+  });
+
+  test("R1-7: Shift+Z accepts the rest of a moment in Review but does nothing in the Second look", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    await page.keyboard.press("Home");
+    const cur = await attr(page, "target-review", "data-current");
+    await page.keyboard.press("Shift+Z");
+    await expect.poll(() => attr(page, "target-review", "data-current")).not.toBe(cur);
+    await tab(page, "second");
+    await page.keyboard.press("Home");
+    const id = await attr(page, "target-second", "data-current");
+    const rev = await attr(page, "target-second", "data-reviewed");
+    await clearCalls(page);
+    await page.keyboard.press("Shift+Z");
+    expect(await attr(page, "target-second", "data-current")).toBe(id);
+    expect(await attr(page, "target-second", "data-reviewed")).toBe(rev);
+    expect(await calls(page, "set_target_choice")).toHaveLength(0);
+    expect(await calls(page, "add_alternative")).toHaveLength(0);
+    // Shift+Space still skips the moment.
+    await page.keyboard.press("Shift+Space");
+    expect(await attr(page, "target-second", "data-reviewed")).toBeGreaterThan(rev);
+  });
+
+  test("R1-8: opening Pick the best N with B puts the cursor in the count; B, type, Enter runs it", async ({ page }) => {
+    await openProject(page);
+    await page.keyboard.press("b");
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "setup");
+    const count = page.getByTestId("target-count");
+    await expect(count).toBeFocused();
+    await page.keyboard.type("40");
+    await expect(count).toHaveValue("40"); // the suggested value was selected, so typing replaces it
+    await clearCalls(page);
+    await page.keyboard.press("Enter");
+    await expect.poll(async () => (await calls(page, "run_target_selection")).length).toBe(1);
+  });
+
+  test("R1-9: E shows the focused Similar frame large next to its nearest kept photo; E or Esc returns", async ({ page }) => {
+    await openSecond(page, "&target=answered", 5000);
+    await page.getByTestId("target-pile-similar").click();
+    await expect(page.getByTestId("target-similar")).toBeVisible();
+    await expect(page.getByTestId("target-sim-large")).toHaveCount(0);
+    const fid = await attr(page, "target-second", "data-current");
+    await page.keyboard.press("e");
+    const large = page.getByTestId("target-sim-large");
+    await expect(large).toBeVisible();
+    await expect(large).toHaveAttribute("data-id", String(fid));
+    await expect(page.getByTestId("target-sim-large-pic")).toBeVisible();
+    await expect(page.getByTestId("target-sim-large-kept")).toBeVisible();
+    await shot(page, "t-35-similar-large");
+    // Click zooms both.
+    await page.getByTestId("target-sim-large-pic").click();
+    await expect(page.getByTestId("target-sim-large-pic")).toHaveAttribute("data-zoom", "100");
+    await expect(page.getByTestId("target-sim-large-kept")).toHaveAttribute("data-zoom", "100");
+    await page.keyboard.press("e");
+    await expect(large).toHaveCount(0);
+    await expect(page.getByTestId("target-similar")).toBeVisible();
+    // Esc leaves the large view first, and only the second Esc closes the overlay.
+    await page.keyboard.press("e");
+    await expect(large).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(large).toHaveCount(0);
+    await expect(page.getByTestId("target-view")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("target-view")).toHaveCount(0);
+  });
+
+  test("keys: G does nothing in the Second look and E does nothing in Not sure", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "second");
+    await page.keyboard.press("g");
+    await page.keyboard.press("e");
+    await expect(page.getByTestId("target-sim-large")).toHaveCount(0);
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-pile", "not_sure");
+  });
 });

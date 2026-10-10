@@ -22,7 +22,7 @@ export const CHOICE_LABEL: Record<TargetChoice, string> = { deliver: "Picked", a
 
 export const SHOOT_TYPES: ShootType[] = ["wedding", "portrait", "sports", "event", "landscape", "general"];
 export const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-export const plural = (n: number, w: string, many = `${w}s`) => `${n} ${n === 1 ? w : many}`;
+export const plural = (n: number, w: string, many = `${w}s`) => `${num(n)} ${n === 1 ? w : many}`;
 
 /** The default target for a project: about a third of its photos (rounded to 10 above 100). */
 export function suggestTarget(photoCount: number): number {
@@ -76,6 +76,7 @@ export function clearReviewed(projectId: number) {
   }
 }
 
+export const clockOf = (t: number | null) => time(t);
 const time = (t: number | null) => (t == null ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
 
 /** "Couple · 14:32 · frame 3 of 8" */

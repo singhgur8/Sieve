@@ -7,7 +7,7 @@ import { commands, DEFAULT_QUERY, unwrap, type CoveredBy, type ImageSelection, t
 import { previewSrc } from "../../lib/entryImage";
 import { hint } from "../../lib/keymap";
 import { loadReviewed, num, ordinal, type Pile, PILE_HINT, PILE_LABEL, pileOf, PILES, saveReviewed, stemOf, type Pass } from "../../lib/target";
-import { ActionButton, Pic, Reasons, ShotBadge, useSyncedZoom, ZoomPic } from "./bits";
+import { ActionButton, Pic, Reasons, ShotBadge, useSyncedZoom, Windowed, ZoomPic } from "./bits";
 import type { StageRef } from "./SetupStep";
 import type { TargetCtx } from "./types";
 
@@ -16,54 +16,14 @@ interface Info {
   cov: CoveredBy | null;
 }
 
-const ROW_H = 176;
+/** Mirrors the engine's SIMILARITY_VERY_SIMILAR: below it a frame of another moment is not a near-duplicate. */
+const VERY_SIMILAR = 0.7;
 const CELL_W = 172;
 
 async function selectionsOf(ids: number[]): Promise<ImageSelection[]> {
   const out: ImageSelection[] = [];
   for (let i = 0; i < ids.length; i += 500) out.push(...(await unwrap(commands.getImageSelections(ids.slice(i, i + 500)))));
   return out;
-}
-
-/** Fixed-height rows, only the rows around the viewport are mounted (the piles hold hundreds of rows). */
-function Windowed({ count, focusRow, renderRow, testid, onWidth }: { count: number; focusRow: number; renderRow: (i: number, width: number) => ReactNode; testid: string; onWidth?: (w: number) => void }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [view, setView] = useState({ top: 0, h: 600, w: 900 });
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => {
-      setView((v) => ({ ...v, h: el.clientHeight, w: el.clientWidth }));
-      onWidth?.(el.clientWidth);
-    };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || focusRow < 0) return;
-    const top = focusRow * ROW_H;
-    if (top < el.scrollTop) el.scrollTop = top;
-    else if (top + ROW_H > el.scrollTop + el.clientHeight) el.scrollTop = top + ROW_H - el.clientHeight;
-  }, [focusRow]);
-  const first = Math.max(0, Math.floor(view.top / ROW_H) - 2);
-  const last = Math.min(count - 1, Math.ceil((view.top + view.h) / ROW_H) + 2);
-  const rows: ReactNode[] = [];
-  for (let i = first; i <= last; i++)
-    rows.push(
-      <div key={i} className="absolute left-0 right-0" style={{ top: i * ROW_H, height: ROW_H }}>
-        {renderRow(i, view.w)}
-      </div>,
-    );
-  return (
-    <div ref={ref} className="min-h-0 flex-1 overflow-y-auto" data-testid={testid} onScroll={(e) => setView((v) => ({ ...v, top: e.currentTarget.scrollTop }))}>
-      <div className="relative" style={{ height: count * ROW_H }}>
-        {rows}
-      </div>
-    </div>
-  );
 }
 
 function Chip({ tone, children, testid }: { tone: "picked" | "notsure" | "aside" | "added"; children: ReactNode; testid?: string }) {
@@ -87,7 +47,10 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const [revNS, setRevNS] = useState(() => loadReviewed(projectId, "second"));
   const [revSim, setRevSim] = useState(() => loadReviewed(projectId, "second_similar"));
   const [info, setInfo] = useState<Map<number, Info>>(new Map());
-  const [flash, setFlash] = useState(false);
+  const [flash, setFlash] = useState<string | null>(null);
+  const [peek, setPeek] = useState(false);
+  const [large, setLarge] = useState(false);
+  const [moreRow, setMoreRow] = useState<number | null>(null);
   const zoom = useSyncedZoom();
   const loading = useRef(new Set<number>());
   const busy = useRef(false);
@@ -198,6 +161,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
     },
     [projectId, piles, flat],
   );
+  useEffect(() => setLarge(false), [pile]);
   const opened = useRef(false);
   useEffect(() => {
     if (loaded && !opened.current) {
@@ -238,6 +202,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   }, [ctx.rev, pile, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const cur = pile === "not_sure" ? (list[at] ?? null) : null;
+  const target = pile === "not_sure" ? cur : fid;
   const loadInfo = useCallback(
     (want: number[]) => {
       const todo = want.filter((i) => !info.has(i) && !loading.current.has(i));
@@ -280,13 +245,18 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   // The kept photos of the current moment and what the user added (P0-3).
   const here = cur != null ? info.get(cur) : undefined;
   const cov = here?.cov ?? null;
-  const curMoment = cur != null ? momentOf.get(cur) : undefined;
+  const curMoment = target != null ? momentOf.get(target) : undefined;
   const keptIds = curMoment?.deliveredIds ?? [];
   const userIds = new Set(curMoment?.userDeliveredIds ?? []);
+  // R1-1: a cover from another moment is not a duplicate: it never offers the swap and shows small unless it is very similar.
+  const cross = !!cov && cov.tier === "another_moment";
+  const strong = !!cov && (cov.sameMoment || cov.similarity >= VERY_SIMILAR);
+  const showCover = !!cov && (strong || peek);
+  useEffect(() => setPeek(false), [cur]);
   useEffect(() => {
     entries.need(keptIds);
   }, [keptIds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
-  const addedIds = keptIds.filter((i) => i !== cur && userIds.has(i));
+  const addedIds = keptIds.filter((i) => i !== target && userIds.has(i));
 
   const entry = cur != null ? entries.get(cur) : undefined;
   const covEntry = cov ? entries.get(cov.coveredById) : undefined;
@@ -297,9 +267,9 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const doneSim = useMemo(() => simRows.filter((r) => r.frames.every((f) => revSim.has(f))).length, [simRows, revSim]);
 
   // ---- navigation: Not sure ----
-  const noteFlash = () => {
-    setFlash(true);
-    setTimeout(() => setFlash(false), 600);
+  const noteFlash = (msg = "Nothing kept in this moment to swap with") => {
+    setFlash(msg);
+    setTimeout(() => setFlash(null), 2200);
   };
   const jumpNS = (to: number, markCur = true) => {
     if (list.length === 0) return;
@@ -377,11 +347,10 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
       busy.current = false;
     }
   };
-  const target = pile === "not_sure" ? cur : fid;
   const targetEntry = target != null ? entries.get(target) : undefined;
   /** The kept photo a swap replaces: the covered-by one in Not sure, else the moment's kept photo nearest to the frame. */
   const swapWith = (): number | null => {
-    if (pile === "not_sure") return cov?.coveredById ?? null;
+    if (pile === "not_sure") return cross ? null : (cov?.coveredById ?? null);
     if (target == null) return null;
     const m = momentOf.get(target);
     const cb = sels.get(target)?.coveredBy;
@@ -390,6 +359,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const swap = () =>
     act(async () => {
       if (target == null) return false;
+      if (pile === "not_sure" && cross && cov) return noteFlash(`${cov.coveredByName} is the pick of another moment. A keeps this one too`), false;
       const other = swapWith();
       if (other == null || other === target) return noteFlash(), false;
       entries.need([other]);
@@ -397,7 +367,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
       if (r) ctx.notify(`Kept ${stemOf(targetEntry, target)} instead of ${stemOf(entries.get(other), other)}. Cmd+Z undoes it`);
       return !!r;
     });
-  const hasKeptNear = pile === "not_sure" ? !!cov : target != null && !!momentOf.get(target)?.deliveredIds.length;
+  const hasKeptNear = pile === "not_sure" ? !!cov && !cross : target != null && !!momentOf.get(target)?.deliveredIds.length;
   const add = () =>
     act(async () => {
       if (target == null) return false;
@@ -452,12 +422,16 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
             return void add(), true;
           case "targetReject":
             return void asideNow(), true;
+          case "targetLarge":
+            return sim && fid != null && setLarge((v) => !v), true;
+          case "targetClose":
+            return large ? (setLarge(false), true) : false;
           default:
             return false;
         }
       },
     }),
-    [pile, at, fid, cur, cov, list, flat, simRows, piles, revNS, revSim, keptIds.length, here, gridW], // eslint-disable-line react-hooks/exhaustive-deps
+    [pile, at, fid, cur, cov, list, flat, simRows, piles, revNS, revSim, keptIds.length, here, gridW, large, cross], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   if (!loaded) return <div className="p-6 text-sm text-neutral-400">Loading…</div>;
@@ -475,6 +449,11 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const pct = denom > 0 ? Math.round((done / denom) * 100) : 0;
   const sim = cov ? Math.round(cov.similarity * 100) : null;
   const nextN = keptIds.length + 1;
+  // R1-9: the kept photo the large view compares the focused frame with (its nearest one, else the moment's first).
+  const fMoment = fid != null ? momentOf.get(fid) : undefined;
+  const fCover = fid != null ? sels.get(fid)?.coveredBy : null;
+  const largeKept = fid == null ? null : fCover != null && fMoment?.deliveredIds.includes(fCover) ? fCover : (fMoment?.deliveredIds[0] ?? null);
+  if (largeKept != null) entries.need([largeKept]);
   const hasAdded = addedIds.length > 0;
   const addedName = hasAdded ? stemOf(entries.get(addedIds[addedIds.length - 1]), addedIds[addedIds.length - 1]) : "";
   const gridShow = pile === "similar" ? (["set_aside"] as const) : pile === "not_sure" ? (["not_sure"] as const) : (["set_aside"] as const);
@@ -554,10 +533,24 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
                   <span className="min-w-0 text-neutral-300">
                     <Reasons sel={here?.sel ?? undefined} />
                   </span>
+                  {cov && !strong && (
+                    <button
+                      className="ml-auto flex shrink-0 items-center gap-2 rounded bg-neutral-900 p-1 text-left hover:bg-neutral-800"
+                      data-testid="target-cover-thumb"
+                      data-peek={peek}
+                      title={peek ? "Hide the kept photo" : "Show the two photos side by side"}
+                      onClick={() => setPeek((v) => !v)}
+                    >
+                      <Pic entry={covEntry} className="h-8 w-12 shrink-0 rounded" />
+                      <span className="text-[11px] text-neutral-300" data-testid="target-cover-note">
+                        {cov.text} · {sim}%
+                      </span>
+                    </button>
+                  )}
                 </figcaption>
               </figure>
 
-              {cov && (
+              {cov && showCover && (
                 <figure className="relative flex min-w-0 flex-1 flex-col" data-testid="target-covered" data-id={cov.coveredById} data-similarity={cov.similarity}>
                   <ZoomPic entry={covEntry} zoom={zoom} className="min-h-0 flex-1 rounded-lg ring-1 ring-emerald-700" testid="target-covered-pic" />
                   <figcaption className="mt-2 text-xs">
@@ -584,7 +577,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
                 <span className="uppercase tracking-wide">Kept from this moment ({keptIds.length})</span>
                 {hasAdded && (
                   <span className="text-xs normal-case text-amber-200" data-testid="target-already-added">
-                    You already added {addedName} from this moment{cov ? `. Already kept: ${stemOf(covEntry, cov.coveredById)} (${sim} %)` : ""}
+                    You already added {addedName} from this moment{cov ? `. Already kept: ${stemOf(covEntry, cov.coveredById)} (${sim}%)` : ""}
                   </span>
                 )}
               </div>
@@ -607,7 +600,16 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
             <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-neutral-800 bg-neutral-950 px-3 py-2" data-testid="target-second-actions">
               <ActionButton testid="target-skip" label="Skip" keys={["Space"]} tone="primary" title={`Leave it as it is and go to the next photo${hint("targetSkip")}. Enter does the same`} onClick={() => cur != null && advance()} />
               <ActionButton testid="target-skip-moment" label="Skip moment" keys={["⇧Space"]} title={`Mark the rest of this moment reviewed and go to the next moment${hint("targetSkipMoment")}`} onClick={nextMomentNS} />
-              {cov && <ActionButton testid="target-second-swap" label={`Swap: keep this instead of ${stemOf(covEntry, cov.coveredById)}`} keys={["S"]} title={`Deliver this photo instead of the similar one that is kept; that one becomes its alternative${hint("targetSwap")}`} onClick={() => void swap()} />}
+              {cov && (
+                <ActionButton
+                  testid="target-second-swap"
+                  label={`Swap: keep this instead of ${stemOf(covEntry, cov.coveredById)}`}
+                  keys={["S"]}
+                  disabled={cross}
+                  title={cross ? `${cov.coveredByName} is the pick of another moment, so there is nothing to swap. A keeps this photo too` : `Deliver this photo instead of the similar one that is kept; that one becomes its alternative${hint("targetSwap")}`}
+                  onClick={() => void swap()}
+                />
+              )}
               {hasAdded ? (
                 <button
                   className="flex h-9 items-center gap-2 whitespace-nowrap rounded-md bg-amber-700 px-3 text-sm text-white hover:bg-amber-600"
@@ -618,14 +620,14 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
                 >
                   Add a {ordinal(nextN)} from this moment <kbd className="rounded border border-amber-300 bg-amber-800 px-1 text-[10px] font-semibold">A</kbd>
                 </button>
-              ) : cov ? (
+              ) : cov && !cross ? (
                 <ActionButton testid="target-second-add" label="Add both" keys={["A"]} tone="good" title={`Keep this photo as well as the similar one${hint("targetAdd")}`} onClick={() => void add()} />
               ) : (
                 <ActionButton testid="target-second-keep" label="Keep" keys={["A", "Z"]} tone="good" disabled={kept} title={`Add this photo to the delivery set${hint("targetKeep")}`} onClick={() => void add()} />
               )}
               <ActionButton testid="target-second-aside" label="Set aside" keys={["X"]} tone="bad" disabled={here?.sel?.choice !== "not_sure"} title={`Take it out for good: set it aside and go on. Nothing is rejected${hint("targetReject")}`} onClick={() => void asideNow()} />
               <span className={`ml-auto text-xs ${flash ? "font-semibold text-amber-300" : "text-neutral-400"}`} data-testid="target-second-hint">
-                {flash ? "Nothing kept in this moment to swap with" : "Left: back · click a photo to zoom both · ] / [: next / previous unreviewed"}
+                {flash ?? "Left: back · click a photo to zoom both · ] / [: next / previous unreviewed"}
               </span>
             </div>
           </>
@@ -638,67 +640,145 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
           </div>
         ) : (
           <>
-            <Windowed
-              testid="target-similar"
-              count={simRows.length}
-              focusRow={fid != null ? (rowOfFrame.get(fid) ?? -1) : -1}
-              renderRow={(n) => {
-                const r = simRows[n];
-                if (!r) return null;
-                const keptHere = r.moment?.deliveredIds ?? [];
-                entries.need([...keptHere, ...r.frames]);
-                const reviewedRow = r.frames.every((f) => revSim.has(f));
-                return (
-                  <div className={`flex h-full items-start gap-4 border-b border-neutral-900 px-4 py-2 ${reviewedRow ? "opacity-60" : ""}`} data-testid={`target-sim-row-${n}`} data-moment={r.key} data-reviewed={reviewedRow}>
-                    <div className="flex shrink-0 gap-2" data-testid={`target-sim-kept-${n}`}>
-                      {keptHere.length === 0 ? (
-                        <div className="flex h-[112px] w-40 items-center justify-center rounded bg-neutral-900 text-[11px] text-neutral-500">No kept photo</div>
-                      ) : (
-                        keptHere.slice(0, 2).map((k) => (
-                          <div key={k} className="w-40" data-testid="target-sim-kept-photo" data-id={k}>
-                            <Pic entry={entries.get(k)} className="h-[112px] w-40 rounded ring-2 ring-emerald-700" />
-                            <div className="mt-1 flex items-center gap-1 text-[11px]">
-                              <Chip tone="picked">Picked</Chip>
-                              <span className="truncate text-neutral-300">{stemOf(entries.get(k), k)}</span>
-                            </div>
+            {large && fid != null ? (
+              <div className="flex min-h-0 flex-1 gap-3 p-3" data-testid="target-sim-large" data-id={fid}>
+                <figure className="relative flex min-w-0 flex-1 flex-col">
+                  <ZoomPic entry={entries.get(fid)} zoom={zoom} primary className="min-h-0 flex-1 rounded-lg" testid="target-sim-large-pic" />
+                  <figcaption className="mt-2 flex items-center gap-3 text-xs">
+                    <Chip tone={sels.get(fid)?.choice === "deliver" ? "picked" : "aside"}>{sels.get(fid)?.choice === "deliver" ? "Kept" : "Set aside"}</Chip>
+                    <span className="text-neutral-200">{stemOf(entries.get(fid), fid)}</span>
+                    <span className="min-w-0 text-neutral-300">{sels.get(fid)?.reasons[0]?.text}</span>
+                  </figcaption>
+                </figure>
+                {largeKept != null && (
+                  <figure className="relative flex min-w-0 flex-1 flex-col" data-id={largeKept}>
+                    <ZoomPic entry={entries.get(largeKept)} zoom={zoom} className="min-h-0 flex-1 rounded-lg ring-1 ring-emerald-700" testid="target-sim-large-kept" />
+                    <figcaption className="mt-2 flex items-center gap-3 text-xs">
+                      <Chip tone="picked">Picked</Chip>
+                      <span className="text-neutral-200">{stemOf(entries.get(largeKept), largeKept)}</span>
+                      <span className="text-neutral-400">{sels.get(fid)?.coveredSimilarity != null ? `${Math.round(sels.get(fid)!.coveredSimilarity! * 100)}% similar` : ""}</span>
+                    </figcaption>
+                  </figure>
+                )}
+              </div>
+            ) : (
+              <Windowed
+                testid="target-similar"
+                count={simRows.length}
+                focusRow={fid != null ? (rowOfFrame.get(fid) ?? -1) : -1}
+                renderRow={(n) => {
+                  const r = simRows[n];
+                  if (!r) return null;
+                  const keptHere = r.moment?.deliveredIds ?? [];
+                  const added = new Set(r.moment?.userDeliveredIds ?? []);
+                  // R1-3: up to 3 kept tiles (the ones you added first), then "+N more".
+                  const shown = [...keptHere.filter((k) => added.has(k)), ...keptHere.filter((k) => !added.has(k))].slice(0, 3);
+                  const more = keptHere.filter((k) => !shown.includes(k));
+                  entries.need([...keptHere, ...r.frames]);
+                  const reviewedRow = r.frames.every((f) => revSim.has(f));
+                  return (
+                    <div className={`flex h-full items-start gap-4 border-b border-neutral-900 px-4 py-2 ${reviewedRow ? "opacity-60" : ""}`} data-testid={`target-sim-row-${n}`} data-moment={r.key} data-reviewed={reviewedRow}>
+                      <div className="flex shrink-0 gap-2 p-1" data-testid={`target-sim-kept-${n}`} data-count={keptHere.length}>
+                        {keptHere.length === 0 ? (
+                          <div className="flex h-[112px] w-40 items-center justify-center rounded bg-neutral-900 text-[11px] text-neutral-500">No kept photo</div>
+                        ) : (
+                          shown.map((k) => {
+                            const mine = added.has(k);
+                            return (
+                              <div key={k} className="w-40" data-testid="target-sim-kept-photo" data-id={k} data-added={mine}>
+                                <Pic entry={entries.get(k)} className={`h-[112px] w-40 rounded ${mine ? "ring-2 ring-sky-400" : "ring-2 ring-emerald-700"}`} />
+                                <div className="mt-1 flex items-center gap-1 text-[11px]">
+                                  <Chip tone={mine ? "added" : "picked"}>{mine ? "you added" : "Picked"}</Chip>
+                                  <span className="truncate text-neutral-300">{stemOf(entries.get(k), k)}</span>
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                        {more.length > 0 && (
+                          <div className="relative w-40" onMouseEnter={() => setMoreRow(n)} onMouseLeave={() => setMoreRow((m) => (m === n ? null : m))}>
+                            <button
+                              className="flex h-[112px] w-40 items-center justify-center rounded bg-neutral-900 text-sm font-semibold text-neutral-200 ring-1 ring-emerald-800 hover:bg-neutral-800"
+                              data-testid={`target-sim-kept-more-${n}`}
+                              title="Show all the kept photos of this moment"
+                              onClick={() => setMoreRow(n)}
+                            >
+                              +{more.length} more
+                            </button>
+                            {moreRow === n && (
+                              <div className="absolute left-full top-0 z-20 ml-1 flex w-72 flex-wrap gap-1 rounded border border-neutral-600 bg-neutral-900 p-2 shadow-xl" data-testid={`target-sim-kept-all-${n}`}>
+                                {keptHere.map((k) => (
+                                  <div key={k} title={stemOf(entries.get(k), k)} data-id={k}>
+                                    <Pic entry={entries.get(k)} className={`size-16 rounded ${added.has(k) ? "ring-2 ring-sky-400" : "ring-1 ring-emerald-700"}`} />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                        ))
-                      )}
+                        )}
+                      </div>
+                      <div className="mt-1 h-[112px] w-px shrink-0 bg-neutral-700" />
+                      <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto px-1 py-1" data-testid={`target-sim-frames-${n}`}>
+                        {r.frames.map((f) => {
+                          const s = sels.get(f);
+                          const on = f === fid;
+                          const nowKept = s?.choice === "deliver";
+                          const near = keptHere.length >= 2 && s?.coveredBy != null && s.coveredSimilarity != null ? s.coveredBy : null;
+                          if (near != null) entries.need([near]);
+                          return (
+                            <button
+                              key={f}
+                              className={`w-40 shrink-0 rounded text-left ${on ? "outline outline-2 outline-offset-2 outline-sky-400" : ""}`}
+                              data-testid={`target-sim-frame-${f}`}
+                              data-focused={on}
+                              data-kept={nowKept}
+                              title={`${stemOf(entries.get(f), f)}: ${s?.reasons[0]?.text ?? ""}. A adds it, S swaps it with the kept photo, E shows it large`}
+                              onClick={() => setFid(f)}
+                            >
+                              <Pic entry={entries.get(f)} className={`h-[112px] w-40 rounded ${nowKept ? "ring-2 ring-emerald-700" : ""}`} />
+                              <div className={`mt-1 flex items-center gap-1 rounded px-0.5 text-[11px] text-neutral-300 ${on ? "bg-sky-950" : ""}`}>
+                                {nowKept ? (
+                                  <Chip tone="picked">Kept</Chip>
+                                ) : (
+                                  <span className="shrink-0" data-testid="target-sim-pct">
+                                    {s?.coveredSimilarity != null ? `${Math.round(s.coveredSimilarity * 100)}%` : ""}
+                                    {near != null ? ` · like ${stemOf(entries.get(near), near)}` : ""}
+                                  </span>
+                                )}
+                                <span className="truncate text-neutral-400">{stemOf(entries.get(f), f)}</span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
-                    <div className="mt-1 h-[112px] w-px shrink-0 bg-neutral-700" />
-                    <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto">
-                      {r.frames.map((f) => {
-                        const s = sels.get(f);
-                        const on = f === fid;
-                        const nowKept = s?.choice === "deliver";
-                        return (
-                          <button
-                            key={f}
-                            className={`w-40 shrink-0 text-left ${on ? "rounded ring-2 ring-sky-500" : ""}`}
-                            data-testid={`target-sim-frame-${f}`}
-                            data-focused={on}
-                            data-kept={nowKept}
-                            title={`${stemOf(entries.get(f), f)}: ${s?.reasons[0]?.text ?? ""}. A adds it, S swaps it with the kept photo`}
-                            onClick={() => setFid(f)}
-                          >
-                            <Pic entry={entries.get(f)} className={`h-[112px] w-40 rounded ${nowKept ? "ring-2 ring-emerald-700" : ""}`} />
-                            <div className="mt-1 flex items-center gap-1 text-[11px] text-neutral-300">
-                              {nowKept ? <Chip tone="picked">Kept</Chip> : <span data-testid="target-sim-pct">{s?.coveredSimilarity != null ? `${Math.round(s.coveredSimilarity * 100)}%` : ""}</span>}
-                              <span className="truncate text-neutral-400">{stemOf(entries.get(f), f)}</span>
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              }}
-            />
+                  );
+                }}
+              />
+            )}
             <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-neutral-800 bg-neutral-950 px-3 py-2" data-testid="target-second-actions">
-              <ActionButton testid="target-sim-add" label="Add it too" keys={["A"]} tone="good" disabled={fid == null || sels.get(fid)?.choice === "deliver"} title={`Keep the highlighted frame as well as the kept photo${hint("targetAdd")}`} onClick={() => void add()} />
+              {hasAdded && fid != null && sels.get(fid)?.choice !== "deliver" ? (
+                <>
+                  <span className="text-xs text-amber-200" data-testid="target-already-added">
+                    You already added {addedName} from this moment
+                  </span>
+                  <button
+                    className="flex h-9 items-center gap-2 whitespace-nowrap rounded-md bg-amber-700 px-3 text-sm text-white hover:bg-amber-600"
+                    data-testid="target-second-add"
+                    data-amber="true"
+                    title={`You already added ${addedName} from this moment. Keep the highlighted frame as well${hint("targetAdd")}`}
+                    onClick={() => void add()}
+                  >
+                    Add a {ordinal(nextN)} from this moment <kbd className="rounded border border-amber-300 bg-amber-800 px-1 text-[10px] font-semibold">A</kbd>
+                  </button>
+                </>
+              ) : (
+                <ActionButton testid="target-sim-add" label="Add it too" keys={["A"]} tone="good" disabled={fid == null || sels.get(fid)?.choice === "deliver"} title={`Keep the highlighted frame as well as the kept photo${hint("targetAdd")}`} onClick={() => void add()} />
+              )}
               <ActionButton testid="target-sim-swap" label="Swap with the kept photo" keys={["S"]} tone="primary" disabled={fid == null || sels.get(fid)?.choice === "deliver"} title={`Deliver the highlighted frame instead of the kept photo of this moment${hint("targetSwap")}`} onClick={() => void swap()} />
+              <ActionButton testid="target-sim-large-toggle" label={large ? "Back to rows" : "Large view"} keys={["E"]} title={`Show the highlighted frame large next to its nearest kept photo; click a photo to zoom both${hint("targetLarge")}. E or Esc goes back`} onClick={() => fid != null && setLarge((v) => !v)} />
               <ActionButton testid="target-sim-next-moment" label="Next moment" keys={["⇧→"]} title={`Mark this row reviewed and go to the next moment${hint("targetNextMoment")}`} onClick={nextMomentSim} />
-              <span className="ml-auto text-xs text-neutral-400">Arrows move · Up / Down: row · ] / [: next / previous unreviewed</span>
+              <span className={`ml-auto text-xs ${flash ? "font-semibold text-amber-300" : "text-neutral-400"}`}>Arrows move · Up / Down: row · E: large view · ] / [: next / previous unreviewed</span>
             </div>
           </>
         ))}

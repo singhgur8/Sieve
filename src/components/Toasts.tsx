@@ -104,7 +104,7 @@ function useDialogOpen(): boolean {
  */
 export function Toasts({ api, error, onDismissError, onLocate, placement = "bottom" }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void; placement?: "bottom" | "top" | "tool" | "target" }) {
   const modal = useDialogOpen();
-  const pos = modal ? "bottom-3 left-4 w-[min(400px,92vw)]" : placement === "target" ? "top-[100px] right-3 w-[min(400px,92vw)]" : placement === "tool" ? "bottom-14 left-[272px] w-[min(400px,92vw)]" : placement === "top" ? "top-[88px] right-[300px] w-[min(400px,92vw)] min-[1600px]:right-[332px]" : "bottom-24 left-1/2 w-[min(480px,92vw)] -translate-x-1/2";
+  const pos = modal ? "bottom-3 left-4 w-[min(400px,92vw)]" : placement === "target" ? "bottom-[64px] right-3 w-[min(360px,92vw)]" : placement === "tool" ? "bottom-14 left-[272px] w-[min(400px,92vw)]" : placement === "top" ? "top-[88px] right-[300px] w-[min(400px,92vw)] min-[1600px]:right-[332px]" : "bottom-24 left-1/2 w-[min(480px,92vw)] -translate-x-1/2";
   return (
     <div className={`pointer-events-none fixed ${pos} z-[60] flex flex-col items-stretch gap-2`} data-testid="toasts" data-placement={modal ? "modal" : placement}>
       {error && (

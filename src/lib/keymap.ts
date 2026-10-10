@@ -125,6 +125,8 @@ export type ActionId =
   | "targetFirst"
   | "targetLast"
   | "targetZoom"
+  | "targetGrid"
+  | "targetLarge"
   | "targetOpen";
 
 export interface Chord {
@@ -300,14 +302,16 @@ export const KEYMAP: KeyDef[] = [
   { id: "targetYes", group: TARGET_GROUP, label: "Yes: this person is important (or the couple is right)", chords: [c("y"), c("Enter")], modes: ALL, display: ["Y", "Enter"], where: "People", external: true },
   { id: "targetNo", group: TARGET_GROUP, label: "No: not important", chords: [c("n")], modes: ALL, display: ["N"], where: "People", external: true },
   { id: "targetEnter", group: TARGET_GROUP, label: "Accept what is shown (Review picks: keep and go on; Second look: skip)", chords: [c("Enter")], modes: ALL, display: ["Enter"], where: "Review picks, Second look", external: true },
-  { id: "targetNextMoment", group: TARGET_GROUP, label: "Looks good, next moment (marks the rest of this moment reviewed)", chords: [c("ArrowRight", { shift: true }), c("z", { shift: true })], modes: ALL, display: ["Shift+Right", "Shift+Z"], where: "Review picks, Second look", external: true },
-  { id: "targetPrevMoment", group: TARGET_GROUP, label: "Previous moment", chords: [c("ArrowLeft", { shift: true })], modes: ALL, display: ["Shift+Left"], where: "Review picks, Second look", external: true },
+  { id: "targetNextMoment", group: TARGET_GROUP, label: "Looks good, next moment (marks the rest of this moment reviewed)", chords: [c("ArrowRight", { shift: true }), c("ArrowDown", { shift: true }), c("z", { shift: true })], modes: ALL, display: ["Shift+Right", "Shift+Z (Review picks only)"], where: "Review picks, Second look", external: true },
+  { id: "targetPrevMoment", group: TARGET_GROUP, label: "Previous moment", chords: [c("ArrowLeft", { shift: true }), c("ArrowUp", { shift: true })], modes: ALL, display: ["Shift+Left"], where: "Review picks, Second look", external: true },
   { id: "targetSkipMoment", group: TARGET_GROUP, label: "Skip the rest of this moment", chords: [c(" ", { shift: true })], modes: ALL, display: ["Shift+Space"], where: "Second look", external: true },
   { id: "targetNextOpen", group: TARGET_GROUP, label: "Next photo not reviewed yet", chords: [c("]")], modes: ALL, display: ["]"], where: "Review picks, Second look", external: true },
   { id: "targetPrevOpen", group: TARGET_GROUP, label: "Previous photo not reviewed yet", chords: [c("[")], modes: ALL, display: ["["], where: "Review picks, Second look", external: true },
   { id: "targetFirst", group: TARGET_GROUP, label: "First photo", chords: [c("Home")], modes: ALL, display: ["Home"], where: "Review picks, Second look", external: true },
   { id: "targetLast", group: TARGET_GROUP, label: "Last photo", chords: [c("End")], modes: ALL, display: ["End"], where: "Review picks, Second look", external: true },
   { id: "targetZoom", group: TARGET_GROUP, label: "Zoom both photos: Fit / 100% (Second look: click a photo)", chords: [c(" ")], modes: ALL, display: ["Space"], where: "Review picks", external: true },
+  { id: "targetGrid", group: TARGET_GROUP, label: "Moment grid / two-up view (the grid shows every moment's picks and alternatives; arrows move, Shift+Right accepts a row, Enter opens a photo)", chords: [c("g")], modes: ALL, display: ["G"], where: "Review picks", external: true },
+  { id: "targetLarge", group: TARGET_GROUP, label: "Large view of the focused frame against its nearest kept photo (E or Esc: back to the rows)", chords: [c("e")], modes: ALL, display: ["E"], where: "Second look, Similar", external: true },
   { id: "targetOpen", group: TARGET_GROUP, label: "Open Pick the best N (at the stage with unfinished work)", chords: [c("b")], modes: ["grid", "loupe"], display: ["B"], where: "Cull step" },
   { id: "targetUndo", group: TARGET_GROUP, label: "Undo the last change", chords: [c("z", { mod: true })], modes: ALL, display: ["Cmd+Z"], where: "Pick the best N", external: true },
   { id: "targetClose", group: TARGET_GROUP, label: "Back to the grid", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Pick the best N", external: true },
@@ -318,13 +322,15 @@ export type TargetStage = "setup" | "people" | "review" | "second";
 const TARGET_KEYS: Record<TargetStage, ActionId[]> = {
   setup: ["targetClose"],
   people: ["targetPrev", "targetNext", "targetYes", "targetNo", "targetUndo", "targetClose"],
-  review: ["targetPrev", "targetNext", "targetNextMoment", "targetPrevMoment", "targetNextOpen", "targetPrevOpen", "targetFirst", "targetLast", "targetKeep", "targetEnter", "targetReject", "targetCycle", "targetSwap", "targetAdd", "targetZoom", "targetUndo", "targetClose"],
-  second: ["targetPrev", "targetNext", "targetNextMoment", "targetPrevMoment", "targetSkipMoment", "targetNextOpen", "targetPrevOpen", "targetFirst", "targetLast", "targetKeep", "targetEnter", "targetReject", "targetCycle", "targetSwap", "targetAdd", "targetSkip", "targetUndo", "targetClose"],
+  review: ["targetPrev", "targetNext", "targetNextMoment", "targetPrevMoment", "targetNextOpen", "targetPrevOpen", "targetFirst", "targetLast", "targetKeep", "targetEnter", "targetReject", "targetCycle", "targetSwap", "targetAdd", "targetZoom", "targetGrid", "targetUndo", "targetClose"],
+  second: ["targetPrev", "targetNext", "targetNextMoment", "targetPrevMoment", "targetSkipMoment", "targetNextOpen", "targetPrevOpen", "targetFirst", "targetLast", "targetKeep", "targetEnter", "targetReject", "targetCycle", "targetSwap", "targetAdd", "targetSkip", "targetLarge", "targetUndo", "targetClose"],
 };
 
 /** The overlay action triggered by `e` in `stage`, if any. */
 export function matchTargetKey(e: KeyboardEvent, stage: TargetStage): ActionId | null {
   for (const id of TARGET_KEYS[stage]) {
+    // R1-7: Shift+Z accepts the rest of a moment in Review only; in the Second look Z keeps, so Shift+Z does nothing.
+    if (stage === "second" && id === "targetNextMoment" && e.key.toLowerCase() === "z") continue;
     for (const d of KEYMAP) if (d.id === id && d.chords.some((ch) => chordMatches(ch, e))) return id;
   }
   return null;
