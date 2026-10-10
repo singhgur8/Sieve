@@ -253,6 +253,57 @@ under "Verify on the Mac" in the Status Log entry. Branches are pushed to `origi
 
 ---
 
+## Phase 9 — Target-count culling: pick the delivery set, review by exception (user request 2026-10-09)
+Why: on a real 2,500-photo wedding Sieve kept ~2,000 (it only rejects defects; burst extras stay unflagged = keepers)
+while the user delivered ~800, so they still went through every photo. The user wants Sieve to pick the delivery set,
+then review it with alternatives at hand, then pass quickly through the rest without re-adding near-duplicates
+("a very similar photo was already added from the good list"). Runs in the Linux cloud container like 8c; real-shoot
+calibration waits for the user's photos + sidecars (task "Calibrate on the user's shoot").
+User rules (2026-10-09/10, verbatim intent):
+- Target count per shoot (e.g. 800) is a **guideline**, not a cap; the user does a 2nd and 3rd pass.
+- Main subject (usually the couple) is found automatically; Sieve **asks** "is this person important?" for other
+  recurring people (parents, siblings) — yes/no. Photos with important people are favoured, the couple most.
+- Couple: keep **many variations**, even the same pose from different angles; only near-identical frames collapse.
+- Group photos: **one per group setup** — most faces looking at the camera, the main subject must be looking.
+  Exception: activity / reaction frames (laughing, screaming, cheering) are kept as extra variations.
+- Detail shots (rings, watch, jewellery, dress, decor) get their **own share**; one per detail; focus must be on the
+  object.
+- Candids (guests, dancing, reception): keep when the subject's face / action is clearly visible — also if a crop
+  would make a good photo; drop backs of heads / no visible faces.
+- Blur: creative blur competes like any frame of its moment; it doesn't get kept just for being intentional.
+- Review: pass 1 = the picked set, each with a strip of the alternatives from its moment (add / swap with one key);
+  pass 2 = Not sure + Set aside, fast, each showing "already kept a similar one: DSC0412" (skip / swap / add both).
+- [ ] **Contract v19** (architect): people (face identity clusters per project: id, sample faces, photo count,
+  role main / important / other / unknown, user-confirmed), "important people" questions; moments (cross-shoot
+  groups of the same scene + people, with shot type couple / group / detail / candid / other); per-image selection
+  state for a target run (deliver / alternative-of(id) / not sure / set aside, with reason + rank) and a "covered by"
+  link (nearest kept similar photo); commands: run target selection (count, shoot type), list people + set role,
+  list moments / alternatives of an image, swap / add alternative. Migration, bindings, ipc-changelog.
+- [ ] **Face identity** (vision-ml-dev): offline face embedding model (ONNX, alongside SCRFD; licence recorded),
+  per-project clustering into people, main subject = the most frequent couple of faces (heuristics: frequency, size,
+  centrality, appearing together), list of other recurring people to ask about. Acceptance: synthetic / public sample
+  faces cluster correctly (purity ≥ 0.9 on a labelled sample set), main pair found, timings recorded.
+- [ ] **Moments and shot types** (vision-ml-dev): group frames into moments across the shoot (time gap + visual
+  similarity + same people), classify shot type (group = ≥3 faces posed, couple = the main pair dominant, detail = no
+  face, sharp salient object, candid = faces not posed); "visible face" score (frontal, size, eyes) and back-of-head
+  / no-face penalty; detail focus check (sharpest region on the salient object). Acceptance: unit tests on synthetic
+  metrics; labelled fixtures for each shot type.
+- [ ] **Target selection engine** (vision-ml-dev): fill the target by priority — couple variations (many, near-
+  duplicates collapsed), one per group setup (most faces looking, main subject looking; activity frames as extra
+  variations), one per detail, candids with visible faces, then next-best until the target; important people
+  boosted; result = deliver / alternatives (ranked per moment) / not sure / set aside with reasons; "covered by"
+  for every non-delivered frame. Acceptance: deterministic tests on synthetic shoots; target respected ±10% when
+  enough frames qualify; every rule above has a test.
+- [ ] **Target cull UI** (frontend-dev): step 1 "Pick the best N" (count + shoot type, progress); people
+  confirmation (faces grid: "Is this person important?" yes / no, main couple shown for confirmation); pass 1 review
+  of the delivery set with an alternatives strip (add alternative / swap / reject, keyboard first); pass 2 quick
+  review of Not sure + Set aside with the "already kept a similar one" thumbnail and skip / swap / add both; counts
+  everywhere. Mock backend support. Acceptance: Playwright for each step and key.
+- [ ] **Calibrate on the user's shoot** (vision-ml-dev, needs the user's 2,500 photos + XMP): run the engine with
+  target 800, compare with the user's final flags (agreement, per shot type, per moment), tune thresholds, record
+  numbers in decisions.md. Blocked until the data arrives — other tasks proceed.
+- [ ] **UX review** (ux-designer) of the whole target-cull flow; **QA gate** (qa-engineer).
+
 ## Future phases (notes to revisit — not part of the autonomous run)
 
 ### Phase 9 — Reference-match grading ("make photo A look like photo B")
