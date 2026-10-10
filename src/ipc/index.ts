@@ -22,6 +22,7 @@ import type {
   MaskShape,
   MatchOptions,
   NormPoint,
+  NormRect,
   ParametricAdjustments,
   PickFlag,
   PointCurves,
@@ -656,4 +657,23 @@ export function unorientPoint(p: NormPoint, orientation: number | null | undefin
     default:
       return { x, y };
   }
+}
+
+// ---- Target-count culling (IPC v20) ----
+
+/**
+ * CSS for a face crop of a photo's existing preview (`FaceSample`): no face files exist, the
+ * people grid shows `convertFileSrc(sample.previewPath)` cropped to `sample.crop`. Use on a
+ * block element; `aspectRatio` makes it square in pixels (the crop is square in pixels).
+ */
+export function faceCropStyle(sample: { crop: NormRect; imageAspect: number }, url: string | null): Record<string, string> {
+  const { x, y, width, height } = sample.crop;
+  const pos = (start: number, size: number) => (size >= 1 ? 0 : (start / (1 - size)) * 100);
+  return {
+    backgroundImage: url ? `url("${url}")` : "none",
+    backgroundRepeat: "no-repeat",
+    backgroundSize: `${100 / Math.max(width, 1e-6)}% ${100 / Math.max(height, 1e-6)}%`,
+    backgroundPosition: `${pos(x, width)}% ${pos(y, height)}%`,
+    aspectRatio: `${(width * sample.imageAspect) / Math.max(height, 1e-6)}`,
+  };
 }

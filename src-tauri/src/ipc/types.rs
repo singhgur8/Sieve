@@ -67,6 +67,8 @@ pub(crate) use string_enum;
 
 // Masks / local adjustments (Phase 7c, IPC v10) live in `ipc/masks.rs`.
 pub use super::masks::*;
+// Target-count culling (Phase 9, IPC v20) lives in `ipc/target.rs`.
+pub use super::target::*;
 
 // ---------------------------------------------------------------------------
 // Camera / file identity
@@ -2581,6 +2583,10 @@ pub struct ImageQuery {
     /// `FilterCounts.suggested*`.
     #[serde(default)]
     pub suggested: Option<PendingSuggestion>,
+    /// v20: only photos whose target-run choice is one of these (empty = no constraint; photos
+    /// without a selection row never match), e.g. `["not_sure", "set_aside"]` for pass 2.
+    #[serde(default)]
+    pub target_choices: Vec<TargetChoice>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2613,6 +2619,7 @@ impl Default for ImageQuery {
             keepers_only: false,
             metadata: MetadataFilter::default(),
             suggested: None,
+            target_choices: Vec::new(),
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,

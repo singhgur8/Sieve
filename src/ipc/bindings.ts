@@ -1048,6 +1048,121 @@ export const commands = {
 	 *  quad refers to (full warped image, white outside the quad).
 	 */
 	getTransformBounds: (id: number, adjustments: ParametricAdjustments) => typedError<TransformBounds, AppError>(__TAURI_INVOKE("get_transform_bounds", { id, adjustments })),
+	/**
+	 *  Starts a target run for the project ("Pick the best N"): people, moments, then the
+	 *  selection, on a background thread; returns the run (`state: running`) at once. Progress:
+	 *  `activityEvent` kind `target_selection`; end: exactly one `targetRunFinished`. The user's
+	 *  decisions (locked rows: target edits and own flags) and confirmed people roles are kept, so
+	 *  re-running after answering the people questions only changes what the user did not decide.
+	 *  Unknown project -> `not_found`; bad count or a run already in progress ->
+	 *  `invalid_argument`.
+	 */
+	runTargetSelection: (projectId: number, settings: TargetRunSettings) => typedError<TargetRun, AppError>(__TAURI_INVOKE("run_target_selection", { projectId, settings })),
+	/**
+	 *  Stops the running target run after its current step (the previous selection is kept;
+	 *  `targetRunFinished` with `state: cancelled`). No-op when idle.
+	 */
+	cancelTargetSelection: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_target_selection")),
+	/**
+	 *  The project's latest target run with counts (`null` = never run). Unknown project ->
+	 *  `not_found`.
+	 */
+	getTargetRun: (projectId: number) => typedError<{
+	projectId: number,
+	/**  `shootType` resolved (never `null`). */
+	settings: TargetRunSettings,
+	state: TargetRunState,
+	startedAtMs: number,
+	finishedAtMs: number | null,
+	/**  Last `apply_target_selection` (flags written), `null` = never applied. */
+	appliedAtMs: number | null,
+	/**  User-facing summary or error, e.g. "Picked 812 of 2,512 photos"; `null` while running. */
+	message: string | null,
+	/**  Engine versions (identity / moments / selection) that produced the selection. */
+	modelVersion: string,
+	/**  Over the current selection rows (a failed / cancelled run keeps the previous ones). */
+	counts: TargetCounts,
+	/**  Open "Is this person important?" questions (`PeopleOverview.questions.length`). */
+	peopleQuestions: number,
+} | null, AppError>(__TAURI_INVOKE("get_target_run", { projectId })),
+	/**
+	 *  The project's people (face identity clusters) and the open "Is this person important?"
+	 *  questions. Unknown project -> `not_found`.
+	 */
+	listPeople: (projectId: number) => typedError<PeopleOverview, AppError>(__TAURI_INVOKE("list_people", { projectId })),
+	/**
+	 *  Answers for a person (`important` / `other`, or corrects `main`); `null` clears the answer
+	 *  (back to the engine's suggestion). Takes effect at the next `run_target_selection`.
+	 *  Unknown person -> `not_found`.
+	 */
+	setPersonRole: (personId: number, role: 
+/**  The main subject (the couple: up to 2 people; a portrait: 1). */
+"main" | 
+/**  Recurring person the user said is important (parents, siblings, ...). */
+"important" | 
+/**  Recurring person the user said is not important, or a guest. */
+"other" | 
+/**  Not decided (the engine had no opinion and the user was not asked / did not answer). */
+"unknown" | null) => typedError<Person, AppError>(__TAURI_INVOKE("set_person_role", { personId, role })),
+	/**
+	 *  The project's moments in capture order (members + delivered members). Unknown project ->
+	 *  `not_found`.
+	 */
+	listMoments: (projectId: number) => typedError<Moment[], AppError>(__TAURI_INVOKE("list_moments", { projectId })),
+	/**
+	 *  Selection rows of `ids` in the given order (for grid cells / loupe badges); photos without
+	 *  a row are omitted. Unknown image -> `not_found`.
+	 */
+	getImageSelections: (ids: number[]) => typedError<ImageSelection[], AppError>(__TAURI_INVOKE("get_image_selections", { ids })),
+	/**
+	 *  The alternatives strip of an image: its delivered photo (itself, or the one it is an
+	 *  alternative of) and that photo's ranked alternatives. Unknown image -> `not_found`.
+	 */
+	getAlternatives: (imageId: number) => typedError<Alternatives, AppError>(__TAURI_INVOKE("get_alternatives", { imageId })),
+	/**
+	 *  "Already kept a similar one": the nearest delivered similar photo of a non-delivered image
+	 *  (`null` when none / delivered / not in the run). Unknown image -> `not_found`.
+	 */
+	getCoveredBy: (imageId: number) => typedError<{
+	imageId: number,
+	/**  The delivered similar photo. */
+	coveredById: number,
+	similarity: number,
+	/**  Both photos are in the same moment. */
+	sameMoment: boolean,
+	/**  User-facing, e.g. "Already kept a similar one: DSC0412". */
+	text: string,
+} | null, AppError>(__TAURI_INVOKE("get_covered_by", { imageId })),
+	/**
+	 *  Swaps a delivered photo with a non-delivered one of the same project (alternative, not
+	 *  sure, set aside): the new photo is delivered and picked, the old one becomes its
+	 *  alternative #1 (unflagged if it was picked) and the strip follows. Locked, flags as the
+	 *  user's, XMP auto-sync notified. Undo: `restore_target_snapshot(result.previous)`.
+	 */
+	swapAlternative: (deliveredId: number, alternativeId: number) => typedError<TargetEditResult, AppError>(__TAURI_INVOKE("swap_alternative", { deliveredId, alternativeId })),
+	/**
+	 *  Adds a non-delivered photo to the delivery set as well ("add both"): delivered, picked,
+	 *  locked. Undo: `restore_target_snapshot(result.previous)`.
+	 */
+	addAlternative: (imageId: number) => typedError<TargetEditResult, AppError>(__TAURI_INVOKE("add_alternative", { imageId })),
+	/**
+	 *  Moves photos to `deliver` / `not_sure` / `set_aside` (locked; `alternative` ->
+	 *  `invalid_argument`). Joining the delivery set picks a photo, leaving it unflags a pick;
+	 *  set aside never rejects. Undo: `restore_target_snapshot(result.previous)`.
+	 */
+	setTargetChoice: (ids: number[], choice: TargetChoice) => typedError<TargetEditResult, AppError>(__TAURI_INVOKE("set_target_choice", { ids, choice })),
+	/**
+	 *  Writes target-edit snapshots back (selection rows + flags), atomically: undo / redo of
+	 *  `swap_alternative` / `add_alternative` / `set_target_choice`. Returns the changed ids.
+	 */
+	restoreTargetSnapshot: (snapshots: TargetSnapshot[]) => typedError<number[], AppError>(__TAURI_INVOKE("restore_target_snapshot", { snapshots })),
+	/**
+	 *  Writes the selection to the flags: delivered -> pick, the rest -> the scorer's suggestion
+	 *  without its pick (confident-defect rejects stay), for photos that are unflagged or flagged
+	 *  by Sieve (origin `auto`); the user's flags and all stars are left alone. Same result type as
+	 *  `apply_suggestions`. Unknown project -> `not_found`.
+	 */
+	applyTargetSelection: (projectId: number) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_target_selection", { projectId })),
 };
 
 /** Events */
@@ -1066,6 +1181,7 @@ export const events = {
 	sceneProgress: makeEvent<SceneProgress>("scene-progress"),
 	styleModelFinished: makeEvent<StyleModelFinished>("style-model-finished"),
 	styleModelProgress: makeEvent<StyleModelProgress>("style-model-progress"),
+	targetRunFinished: makeEvent<TargetRunFinished>("target-run-finished"),
 	thumbnailFailed: makeEvent<ThumbnailFailed>("thumbnail-failed"),
 	thumbnailReady: makeEvent<ThumbnailReady>("thumbnail-ready"),
 	xmpSynced: makeEvent<XmpSynced>("xmp-synced"),
@@ -1088,6 +1204,8 @@ export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"h
 export const DEFAULT_SCENE_APPLY_OPTIONS = {"excludeIds":[],"includeNonKeepers":false,"matchOptions":{"copyFields":["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","process_version"],"matchExposure":true,"matchTone":false,"matchWhiteBalance":true,"strength":1.0},"skipUserEdited":true} as const;
 
 export const LUT_LIBRARY_GROUP_ID = 2 as const;
+
+export const MAX_TARGET_COUNT = 100000 as const;
 
 export const MINOR_SCENE_MAX_KEEPERS = 2 as const;
 
@@ -1134,7 +1252,9 @@ export type ActivityKind =
 /**  Paste / sync settings to many photos. */
 "paste_sync" | 
 /**  Apply a scene edit to its members. */
-"apply_scene" | "export" | "model_download" | "other";
+"apply_scene" | "export" | "model_download" | 
+/**  Target-count selection: people, moments, choosing the delivery set (v20). */
+"target_selection" | "other";
 
 /**  Lifecycle of a background activity (v18). */
 export type ActivityState = "running" | 
@@ -1348,6 +1468,19 @@ export type AiTarget =
 
 /**  AI selection families, for capability reporting (`MaskCapabilities.ai`). */
 export type AiTargetKind = "subject" | "sky" | "background" | "people" | "object" | "landscape";
+
+/**  `get_alternatives` result (IPC v20). */
+export type Alternatives = {
+	/**  The image asked about. */
+	imageId: number,
+	/**
+	 *  The delivered photo the strip belongs to: the image itself when delivered, its
+	 *  `alternativeOf` when an alternative, else `null` (no strip).
+	 */
+	delivered: ImageSelection | null,
+	/**  Alternatives of `delivered`, by rank (empty when `delivered` is `null`). */
+	alternatives: ImageSelection[],
+};
 
 /**  Analysis failed for an image (unreadable preview, model error). */
 export type AnalysisFailed = {
@@ -1859,6 +1992,18 @@ export type ColorWheel = {
 	hue: number,
 	saturation: number,
 	luminance: number,
+};
+
+/**  `get_covered_by` result (IPC v20): "already kept a similar one". */
+export type CoveredBy = {
+	imageId: number,
+	/**  The delivered similar photo. */
+	coveredById: number,
+	similarity: number,
+	/**  Both photos are in the same moment. */
+	sameMoment: boolean,
+	/**  User-facing, e.g. "Already kept a similar one: DSC0412". */
+	text: string,
 };
 
 /**  Result of `create_project`. */
@@ -2536,6 +2681,25 @@ export type FaceInfo = {
 };
 
 /**
+ *  One face to show for a person: a crop of the photo's existing loupe preview. No face files
+ *  are written: show `previewPath` (via `convertFileSrc`, like `ThumbnailState.previewPath`)
+ *  cropped to `crop` (TS helper `faceCropStyle` in `src/ipc/index.ts`).
+ */
+export type FaceSample = {
+	imageId: number,
+	/**  Index into the image's faces (`get_faces(imageId)` order = `image_analysis.faces_json`). */
+	faceIndex: number,
+	/**  The detected face box (`FaceInfo.bbox` frame: normalized preview, orientation applied). */
+	bbox: NormRect,
+	/**  Square (in pixels) padded crop around the face, inside 0..=1, same frame as `bbox`. */
+	crop: NormRect,
+	/**  Width / height of the preview (orientation applied), to size the crop box. */
+	imageAspect: number,
+	/**  Absolute path of the 2048 px preview (`null` while it is missing). */
+	previewPath: string | null,
+};
+
+/**
  *  Output file names. `template` grammar: literal text plus tokens in braces (see
  *  [`parse_filename_template`]); the format's extension is appended.
  */
@@ -2807,12 +2971,45 @@ export type ImageQuery = {
 	 *  `FilterCounts.suggested*`.
 	 */
 	suggested?: PendingSuggestion | null,
+	/**
+	 *  v20: only photos whose target-run choice is one of these (empty = no constraint; photos
+	 *  without a selection row never match), e.g. `["not_sure", "set_aside"]` for pass 2.
+	 */
+	targetChoices?: TargetChoice[],
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
 	offset: number,
 	/**  Capped at [`ImageQuery::MAX_LIMIT`]. */
 	limit: number,
+};
+
+/**  The selection state of one photo (IPC v20). */
+export type ImageSelection = {
+	imageId: number,
+	choice: TargetChoice,
+	momentId: number | null,
+	/**  The frame's own shot type (the moment's is its dominant one). */
+	shotType: ShotType | null,
+	/**  `alternative` only: the delivered photo this is an alternative to. */
+	alternativeOf: number | null,
+	/**  `alternative` only: 1 = best alternative of `alternativeOf`. */
+	rank: number | null,
+	/**
+	 *  Non-delivered photos: the nearest delivered similar photo ("already kept a similar
+	 *  one"); `null` when nothing similar was delivered.
+	 */
+	coveredBy: number | null,
+	/**  Similarity to `coveredBy`, 0..=1 (1 = identical). */
+	coveredSimilarity: number | null,
+	/**  Selection priority 0..=1 (higher = chosen earlier). */
+	score: number,
+	/**  Most important first. */
+	reasons: TargetReason[],
+	/**  The user decided (target edit or own flag): re-runs keep the choice. */
+	locked: boolean,
+	/**  People recognised in the photo. */
+	personIds: number[],
 };
 
 /**  Natural order of each key; `ImageQuery.sortDescending` reverses it. */
@@ -3605,6 +3802,24 @@ export type ModelGroupStatus = {
 	files: ModelFileStatus[],
 };
 
+/**  A group of frames of the same scene and people across the shoot (IPC v20). */
+export type Moment = {
+	id: number,
+	projectId: number,
+	/**  Dominant shot type of the frames. */
+	shotType: ShotType,
+	startedAtMs: number | null,
+	endedAtMs: number | null,
+	/**  Members in capture order (at least 1). */
+	imageIds: number[],
+	/**  People seen in the moment (most frames first). */
+	personIds: number[],
+	/**  Members chosen for delivery, in capture order. */
+	deliveredIds: number[],
+	/**  Best frame (the cover of the moment), if any. */
+	representativeId: number | null,
+};
+
 /**
  *  Estimated colour of neutral surfaces in a *rendered* image (render space: sRGB/D65).
  *  A perfectly balanced render has `a = b = 0` (xy = D65 0.3127, 0.3290).
@@ -3749,8 +3964,64 @@ export type PendingSuggestion =
 /**  No flag suggested, but stars (`suggestedRating > 0`). */
 "rating";
 
+/**  `list_people` result (IPC v20). */
+export type PeopleOverview = {
+	projectId: number,
+	/**  Main people first, then important, then by `photoCount` (descending), then id. */
+	people: Person[],
+	/**
+	 *  "Is this person important?" questions still open (`ask && !roleConfirmed`), in asking
+	 *  order (most photos first).
+	 */
+	questions: number[],
+	/**
+	 *  Face identity model of the stored embeddings; `null` = face identity not available (no
+	 *  model / never run): `people` is empty and the selection runs without people.
+	 */
+	modelVersion: string | null,
+	/**  User-facing note (e.g. "Face recognition is not available yet"), else `null`. */
+	message: string | null,
+};
+
+/**  A face identity cluster of one project (IPC v20). */
+export type Person = {
+	id: number,
+	projectId: number,
+	/**  Effective role: the user's answer when `roleConfirmed`, else `suggestedRole`. */
+	role: PersonRole,
+	/**  The user set the role (`set_person_role`); re-runs never change it. */
+	roleConfirmed: boolean,
+	/**  The engine's guess (main pair = most frequent faces appearing together, large and central). */
+	suggestedRole: PersonRole,
+	/**
+	 *  The engine wants to ask the user about this person (recurring, not main). Questions still
+	 *  open = `ask && !roleConfirmed`.
+	 */
+	ask: boolean,
+	/**  Photos of the project showing this person. */
+	photoCount: number,
+	/**  Faces assigned to this person (>= photoCount when a person appears twice, e.g. mirrors). */
+	faceCount: number,
+	/**  Up to 6 faces, best first (`samples[0]` = the representative face for the people grid). */
+	samples: FaceSample[],
+};
+
 /**  Body parts of an AI "People" selection (Lightroom's list; empty = entire person). */
 export type PersonPart = "face_skin" | "body_skin" | "eyebrows" | "eye_sclera" | "iris_pupil" | "lips" | "teeth" | "hair" | "clothes";
+
+/**
+ *  How much a person matters for the selection (IPC v20). Photos with important people
+ *  are favoured, the main subject most.
+ */
+export type PersonRole = 
+/**  The main subject (the couple: up to 2 people; a portrait: 1). */
+"main" | 
+/**  Recurring person the user said is important (parents, siblings, ...). */
+"important" | 
+/**  Recurring person the user said is not important, or a guest. */
+"other" | 
+/**  Not decided (the engine had no opinion and the user was not asked / did not answer). */
+"unknown";
 
 export type PickFlag = "pick" | "reject" | "unflagged";
 
@@ -4458,6 +4729,24 @@ export type Sharpening = {
 /**  Shoot context; biases subject prioritization and tag thresholds. */
 export type ShootType = "wedding" | "portrait" | "sports" | "event" | "landscape" | "general";
 
+/**  What kind of photo a frame / moment is (IPC v20); drives the selection rules. */
+export type ShotType = 
+/**  The main pair (or the portrait subject) dominates: keep many variations. */
+"couple" | 
+/**  >= 3 faces, posed: one per group setup (plus activity / reaction frames). */
+"group" | 
+/**  No face, a sharp salient object (rings, dress, decor): one per detail. */
+"detail" | 
+/**  Faces not posed (guests, dancing, reception): keep when a face / action is visible. */
+"candid" | "other";
+
+/**  Per shot type counts of a run. */
+export type ShotTypeCount = {
+	shotType: ShotType,
+	total: number,
+	deliver: number,
+};
+
 /**  A scene `apply_all_edited_scenes` could not apply (v17). */
 export type SkippedScene = {
 	sceneId: number,
@@ -4811,6 +5100,150 @@ export type TagSource =
 "auto" | 
 /**  Applied by the user. */
 "user";
+
+/**  Choice of the selection for one photo (IPC v20). */
+export type TargetChoice = 
+/**  In the delivery set (suggested pick). */
+"deliver" | 
+/**  A ranked alternative to one delivered photo of the same moment (`alternativeOf`). */
+"alternative" | 
+/**  Borderline: reviewed in pass 2. */
+"not_sure" | 
+/**
+ *  Not chosen (near-duplicate, weaker variation, defect, no visible face ...). Never a
+ *  reject by itself: only confident defects keep their reject suggestion.
+ */
+"set_aside";
+
+/**
+ *  Counts over a project's selection rows (IPC v20). `total = deliver + alternative + notSure
+ *  + setAside`.
+ */
+export type TargetCounts = {
+	total: number,
+	deliver: number,
+	alternative: number,
+	notSure: number,
+	setAside: number,
+	/**  Rows the user decided (`ImageSelection.locked`). */
+	locked: number,
+	/**  Shot types present, in `ShotType` order. */
+	perShotType: ShotTypeCount[],
+};
+
+/**  Result of a target edit (`swap_alternative`, `add_alternative`, `set_target_choice`). */
+export type TargetEditResult = {
+	/**  Selection rows that changed (now), incl. re-ranked / re-pointed siblings. */
+	changed: ImageSelection[],
+	/**  Images whose flag changed (refetch with `get_images`). */
+	flagsChanged: number[],
+	/**  Their state before the edit (`restore_target_snapshot` undoes it). */
+	previous: TargetSnapshot[],
+	counts: TargetCounts,
+};
+
+/**
+ *  One user-facing reason behind a choice (IPC v20), e.g.
+ *  `{kind: "near_duplicate", text: "Almost the same as DSC0412", relatedImageId: 412}`.
+ */
+export type TargetReason = {
+	kind: TargetReasonKind,
+	/**  Short, sentence case, no trailing period (same style as `SuggestionReason.text`). */
+	text: string,
+	relatedImageId?: number | null,
+};
+
+/**  Category of a [`TargetReason`] (IPC v20). */
+export type TargetReasonKind = 
+/**  A variation of the main pair (pose / angle / expression). */
+"couple_variation" | 
+/**  Best frame of a group setup (most faces looking, main subject looking). */
+"group_best" | 
+/**  Group activity / reaction frame kept as an extra variation. */
+"group_activity" | 
+/**  Best frame of a detail (focus on the object). */
+"detail_best" | 
+/**  Candid with the subject's face / action clearly visible (also as a crop). */
+"candid_visible" | 
+/**  Shows people the user marked important (or the main subject). */
+"important_person" | 
+/**  Next best frame, added to reach the target. */
+"next_best" | 
+/**  Almost the same as the delivered `relatedImageId`. */
+"near_duplicate" | 
+/**  Another frame of the same group setup / detail is better (`relatedImageId`). */
+"not_best_of_setup" | 
+/**  No visible face (back of the head, face hidden). */
+"no_visible_face" | 
+/**  Detail shot whose focus is not on the object. */
+"detail_out_of_focus" | 
+/**  A defect (the scorer's reason, e.g. eyes closed, missed focus). */
+"defect" | 
+/**  Good, but the target was reached by better frames. */
+"below_target" | 
+/**  The user decided (flag, swap, add, set aside). */
+"user_choice" | 
+/**  Not analysed yet. */
+"not_analyzed" | "other";
+
+/**  A project's latest target run (IPC v20). */
+export type TargetRun = {
+	projectId: number,
+	/**  `shootType` resolved (never `null`). */
+	settings: TargetRunSettings,
+	state: TargetRunState,
+	startedAtMs: number,
+	finishedAtMs: number | null,
+	/**  Last `apply_target_selection` (flags written), `null` = never applied. */
+	appliedAtMs: number | null,
+	/**  User-facing summary or error, e.g. "Picked 812 of 2,512 photos"; `null` while running. */
+	message: string | null,
+	/**  Engine versions (identity / moments / selection) that produced the selection. */
+	modelVersion: string,
+	/**  Over the current selection rows (a failed / cancelled run keeps the previous ones). */
+	counts: TargetCounts,
+	/**  Open "Is this person important?" questions (`PeopleOverview.questions.length`). */
+	peopleQuestions: number,
+};
+
+/**
+ *  A `run_target_selection` run ended (IPC v20): exactly once per accepted call, after the
+ *  selection (and the suggestion overlay) is stored. `run.state` is `finished`, `failed` or
+ *  `cancelled`. Refetch people / moments / selections / the grid. Progress is reported as
+ *  `activityEvent` kind `target_selection`.
+ */
+export type TargetRunFinished = {
+	run: TargetRun,
+};
+
+/**  What the user asked for (IPC v20). */
+export type TargetRunSettings = {
+	/**
+	 *  How many photos to deliver (a guideline: the result may be ~10% off when the moments
+	 *  call for it). 1..=`MAX_TARGET_COUNT`.
+	 */
+	targetCount: number,
+	/**  `null` = the project's shoot type. `TargetRun.settings` always carries the resolved one. */
+	shootType: ShootType | null,
+};
+
+/**  Lifecycle of a project's target run (IPC v20). */
+export type TargetRunState = "running" | "finished" | 
+/**  Ended by an error (`TargetRun.message`); the previous selection is kept. */
+"failed" | 
+/**  Stopped by `cancel_target_selection` (or the app quit); the previous selection is kept. */
+"cancelled";
+
+/**  Undo record of a target edit: the selection row and the flags of one photo before it. */
+export type TargetSnapshot = {
+	imageId: number,
+	choice: TargetChoice,
+	alternativeOf: number | null,
+	rank: number | null,
+	coveredBy: number | null,
+	locked: boolean,
+	cull: CullSnapshot,
+};
 
 /**  Extraction failed for an image. Mirrors `ThumbnailState::Failed`. */
 export type ThumbnailFailed = {

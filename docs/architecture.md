@@ -28,6 +28,10 @@ src-tauri/
                                from; linear undo across Auto edit -> Apply, IPC v17)
   migrations/0016_cull_clarity.sql v16: images.pick_origin (user/auto), quality_scores.reasons_json, keeper rule
                                mode (old default -> not_rejected), camera/lens facet indexes (IPC v18)
+  migrations/0017_capture_transform.sql v17: corrected capture time + source, applied preset, reject strictness (IPC v19)
+  migrations/0018_camera_serial_sync.sql v18: camera body serials, `sync` batches (IPC v19.2)
+  migrations/0019_target_cull.sql v19: people, face_embeddings, moments, target_runs, target_selection,
+                               quality_scores.scored_pick (IPC v20, target-count culling)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -37,6 +41,7 @@ src-tauri/
     ipc/
       types.rs                 all contract types (source of truth for TS)
       masks.rs                 mask / local-adjustment types (v10), re-exported from types.rs
+      target.rs                target-count culling types (v20: people, moments, selection), re-exported from types.rs
       commands.rs              #[tauri::command] handlers + Catalog state (runs DB work on blocking pool)
       events.rs                ImportProgress, ThumbnailReady, ThumbnailFailed,
                                AnalysisProgress, AnalysisReady, AnalysisFailed, AnalysisFinished,
@@ -46,6 +51,7 @@ src-tauri/
       mod.rs                   open (WAL, foreign_keys), user_version migrations
       schema.rs                ordered migration list
       repo.rs                  catalog queries (pure fns over Connection; unit tested)
+      target.rs                target-count culling storage, suggestion overlay, apply, user edits (v20)
     raw/mod.rs                 format identification + `extract` (embedded JPEG pick, LibRaw fallback)
       source.rs tiff.rs        byte source; TIFF/ARW IFD + EXIF parsing
       raf.rs cr3.rs jpeg.rs    Fuji RAF header, Canon CR3 ISO-BMFF boxes, JPEG marker scan
@@ -58,6 +64,9 @@ src-tauri/
     ml/mod.rs                  culling engine: Analysis state/worker, Analyzer (ONNX), score, group_bursts
     ml/thresholds.rs           default CullThresholds per ShootType (calibration data)
     ml/auto_faces.rs           on-demand SCRFD face boxes for Auto tone on unanalysed photos (held by DevelopCache)
+    ml/identity.rs             face embeddings + per-project people clusters (v20; stub until vision-ml-dev)
+    ml/moments.rs              moments across the shoot + shot types (v20; stub)
+    ml/selection.rs            TargetSelection worker (managed state) + target selection engine (v20; engine stub)
     ml/masking.rs              AI mask seam: Segmenter (managed state), SegmentModel trait (v10)
     xmp/mod.rs                 XMP sidecar sync: XmpSync state (auto-sync worker), read/write/merge, sidecar_path
     xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
@@ -95,7 +104,8 @@ docs/                          this file, ipc-changelog.md, phase plans
 |---|---|
 | `src-tauri/src/ipc/`, `src-tauri/src/lib.rs`, `main.rs`, `src-tauri/migrations/`, `src-tauri/src/db/schema.rs`, `src/ipc/`, `docs/` | architect |
 | rest of `src-tauri/` (incl. `db/repo.rs`, `db/projects.rs`, `styles/`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
-| `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev |
+| `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev (surface of `ml::selection::TargetSelection` + `run_pipeline` fixed by the architect) |
+| `src-tauri/src/db/target.rs` (target-count culling storage, IPC v20) | architect, then rust-engine-dev |
 | `src-tauri/src/scene/` (surface in `scene/mod.rs` + `store.rs` fixed by the architect) | vision-ml-dev |
 | `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/`, `src-tauri/src/profiles/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
@@ -239,6 +249,24 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `auto_upright` / `autoUpright` (v19) | `id: number, mode: UprightMode, adjustments: ParametricAdjustments \| null` | `UprightResult` (solved `UprightSolution` or `null` + message; nothing saved) |
 | `render_preview_variant` / `renderPreviewVariant` (v19) | `id: number, adjustments: ParametricAdjustments, variant: PreviewVariant, options: RenderOptions` | `RenderedPreview \| null` (preset applied / panel groups reset; no save, no history; use slot `preview`) |
 | `set_project_reject_strictness` / `setProjectRejectStrictness` (v19) | `projectId: number, strictness: RejectStrictness` | `null` (kicks a rescore) |
+| `get_transform_bounds` / `getTransformBounds` (v19.3) | `id: number, adjustments: ParametricAdjustments` | `TransformBounds` (warped outline + constrained crop; nothing saved) |
+| `run_target_selection` / `runTargetSelection` (v20) | `projectId: number, settings: TargetRunSettings` | `TargetRun` (`running`; background; `activityEvent` kind `target_selection`, then `targetRunFinished`) |
+| `cancel_target_selection` / `cancelTargetSelection` (v20) | – | `null` (previous selection kept) |
+| `get_target_run` / `getTargetRun` (v20) | `projectId: number` | `TargetRun \| null` (settings, state, counts, open people questions) |
+| `list_people` / `listPeople` (v20) | `projectId: number` | `PeopleOverview` (people + "Is this person important?" questions) |
+| `set_person_role` / `setPersonRole` (v20) | `personId: number, role: PersonRole \| null` | `Person` (user-confirmed; `null` = back to the suggestion) |
+| `list_moments` / `listMoments` (v20) | `projectId: number` | `Moment[]` (capture order, shot type, members, delivered) |
+| `get_image_selections` / `getImageSelections` (v20) | `ids: number[]` | `ImageSelection[]` (given order; no row = omitted) |
+| `get_alternatives` / `getAlternatives` (v20) | `imageId: number` | `Alternatives` (delivered photo + ranked alternatives) |
+| `get_covered_by` / `getCoveredBy` (v20) | `imageId: number` | `CoveredBy \| null` ("Already kept a similar one") |
+| `swap_alternative` / `swapAlternative` (v20) | `deliveredId: number, alternativeId: number` | `TargetEditResult` (locked; flags as the user's; undo via `previous`) |
+| `add_alternative` / `addAlternative` (v20) | `imageId: number` | `TargetEditResult` ("add both") |
+| `set_target_choice` / `setTargetChoice` (v20) | `ids: number[], choice: TargetChoice` (not `alternative`) | `TargetEditResult` |
+| `restore_target_snapshot` / `restoreTargetSnapshot` (v20) | `snapshots: TargetSnapshot[]` | `number[]` (undo / redo of target edits) |
+| `apply_target_selection` / `applyTargetSelection` (v20) | `projectId: number` | `ApplySuggestionsResult` (selection -> flags, origin `auto`; user flags and stars untouched) |
+
+v20: `ImageQuery.targetChoices?: TargetChoice[]`; `ActivityKind::TargetSelection`; event `targetRunFinished`; `set_pick`
+also locks the photo's target-run choice. See "Target-count culling (v19, IPC v20)".
 
 v19: `paste_settings` / `sync_settings` / `paste_previous` return `EditBatchResult` (one undoable batch, kind
 `paste`; duplicates ignored); `CaptureMeta.capturedAtMs` = corrected time + `originalCapturedAtMs` /
@@ -794,7 +822,7 @@ migrations tracked by `PRAGMA user_version`.
 | `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF (`captured_at_ms` = corrected capture time since v17, `exif_captured_at_ms` = the file's own, `capture_time_source` exif/sidecar/user), rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity), `camera_serial` / `camera_serial_read` (v18: body serial from EXIF; `read = 0` = imported before v18, filled by the background `db::camera_serial::backfill`) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
-| `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) + `reasons_json` (v16, JSON `SuggestionReason[]`) |
+| `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) + `reasons_json` (v16, JSON `SuggestionReason[]`); v19: `scored_pick` = the scorer's own flag, `suggested_pick` = effective (target selection overlay) |
 | `image_analysis` | per-image analysis status (queued/done/failed), model version, error, `phash` (u64 as i64), `faces_json` (`FaceInfo[]`), `metrics_json` (`ml::ImageMetrics`) |
 | `burst_groups` | time/similarity clusters, optional keeper |
 | `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
@@ -809,6 +837,11 @@ migrations tracked by `PRAGMA user_version`.
 | `export_items` | per (job, seq): image, status pending/done/failed/skipped, output path, error |
 | `scenes` | lighting scenarios: derived folder / started / ended, method auto/manual (members via `images.scene_id`); v12 edit plan: `representative_id/_source/_reason`, `applied_at_ms`, `applied_params_json`, `applied_batch_id`; v13: `skipped`, `applied_covered_json` (ids the last apply considered) |
 | `scene_features` | per-image appearance features for detection (JSON, `version`, `computed_at`) |
+| `people` | face identity clusters per project (v19): `suggested_role`, `user_role` (NULL = not confirmed), `ask`, sample faces JSON, `centroid` (f32 LE) + `dim`, face / photo counts |
+| `face_embeddings` | one per (image, face index into `faces_json`) (v19): `model_version`, `dim`, `embedding` (f32 LE BLOB), `bbox_json`, `quality`, `person_id` |
+| `moments` | cross-shoot groups per project (v19): `shot_type`, time range, representative, person ids JSON (members via `target_selection.moment_id`) |
+| `target_runs` | latest target run per project (v19): count, shoot type, state, message, model version, started / finished / applied |
+| `target_selection` | per-image choice of the project's run (v19): choice, moment, shot type, `alternative_of` + `rank`, `covered_by` + similarity, score, reasons JSON, `locked` |
 | `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
 
 Filter-bar indexes (schema v11, `0011_hardening.sql`): `idx_images_folder_pick_rating (folder_id, pick, rating)`
@@ -933,6 +966,43 @@ variant with `styles::resolve_preview_variant` and render through the normal tic
 Batches: Paste / Sync / Paste from Previous go through `batches::apply_fields_recorded` (kind `paste`), so a paste to
 any selection is one `undo_edit_batch` step. Reject strictness is per project
 (`projects::reject_strictness_of_image` for the scorer).
+
+### Target-count culling (v19, IPC v20)
+Goal (roadmap Phase 9): pick the delivery set to a target count (a guideline), review it with alternatives at hand,
+then pass quickly through the rest with "already kept a similar one". One run per project, three engine stages on the
+`TargetSelection` worker thread (`ml::selection`, own SQLite connection, one run at a time, `cancel_target_selection`
+between stages):
+1. **People** (`ml::identity::update_people`): face embeddings per (image, face index into `image_analysis.faces_json`,
+   the `get_faces` order) in `face_embeddings` (f32 little-endian BLOB, `dim`, L2-normalised, `model_version`, the box
+   it came from so re-analysis can invalidate it), clustered per project into `people`. Re-runs continue existing people
+   by centroid (`PersonDraft.prior_id`) so ids and the user's answers (`user_role`) survive. Main subject = the most
+   frequent pair appearing together (portrait: one face); other recurring people get `ask` = the "Is this person
+   important?" questions (`PeopleOverview.questions`); `set_person_role` answers, applied at the next run.
+2. **Moments** (`ml::moments::detect_moments`): time gap + visual similarity + same people, across bursts and scenes,
+   never across projects; shot type per frame and per moment (couple / group / detail / candid / other) plus per-frame
+   signals (visible face, back of head, detail focus).
+3. **Selection** (`ml::selection::select`): the user's rules (roadmap Phase 9) fill the target by priority; every
+   analysed photo gets a `target_selection` row: `deliver`, `alternative` (of one delivered photo of its moment, `rank`
+   1..n), `not_sure`, `set_aside`, with reasons and `covered_by` (+ similarity) = the nearest delivered similar photo.
+   Stored by `db::target::store_results` (moments replaced; unlocked rows replaced; locked rows keep their choice).
+
+Face crops for the people grid are not files: `FaceSample` = preview path + `crop` (padded square in pixels, computed
+by `db::target::face_crop`), drawn by CSS (`faceCropStyle` in `src/ipc/index.ts`).
+
+Flags (the key decision, decisions.md 2026-10-10): the selection is the project's **suggestion**.
+`quality_scores.scored_pick` keeps the scorer's own suggestion (reject strictness, confident-defect and burst rejects
+of IPC v19); `suggested_pick` becomes the effective one (`db::target::OVERLAY_SQL`): `deliver` -> `pick`; other choices
+-> `scored_pick` without `pick` (defect rejects stay); no row -> `scored_pick`. Every writer keeps it in step
+(`ml::store::write_scored`, `db::target` writers), so the cull summary, `suggested` filter, Apply suggestions, keeper rule
+and scenes follow the run without changes. `apply_target_selection` writes the effective suggestion to photos of the
+run that are unflagged or auto-flagged (origin `auto`), never the user's flags or stars, so re-applying after a re-run
+moves only Sieve's own picks. Not being chosen never rejects.
+
+User decisions win: `set_pick` locks the photo's row (`db::target::note_user_flags`: pick -> deliver, reject -> set
+aside, unflagged -> a delivered photo becomes not sure); target edits (`swap_alternative`, `add_alternative`,
+`set_target_choice`) lock and write the flags of photos entering / leaving the delivery set as the user's (pick /
+unflagged); `restore_target_snapshot` undoes them (rows + flags). Re-runs pass locked rows to the engine
+(`SelectionInput.locked`) and `store_results` never changes their choice.
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

@@ -25,7 +25,8 @@ use ipc::commands::{self, Catalog};
 use ipc::events::{
     ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, EditedPreviewChanged,
     ExportFinished, ExportProgress, ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress,
-    StyleModelFinished, StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    StyleModelFinished, StyleModelProgress, TargetRunFinished, ThumbnailFailed, ThumbnailReady, XmpSynced,
+    XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -193,6 +194,21 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::set_project_reject_strictness,
             // IPC v19.3
             commands::get_transform_bounds,
+            // IPC v20
+            commands::run_target_selection,
+            commands::cancel_target_selection,
+            commands::get_target_run,
+            commands::list_people,
+            commands::set_person_role,
+            commands::list_moments,
+            commands::get_image_selections,
+            commands::get_alternatives,
+            commands::get_covered_by,
+            commands::swap_alternative,
+            commands::add_alternative,
+            commands::set_target_choice,
+            commands::restore_target_snapshot,
+            commands::apply_target_selection,
         ])
         .events(collect_events![
             ImportProgress,
@@ -213,7 +229,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             StyleModelFinished,
             ActivityEvent,
             // IPC v19.1
-            EditedPreviewChanged
+            EditedPreviewChanged,
+            // IPC v20
+            TargetRunFinished
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -236,6 +254,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         .constant("DEFAULT_SCENE_APPLY_OPTIONS", ipc::types::SceneApplyOptions::default())
         // IPC v15: scenes with at most this many keepers are `minor`.
         .constant("MINOR_SCENE_MAX_KEEPERS", ipc::types::MINOR_SCENE_MAX_KEEPERS)
+        // IPC v20: largest `TargetRunSettings.targetCount`.
+        .constant("MAX_TARGET_COUNT", ipc::types::MAX_TARGET_COUNT)
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -332,6 +352,11 @@ pub fn run() {
             app.manage(Ingest::new(config));
             // On-demand face boxes for Auto tone on unanalysed photos (culling detector).
             let auto_faces = ml::auto_faces::AutoFaces::new(models_dir.clone());
+            // Target-count culling worker (IPC v20; face identity model next to SCRFD).
+            app.manage(ml::selection::TargetSelection::new(ml::selection::TargetSelectionConfig {
+                catalog_path: path.clone(),
+                models_dir: models_dir.clone(),
+            }));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             // Personal style model (IPC v14; training runs on its own thread + connection).
             app.manage(StyleModel::new(StyleModelConfig { catalog_path: path.clone() }));

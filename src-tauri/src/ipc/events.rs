@@ -6,6 +6,7 @@ use tauri_specta::Event;
 
 use super::types::{
     string_enum, EditedPreview, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase,
+    TargetRun,
 };
 
 string_enum! {
@@ -23,6 +24,8 @@ string_enum! {
         ApplyScene => "apply_scene",
         Export => "export",
         ModelDownload => "model_download",
+        /// Target-count selection: people, moments, choosing the delivery set (v20).
+        TargetSelection => "target_selection",
         Other => "other",
     }
 }
@@ -267,4 +270,14 @@ pub struct StyleModelFinished {
     /// User-facing reason when not `ok` (e.g. "Edit at least 20 photos first").
     pub error: Option<String>,
     pub status: StyleModelStatus,
+}
+
+/// A `run_target_selection` run ended (IPC v20): exactly once per accepted call, after the
+/// selection (and the suggestion overlay) is stored. `run.state` is `finished`, `failed` or
+/// `cancelled`. Refetch people / moments / selections / the grid. Progress is reported as
+/// `activityEvent` kind `target_selection`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetRunFinished {
+    pub run: TargetRun,
 }

@@ -162,8 +162,8 @@ pub fn write_scored(tx: &Transaction, id: ImageId, s: &Scored, now: i64) -> AppR
     tx.prepare_cached(
         "INSERT OR REPLACE INTO quality_scores (image_id, overall, face_sharpness, global_sharpness, eyes_open,
              composition, face_count, clipped_highlights_pct, clipped_shadows_pct, mean_luma, model_version,
-             analyzed_at, suggested_rating, suggested_pick, reasons_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             analyzed_at, suggested_rating, suggested_pick, reasons_json, scored_pick)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?14)",
     )?
     .execute(params![
         id,
@@ -182,6 +182,9 @@ pub fn write_scored(tx: &Transaction, id: ImageId, s: &Scored, now: i64) -> AppR
         q.suggested_pick.as_str(),
         serde_json::to_string(&q.reasons)?,
     ])?;
+    // IPC v20: `suggested_pick` is the effective suggestion (the target selection, if any, on
+    // top of the scorer's own `scored_pick`).
+    crate::db::target::overlay_suggestions(tx, &[id])?;
     tx.prepare_cached("UPDATE image_analysis SET faces_json = ?2 WHERE image_id = ?1")?
         .execute(params![id, serde_json::to_string(&s.faces)?])?;
     set_auto_tags(tx, id, &s.tags, &[CullTag::DuplicateBurst])?;

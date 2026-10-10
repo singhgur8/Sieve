@@ -834,6 +834,9 @@ fn query_filter_skip(
     if let Some(kind) = q.suggested {
         clauses.push(suggested_sql(kind, "i."));
     }
+    if !q.target_choices.is_empty() {
+        clauses.push(crate::db::target::choices_clause(&q.target_choices, "i."));
+    }
     metadata_clauses(&q.metadata, "i.", skip, &mut clauses, &mut args)?;
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());

@@ -27,6 +27,7 @@ pub mod capture_time;
 pub mod projects;
 pub mod repo;
 pub mod schema;
+pub mod target;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

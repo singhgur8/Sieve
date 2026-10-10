@@ -839,6 +839,139 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v20 — 2026-10-10 (Phase 9: target-count culling — people, moments, target run, alternatives, "covered by")
+
+Additive on the wire (new types, 14 commands, 1 event, an optional `ImageQuery` field, a new `ActivityKind`). Schema v19
+(`migrations/0019_target_cull.sql`): `people`, `face_embeddings`, `moments`, `target_runs`, `target_selection`,
+`quality_scores.scored_pick` (backfilled = `suggested_pick`). `src/ipc/bindings.ts` regenerated. Types live in
+`src-tauri/src/ipc/target.rs` (re-exported from `types.rs`). Spec: docs/roadmap.md Phase 9 (user rules), architecture.md
+"Target-count culling".
+
+Types
+- People: `PersonRole` (`main | important | other | unknown`), `Person {id, projectId, role (effective), roleConfirmed,
+  suggestedRole, ask, photoCount, faceCount, samples: FaceSample[] (<= 6, [0] = representative)}`, `PeopleOverview
+  {projectId, people (main, important, then by photos), questions: PersonId[] (open "Is this person important?" =
+  ask && !roleConfirmed, most photos first), modelVersion | null (null = face identity unavailable), message}`.
+- Face crops: `FaceSample {imageId, faceIndex (get_faces order), bbox, crop (padded square in pixels, inside the
+  frame), imageAspect, previewPath}` — a crop of the existing 2048 px preview, no new files; TS helper
+  `faceCropStyle(sample, convertFileSrc(previewPath))` in `src/ipc/index.ts` (CSS background crop + aspect ratio).
+- Moments: `ShotType` (`couple | group | detail | candid | other`), `Moment {id, projectId, shotType, startedAtMs,
+  endedAtMs, imageIds (capture order), personIds, deliveredIds, representativeId}`.
+- Target run: `TargetRunSettings {targetCount (1..=MAX_TARGET_COUNT = 100000, a guideline), shootType | null (= the
+  project's)}`, `TargetRunState` (`running | finished | failed | cancelled`), `TargetRun {projectId, settings
+  (resolved), state, startedAtMs, finishedAtMs, appliedAtMs, message, modelVersion, counts: TargetCounts,
+  peopleQuestions}`, `TargetCounts {total, deliver, alternative, notSure, setAside, locked, perShotType:
+  ShotTypeCount[]}`.
+- Per image: `TargetChoice` (`deliver | alternative | not_sure | set_aside`), `ImageSelection {imageId, choice,
+  momentId, shotType, alternativeOf, rank (1 = best), coveredBy, coveredSimilarity, score, reasons: TargetReason[],
+  locked, personIds}`, `TargetReason {kind: TargetReasonKind, text, relatedImageId?}` (kinds `couple_variation |
+  group_best | group_activity | detail_best | candid_visible | important_person | next_best | near_duplicate |
+  not_best_of_setup | no_visible_face | detail_out_of_focus | defect | below_target | user_choice | not_analyzed |
+  other`; same text style as `SuggestionReason`).
+- `Alternatives {imageId, delivered: ImageSelection | null, alternatives (by rank)}`, `CoveredBy {imageId,
+  coveredById, similarity, sameMoment, text ("Already kept a similar one: DSC0412")}`.
+- Edits: `TargetEditResult {changed: ImageSelection[], flagsChanged, previous: TargetSnapshot[], counts}`,
+  `TargetSnapshot {imageId, choice, alternativeOf, rank, coveredBy, locked, cull: CullSnapshot}` (undo).
+- `ImageQuery.targetChoices?: TargetChoice[]` (empty = no constraint; photos without a selection row never match),
+  e.g. pass 2 = `["not_sure", "set_aside"]`. Honoured by `list_images`, `list_image_ids`, `get_metadata_filter_options`.
+- `ActivityKind::TargetSelection` (`"target_selection"`). Exhaustive TS `Record<ActivityKind, …>` literals need the key
+  (none today: `BUSY_WHY` is `Partial`).
+
+Commands (TS names in camelCase)
+| Command | Args | Returns |
+|---|---|---|
+| `run_target_selection` | `projectId, settings: TargetRunSettings` | `TargetRun` (`running`; background; `activityEvent` kind `target_selection`, then one `targetRunFinished`) |
+| `cancel_target_selection` | – | `null` (previous selection kept) |
+| `get_target_run` | `projectId` | `TargetRun \| null` (a `running` row without a worker reads `cancelled`) |
+| `list_people` | `projectId` | `PeopleOverview` |
+| `set_person_role` | `personId, role: PersonRole \| null` | `Person` (`null` = back to the suggestion; applies at the next run) |
+| `list_moments` | `projectId` | `Moment[]` |
+| `get_image_selections` | `ids` | `ImageSelection[]` (given order; ids without a row omitted) |
+| `get_alternatives` | `imageId` | `Alternatives` (strip of its delivered photo) |
+| `get_covered_by` | `imageId` | `CoveredBy \| null` |
+| `swap_alternative` | `deliveredId, alternativeId` | `TargetEditResult` |
+| `add_alternative` | `imageId` | `TargetEditResult` ("add both") |
+| `set_target_choice` | `ids, choice` (not `alternative`) | `TargetEditResult` |
+| `restore_target_snapshot` | `snapshots: TargetSnapshot[]` | `number[]` (undo / redo of the three edits) |
+| `apply_target_selection` | `projectId` | `ApplySuggestionsResult` |
+
+Event: `targetRunFinished {run: TargetRun}` (`target-run-finished`), exactly once per accepted run.
+
+Semantics (implemented in `db::target`, tested in `db::target::tests`)
+- **Selection = the suggestion.** `quality_scores.scored_pick` = the scorer's own suggestion (reject strictness and
+  burst rejects of v19 included); `suggested_pick` = effective: with a selection row `deliver` -> `pick`, other choices
+  -> `scored_pick` with `pick` dropped to `unflagged` (confident-defect rejects stay); without a row = `scored_pick`.
+  So while a run exists it **supersedes** the strictness *pick* suggestions, keeps its *reject* suggestions, and every
+  existing reader (cull summary pending counts, `suggested` filter, Apply suggestions dialog, keeper rule
+  `useSuggestions`, scenes) follows it with no SQL change. Kept in step by `ml::store::write_scored` (rescores) and
+  every `db::target` writer. Not being chosen never rejects a photo (Lightroom's "Delete Rejected Photos" stays safe).
+- **Apply** (`apply_target_selection`) = the existing flag semantics: writes the effective suggestion to photos of the
+  run that are unflagged or flagged by Sieve (`pick_origin = 'auto'`, origin stays `auto`); never touches the user's
+  flags or any stars; stamps `appliedAtMs`. Re-applying after a re-run moves Sieve's own picks with the selection.
+  Cull summary / keepers / XMP / Lightroom picks keep working unchanged.
+- **User decisions win.** `set_pick` now also locks the photo's selection row (`db::target::note_user_flags`: pick ->
+  `deliver`, reject -> `set_aside`, unflagged -> a delivered photo becomes `not_sure`). Target edits lock too and write
+  the flags of photos entering (pick) / leaving (a pick becomes unflagged) the delivery set as the user's. Re-runs keep
+  locked rows' choice / alternative / rank / reasons (they only take the new moment, shot type and score) and the user's
+  people answers (`people.user_role`, kept through `PersonDraft.prior_id`). Note: `restore_cull_snapshot` (generic flag
+  undo) does not unlock rows; use `restore_target_snapshot` for target edits.
+- Swap: the alternative is delivered, the old photo becomes its alternative #1, the old strip and covered links follow
+  the new photo. Leaving the delivery set (`set_target_choice`, user reject): its alternatives become `not_sure` and
+  rows it covered lose `coveredBy`.
+
+Placeholders (TODO-free stubs; the app builds and runs end to end)
+- `ml::selection`: `TargetSelection` managed state (`new`, `is_running`, `start`, `cancel`; registered in `lib.rs`),
+  worker thread + activity + event, `run_pipeline` (identity -> moments -> `select` -> `db::target::store_results`),
+  `select` / `choose` (stub: no decisions; the run finishes with "Target selection is not available yet: no photos were
+  chosen").
+- `ml::identity`: `update_people` (stub: `people: None`, "Face recognition is not available yet"), `cluster_people`,
+  `suggest_roles`, `PriorPerson`.
+- `ml::moments`: `detect_moments` (stub: empty `MomentPlan`), `group_moments`, `classify_shot`, `FrameSignals`,
+  `MomentFrame`.
+- Storage for the engines (`db::target`): `upsert_embedding` / `project_embeddings` (f32 LE BLOB + `dim`),
+  `replace_people(PersonDraft[])`, `store_results(MomentDraft[], SelectionDraft[])`, `people_roles`,
+  `locked_choices`.
+
+Mock backend (`src/testing/mockTarget.ts`, wired in `mockBackend.ts`)
+- `?target=1`: a finished run on project 1 (target 800): a couple (2 `main`) + 4 recurring people with open questions,
+  face samples cropped from mock previews, moments of 8 frames cycling couple / couple / group / detail / candid /
+  couple / other / group / candid / detail, deliveries per shot type (couple 3, candid 2, group / detail 1, other 0),
+  ranked alternatives (couple <= 3, group <= 2), `not_sure` / `set_aside` with reasons, `coveredBy` + similarity on every
+  non-delivered frame that has a delivered neighbour, the suggestion overlay. `?target=answered`: same with the
+  questions answered (2 important, 2 other).
+- Without the switch: no run; `run_target_selection` builds the same data after `window.__mockTargetDelay` ms (default
+  300) with `activity-event` (kind `target_selection`) and one `target-run-finished`. All edits, undo, apply,
+  `set_pick` locking and `ImageQuery.targetChoices` are mirrored. Contract check: `tests/ui/ipc-v20-mock.spec.ts`.
+
+Who implements what
+- architect (done): types, schema v19, commands + registration, `db::target` (storage, overlay, apply, edits, undo,
+  `set_pick` hook, `ImageQuery.targetChoices` in `repo::query_filter`), `ml::store::write_scored` writes `scored_pick` +
+  overlay, `ml::{identity, moments, selection}` stubs + worker, Rust tests, bindings, `faceCropStyle`, mock + spec.
+- vision-ml-dev:
+  1. **Face identity** (`ml::identity::update_people`): offline ONNX face embedding model next to SCRFD (licence in
+     decisions.md, add to `scripts/fetch-models.sh` / bundle staging), embed faces from the preview (store with
+     `db::target::upsert_embedding`, re-embed when the stored `bbox` no longer matches `faces_json[faceIndex]` or the
+     model changed), cluster per project continuing prior people by centroid (`prior_id`), main pair / portrait
+     subject, `ask` for recurring people; report progress; respect `cancel`.
+  2. **Moments and shot types** (`ml::moments::detect_moments`): moments across the shoot (time gap + visual
+     similarity + same people), shot type per frame and per moment, `FrameSignals` (visible face, back-of-head /
+     no-face, detail focus).
+  3. **Target selection** (`ml::selection::select` / `choose`): the Phase 9 priority rules, alternatives ranked per
+     delivered photo, `not_sure` / `set_aside` with reasons, `coveredBy` for every non-delivered frame with a similar
+     delivered one, keep `SelectionInput.locked`, never deliver a confident-defect reject or a user reject, deterministic.
+     Wait for analysis to be idle (or select only analysed photos, `not_analyzed` reason for the rest). Bump
+     `SELECTION_VERSION`.
+- frontend-dev: Target cull UI per roadmap (step 1 "Pick the best N": `runTargetSelection`, progress from
+  `activityEvent` kind `target_selection`, refetch on `events.targetRunFinished`; people confirmation: `listPeople`,
+  `faceCropStyle`, `setPersonRole`, then re-run; pass 1: grid with `targetChoices: ["deliver"]`, alternatives strip
+  `getAlternatives`, `swapAlternative` / `addAlternative` / `setPick` reject, undo via `restoreTargetSnapshot(previous)`;
+  pass 2: `targetChoices: ["not_sure", "set_aside"]`, `getCoveredBy` thumbnail, skip / swap / add both; counts from
+  `TargetRun.counts`; "Mark N as picks" = `applyTargetSelection`). While a run exists, the generic "Apply suggestions"
+  applies the same picks (overlay); consider offering the "Picks and ratings" keeper rule after applying so keepers =
+  the delivery set. `isFiltered` / `describeFilters` / chips / `membershipSensitive` must know `targetChoices`.
+- rust-engine-dev: nothing required. New writers of `images.pick` should keep `pick_origin` rules; a new writer of
+  `quality_scores` must also write `scored_pick` and call `db::target::overlay_suggestions`.
+
 ## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
 
 Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.

@@ -98,6 +98,7 @@ import type {
   TransformBounds,
   WhiteBalance,
 } from "../ipc";
+import { createMockTarget, NOT_TARGET } from "./mockTarget";
 import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS, ALL_ADJUSTMENT_FIELDS } from "../ipc";
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
@@ -691,6 +692,7 @@ export function installMockBackend(count: number) {
       if (q.missingOnly && r.missingSinceMs == null) return false;
       if (q.keepersOnly && !keeper(r)) return false;
       if (q.suggested != null && !pendingOk(r, q.suggested)) return false;
+      if (!target.choiceOk(r.id, q.targetChoices)) return false;
       if (!metaOk(r, q.metadata)) return false;
       return true;
     });
@@ -897,6 +899,9 @@ export function installMockBackend(count: number) {
           primary: i === 1,
           considered: true,
         }));
+
+  // ---- v20 target-count culling (`src/testing/mockTarget.ts`; `?target=1` = a finished run on project 1) ----
+  const target = createMockTarget({ rows, byId, projectOf: (r) => projectOfFolder(r.folderId), requireProject, faces, guardWrite: () => guardWrite() });
 
   // ---- develop (v5) emulation: adjustments, linear history with cursor, presets, LUTs, renders ----
   interface Hist {
@@ -1619,6 +1624,8 @@ export function installMockBackend(count: number) {
         throw { kind: injected.kind, message: injected.message };
       }
       const ids = (args.ids as number[] | undefined) ?? [];
+      const targetResult = target.handle(cmd, args);
+      if (targetResult !== NOT_TARGET) return targetResult;
       switch (cmd) {
         case "get_catalog_state":
           return catalog;
@@ -1667,6 +1674,8 @@ export function installMockBackend(count: number) {
               r.pickOrigin = r.pick === "unflagged" ? null : "user";
             }
           });
+          // v20: the user's flag locks the target-run choice.
+          target.noteUserFlags(ids, args.pick as PickFlag);
           return null;
         case "set_rating":
           guardWrite();

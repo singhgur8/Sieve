@@ -13,13 +13,14 @@ use tauri_specta::Event;
 use super::error::{AppError, AppResult, ErrorKind};
 use super::types::*;
 use crate::db::projects::{self, FolderScope, ImportTarget};
-use crate::db::{self, repo};
+use crate::db::{self, repo, target};
 use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
 use crate::export::{self, Exporter};
 use crate::ingest::{self, Ingest};
 use crate::lut::{self, LutLibrary};
 use crate::ml::masking::Segmenter;
+use crate::ml::selection::{TargetJob, TargetSelection};
 use crate::ml::style::StyleModel;
 use crate::ml::{self, Analysis};
 use crate::model_fetch::ModelDownloads;
@@ -326,7 +327,14 @@ pub async fn set_pick(
     ids: Vec<ImageId>,
     pick: PickFlag,
 ) -> AppResult<()> {
-    catalog.run(move |c| repo::set_pick(c, &ids, pick)).await?;
+    catalog
+        .run(move |c| {
+            repo::set_pick(c, &ids, pick)?;
+            // IPC v20: the user's flag locks the photo's target-run choice (re-runs and
+            // `apply_target_selection` keep it).
+            target::note_user_flags(c, &ids, pick).map(|_| ())
+        })
+        .await?;
     xmp.notify(&app);
     Ok(())
 }
@@ -2752,4 +2760,219 @@ pub async fn set_project_reject_strictness(
 ) -> AppResult<()> {
     catalog.run(move |c| projects::set_project_reject_strictness(c, project_id, strictness)).await?;
     analysis.start(&app, AnalysisScope::Rescore)
+}
+
+// ---------------------------------------------------------------------------
+// Target-count culling (Phase 9, IPC v20). Storage + user edits: `db::target` (architect);
+// people / moments / selection engines: `ml::{identity, moments, selection}` (vision-ml-dev).
+// ---------------------------------------------------------------------------
+
+/// Starts a target run for the project ("Pick the best N"): people, moments, then the
+/// selection, on a background thread; returns the run (`state: running`) at once. Progress:
+/// `activityEvent` kind `target_selection`; end: exactly one `targetRunFinished`. The user's
+/// decisions (locked rows: target edits and own flags) and confirmed people roles are kept, so
+/// re-running after answering the people questions only changes what the user did not decide.
+/// Unknown project -> `not_found`; bad count or a run already in progress ->
+/// `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn run_target_selection(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    selection: State<'_, TargetSelection>,
+    project_id: ProjectId,
+    settings: TargetRunSettings,
+) -> AppResult<TargetRun> {
+    if selection.is_running() {
+        return Err(AppError::invalid("Target selection is already running"));
+    }
+    let resolved = catalog
+        .run(move |c| {
+            let resolved = target::resolve_settings(c, project_id, &settings)?;
+            target::begin_run(c, project_id, &resolved)?;
+            Ok(resolved)
+        })
+        .await?;
+    let job = TargetJob {
+        project_id,
+        target_count: resolved.target_count,
+        shoot_type: resolved.shoot_type.unwrap_or(ShootType::General),
+    };
+    if let Err(e) = selection.start(&app, job) {
+        let message = e.message.clone();
+        catalog.run(move |c| target::finish_run(c, project_id, TargetRunState::Failed, Some(&message), None)).await?;
+        return Err(e);
+    }
+    // `running`, or already the final state when the job was quick (the event follows anyway).
+    catalog
+        .run(move |c| target::get_run(c, project_id, true))
+        .await?
+        .ok_or_else(|| AppError::internal("target run vanished"))
+}
+
+/// Stops the running target run after its current step (the previous selection is kept;
+/// `targetRunFinished` with `state: cancelled`). No-op when idle.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_target_selection(selection: State<'_, TargetSelection>) -> AppResult<()> {
+    selection.cancel();
+    Ok(())
+}
+
+/// The project's latest target run with counts (`null` = never run). Unknown project ->
+/// `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_target_run(
+    catalog: State<'_, Catalog>,
+    selection: State<'_, TargetSelection>,
+    project_id: ProjectId,
+) -> AppResult<Option<TargetRun>> {
+    let running = selection.is_running();
+    catalog.run(move |c| target::get_run(c, project_id, running)).await
+}
+
+/// The project's people (face identity clusters) and the open "Is this person important?"
+/// questions. Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_people(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<PeopleOverview> {
+    catalog.run(move |c| target::list_people(c, project_id)).await
+}
+
+/// Answers for a person (`important` / `other`, or corrects `main`); `null` clears the answer
+/// (back to the engine's suggestion). Takes effect at the next `run_target_selection`.
+/// Unknown person -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_person_role(
+    catalog: State<'_, Catalog>,
+    person_id: PersonId,
+    role: Option<PersonRole>,
+) -> AppResult<Person> {
+    catalog.run(move |c| target::set_person_role(c, person_id, role)).await
+}
+
+/// The project's moments in capture order (members + delivered members). Unknown project ->
+/// `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_moments(catalog: State<'_, Catalog>, project_id: ProjectId) -> AppResult<Vec<Moment>> {
+    catalog.run(move |c| target::list_moments(c, project_id)).await
+}
+
+/// Selection rows of `ids` in the given order (for grid cells / loupe badges); photos without
+/// a row are omitted. Unknown image -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_image_selections(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<Vec<ImageSelection>> {
+    catalog.run(move |c| target::selections(c, &ids)).await
+}
+
+/// The alternatives strip of an image: its delivered photo (itself, or the one it is an
+/// alternative of) and that photo's ranked alternatives. Unknown image -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_alternatives(catalog: State<'_, Catalog>, image_id: ImageId) -> AppResult<Alternatives> {
+    catalog.run(move |c| target::alternatives(c, image_id)).await
+}
+
+/// "Already kept a similar one": the nearest delivered similar photo of a non-delivered image
+/// (`null` when none / delivered / not in the run). Unknown image -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_covered_by(catalog: State<'_, Catalog>, image_id: ImageId) -> AppResult<Option<CoveredBy>> {
+    catalog.run(move |c| target::covered_by(c, image_id)).await
+}
+
+/// Swaps a delivered photo with a non-delivered one of the same project (alternative, not
+/// sure, set aside): the new photo is delivered and picked, the old one becomes its
+/// alternative #1 (unflagged if it was picked) and the strip follows. Locked, flags as the
+/// user's, XMP auto-sync notified. Undo: `restore_target_snapshot(result.previous)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn swap_alternative(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    delivered_id: ImageId,
+    alternative_id: ImageId,
+) -> AppResult<TargetEditResult> {
+    let result = catalog.run(move |c| target::swap(c, delivered_id, alternative_id)).await?;
+    if !result.flags_changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+/// Adds a non-delivered photo to the delivery set as well ("add both"): delivered, picked,
+/// locked. Undo: `restore_target_snapshot(result.previous)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn add_alternative(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    image_id: ImageId,
+) -> AppResult<TargetEditResult> {
+    let result = catalog.run(move |c| target::add(c, image_id)).await?;
+    if !result.flags_changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+/// Moves photos to `deliver` / `not_sure` / `set_aside` (locked; `alternative` ->
+/// `invalid_argument`). Joining the delivery set picks a photo, leaving it unflags a pick;
+/// set aside never rejects. Undo: `restore_target_snapshot(result.previous)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_target_choice(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    ids: Vec<ImageId>,
+    choice: TargetChoice,
+) -> AppResult<TargetEditResult> {
+    let result = catalog.run(move |c| target::set_choice(c, &ids, choice)).await?;
+    if !result.flags_changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(result)
+}
+
+/// Writes target-edit snapshots back (selection rows + flags), atomically: undo / redo of
+/// `swap_alternative` / `add_alternative` / `set_target_choice`. Returns the changed ids.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_target_snapshot(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    snapshots: Vec<TargetSnapshot>,
+) -> AppResult<Vec<ImageId>> {
+    let changed = catalog.run(move |c| target::restore(c, &snapshots)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(changed)
+}
+
+/// Writes the selection to the flags: delivered -> pick, the rest -> the scorer's suggestion
+/// without its pick (confident-defect rejects stay), for photos that are unflagged or flagged
+/// by Sieve (origin `auto`); the user's flags and all stars are left alone. Same result type as
+/// `apply_suggestions`. Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_target_selection(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    project_id: ProjectId,
+) -> AppResult<ApplySuggestionsResult> {
+    let result = catalog.run(move |c| target::apply(c, project_id)).await?;
+    if result.applied > 0 {
+        xmp.notify(&app);
+    }
+    Ok(result)
 }

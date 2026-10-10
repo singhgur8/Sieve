@@ -5,4 +5,5 @@ pub mod commands;
 pub mod error;
 pub mod events;
 pub mod masks;
+pub mod target;
 pub mod types;
