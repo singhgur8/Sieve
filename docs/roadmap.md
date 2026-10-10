@@ -364,7 +364,7 @@ User rules (2026-10-09/10, verbatim intent):
   state for a target run (deliver / alternative-of(id) / not sure / set aside, with reason + rank) and a "covered by"
   link (nearest kept similar photo); commands: run target selection (count, shoot type), list people + set role,
   list moments / alternatives of an image, swap / add alternative. Migration, bindings, ipc-changelog.
-- [ ] **Face identity** (vision-ml-dev): offline face embedding model (ONNX, alongside SCRFD; licence recorded),
+- [x] **Face identity** (vision-ml-dev): offline face embedding model (ONNX, alongside SCRFD; licence recorded),
   per-project clustering into people, main subject = the most frequent couple of faces (heuristics: frequency, size,
   centrality, appearing together), list of other recurring people to ask about. Acceptance: synthetic / public sample
   faces cluster correctly (purity ≥ 0.9 on a labelled sample set), main pair found, timings recorded.
