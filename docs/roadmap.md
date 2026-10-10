@@ -412,7 +412,7 @@ Model (orchestrator decision 2026-10-10, see decisions.md):
   writing); apply with one batch undo snapshot; per-photo result (applied / skipped (edited) / flagged (low-key,
   silhouette, auto failed) with reason); the look / light key partition as a single documented table in Rust;
   baseline provenance per photo (so a re-run after changing the anchor updates only photos still on the baseline).
-- [ ] **Light normalization engine** (rust-engine-dev with vision-ml-dev): per-photo Auto + anchor offset; clamps;
+- [x] **Light normalization engine** (rust-engine-dev with vision-ml-dev): per-photo Auto + anchor offset; clamps;
   per-scene / burst smoothing; low-key / silhouette detection; WB per lighting (mixed indoor / outdoor);
   deterministic. Acceptance: on sample scenes (synthetic + downloaded sample RAWs) the rendered frames' mean luma and
   neutral-grey WB vary far less across a scene than plain copy-paste of the anchor's settings and stay within
