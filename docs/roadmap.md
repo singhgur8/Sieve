@@ -389,6 +389,43 @@ User rules (2026-10-09/10, verbatim intent):
   numbers in decisions.md. Blocked until the data arrives — other tasks proceed.
 - [x] **UX review** (ux-designer) of the whole target-cull flow; **QA gate** (qa-engineer).
 
+## Phase 10 — Baseline edit: one preset + one edited photo → the whole shoot, finish in Lightroom (user request 2026-10-10)
+Why (user): "I don't think we did a good job on the editing portion … I would like to have a decent baseline to start
+from … select a preset from my selection. And once that preset and one photo has an edit, just edit the rest of the
+library in that same way … I will just switch over to Lightroom to finish off that edit." And: "I essentially want the
+preset colors to be there, but make sure you auto edit the rest of the photos so their lighting and what not looks good."
+Model (orchestrator decision 2026-10-10, see decisions.md):
+- **Look** settings are copied as-is from the preset + the anchor photo: profile, HSL / color mixer, color grading, tone
+  curve, calibration, vibrance / saturation, texture / clarity / dehaze, sharpening / noise, grain, vignette, LUT.
+- **Light** settings are computed per photo: exposure, contrast, highlights, shadows, whites, blacks, temperature,
+  tint = that photo's own Auto (auto tone + auto WB) **plus the anchor's offset from its own Auto** (so "I like it a
+  bit warmer / brighter than Auto" carries over, while a dark church and a sunny park both land well exposed).
+- Never copied: crop, transform / upright, masks / local adjustments, spot removal (photo-specific).
+- Frames of the same burst / scene get consistent light values (no flicker through a sequence); silhouettes and
+  deliberate low-key frames are not brightened blindly (flagged for a look instead).
+- Scope defaults to the keepers (the delivery set after Pick the best N), option: all photos / selection. Photos the
+  user already edited are skipped unless "replace" is chosen. One undo for the whole batch.
+- Output is Lightroom-native: everything lands in the XMP sidecars as `crs:` settings so Lightroom renders the same
+  look and the user finishes there (Read Metadata from Files / import).
+- [ ] **Contract v21** (architect): baseline edit run (preset id, anchor id, scope, skip / replace) as a background job
+  with activity events; preview command (before / after for a sample of N photos spread across scenes, without
+  writing); apply with one batch undo snapshot; per-photo result (applied / skipped (edited) / flagged (low-key,
+  silhouette, auto failed) with reason); the look / light key partition as a single documented table in Rust;
+  baseline provenance per photo (so a re-run after changing the anchor updates only photos still on the baseline).
+- [ ] **Light normalization engine** (rust-engine-dev with vision-ml-dev): per-photo Auto + anchor offset; clamps;
+  per-scene / burst smoothing; low-key / silhouette detection; WB per lighting (mixed indoor / outdoor);
+  deterministic. Acceptance: on sample scenes (synthetic + downloaded sample RAWs) the rendered frames' mean luma and
+  neutral-grey WB vary far less across a scene than plain copy-paste of the anchor's settings and stay within
+  tolerance of the anchor's look; preset look keys byte-identical to the preset+anchor on every photo; XMP round
+  trip (exiftool) shows the `crs:` values; timings for 2,500 photos recorded.
+- [ ] **Baseline edit UI** (frontend-dev): one obvious entry ("Baseline edit" in Edit): 1) pick a preset from the
+  library (previews rendered on the anchor), 2) adjust the anchor in Develop (light + WB first), 3) "Edit the rest"
+  with scope + skip / replace + a before/after preview grid of ~12 photos across scenes, 4) apply with progress and
+  one Undo, 5) "Finish in Lightroom" panel: sidecars saved, exact Lightroom steps. Mock support. Acceptance:
+  Playwright for each step.
+- [ ] **UX review** (ux-designer); **QA gate** (qa-engineer); "Verify on the Mac": the baseline opens in Lightroom
+  with the same look.
+
 ## Future phases (notes to revisit — not part of the autonomous run)
 
 ### Phase 9 — Reference-match grading ("make photo A look like photo B")
