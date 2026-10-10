@@ -32,6 +32,9 @@ src-tauri/
   migrations/0018_camera_serial_sync.sql v18: camera body serials, `sync` batches (IPC v19.2)
   migrations/0019_target_cull.sql v19: people, face_embeddings, moments, target_runs, target_selection,
                                quality_scores.scored_pick (IPC v20, target-count culling)
+  migrations/0020_target_review.sql v20: target_selection.origin, target_similarity (IPC v20.1)
+  migrations/0021_baseline_edit.sql v21: baseline_runs, baseline_results, baseline_provenance; `baseline` batch kind
+                               + history source (IPC v21, baseline edit)
   src/
     main.rs                    -> sieve_lib::run()
     lib.rs                     plugins, managed Catalog + Ingest + Analysis + XmpSync + DevelopCache + LutLibrary + Exporter,
@@ -42,6 +45,7 @@ src-tauri/
       types.rs                 all contract types (source of truth for TS)
       masks.rs                 mask / local-adjustment types (v10), re-exported from types.rs
       target.rs                target-count culling types (v20: people, moments, selection), re-exported from types.rs
+      baseline.rs              baseline edit types + the look / light / never partition table (v21), re-exported
       commands.rs              #[tauri::command] handlers + Catalog state (runs DB work on blocking pool)
       events.rs                ImportProgress, ThumbnailReady, ThumbnailFailed,
                                AnalysisProgress, AnalysisReady, AnalysisFailed, AnalysisFinished,
@@ -52,6 +56,7 @@ src-tauri/
       schema.rs                ordered migration list
       repo.rs                  catalog queries (pure fns over Connection; unit tested)
       target.rs                target-count culling storage, suggestion overlay, apply, user edits (v20)
+      baseline.rs              baseline edit storage: scope, runs, results, provenance, atomic store (v21)
     raw/mod.rs                 format identification + `extract` (embedded JPEG pick, LibRaw fallback)
       source.rs tiff.rs        byte source; TIFF/ARW IFD + EXIF parsing
       raf.rs cr3.rs jpeg.rs    Fuji RAF header, Canon CR3 ISO-BMFF boxes, JPEG marker scan
@@ -73,6 +78,7 @@ src-tauri/
     xmp/masks.rs               crs:MaskGroupBasedCorrections <-> masks (mapping tables, Lightroom mattes) (v10)
     develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
     develop/edited.rs          edited-preview disk cache + low-priority regeneration worker (IPC v19.1)
+    develop/baseline.rs        baseline edit engine (look copy + per-photo light) + BaselineEdit worker (v21; engine stub)
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
@@ -106,6 +112,7 @@ docs/                          this file, ipc-changelog.md, phase plans
 | rest of `src-tauri/` (incl. `db/repo.rs`, `db/projects.rs`, `styles/`, `raw/`, `ingest/`, `Cargo.toml`) | rust-engine-dev |
 | `src-tauri/src/ml/`, `src-tauri/models/` (may append to `Cargo.toml`) | vision-ml-dev (surface of `ml::selection::TargetSelection` + `run_pipeline` fixed by the architect) |
 | `src-tauri/src/db/target.rs` (target-count culling storage, IPC v20) | architect, then rust-engine-dev |
+| `src-tauri/src/db/baseline.rs`, `src-tauri/src/develop/baseline.rs` (baseline edit, IPC v21; surface fixed by the architect) | rust-engine-dev (`develop::baseline::low_key`: vision-ml-dev) |
 | `src-tauri/src/scene/` (surface in `scene/mod.rs` + `store.rs` fixed by the architect) | vision-ml-dev |
 | `src-tauri/src/xmp/`, `src-tauri/src/develop/`, `src-tauri/src/lut/`, `src-tauri/src/export/`, `src-tauri/src/profiles/` | rust-engine-dev |
 | `src/` except `src/ipc/`, `package.json`, Vite/Tailwind/TS config | frontend-dev |
@@ -267,6 +274,19 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 
 v20: `ImageQuery.targetChoices?: TargetChoice[]`; `ActivityKind::TargetSelection`; event `targetRunFinished`; `set_pick`
 also locks the photo's target-run choice. See "Target-count culling (v19, IPC v20)".
+
+| Command (Rust / TS) | Args | Returns |
+|---|---|---|
+| `preview_baseline` / `previewBaseline` (v21) | `projectId: number, settings: BaselineSettings, options: BaselinePreviewOptions \| null` | `BaselinePreview` (anchor Auto / offset, before / after settings of ~12 samples across scenes, plan counts; nothing written) |
+| `run_baseline` / `runBaseline` (v21) | `projectId: number, settings: BaselineSettings` | `BaselineRun` (`running`; background; `activityEvent` kind `baseline_edit`, then `baselineRunFinished`) |
+| `cancel_baseline` / `cancelBaseline` (v21) | – | `null` (nothing written) |
+| `get_baseline_run` / `getBaselineRun` (v21) | `projectId: number` | `BaselineRun \| null` (latest; `batch` for the one undo) |
+| `get_baseline_results` / `getBaselineResults` (v21) | `projectId: number, outcomes: BaselineOutcome[] \| null` | `BaselinePhotoResult[]` (latest finished run) |
+| `get_baseline_provenance` / `getBaselineProvenance` (v21) | `ids: number[]` | `BaselineProvenance[]` (on_baseline / user_edited / undone) |
+
+v21: `ImageQuery.baselineOutcomes?: BaselineOutcome[]`; `EditBatchKind::Baseline`, `EditSource::Baseline`,
+`ActivityKind::BaselineEdit`; event `baselineRunFinished`; constants `BASELINE_PARTITION` (+ field lists). Undo a run with
+`undo_edit_batch(run.batch.batchId)`. See "Baseline edit (v21, IPC v21)".
 
 v19: `paste_settings` / `sync_settings` / `paste_previous` return `EditBatchResult` (one undoable batch, kind
 `paste`; duplicates ignored); `CaptureMeta.capturedAtMs` = corrected time + `originalCapturedAtMs` /
@@ -842,6 +862,9 @@ migrations tracked by `PRAGMA user_version`.
 | `moments` | cross-shoot groups per project (v19): `shot_type`, time range, representative, person ids JSON (members via `target_selection.moment_id`) |
 | `target_runs` | latest target run per project (v19): count, shoot type, state, message, model version, started / finished / applied |
 | `target_selection` | per-image choice of the project's run (v19): choice, moment, shot type, `alternative_of` + `rank`, `covered_by` + similarity, score, reasons JSON, `locked` |
+| `baseline_runs` | baseline edit runs per project (v21): anchor, preset, `settings_json`, state, message, engine version, `anchor_json` (`BaselineAnchor`), `counts_json`, `batch_id` (the one `baseline` edit batch) |
+| `baseline_results` | per-photo results of each project's latest finished run (v21): outcome, reasons JSON, scene / burst, Auto + written light JSON |
+| `baseline_provenance` | per photo, the last baseline run that wrote it (v21): run, batch, `history_entry_id` (on the baseline while the cursor is that entry), flagged, applied at |
 | `mask_cache` | AI mattes per (image, digest): kind, origin lightroom/sieve, model version, input digest, PNG path under `<cacheDir>/masks/`, size, sensor-frame bounds, coverage (v10) |
 
 Filter-bar indexes (schema v11, `0011_hardening.sql`): `idx_images_folder_pick_rating (folder_id, pick, rating)`
@@ -1034,6 +1057,64 @@ v20.1 (UX review 9, schema v20 `0020_target_review.sql`):
   rejected it) / similar (near-duplicate or not-best-of-setup reason, or covered at >= 0.7) / weaker. Exposed as
   `ImageSelection.pile`, `TargetCounts.piles`, `ImageQuery.targetPiles`; plus `ImageQuery.targetReasonKinds` (first
   reason) and `ImageSort::TargetMoment` (moment start, then score).
+
+### Baseline edit (v21, IPC v21)
+Goal (roadmap Phase 10, the user's words): pick a preset, edit one photo of the shoot (the **anchor**), and have Sieve
+"edit the rest of the library in that same way": the preset's colours everywhere, but each photo's lighting
+auto-corrected, then finish in Lightroom. Output is Lightroom-native `crs:` settings in the XMP sidecars.
+
+**Partition** (`ipc::baseline::BASELINE_PARTITION`, the single table; TS constant `BASELINE_PARTITION`): every
+`AdjustmentField` is exactly one of
+- **look**, copied as-is from the anchor: texture, clarity, dehaze, vibrance, saturation, HSL, LUT, tone curve, color
+  grading, calibration, sharpening, noise reduction, vignette, grain, black & white, profile + look, process version;
+- **light**, computed per photo: white balance, exposure, contrast, highlights, shadows, whites, blacks;
+- **never**, photo-specific: crop, masks, transform (Upright).
+Each row lists the `crs:` keys it owns (`crs_key_class(name)`); keys Sieve does not model (lens corrections, spot
+removal, red eye) are never touched. Vibrance / saturation are look although Lightroom's Auto sets them (they are the
+preset's colour); the light Auto is the six tone sliders + auto WB.
+
+**Light model** (`develop::baseline`): light(photo) = Auto(photo, rendered with the look) + offset, offset =
+anchor light - Auto(anchor) (`LightOffset`: EV / slider deltas, temperature in mireds, tint additive), so "a bit warmer /
+brighter than Auto" carries over while a dark church and a sunny park both land well exposed. Then smoothing per burst /
+scene (no flicker), low-key / silhouette frames kept dark and flagged, clamps + Lightroom rounding. Auto failing ->
+the anchor's light, flagged. Stages: `measure_anchor`, `photo_light`, `low_key`, `smooth`, `clamp_light`, `compose`
+(look copied, light set, never kept), driven by `compute` over a `LightMeter` (`DevelopMeter` = `develop::auto` on the
+develop cache; synthetic meters in tests). v21 ships a stub engine (plain Auto, no offset / smoothing / low-key) that
+runs end to end.
+
+**Run** (`BaselineEdit` worker, one at a time, own catalog connection): resolve settings (anchor / selection in the
+project, preset exists) -> scope (`keepers` by the keeper rule = the delivery set after Pick the best N, `all`, or a
+selection; capture order) -> measure the anchor (stored on the run) -> plan every photo -> write **once**: one edit
+batch (kind `baseline`, label "Baseline Edit", history source `baseline`) + per-photo results + provenance in one
+savepoint (`db::baseline::store_results`). Cancel / failure before that writes nothing. Progress: `activityEvent` kind
+`baseline_edit`; end: one `baselineRunFinished`; XMP auto-sync notified. Undo = `undo_edit_batch(run.batch.batchId)`
+(linear-undo rules of v16 unchanged). Preview (`preview_baseline`) runs the same `compute` on ~12 samples spread
+across scenes (`pick_samples`) and returns before / after settings; the UI renders `after` through the normal
+`render_preview` path (no new render route).
+
+**Outcomes**: `applied`; `flagged` (written, needs a look: the batch item's `review_reason`, so `ImageEditState.
+needsReview` / `mark_reviewed` work as for scene applies); `skipped_edited` (already edited, unless `replaceEdited`);
+`anchor` (never written); `failed` (original missing). Grid filter `ImageQuery.baselineOutcomes`.
+
+**Provenance** (`baseline_provenance`, derived on read): a photo is `on_baseline` while its history cursor is the entry
+the baseline wrote (and that entry carries the run's batch id), `undone` when the batch was undone, else
+`user_edited`. So user edits after the baseline mark the photo without triggers, per-photo undo back to the baseline
+entry restores it, and a re-run after changing the anchor updates unedited photos and photos still on the baseline
+only.
+
+**Relation to Apply to Scene and style learning** (decisions.md 2026-10-10 "Contract v21"): the baseline **replaces
+Apply to Scene as the primary Edit-step path** (one anchor for the whole shoot instead of one edit per scene) and
+**reuses** its pieces: scenes and bursts (`images.scene_id`, `burst_group_id`) for smoothing and sample spread, the
+keeper rule for scope, `edit_batches` + `undo_edit_batch` + needs-review for the batch, the edited-preview cache and
+XMP auto-sync for output, `develop::auto` (Phase 8b auto tone / WB) as the per-photo Auto, the style library presets
+(IPC v14) as the look source. Apply to Scene stays available for per-scene refinement after a baseline: it treats
+`baseline` photos like `auto_style` ones (unapplied keepers it may overwrite). Scene matching's relative grading
+(`scene::matching`) is not used: the anchor offset over Auto is the relative part. The **style model**
+(`ml::style`, "Auto edit (my style)") is independent and not used by v21; a later engine may use its prediction instead
+of plain Auto as the per-photo base (same `LightMeter` seam). Note: style training today takes every photo with
+non-neutral settings (`ml::style`, `adjustments.neutral = 0`), so machine-made baseline (and `auto_style`) settings
+would become training examples; vision-ml-dev should train only on photos whose edit source is `user` / `sidecar` (or
+whose settings differ from what a batch wrote).
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

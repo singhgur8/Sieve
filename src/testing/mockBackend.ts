@@ -99,6 +99,7 @@ import type {
   WhiteBalance,
 } from "../ipc";
 import { createMockTarget, NOT_TARGET } from "./mockTarget";
+import { createMockBaseline, NOT_BASELINE } from "./mockBaseline";
 import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS, ALL_ADJUSTMENT_FIELDS } from "../ipc";
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
@@ -693,6 +694,7 @@ export function installMockBackend(count: number) {
       if (q.keepersOnly && !keeper(r)) return false;
       if (q.suggested != null && !pendingOk(r, q.suggested)) return false;
       if (!target.queryOk(r.id, q)) return false;
+      if (!baseline.queryOk(r.id, q)) return false;
       if (!metaOk(r, q.metadata)) return false;
       return true;
     });
@@ -955,6 +957,7 @@ export function installMockBackend(count: number) {
     if (label === "Apply to Scene" || label === "Match Scene") return "scene_apply";
     if (label === "Auto Edit (My Style)") return "auto_style";
     if (label === "Paste Settings" || label === "Sync Settings" || label === "Paste from Previous") return "pasted";
+    if (label === "Baseline Edit") return "baseline";
     return "user";
   };
   /**
@@ -1166,7 +1169,8 @@ export function installMockBackend(count: number) {
     const e = cursorEntry(id);
     if (!e) return { ...none, editSource: "sidecar" };
     const item = e.batchId != null ? batches.get(e.batchId)?.items.find((i) => i.id === id) : undefined;
-    const needs = e.source === "scene_apply" && e.batchId != null && !!item?.reviewReason && !item.reviewed;
+    // v21: photos a baseline run flagged need a look too.
+    const needs = (e.source === "scene_apply" || e.source === "baseline") && e.batchId != null && !!item?.reviewReason && !item.reviewed;
     return {
       imageId: id,
       editSource: e.source,
@@ -1367,6 +1371,34 @@ export function installMockBackend(count: number) {
     const batchId = recordItems(label, items, sceneIds);
     return { batchId, label, changedIds: items.map((i) => i.id) };
   }
+  // ---- v21 baseline edit (`src/testing/mockBaseline.ts`; `?baseline=presets|anchor|1`) ----
+  const baseline = createMockBaseline({
+    rows,
+    byId,
+    projectOf: (r) => projectOfFolder(r.folderId),
+    requireProject,
+    keeper,
+    getAdj: (id) => completeAdjustments(getAdj(id)),
+    neutral,
+    isNeutral,
+    copyFields,
+    commitUser: (id, next, label) => commit(id, next, label, false),
+    commitBatch: (label, items) => {
+      const recorded = items.map((it) => batchCommit(it.id, it.next, label, null, it.reviewReason)).filter((x): x is MockBatchItem => x != null);
+      const batchId = recordItems(label, recorded, []);
+      if (batchId != null) batches.get(batchId)!.kind = "baseline";
+      return { batchId, label, changedIds: recorded.map((i) => i.id) };
+    },
+    cursor: (id) => {
+      const e = cursorEntry(id);
+      return e ? { entryId: e.id, batchId: e.batchId } : null;
+    },
+    batchInfo: (batchId) => (batches.has(batchId) ? batchInfo(batchId) : null),
+    presets,
+    styleGroups,
+    nextPresetId: () => ++presetId,
+    guardWrite,
+  });
   /** v17 (Rust `workflow::scene_label`): "Scene N" by plan position, "This scene" outside a plan. */
   function sceneLabel(sid: number): string {
     const sc = sceneOf(sid);
@@ -1627,6 +1659,8 @@ export function installMockBackend(count: number) {
       const ids = (args.ids as number[] | undefined) ?? [];
       const targetResult = target.handle(cmd, args);
       if (targetResult !== NOT_TARGET) return targetResult;
+      const baselineResult = baseline.handle(cmd, args);
+      if (baselineResult !== NOT_BASELINE) return baselineResult;
       switch (cmd) {
         case "get_catalog_state":
           return catalog;

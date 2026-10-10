@@ -23,10 +23,10 @@ use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
-    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, EditedPreviewChanged,
-    ExportFinished, ExportProgress, ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress,
-    StyleModelFinished, StyleModelProgress, TargetRunFinished, ThumbnailFailed, ThumbnailReady, XmpSynced,
-    XmpWriteFailed,
+    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, BaselineRunFinished,
+    EditedPreviewChanged, ExportFinished, ExportProgress, ImportProgress, ModelDownloadFinished, ModelDownloadProgress,
+    SceneProgress, StyleModelFinished, StyleModelProgress, TargetRunFinished, ThumbnailFailed, ThumbnailReady,
+    XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -212,6 +212,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::plan_target_apply,
             commands::restore_target_apply,
             commands::lock_target_choices,
+            // IPC v21
+            commands::preview_baseline,
+            commands::run_baseline,
+            commands::cancel_baseline,
+            commands::get_baseline_run,
+            commands::get_baseline_results,
+            commands::get_baseline_provenance,
         ])
         .events(collect_events![
             ImportProgress,
@@ -234,7 +241,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             // IPC v19.1
             EditedPreviewChanged,
             // IPC v20
-            TargetRunFinished
+            TargetRunFinished,
+            // IPC v21
+            BaselineRunFinished
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -259,6 +268,15 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         .constant("MINOR_SCENE_MAX_KEEPERS", ipc::types::MINOR_SCENE_MAX_KEEPERS)
         // IPC v20: largest `TargetRunSettings.targetCount`.
         .constant("MAX_TARGET_COUNT", ipc::types::MAX_TARGET_COUNT)
+        // IPC v21: the baseline edit's look / light / never partition (one row per
+        // AdjustmentField, with the crs: keys it owns), its field lists and sample sizes.
+        .constant("BASELINE_PARTITION", ipc::types::baseline_partition())
+        .constant("BASELINE_LOOK_FIELDS", ipc::types::fields_of_class(ipc::types::SettingClass::Look))
+        .constant("BASELINE_LIGHT_FIELDS", ipc::types::fields_of_class(ipc::types::SettingClass::Light))
+        .constant("BASELINE_NEVER_FIELDS", ipc::types::fields_of_class(ipc::types::SettingClass::Never))
+        .constant("DEFAULT_BASELINE_SAMPLES", ipc::types::DEFAULT_BASELINE_SAMPLES)
+        .constant("MAX_BASELINE_SAMPLES", ipc::types::MAX_BASELINE_SAMPLES)
+        .constant("BASELINE_LABEL", ipc::types::BASELINE_LABEL)
         // IDs and unix-ms timestamps are i64 but always < 2^53.
         .dangerously_cast_bigints_to_number()
 }
@@ -359,6 +377,10 @@ pub fn run() {
             app.manage(ml::selection::TargetSelection::new(ml::selection::TargetSelectionConfig {
                 catalog_path: path.clone(),
                 models_dir: models_dir.clone(),
+            }));
+            // Baseline edit worker (IPC v21; own catalog connection, develop cache from state).
+            app.manage(develop::baseline::BaselineEdit::new(develop::baseline::BaselineConfig {
+                catalog_path: path.clone(),
             }));
             app.manage(Analysis::new(AnalysisConfig { catalog_path: path.clone(), models_dir }));
             // Personal style model (IPC v14; training runs on its own thread + connection).

@@ -24,6 +24,7 @@
 //!   queue); concurrent decodes of the same image are coalesced.
 
 pub mod auto;
+pub mod baseline;
 pub mod batches;
 pub mod camera;
 pub mod cancel;

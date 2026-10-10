@@ -5,8 +5,8 @@ use specta::Type;
 use tauri_specta::Event;
 
 use super::types::{
-    string_enum, EditedPreview, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus, StyleTrainPhase,
-    TargetRun,
+    string_enum, BaselineRun, EditedPreview, ExportFailure, ExportJobId, ImageId, SceneTask, StyleModelStatus,
+    StyleTrainPhase, TargetRun,
 };
 
 string_enum! {
@@ -26,6 +26,8 @@ string_enum! {
         ModelDownload => "model_download",
         /// Target-count selection: people, moments, choosing the delivery set (v20).
         TargetSelection => "target_selection",
+        /// Baseline edit run: per-photo Auto + the anchor's look over the shoot (v21).
+        BaselineEdit => "baseline_edit",
         Other => "other",
     }
 }
@@ -280,4 +282,14 @@ pub struct StyleModelFinished {
 #[serde(rename_all = "camelCase")]
 pub struct TargetRunFinished {
     pub run: TargetRun,
+}
+
+/// A `run_baseline` run ended (IPC v21): exactly once per accepted call, after the batch and
+/// the per-photo results are stored. `run.state` is `finished`, `failed` or `cancelled`
+/// (nothing written unless `finished`). Refetch the grid / edit states / results. Progress is
+/// reported as `activityEvent` kind `baseline_edit`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineRunFinished {
+    pub run: BaselineRun,
 }

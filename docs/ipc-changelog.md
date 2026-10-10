@@ -1067,6 +1067,141 @@ Who updates what
   grid footer names Shift+→/↓.
 - rust-engine-dev, vision-ml-dev, frontend-dev: nothing further.
 
+## v21 — 2026-10-10 (Phase 10: baseline edit — one preset + one edited photo -> the whole shoot, finish in Lightroom)
+
+Additive on the wire (new types, 6 commands, 1 event, 7 constants, an optional `ImageQuery` field, new enum values
+`EditBatchKind::Baseline`, `EditSource::Baseline`, `ActivityKind::BaselineEdit`). Schema v21
+(`migrations/0021_baseline_edit.sql`): `baseline_runs`, `baseline_results`, `baseline_provenance`; `edit_batches.kind`
+and `adjustment_history.source` CHECKs accept `baseline` (writable_schema edit, as 0018). `src/ipc/bindings.ts`
+regenerated. Types live in `src-tauri/src/ipc/baseline.rs` (re-exported from `types.rs`). Spec: docs/roadmap.md Phase 10
+(the user's words + the model), architecture.md "Baseline edit", decisions.md 2026-10-10 ("Baseline edit model",
+"Contract v21").
+
+Look / light partition (`BASELINE_PARTITION`, the one table; TS constant of `SettingPartitionEntry {field, class,
+crsKeys, note}` rows, plus `BASELINE_LOOK_FIELDS` / `BASELINE_LIGHT_FIELDS` / `BASELINE_NEVER_FIELDS`)
+| Class | `AdjustmentField`s | `crs:` keys |
+|---|---|---|
+| light (per photo: its Auto + the anchor's offset from its own Auto) | `white_balance`, `exposure`, `contrast`, `highlights`, `shadows`, `whites`, `blacks` | `WhiteBalance`, `Temperature`, `Tint`, `Exposure2012`, `Contrast2012`, `Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012` |
+| look (copied as-is from the anchor, which carries the preset) | `texture`, `clarity`, `dehaze`, `vibrance`, `saturation`, `hsl_hue` / `hsl_saturation` / `hsl_luminance`, `lut`, `tone_curve`, `color_grading`, `calibration`, `sharpening`, `noise_reduction` (+ `_luminance` / `_color`), `vignette`, `grain`, `black_and_white`, `profile`, `process_version` | `Texture`, `Clarity2012`, `Dehaze`, `Vibrance`, `Saturation`, `HueAdjustment*`, `SaturationAdjustment*`, `LuminanceAdjustment*`, `sieve:LutId` / `sieve:LutAmount`, `Parametric*`, `ToneCurvePV2012*`, `ToneCurveName2012`, `SplitToning*`, `ColorGrade*`, `Red/Green/BlueHue`, `Red/Green/BlueSaturation`, `ShadowTint`, `Sharpness`, `Sharpen*`, `LuminanceSmoothing`, `LuminanceNoiseReduction*`, `ColorNoiseReduction*`, `PostCropVignette*`, `Grain*`, `ConvertToGrayscale`, `GrayMixer*`, `CameraProfile`, `CameraProfileDigest`, `Look`, `ProcessVersion` |
+| never (the photo keeps its own) | `crop`, `masks`, `transform` | `Crop*`, `HasCrop`, `MaskGroupBasedCorrections`, `Perspective*`, `Upright*`, `CropConstrainToWarp` |
+Keys Sieve does not model (lens corrections, `RetouchInfo` spot removal, red eye, legacy local corrections) are never
+touched: they stay in each sidecar. Rust helpers: `setting_class(field)`, `fields_of_class(class)`,
+`crs_key_class(name)` (exact name, then longest `*` prefix). Tests check every field is classified once and every
+`crs:` key Sieve writes / imports agrees with `styles::preset_file::field_of`.
+
+Types
+- `BaselineSettings {anchorId, presetId | null, scope: BaselineScope, replaceEdited}`; `BaselineScope` tagged `kind`:
+  `keepers` (keeper rule = the delivery set after "Pick the best N" + Apply; default), `all`, `selection {ids}`.
+  Look source = the anchor's current settings (they carry the preset); while the anchor has no edits, the preset
+  resolved on it. `presetId` is provenance otherwise.
+- `BaselinePreviewOptions {sampleCount (1..=MAX_BASELINE_SAMPLES 48, default DEFAULT_BASELINE_SAMPLES 12),
+  imageIds | null}` (`#[serde(default)]`, both optional in TS).
+- `LightValues {exposure, contrast, highlights, shadows, whites, blacks, temperatureK, tint}` (absolute, WB custom),
+  `LightOffset {… , temperatureMired, tint}` (= anchor - its Auto; negative mireds = warmer than Auto).
+- `BaselineAnchor {imageId, light, auto, offset}`.
+- Per photo: `BaselineOutcome` = `applied | flagged | skipped_edited | anchor | failed`; `BaselineReasonKind` =
+  `low_key | silhouette | auto_failed | mixed_light | clamped | unreadable | other`; `BaselineReason {kind, text}`;
+  `BaselinePhotoResult {imageId, outcome, reasons, sceneId, burstGroupId, auto | null, light | null}`.
+  `flagged` = written but needs a look (shows as `ImageEditState.needsReview` with the first reason as
+  `reviewReason`, cleared by `mark_reviewed` or an edit, like a non-converged scene apply).
+- Preview: `BaselineSample {photo, before, after}` (settings; render `after` with the existing `render_preview(imageId,
+  after, …)` in slot `preview`), `BaselinePlanCounts {inScope, toWrite, onBaseline, edited}`, `BaselinePreview
+  {projectId, settings (resolved), anchor, samples, counts, engineVersion}`.
+- Run: `BaselineRunState` (`running | finished | failed | cancelled`), `BaselineCounts {total, applied, flagged,
+  skippedEdited, anchor, failed}`, `BaselineRun {id, projectId, settings, state, startedAtMs, finishedAtMs, message,
+  engineVersion, anchor | null, counts, batch: EditBatchInfo | null}`.
+- Provenance: `BaselineState` (`on_baseline | user_edited | undone`), `BaselineProvenance {imageId, runId, batchId,
+  anchorId, presetId, appliedAtMs, state, flagged}`.
+- `ImageQuery.baselineOutcomes?: BaselineOutcome[]` (`#[serde(default)]`): the photo's result in its project's latest
+  finished run (e.g. `["flagged"]` = "needs a look"); honoured by `list_images`, `list_image_ids`,
+  `get_metadata_filter_options`.
+- `EditBatchKind::Baseline` (`"baseline"`), `EditSource::Baseline` (`"baseline"`, history label `BASELINE_LABEL` =
+  "Baseline Edit"), `ActivityKind::BaselineEdit` (`"baseline_edit"`). Exhaustive TS `Record<EditSource | EditBatchKind
+  | ActivityKind, …>` literals need the key (none today).
+- Constants: `BASELINE_PARTITION`, `BASELINE_LOOK_FIELDS`, `BASELINE_LIGHT_FIELDS`, `BASELINE_NEVER_FIELDS`,
+  `DEFAULT_BASELINE_SAMPLES`, `MAX_BASELINE_SAMPLES`, `BASELINE_LABEL`.
+
+Commands (TS names in camelCase)
+| Command | Args | Returns |
+|---|---|---|
+| `preview_baseline` | `projectId, settings, options: BaselinePreviewOptions \| null` | `BaselinePreview` (nothing written; decodes the anchor + samples) |
+| `run_baseline` | `projectId, settings` | `BaselineRun` (`running`; background; `activityEvent` kind `baseline_edit`, then one `baselineRunFinished`) |
+| `cancel_baseline` | – | `null` (nothing written) |
+| `get_baseline_run` | `projectId` | `BaselineRun \| null` (latest; a `running` row without a worker reads `cancelled`) |
+| `get_baseline_results` | `projectId, outcomes: BaselineOutcome[] \| null` | `BaselinePhotoResult[]` (latest finished run, capture order) |
+| `get_baseline_provenance` | `ids` | `BaselineProvenance[]` (given order; never-baselined photos omitted) |
+Undo = the existing `undo_edit_batch(run.batch.batchId)` (linear-undo rules unchanged; one call for the whole run).
+Errors: unknown project / anchor / preset / image -> `not_found`; photos of another project, bad options, a run already
+in progress -> `invalid_argument`; preview with an unreadable anchor -> `file_missing` / `decode_failed`.
+
+Event: `baselineRunFinished {run: BaselineRun}` (`baseline-run-finished`), exactly once per accepted run.
+
+Semantics (implemented in `db::baseline` + `develop::baseline`, tested there)
+- Scope rows in capture order; the anchor is never written (outcome `anchor`). Unedited photos and photos still on an
+  earlier baseline are written; photos with any other edit (user, paste, scene apply, style, Lightroom sidecar) are
+  `skipped_edited` unless `replaceEdited`. Missing originals -> `failed`.
+- A run computes everything, then writes once: one edit batch (kind `baseline`, label "Baseline Edit") + results +
+  provenance in one SQLite savepoint. Cancel / failure before that writes nothing. A finished run replaces the
+  project's earlier results; provenance rows are replaced for the photos it changed.
+- Provenance is derived on read: `on_baseline` while the photo's history cursor is the entry the baseline wrote (and
+  that entry carries the run's batch id); `undone` when that batch was undone; else `user_edited` (any edit, paste,
+  per-photo undo / redo away from it, another batch). Per-photo undo back to the baseline entry makes it `on_baseline`
+  again. No triggers.
+- Apply to Scene treats `baseline` photos like `auto_style` ones (still "unapplied" keepers, overwritten by an apply).
+- Sidecars: the batch marks photos XMP-dirty and notifies auto-sync, so the `crs:` values land in the XMPs (Lightroom:
+  Read Metadata from Files).
+
+Stub engine (TODO-free; runs end to end)
+- `develop::baseline`: `BaselineEdit` managed state (`new`, `is_running`, `start`, `cancel`; registered in `lib.rs`),
+  worker + activity + event + XMP notify, `prepare`, `preview`, `run_pipeline`, `compute`; stages `measure_anchor`
+  (real: Auto of the anchor with its look, offset), `photo_light` (**stub: plain Auto, no offset**; Auto failure ->
+  anchor light, flagged `auto_failed`), `low_key` (**stub: never**), `smooth` (**stub: no-op**), `clamp_light`
+  (clamp + Lightroom rounding), `compose` (look copied, light set, never kept), `pick_samples` (scenes round-robin,
+  evenly spaced, one per burst first). `LightMeter` trait (`auto_light`, `as_shot`) with `DevelopMeter` (develop
+  cache: `auto::auto_tone_with_faces` on the six light sliders + `auto::auto_white_balance`) so tests use synthetic
+  meters. `ENGINE_VERSION = "baseline-stub-1"`.
+- `db::baseline`: `resolve_settings`, `scope_photos`, `photo_states`, `plan_counts`, `look_source`, `begin_run`,
+  `set_anchor`, `finish_run`, `store_results`, `get_run`, `run_by_id`, `results`, `provenance`.
+
+Mock backend (`src/testing/mockBaseline.ts`, wired in `mockBackend.ts`)
+- `?baseline=presets`: an imported preset group "Wedding Looks" (Soft Film, Warm Matte, Clean B&W) in `list_styles`
+  / `list_presets` / `apply_preset`. `?baseline=anchor`: + the anchor = project 1's first keeper with Soft Film applied
+  and +0.3 EV / warmer than Auto (UI steps 1-2 done), no run. `?baseline=1`: + a finished run on project 1 (keepers;
+  applied / flagged low-key + auto-failed / anchor results, one undoable `baseline` batch, provenance).
+- The mock engine follows the target model (Auto + offset; every 11th photo low-key 0.5 EV darker, every 19th Auto
+  failed), not the Rust stub, so the UI shows realistic values. `run_baseline` finishes after
+  `window.__mockBaselineDelay` ms (default 300) with `activity-event` kind `baseline_edit` + one
+  `baseline-run-finished`; cancel, results, provenance (incl. `user_edited` after a save), `ImageQuery.baselineOutcomes`,
+  `needsReview` for flagged photos and `undo_edit_batch` are mirrored. Contract check: `tests/ui/ipc-v21-mock.spec.ts`.
+
+Who implements what
+- architect (done): types, schema v21, commands + registration, `db::baseline` (storage, scope, provenance, results,
+  atomic store), `develop::baseline` surface + stub engine + worker, `EditSource` / `EditBatchKind` / needs-review /
+  history label, `repo` filter, Apply-to-Scene treatment, Rust tests, bindings, mock + spec, docs.
+- rust-engine-dev (with vision-ml-dev): **light normalization engine** in `develop::baseline` (roadmap task 2):
+  `photo_light` = Auto + `anchor.offset` (`LightOffset::add_to`), clamps; `smooth` per burst / scene (no flicker,
+  WB per lighting, `mixed_light`); deterministic; parallel measurement (rayon, bounded memory; the develop cache
+  decodes each RAW once) with progress + cancel per photo; as-shot anchors; acceptance numbers (luma / grey WB spread
+  per scene vs copy-paste, look keys byte-identical, exiftool `crs:` round trip, timings for 2,500 photos). Bump
+  `ENGINE_VERSION`. The surface (`BaselineEdit`, `prepare`, `preview`, `run_pipeline`, `LightMeter`, `db::baseline`)
+  stays; extend `PhotoInput` if needed.
+- vision-ml-dev: `low_key` (deliberate low-key frames and back-lit silhouettes: keep their own brightness, flag
+  `low_key` / `silhouette`), using the analysis (`ExposureStats`, faces) or the measurement render; calibrate on sample
+  scenes.
+  Also: `ml::style` training takes every photo with non-neutral settings, so baseline (and `auto_style`) results would
+  become training examples; restrict training to edit source `user` / `sidecar` (`batches::edit_states`).
+- frontend-dev: Baseline edit UI (roadmap task 3): entry "Baseline edit" in Edit; 1) preset from the library
+  (`listStyles`, previews on the anchor via `renderPreviewVariant(anchor, adj, {kind: "preset", presetId})`, apply
+  with `applyPreset`), 2) adjust the anchor in Develop, 3) "Edit the rest": scope (`keepers` default / `all` /
+  `selection`), skip / replace (`replaceEdited`), counts from `previewBaseline(...).counts`, a before / after grid of
+  ~12 `samples` (render `after` with `renderPreview` in slot `preview`, `before` = the edited thumbnail), 4) apply
+  with `runBaseline`, progress from `activityEvent` kind `baseline_edit`, refetch on `events.baselineRunFinished`,
+  one Undo = `undoEditBatch(run.batch.batchId)` (disabled unless `run.batch.undoable`), "N need a look" =
+  `ImageQuery.baselineOutcomes: ["flagged"]` (+ `markReviewed`), 5) "Finish in Lightroom" panel (sidecars saved via
+  auto-sync / `writeXmpAllDirty`, exact Lightroom steps). Show provenance badges from `getBaselineProvenance` /
+  `ImageEditState.editSource === "baseline"`. `isFiltered` / `describeFilters` / chips / `membershipSensitive` must know
+  `baselineOutcomes`.
+
 ## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
 
 Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.

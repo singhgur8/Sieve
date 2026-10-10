@@ -14,6 +14,7 @@ use super::error::{AppError, AppResult, ErrorKind};
 use super::types::*;
 use crate::db::projects::{self, FolderScope, ImportTarget};
 use crate::db::{self, repo, target};
+use crate::develop::baseline::{BaselineEdit, BaselineJob, DevelopMeter};
 use crate::develop::masks::MaskCache;
 use crate::develop::{self, DevelopCache, SourceImage};
 use crate::export::{self, Exporter};
@@ -3025,4 +3026,108 @@ pub async fn restore_target_apply(
 #[specta::specta]
 pub async fn lock_target_choices(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<Vec<ImageId>> {
     catalog.run(move |c| target::lock(c, &ids)).await
+}
+
+// ---------------------------------------------------------------------------
+// IPC v21 (Phase 10): baseline edit. One preset + one edited photo (the anchor) -> the whole
+// shoot: look groups copied from the anchor, light groups = each photo's Auto + the anchor's
+// offset from its own Auto (`BASELINE_PARTITION`). Engine: `develop::baseline`; storage:
+// `db::baseline`. Undo a run with `undo_edit_batch(run.batch.batchId)`.
+// ---------------------------------------------------------------------------
+
+/// Before / after settings for a sample of the run's photos spread across scenes (or
+/// `options.imageIds`), with the anchor's Auto / offset and the plan counts. Nothing is
+/// written. Decodes the anchor and each sample (~0.3-0.8 s per photo the first time). Unknown
+/// project / anchor / preset -> `not_found`; photos of another project, bad options ->
+/// `invalid_argument`; anchor original missing / unreadable -> `file_missing` / `decode_failed`.
+#[tauri::command]
+#[specta::specta]
+pub async fn preview_baseline(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    project_id: ProjectId,
+    settings: BaselineSettings,
+    options: Option<BaselinePreviewOptions>,
+) -> AppResult<BaselinePreview> {
+    let options = options.unwrap_or_default();
+    let prepared = catalog.run(move |c| develop::baseline::prepare(c, project_id, &settings)).await?;
+    let meter = DevelopMeter { cache: develop.inner().clone() };
+    blocking(move || develop::baseline::preview(&meter, project_id, &prepared, &options)).await
+}
+
+/// Starts a baseline run on a background thread and returns it (`state: running`). Progress:
+/// `activityEvent` kind `baseline_edit`; end: exactly one `baselineRunFinished`. Writes every
+/// photo in scope as one edit batch (kind `baseline`) at the end; cancelled / failed runs
+/// write nothing. Errors as `preview_baseline`; a run already in progress ->
+/// `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn run_baseline(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    baseline: State<'_, BaselineEdit>,
+    project_id: ProjectId,
+    settings: BaselineSettings,
+) -> AppResult<BaselineRun> {
+    if baseline.is_running() {
+        return Err(AppError::invalid("A baseline edit is already running"));
+    }
+    let (run_id, resolved) = catalog
+        .run(move |c| {
+            let resolved = db::baseline::resolve_settings(c, project_id, &settings)?;
+            let id = db::baseline::begin_run(c, project_id, &resolved, develop::baseline::ENGINE_VERSION)?;
+            Ok((id, resolved))
+        })
+        .await?;
+    if let Err(e) = baseline.start(&app, BaselineJob { run_id, project_id, settings: resolved }) {
+        let message = e.message.clone();
+        catalog.run(move |c| db::baseline::finish_run(c, run_id, BaselineRunState::Failed, Some(&message))).await?;
+        return Err(e);
+    }
+    catalog.run(move |c| db::baseline::run_by_id(c, run_id, true)).await
+}
+
+/// Stops the running baseline run (nothing is written; one `baselineRunFinished` with `state:
+/// cancelled`). No-op when idle.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_baseline(baseline: State<'_, BaselineEdit>) -> AppResult<()> {
+    baseline.cancel();
+    Ok(())
+}
+
+/// The project's latest baseline run (`null` = never run; a `running` row without a worker
+/// reads `cancelled`). Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_baseline_run(
+    catalog: State<'_, Catalog>,
+    baseline: State<'_, BaselineEdit>,
+    project_id: ProjectId,
+) -> AppResult<Option<BaselineRun>> {
+    let running = baseline.is_running();
+    catalog.run(move |c| db::baseline::get_run(c, project_id, running)).await
+}
+
+/// Per-photo results of the project's latest finished run, capture order, filtered by
+/// `outcomes` (`null` / empty = all). Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_baseline_results(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    outcomes: Option<Vec<BaselineOutcome>>,
+) -> AppResult<Vec<BaselinePhotoResult>> {
+    catalog.run(move |c| db::baseline::results(c, project_id, outcomes.as_deref())).await
+}
+
+/// Baseline provenance of `ids` (given order; photos never written by a baseline omitted):
+/// which run wrote them and whether they are still on it. Unknown image -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_baseline_provenance(
+    catalog: State<'_, Catalog>,
+    ids: Vec<ImageId>,
+) -> AppResult<Vec<BaselineProvenance>> {
+    catalog.run(move |c| db::baseline::provenance(c, &ids)).await
 }

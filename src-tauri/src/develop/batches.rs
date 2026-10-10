@@ -449,7 +449,8 @@ impl StateRow {
             }
         };
         let batch_id = if source == EditSource::None { None } else { self.batch_id };
-        let needs_review = source == EditSource::SceneApply
+        // Scene applies that did not converge, and photos a baseline run flagged (v21).
+        let needs_review = matches!(source, EditSource::SceneApply | EditSource::Baseline)
             && batch_id.is_some()
             && self.review_reason.is_some()
             && self.reviewed_at.is_none();

@@ -1198,6 +1198,75 @@ export const commands = {
 	 *  `not_found`. Returns the ids newly locked.
 	 */
 	lockTargetChoices: (ids: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("lock_target_choices", { ids })),
+	/**
+	 *  Before / after settings for a sample of the run's photos spread across scenes (or
+	 *  `options.imageIds`), with the anchor's Auto / offset and the plan counts. Nothing is
+	 *  written. Decodes the anchor and each sample (~0.3-0.8 s per photo the first time). Unknown
+	 *  project / anchor / preset -> `not_found`; photos of another project, bad options ->
+	 *  `invalid_argument`; anchor original missing / unreadable -> `file_missing` / `decode_failed`.
+	 */
+	previewBaseline: (projectId: number, settings: BaselineSettings, options: {
+	/**
+	 *  How many photos to sample, spread across scenes (and bursts) in capture order;
+	 *  1..=[`MAX_BASELINE_SAMPLES`], default [`DEFAULT_BASELINE_SAMPLES`].
+	 */
+	sampleCount?: number,
+	/**
+	 *  Preview exactly these photos instead (in this order; must be in the run's scope);
+	 *  `null` = sample.
+	 */
+	imageIds?: number[] | null,
+} | null) => typedError<BaselinePreview, AppError>(__TAURI_INVOKE("preview_baseline", { projectId, settings, options })),
+	/**
+	 *  Starts a baseline run on a background thread and returns it (`state: running`). Progress:
+	 *  `activityEvent` kind `baseline_edit`; end: exactly one `baselineRunFinished`. Writes every
+	 *  photo in scope as one edit batch (kind `baseline`) at the end; cancelled / failed runs
+	 *  write nothing. Errors as `preview_baseline`; a run already in progress ->
+	 *  `invalid_argument`.
+	 */
+	runBaseline: (projectId: number, settings: BaselineSettings) => typedError<BaselineRun, AppError>(__TAURI_INVOKE("run_baseline", { projectId, settings })),
+	/**
+	 *  Stops the running baseline run (nothing is written; one `baselineRunFinished` with `state:
+	 *  cancelled`). No-op when idle.
+	 */
+	cancelBaseline: () => typedError<null, AppError>(__TAURI_INVOKE("cancel_baseline")),
+	/**
+	 *  The project's latest baseline run (`null` = never run; a `running` row without a worker
+	 *  reads `cancelled`). Unknown project -> `not_found`.
+	 */
+	getBaselineRun: (projectId: number) => typedError<{
+	id: number,
+	projectId: number,
+	settings: BaselineSettings,
+	state: BaselineRunState,
+	startedAtMs: number,
+	finishedAtMs: number | null,
+	/**
+	 *  User-facing summary or error ("Edited 742 photos; 18 need a look; 40 already edited
+	 *  were skipped").
+	 */
+	message: string | null,
+	engineVersion: string,
+	/**  Known once the anchor was measured (`null` while starting, or failed before it). */
+	anchor: BaselineAnchor | null,
+	/**  Zero until finished. */
+	counts: BaselineCounts,
+	/**
+	 *  The edit batch it wrote (kind `baseline`): undo with `undo_edit_batch(batch.batchId)`
+	 *  while `batch.undoable`. `null` = nothing written.
+	 */
+	batch: EditBatchInfo | null,
+} | null, AppError>(__TAURI_INVOKE("get_baseline_run", { projectId })),
+	/**
+	 *  Per-photo results of the project's latest finished run, capture order, filtered by
+	 *  `outcomes` (`null` / empty = all). Unknown project -> `not_found`.
+	 */
+	getBaselineResults: (projectId: number, outcomes: BaselineOutcome[] | null) => typedError<BaselinePhotoResult[], AppError>(__TAURI_INVOKE("get_baseline_results", { projectId, outcomes })),
+	/**
+	 *  Baseline provenance of `ids` (given order; photos never written by a baseline omitted):
+	 *  which run wrote them and whether they are still on it. Unknown image -> `not_found`.
+	 */
+	getBaselineProvenance: (ids: number[]) => typedError<BaselineProvenance[], AppError>(__TAURI_INVOKE("get_baseline_provenance", { ids })),
 };
 
 /** Events */
@@ -1207,6 +1276,7 @@ export const events = {
 	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
 	analysisReady: makeEvent<AnalysisReady>("analysis-ready"),
+	baselineRunFinished: makeEvent<BaselineRunFinished>("baseline-run-finished"),
 	editedPreviewChanged: makeEvent<EditedPreviewChanged>("edited-preview-changed"),
 	exportFinished: makeEvent<ExportFinished>("export-finished"),
 	exportProgress: makeEvent<ExportProgress>("export-progress"),
@@ -1226,11 +1296,23 @@ export const events = {
 /* Constants */
 export const AUTO_TONE_FIELDS = ["exposure","contrast","highlights","shadows","whites","blacks","vibrance","saturation"] as const;
 
+export const BASELINE_LABEL = "Baseline Edit" as const;
+
+export const BASELINE_LIGHT_FIELDS = ["white_balance","exposure","contrast","highlights","shadows","whites","blacks"] as const;
+
+export const BASELINE_LOOK_FIELDS = ["texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","noise_reduction_luminance","noise_reduction_color","process_version"] as const;
+
+export const BASELINE_NEVER_FIELDS = ["crop","masks","transform"] as const;
+
+export const BASELINE_PARTITION = [{"class":"light","crsKeys":["WhiteBalance","Temperature","Tint"],"field":"white_balance","note":"Auto WB + anchor offset (mireds, tint)"},{"class":"light","crsKeys":["Exposure2012"],"field":"exposure","note":"Auto + anchor offset"},{"class":"light","crsKeys":["Contrast2012"],"field":"contrast","note":"Auto + anchor offset"},{"class":"light","crsKeys":["Highlights2012"],"field":"highlights","note":"Auto + anchor offset"},{"class":"light","crsKeys":["Shadows2012"],"field":"shadows","note":"Auto + anchor offset"},{"class":"light","crsKeys":["Whites2012"],"field":"whites","note":"Auto + anchor offset"},{"class":"light","crsKeys":["Blacks2012"],"field":"blacks","note":"Auto + anchor offset"},{"class":"look","crsKeys":["Texture"],"field":"texture","note":"presence"},{"class":"look","crsKeys":["Clarity2012"],"field":"clarity","note":"presence"},{"class":"look","crsKeys":["Dehaze"],"field":"dehaze","note":"presence"},{"class":"look","crsKeys":["Vibrance"],"field":"vibrance","note":"preset colour (not part of the light Auto)"},{"class":"look","crsKeys":["Saturation"],"field":"saturation","note":"preset colour (not part of the light Auto)"},{"class":"look","crsKeys":["HueAdjustment*"],"field":"hsl_hue","note":"color mixer"},{"class":"look","crsKeys":["SaturationAdjustment*"],"field":"hsl_saturation","note":"color mixer"},{"class":"look","crsKeys":["LuminanceAdjustment*"],"field":"hsl_luminance","note":"color mixer"},{"class":"look","crsKeys":["sieve:LutId","sieve:LutAmount"],"field":"lut","note":"Sieve LUT (not read by Lightroom)"},{"class":"look","crsKeys":["Parametric*","ToneCurvePV2012*","ToneCurveName2012"],"field":"tone_curve","note":"tone curve"},{"class":"look","crsKeys":["SplitToning*","ColorGrade*"],"field":"color_grading","note":"color grading"},{"class":"look","crsKeys":["RedHue","RedSaturation","GreenHue","GreenSaturation","BlueHue","BlueSaturation","ShadowTint"],"field":"calibration","note":"calibration"},{"class":"look","crsKeys":["Sharpness","SharpenRadius","SharpenDetail","SharpenEdgeMasking"],"field":"sharpening","note":"detail"},{"class":"look","crsKeys":["LuminanceSmoothing","LuminanceNoiseReduction*","ColorNoiseReduction*"],"field":"noise_reduction","note":"detail"},{"class":"look","crsKeys":["PostCropVignette*"],"field":"vignette","note":"effects"},{"class":"look","crsKeys":["Grain*"],"field":"grain","note":"effects"},{"class":"look","crsKeys":["ConvertToGrayscale","GrayMixer*"],"field":"black_and_white","note":"treatment"},{"class":"never","crsKeys":["Crop*","HasCrop"],"field":"crop","note":"per-frame geometry"},{"class":"look","crsKeys":["CameraProfile","CameraProfileDigest","Look"],"field":"profile","note":"profile + creative look"},{"class":"never","crsKeys":["MaskGroupBasedCorrections"],"field":"masks","note":"local adjustments belong to one frame"},{"class":"look","crsKeys":[],"field":"noise_reduction_luminance","note":"subset of noise_reduction"},{"class":"look","crsKeys":[],"field":"noise_reduction_color","note":"subset of noise_reduction"},{"class":"look","crsKeys":["ProcessVersion"],"field":"process_version","note":"same process as the anchor"},{"class":"never","crsKeys":["Perspective*","Upright*","CropConstrainToWarp"],"field":"transform","note":"per-frame geometry (Upright / Transform)"}] as const;
+
 export const COPY_SETTINGS_GROUPS = [{"id":"white_balance","items":[{"fields":["white_balance"],"label":"White Balance","supported":true}],"label":"White Balance"},{"id":"basic_tone","items":[{"fields":["exposure"],"label":"Exposure","supported":true},{"fields":["contrast"],"label":"Contrast","supported":true},{"fields":["highlights"],"label":"Highlights","supported":true},{"fields":["shadows"],"label":"Shadows","supported":true},{"fields":["whites"],"label":"White Clipping","supported":true},{"fields":["blacks"],"label":"Black Clipping","supported":true}],"label":"Basic Tone"},{"id":"tone_curve","items":[{"fields":["tone_curve"],"label":"Tone Curve","supported":true}],"label":"Tone Curve"},{"id":"presence","items":[{"fields":["texture"],"label":"Texture","supported":true},{"fields":["clarity"],"label":"Clarity","supported":true},{"fields":["dehaze"],"label":"Dehaze","supported":true},{"fields":["vibrance"],"label":"Vibrance","supported":true},{"fields":["saturation"],"label":"Saturation","supported":true}],"label":"Presence"},{"id":"color","items":[{"fields":["hsl_hue"],"label":"Hue","supported":true},{"fields":["hsl_saturation"],"label":"Saturation","supported":true},{"fields":["hsl_luminance"],"label":"Luminance","supported":true}],"label":"Color Adjustments"},{"id":"color_grading","items":[{"fields":["color_grading"],"label":"Color Grading","supported":true}],"label":"Color Grading"},{"id":"detail","items":[{"fields":["sharpening"],"label":"Sharpening","supported":true},{"fields":["noise_reduction_luminance"],"label":"Luminance Noise Reduction","supported":true},{"fields":["noise_reduction_color"],"label":"Color Noise Reduction","supported":true}],"label":"Detail"},{"id":"treatment_profile","items":[{"fields":["black_and_white"],"label":"Treatment & B&W Mix","supported":true},{"fields":["profile","lut"],"label":"Profile","supported":true}],"label":"Treatment & Profile"},{"id":"lens_corrections","items":[{"fields":[],"label":"Lens Profile Corrections","supported":false},{"fields":[],"label":"Chromatic Aberration","supported":false},{"fields":[],"label":"Lens Distortion","supported":false},{"fields":[],"label":"Lens Vignetting","supported":false}],"label":"Lens Corrections"},{"id":"transform","items":[{"fields":["transform"],"label":"Upright & Transform","supported":true}],"label":"Transform"},{"id":"effects","items":[{"fields":["vignette"],"label":"Post-Crop Vignetting","supported":true},{"fields":["grain"],"label":"Grain","supported":true}],"label":"Effects"},{"id":"calibration","items":[{"fields":["calibration"],"label":"Calibration","supported":true}],"label":"Calibration"},{"id":"masking","items":[{"fields":["masks"],"label":"Masks","supported":true}],"label":"Masking"},{"id":"spot_removal","items":[{"fields":[],"label":"Spot Removal","supported":false}],"label":"Spot Removal"},{"id":"crop","items":[{"fields":["crop"],"label":"Crop, Straighten Angle & Aspect Ratio","supported":true}],"label":"Crop"},{"id":"process_version","items":[{"fields":["process_version"],"label":"Process Version","supported":true}],"label":"Process Version"}] as const;
 
 export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"transform":{"aspect":0.0,"constrainCrop":false,"guides":[],"horizontal":0.0,"offsetX":0.0,"offsetY":0.0,"rotate":0.0,"scale":100.0,"solution":null,"upright":"off","vertical":0.0},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
 export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"transform":{"aspect":0.0,"constrainCrop":false,"guides":[],"horizontal":0.0,"offsetX":0.0,"offsetY":0.0,"rotate":0.0,"scale":100.0,"solution":null,"upright":"off","vertical":0.0},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+
+export const DEFAULT_BASELINE_SAMPLES = 12 as const;
 
 export const DEFAULT_KEEPER_RULE = {"minRating":1,"mode":"not_rejected","useSuggestions":true} as const;
 
@@ -1239,6 +1321,8 @@ export const DEFAULT_LOCAL_ADJUSTMENTS = {"blacks":0.0,"clarity":0.0,"color":{"h
 export const DEFAULT_SCENE_APPLY_OPTIONS = {"excludeIds":[],"includeNonKeepers":false,"matchOptions":{"copyFields":["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","profile","process_version"],"matchExposure":true,"matchTone":false,"matchWhiteBalance":true,"strength":1.0},"skipUserEdited":true} as const;
 
 export const LUT_LIBRARY_GROUP_ID = 2 as const;
+
+export const MAX_BASELINE_SAMPLES = 48 as const;
 
 export const MAX_TARGET_COUNT = 100000 as const;
 
@@ -1289,7 +1373,9 @@ export type ActivityKind =
 /**  Apply a scene edit to its members. */
 "apply_scene" | "export" | "model_download" | 
 /**  Target-count selection: people, moments, choosing the delivery set (v20). */
-"target_selection" | "other";
+"target_selection" | 
+/**  Baseline edit run: per-photo Auto + the anchor's look over the shoot (v21). */
+"baseline_edit" | "other";
 
 /**  Lifecycle of a background activity (v18). */
 export type ActivityState = "running" | 
@@ -1649,6 +1735,249 @@ export type AutoToneValues = {
 	vibrance: number | null,
 	saturation: number | null,
 };
+
+/**  The anchor as the engine sees it (IPC v21). */
+export type BaselineAnchor = {
+	imageId: number,
+	/**  The anchor's light values (its as-shot white balance resolved). */
+	light: LightValues,
+	/**  The anchor's own Auto (with its look). */
+	auto: LightValues,
+	/**  `light - auto`: carried over to every photo. */
+	offset: LightOffset,
+};
+
+/**  Outcome counts of a run (sums to `total`). */
+export type BaselineCounts = {
+	total: number,
+	applied: number,
+	flagged: number,
+	skippedEdited: number,
+	anchor: number,
+	failed: number,
+};
+
+/**  What a baseline run did with one photo (IPC v21). */
+export type BaselineOutcome = 
+/**  Written: look copied, light = its Auto + the anchor's offset. */
+"applied" | 
+/**
+ *  Written, but needs a look (`reasons`): e.g. low-key / silhouette frames are not
+ *  brightened to Auto, or Auto failed and the anchor's light was copied. Shows as
+ *  "needs review" (`ImageEditState.needsReview`) until `mark_reviewed` or an edit.
+ */
+"flagged" | 
+/**
+ *  Not written: the photo already had edits (not from a baseline) and
+ *  `replaceEdited` was off.
+ */
+"skipped_edited" | 
+/**  The anchor itself (never written). */
+"anchor" | 
+/**  Not written: the photo could not be read (`reasons[0].text` says why). */
+"failed";
+
+/**  What a run did (or a preview would do) with one photo (IPC v21). */
+export type BaselinePhotoResult = {
+	imageId: number,
+	outcome: BaselineOutcome,
+	/**  Most important first; empty for `applied` / `anchor`. */
+	reasons: BaselineReason[],
+	sceneId: number | null,
+	burstGroupId: number | null,
+	/**
+	 *  The photo's own Auto (with the look applied); `null` when not computed (skipped /
+	 *  failed / Auto failed).
+	 */
+	auto: LightValues | null,
+	/**  The light values written (Auto + offset, smoothed, clamped); `null` when not written. */
+	light: LightValues | null,
+};
+
+/**  Counts of a planned run (`preview_baseline`): known without computing any Auto. */
+export type BaselinePlanCounts = {
+	/**  Photos in scope (incl. the anchor when in scope). */
+	inScope: number,
+	/**  Photos the run would write (unedited + on baseline + edited when `replaceEdited`). */
+	toWrite: number,
+	/**  Of `toWrite`: photos still on an earlier baseline (updated by a re-run). */
+	onBaseline: number,
+	/**  Photos with their own edits: skipped, or replaced when `replaceEdited`. */
+	edited: number,
+};
+
+/**  Result of `preview_baseline` (IPC v21). Nothing is written. */
+export type BaselinePreview = {
+	projectId: number,
+	settings: BaselineSettings,
+	anchor: BaselineAnchor,
+	/**  Spread across scenes, capture order (or `imageIds` order). */
+	samples: BaselineSample[],
+	counts: BaselinePlanCounts,
+	/**  Engine version that computed it (`BaselineRun.engineVersion`). */
+	engineVersion: string,
+};
+
+/**  Options of `preview_baseline` (`null` = defaults). */
+export type BaselinePreviewOptions = {
+	/**
+	 *  How many photos to sample, spread across scenes (and bursts) in capture order;
+	 *  1..=[`MAX_BASELINE_SAMPLES`], default [`DEFAULT_BASELINE_SAMPLES`].
+	 */
+	sampleCount?: number,
+	/**
+	 *  Preview exactly these photos instead (in this order; must be in the run's scope);
+	 *  `null` = sample.
+	 */
+	imageIds?: number[] | null,
+};
+
+/**
+ *  Baseline provenance of one photo (IPC v21, table `baseline_provenance`): the last baseline
+ *  run that wrote its settings.
+ */
+export type BaselineProvenance = {
+	imageId: number,
+	runId: number,
+	batchId: number,
+	anchorId: number | null,
+	presetId: number | null,
+	appliedAtMs: number,
+	state: BaselineState,
+	/**  Written as flagged (needs a look) by that run. */
+	flagged: boolean,
+};
+
+/**  One reason of a [`BaselinePhotoResult`]. */
+export type BaselineReason = {
+	kind: BaselineReasonKind,
+	/**  User-facing, e.g. "Dark on purpose: kept darker than Auto". */
+	text: string,
+};
+
+/**  Why a photo was flagged / failed (IPC v21). */
+export type BaselineReasonKind = 
+/**  Deliberately dark frame: kept darker than Auto would make it. */
+"low_key" | 
+/**  Back-lit subject against a bright background: not brightened blindly. */
+"silhouette" | 
+/**  Auto tone / WB could not be computed: the anchor's light values were used. */
+"auto_failed" | 
+/**  Mixed light (e.g. window + tungsten): white balance is uncertain. */
+"mixed_light" | 
+/**  A light value hit its slider limit. */
+"clamped" | 
+/**  Original missing / unreadable (outcome `failed`). */
+"unreadable" | "other";
+
+/**  One `run_baseline` (IPC v21). `get_baseline_run` returns the project's latest. */
+export type BaselineRun = {
+	id: number,
+	projectId: number,
+	settings: BaselineSettings,
+	state: BaselineRunState,
+	startedAtMs: number,
+	finishedAtMs: number | null,
+	/**
+	 *  User-facing summary or error ("Edited 742 photos; 18 need a look; 40 already edited
+	 *  were skipped").
+	 */
+	message: string | null,
+	engineVersion: string,
+	/**  Known once the anchor was measured (`null` while starting, or failed before it). */
+	anchor: BaselineAnchor | null,
+	/**  Zero until finished. */
+	counts: BaselineCounts,
+	/**
+	 *  The edit batch it wrote (kind `baseline`): undo with `undo_edit_batch(batch.batchId)`
+	 *  while `batch.undoable`. `null` = nothing written.
+	 */
+	batch: EditBatchInfo | null,
+};
+
+/**
+ *  A `run_baseline` run ended (IPC v21): exactly once per accepted call, after the batch and
+ *  the per-photo results are stored. `run.state` is `finished`, `failed` or `cancelled`
+ *  (nothing written unless `finished`). Refetch the grid / edit states / results. Progress is
+ *  reported as `activityEvent` kind `baseline_edit`.
+ */
+export type BaselineRunFinished = {
+	run: BaselineRun,
+};
+
+/**  Lifecycle of a baseline run (IPC v21). */
+export type BaselineRunState = "running" | 
+/**  Written (one batch); per-photo results stored. */
+"finished" | 
+/**  Nothing written; `message` says why. */
+"failed" | 
+/**  Stopped by `cancel_baseline` (or the app quit) before writing: nothing written. */
+"cancelled";
+
+/**
+ *  One photo of a preview: its result and the settings before / after (nothing written).
+ *  Render `after` with `render_preview(imageId, after, …)` in slot `preview` (or `before` for
+ *  the left side; the edited thumbnail shows the current settings too).
+ */
+export type BaselineSample = {
+	photo: BaselinePhotoResult,
+	before: ParametricAdjustments,
+	/**  What the run would write (= `before` when the outcome writes nothing). */
+	after: ParametricAdjustments,
+};
+
+/**  Which photos of the project a baseline run edits (IPC v21). */
+export type BaselineScope = 
+/**
+ *  The project's keepers under `CatalogState.keeperRule` (after "Pick the best N" +
+ *  Apply, the delivery set). Default.
+ */
+{ kind: "keepers" } | 
+/**  Every photo of the project. */
+{ kind: "all" } | 
+/**
+ *  These photos (must belong to the project; unknown -> `not_found`, another project ->
+ *  `invalid_argument`).
+ */
+{ kind: "selection"; ids: number[] };
+
+/**  What to run (IPC v21; `preview_baseline` / `run_baseline`). */
+export type BaselineSettings = {
+	/**
+	 *  The photo whose look is copied and whose offset from Auto carries over (must belong to
+	 *  the project). Never written by the run.
+	 */
+	anchorId: number,
+	/**
+	 *  The preset chosen in step 1 (style library / `list_presets` id; unknown -> `not_found`),
+	 *  `null` = none. Provenance, and the look source while the anchor has no edits yet (the
+	 *  preset resolved on the anchor, `styles::resolve_preset`); once the anchor is edited its
+	 *  current settings are the look (they carry the preset).
+	 */
+	presetId: number | null,
+	scope: BaselineScope,
+	/**
+	 *  Also replace photos that already have edits (`false` = skip them: outcome
+	 *  `skipped_edited`). Photos still on an earlier baseline and unedited photos are always
+	 *  (re)written.
+	 */
+	replaceEdited: boolean,
+};
+
+/**  Where a photo stands relative to the baseline that wrote it (IPC v21). */
+export type BaselineState = 
+/**
+ *  Its current settings are what the baseline wrote (history cursor on that entry):
+ *  a re-run updates it.
+ */
+"on_baseline" | 
+/**
+ *  Changed since (an edit, a paste, per-photo undo, another batch): a re-run skips it
+ *  unless `replaceEdited`.
+ */
+"user_edited" | 
+/**  The baseline batch was undone. */
+"undone";
 
 /**  Bits per channel of the written file. On the wire: `"8"` / `"16"`. */
 export type BitDepth = "8" | "16";
@@ -2367,7 +2696,12 @@ export type EditBatchKind =
  *  `sync_delta` (v19.2): one Auto Sync commit, the source photo's edit plus the same
  *  change on every target.
  */
-"sync";
+"sync" | 
+/**
+ *  `run_baseline` (v21): the baseline edit of a whole shoot (preset look + per-photo
+ *  light), label `BASELINE_LABEL`.
+ */
+"baseline";
 
 /**  An undoable multi-image edit (`undo_edit_batch`). */
 export type EditBatchResult = {
@@ -2454,7 +2788,9 @@ export type EditSource =
  *  Settings that came from outside Sieve's history: read from the XMP sidecar (import,
  *  Read from XMP), e.g. edited in Lightroom.
  */
-"sidecar";
+"sidecar" | 
+/**  A baseline edit run (`run_baseline`, v21; label `BASELINE_LABEL`). */
+"baseline";
 
 /**  Adjustments + history after an undo/redo/jump. */
 export type EditState = {
@@ -3045,6 +3381,12 @@ export type ImageQuery = {
 	 *  no constraint), e.g. `["not_sure"]` for the Second look's default pile.
 	 */
 	targetPiles?: TargetPile[],
+	/**
+	 *  v21: only photos whose result in their project's latest finished baseline run is one of
+	 *  these (`BaselinePhotoResult.outcome`; empty = no constraint; photos without a result
+	 *  never match), e.g. `["flagged"]` for "needs a look".
+	 */
+	baselineOutcomes?: BaselineOutcome[],
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -3294,6 +3636,38 @@ export type LensCount = {
 	/**  `null` = unknown lens. */
 	lens: string | null,
 	count: number,
+};
+
+/**
+ *  The anchor's offset from its own Auto (`anchor - auto(anchor)`): what the user changed
+ *  relative to Auto, carried over to every photo.
+ */
+export type LightOffset = {
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	/**  Mireds (1e6 / K) added to the photo's Auto: negative = warmer than Auto. */
+	temperatureMired: number,
+	tint: number,
+};
+
+/**  The light settings of one photo (absolute slider values; white balance always custom). */
+export type LightValues = {
+	/**  EV, -5..=5. */
+	exposure: number,
+	/**  -100..=100 (the next five too). */
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	/**  Kelvin, 2000..=50000. */
+	temperatureK: number,
+	/**  -150..=150. */
+	tint: number,
 };
 
 /**

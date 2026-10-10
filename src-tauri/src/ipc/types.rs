@@ -69,6 +69,8 @@ pub(crate) use string_enum;
 pub use super::masks::*;
 // Target-count culling (Phase 9, IPC v20) lives in `ipc/target.rs`.
 pub use super::target::*;
+// Baseline edit (Phase 10, IPC v21) lives in `ipc/baseline.rs`.
+pub use super::baseline::*;
 
 // ---------------------------------------------------------------------------
 // Camera / file identity
@@ -2600,6 +2602,11 @@ pub struct ImageQuery {
     /// no constraint), e.g. `["not_sure"]` for the Second look's default pile.
     #[serde(default)]
     pub target_piles: Vec<TargetPile>,
+    /// v21: only photos whose result in their project's latest finished baseline run is one of
+    /// these (`BaselinePhotoResult.outcome`; empty = no constraint; photos without a result
+    /// never match), e.g. `["flagged"]` for "needs a look".
+    #[serde(default)]
+    pub baseline_outcomes: Vec<BaselineOutcome>,
     pub sort: ImageSort,
     /// Reverse the natural order of `sort` (images missing the key stay last).
     pub sort_descending: bool,
@@ -2635,6 +2642,7 @@ impl Default for ImageQuery {
             target_choices: Vec::new(),
             target_reason_kinds: Vec::new(),
             target_piles: Vec::new(),
+            baseline_outcomes: Vec::new(),
             sort: ImageSort::CaptureTime,
             sort_descending: false,
             offset: 0,
@@ -4566,6 +4574,8 @@ string_enum! {
         /// Settings that came from outside Sieve's history: read from the XMP sidecar (import,
         /// Read from XMP), e.g. edited in Lightroom.
         Sidecar => "sidecar",
+        /// A baseline edit run (`run_baseline`, v21; label `BASELINE_LABEL`).
+        Baseline => "baseline",
     }
 }
 
@@ -4706,6 +4716,9 @@ string_enum! {
         /// `sync_delta` (v19.2): one Auto Sync commit, the source photo's edit plus the same
         /// change on every target.
         Sync => "sync",
+        /// `run_baseline` (v21): the baseline edit of a whole shoot (preset look + per-photo
+        /// light), label `BASELINE_LABEL`.
+        Baseline => "baseline",
     }
 }
 

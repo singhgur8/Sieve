@@ -281,7 +281,8 @@ fn entry_for(
                 .filter(|&id| id != rep.id)
                 .filter(|&id| match &row.covered {
                     Some(covered) => {
-                        !covered.contains(&id) && matches!(source_of(id), EditSource::None | EditSource::AutoStyle)
+                        !covered.contains(&id)
+                            && matches!(source_of(id), EditSource::None | EditSource::AutoStyle | EditSource::Baseline)
                     }
                     // Applied before v15 (coverage unknown): keepers that still have no edit.
                     None => source_of(id) == EditSource::None,

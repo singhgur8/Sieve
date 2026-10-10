@@ -850,6 +850,11 @@ fn query_filter_skip(
             crate::db::target::PILE_SQL
         ));
     }
+    if !q.baseline_outcomes.is_empty() {
+        // v21: `baseline_results` only holds each project's latest finished run.
+        let ph = text_list(&q.baseline_outcomes, &mut args, BaselineOutcome::as_str);
+        clauses.push(format!("i.id IN (SELECT image_id FROM baseline_results WHERE outcome IN ({ph}))"));
+    }
     metadata_clauses(&q.metadata, "i.", skip, &mut clauses, &mut args)?;
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());

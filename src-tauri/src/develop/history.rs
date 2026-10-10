@@ -58,6 +58,7 @@ pub fn source_for_label(label: &str) -> EditSource {
         super::batches::LABEL_APPLY_SCENE | crate::scene::LABEL_MATCH => EditSource::SceneApply,
         super::batches::LABEL_STYLE => EditSource::AutoStyle,
         LABEL_PASTE | LABEL_SYNC | LABEL_PASTE_PREVIOUS => EditSource::Pasted,
+        crate::ipc::types::BASELINE_LABEL => EditSource::Baseline,
         _ => EditSource::User,
     }
 }
