@@ -1,11 +1,12 @@
 // Small parts shared by the steps of "Pick the best N".
-import { useState, type ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { ImageOff, Loader2 } from "lucide-react";
 import type { ImageSelection, RawImageEntry, ShotType } from "../../ipc";
 import { previewSrc, thumbSrc } from "../../lib/entryImage";
 import { SHOT_HINT, SHOT_LABEL, SHOT_STYLE } from "../../lib/target";
 import type { ActionId } from "../../lib/keymap";
 import type { StageKey } from "./types";
+import { FIT, ZoomPane, scaleForPct, zoomAt, type Metrics, type View } from "../ZoomPane";
 
 /** A keyboard key as a small cap, e.g. next to a button label. */
 export function Key({ children }: { children: ReactNode }) {
@@ -83,3 +84,43 @@ export function ActionButton({
 
 /** What a step shows for a key; the shell calls it for every overlay key. Returns true when the key was used. */
 export type StageHandler = (id: ActionId, e: StageKey) => boolean;
+
+/**
+ * Zoom shared by two panes (P1-7): the same view (scale + normalised centre) drives both, so 100% lands on the same point of both
+ * photos and survives Left / Right. `toggle` is Fit <-> 100% at a pane point (or the centre).
+ */
+export function useSyncedZoom() {
+  const [view, setView] = useState<View>(FIT);
+  const metrics = useRef<Metrics | null>(null);
+  const [, bump] = useState(0);
+  const toggle = useCallback((at?: { x: number; y: number }) => {
+    const m = metrics.current;
+    setView((v) => {
+      if (v.scale > 1.001) return FIT;
+      if (!m) return v;
+      const a = at ?? m.hover ?? { x: m.cw / 2, y: m.ch / 2 };
+      return zoomAt(m, Math.max(1.5, scaleForPct(m, 100)), a.x, a.y, 100);
+    });
+  }, []);
+  return { view, setView, metrics, toggle, measured: () => bump((n) => n + 1) };
+}
+export type SyncedZoom = ReturnType<typeof useSyncedZoom>;
+
+/** A pane of two that zoom together. `primary` owns the shared metrics (the one whose pixels define "100%"). */
+export function ZoomPic({ entry, zoom, primary = false, className = "", testid }: { entry: RawImageEntry | undefined; zoom: SyncedZoom; primary?: boolean; className?: string; testid?: string }) {
+  const own = useRef<Metrics | null>(null);
+  return (
+    <div className={`relative overflow-hidden bg-neutral-900 ${className}`} data-testid={testid} data-id={entry?.id} data-zoom={zoom.view.scale > 1.001 ? "100" : "fit"} data-cx={zoom.view.cx.toFixed(3)} data-cy={zoom.view.cy.toFixed(3)}>
+      <ZoomPane
+        entry={entry}
+        version={0}
+        view={zoom.view}
+        onView={zoom.setView}
+        metricsRef={primary ? zoom.metrics : own}
+        onMeasured={primary ? zoom.measured : undefined}
+        rescaleActual={primary}
+        onClickZoom={(x, y) => zoom.toggle({ x, y })}
+      />
+    </div>
+  );
+}

@@ -23,7 +23,7 @@ export interface Toast {
 
 export interface ToastApi {
   toasts: Toast[];
-  push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error" }) => number;
+  push: (message: string, opts?: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number }) => number;
   dismiss: (id: number) => void;
   /** Drops the toast's Undo (kept text), e.g. when a newer edit made it unsafe. */
   retract: (id: number) => void;
@@ -45,12 +45,12 @@ export function useToasts(): ToastApi {
   }, []);
 
   const push = useCallback(
-    (message: string, opts: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error" } = {}) => {
+    (message: string, opts: { action?: ToastAction; secondary?: ToastAction; third?: ToastAction; kind?: "info" | "error"; ttl?: number } = {}) => {
       const id = next.current++;
       const kind = opts.kind ?? "info";
       // A new message replaces plain older ones; toasts carrying an action (Undo) stay until they expire.
       setToasts((all) => [...all.filter((t) => t.action).slice(-1), { id, message, kind, action: opts.action, secondary: opts.secondary, third: opts.third }]);
-      if (kind === "info") timers.current.set(id, setTimeout(() => dismiss(id), opts.action ? 10000 : 4000));
+      if (kind === "info") timers.current.set(id, setTimeout(() => dismiss(id), opts.ttl ?? (opts.action ? 10000 : 4000)));
       return id;
     },
     [dismiss],
@@ -102,9 +102,9 @@ function useDialogOpen(): boolean {
  * `top`: Develop. Without a dialog the stack sits at the viewer's top-right (left of the adjustment panel) so it stays off the
  * photo's centre and the viewer toolbar; while a dialog is open it moves to the bottom-left, clear of the dialog.
  */
-export function Toasts({ api, error, onDismissError, onLocate, placement = "bottom" }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void; placement?: "bottom" | "top" | "tool" }) {
+export function Toasts({ api, error, onDismissError, onLocate, placement = "bottom" }: { api: ToastApi; error: ErrorInfo | null; onDismissError: () => void; onLocate?: () => void; placement?: "bottom" | "top" | "tool" | "target" }) {
   const modal = useDialogOpen();
-  const pos = modal ? "bottom-3 left-4 w-[min(400px,92vw)]" : placement === "tool" ? "bottom-14 left-[272px] w-[min(400px,92vw)]" : placement === "top" ? "top-[88px] right-[300px] w-[min(400px,92vw)] min-[1600px]:right-[332px]" : "bottom-24 left-1/2 w-[min(480px,92vw)] -translate-x-1/2";
+  const pos = modal ? "bottom-3 left-4 w-[min(400px,92vw)]" : placement === "target" ? "top-[100px] right-3 w-[min(400px,92vw)]" : placement === "tool" ? "bottom-14 left-[272px] w-[min(400px,92vw)]" : placement === "top" ? "top-[88px] right-[300px] w-[min(400px,92vw)] min-[1600px]:right-[332px]" : "bottom-24 left-1/2 w-[min(480px,92vw)] -translate-x-1/2";
   return (
     <div className={`pointer-events-none fixed ${pos} z-[60] flex flex-col items-stretch gap-2`} data-testid="toasts" data-placement={modal ? "modal" : placement}>
       {error && (
@@ -127,7 +127,7 @@ export function Toasts({ api, error, onDismissError, onLocate, placement = "bott
           </button>
         </div>
       )}
-      {api.toasts.map((t) => (
+      {(placement === "target" ? api.toasts.slice(-1) : api.toasts).map((t) => (
         <div
           key={t.id}
           role="status"

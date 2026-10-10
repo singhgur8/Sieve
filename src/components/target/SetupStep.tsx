@@ -104,7 +104,7 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
           <button
             className="flex h-9 items-center gap-2 rounded-md bg-sky-700 px-4 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-40"
             data-testid="target-run"
-            title={valid ? `Choose the best ${num(n)} of ${num(photoCount)} photos. Nothing is flagged until you apply` : "Enter a number between 1 and 100,000"}
+            title={valid ? `Choose the best ${num(n)} of ${num(photoCount)} photos. Your keeps, swaps and adds are flagged as you make them. Apply flags the rest` : "Enter a number between 1 and 100,000"}
             disabled={!valid}
             onClick={() => void start()}
           >
@@ -165,11 +165,21 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
               );
             })}
           </ul>
+          {c.deliver < 0.9 * run.settings.targetCount && (
+            <p className="mt-3 rounded bg-neutral-800 px-3 py-2 text-xs text-neutral-200" data-testid="target-shortfall">
+              {num(run.settings.targetCount - c.deliver)} short of {num(run.settings.targetCount)}: only {num(c.deliver)} photos qualify under the rules. The {num(c.notSure)} Not sure are the closest; add the ones you like in the Second look.
+            </p>
+          )}
+          {c.deliver > run.settings.targetCount && (
+            <p className="mt-3 rounded bg-neutral-800 px-3 py-2 text-xs text-neutral-200" data-testid="target-overshoot">
+              Over by {num(c.deliver - run.settings.targetCount)}: the first frame of every moment is always kept (up to +10 %).
+            </p>
+          )}
           <dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm text-neutral-300">
             <div title="Almost made it: a quick second look decides" data-testid="target-sum-notsure">
               Not sure <b className="text-neutral-50">{num(c.notSure)}</b>
             </div>
-            <div title="Near-duplicates, defects and weaker frames. Nothing is rejected" data-testid="target-sum-setaside">
+            <div title="Near-duplicates, defects and weaker frames. Nothing is flagged until you apply" data-testid="target-sum-setaside">
               Set aside <b className="text-neutral-50">{num(c.setAside)}</b>
             </div>
             <div title="Alternatives are kept next to their pick for a one-key swap" data-testid="target-sum-alts">
@@ -181,7 +191,7 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
               <ActionButton testid="target-next-people" label={`Check the people (${plural(run.peopleQuestions, "question")})`} keys={[]} tone="primary" title="Confirm the couple and say who else matters, then re-run" onClick={() => ctx.go("people")} />
             )}
             <ActionButton testid="target-next-review" label={`Review the ${num(c.deliver)} picks`} keys={[]} tone={run.peopleQuestions > 0 ? "neutral" : "primary"} title="Go through the delivery set with the alternatives of each moment" onClick={() => ctx.go("review")} />
-            <ActionButton testid="target-next-second" label="Second look" keys={[]} title="Quickly check the Not sure and Set aside photos" onClick={() => ctx.go("second")} />
+            <ActionButton testid="target-next-second" label={`Second look · ${num(c.notSure)} not sure`} keys={[]} title="Quickly check the Not sure photos; similar, weaker and defective frames are in the piles next to them" onClick={() => ctx.go("second")} />
             {run.peopleQuestions === 0 && (
               <span className="flex items-center gap-1 text-xs text-neutral-400" title="People you answered about are kept for every re-run">
                 <Users className="size-3.5" /> People confirmed

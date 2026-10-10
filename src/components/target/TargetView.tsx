@@ -8,7 +8,7 @@ import { useEntries } from "../../hooks/useTarget";
 import { useKeyboard } from "../../hooks/useKeyboard";
 import { hint, matchTargetKey, type TargetStage } from "../../lib/keymap";
 import { modalCount } from "../../lib/modal";
-import { plural } from "../../lib/target";
+import { num, plural } from "../../lib/target";
 import { Dialog } from "../Dialog";
 import { HelpLink } from "../HelpLink";
 import { ActionButton } from "./bits";
@@ -30,6 +30,8 @@ interface Props {
   run: TargetRun | null;
   refreshRun: () => Promise<void>;
   initialStage: Stage;
+  /** Open with the Apply dialog (the Cull step's Best N row). */
+  initialApply?: boolean;
   keeperRule: KeeperRule | null;
   onKeeperRule: (r: KeeperRule) => Promise<void>;
   /** Flags / selection changed: refresh the library and the Cull summary. */
@@ -41,14 +43,15 @@ interface Props {
   onError: (e: unknown) => void;
 }
 
-const num = (n: number) => n.toLocaleString("en-US");
-
 export function TargetView(p: Props) {
   const [stage, setStage] = useState<Stage>(p.initialStage);
   const [rev, setRev] = useState(0);
   const [undoLabel, setUndoLabel] = useState<string | null>(null);
-  const [applyOpen, setApplyOpen] = useState(false);
-  const stack = useRef<{ label: string; previous: TargetSnapshot[] }[]>([]);
+  const [applyOpen, setApplyOpen] = useState(!!p.initialApply);
+  const [focus, setFocus] = useState<{ id: number; stage: Stage; n: number } | null>(null);
+  const stage_ = useRef(stage);
+  stage_.current = stage;
+  const stack = useRef<{ label: string; previous: TargetSnapshot[]; at?: number; stage: Stage }[]>([]);
   const stageRef = useRef<StageRef>(null);
   const entries = useEntries(p.onError);
   const changedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -59,11 +62,12 @@ export function TargetView(p: Props) {
   useEffect(() => () => clearTimeout(changedTimer.current), []);
 
   const edit = useCallback(
-    async (label: string, pr: Promise<TargetEditResult>) => {
+    async (label: string, pr: Promise<TargetEditResult>, at?: number) => {
       try {
+        const stageNow = stage_.current;
         const r = await pr;
         if (r.previous.length > 0) {
-          stack.current = [...stack.current, { label, previous: r.previous }].slice(-200);
+          stack.current = [...stack.current, { label, previous: r.previous, at, stage: stageNow }].slice(-200);
           setUndoLabel(label);
         }
         entries.drop(r.previous.map((s) => s.imageId));
@@ -80,6 +84,7 @@ export function TargetView(p: Props) {
   );
 
   const undo = useCallback(async () => {
+    if (stage_.current === "people") return p.notify("Change an answer with Y / N"); // people answers are not on the undo stack
     const top = stack.current[stack.current.length - 1];
     if (!top) return p.notify("Nothing to undo");
     stack.current = stack.current.slice(0, -1);
@@ -91,6 +96,11 @@ export function TargetView(p: Props) {
       void p.refreshRun();
       changed();
       p.notify(`Undid: ${top.label}`);
+      // Back to what was undone (P1-3): switch to its stage and select the photo.
+      if (top.at != null && (top.stage === "review" || top.stage === "second")) {
+        setStage(top.stage);
+        setFocus({ id: top.at, stage: top.stage, n: Date.now() });
+      }
     } catch (e) {
       p.onError(e);
     }
@@ -117,6 +127,8 @@ export function TargetView(p: Props) {
     undo: () => void undo(),
     canUndo: undoLabel != null,
     rev,
+    focus,
+    focusDone: () => setFocus(null),
     notify: p.notify,
     onError: p.onError,
     showInGrid: p.onShowInGrid,

@@ -46,7 +46,8 @@ import { openHelp, useHelpState } from "./lib/helpStore";
 import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
 import { TargetView, type Stage as TargetStage } from "./components/target/TargetView";
-import { hasTargetRun, TargetButton, TargetOffer } from "./components/target/TargetEntry";
+import { BestRow, hasTargetRun, offerApplies, TargetButton, TargetOffer } from "./components/target/TargetEntry";
+import { runProgress } from "./lib/target";
 import { useTargetRun } from "./hooks/useTarget";
 import { PhotoInfoPanel } from "./components/PhotoInfoPanel";
 import { CaptureTimeDialog } from "./components/CaptureTimeDialog";
@@ -106,6 +107,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const [planFocus, setPlanFocus] = useState<number | null>(null);
   // "Pick the best N" (target-count culling) overlay of the Cull step; the value is the stage it opened on.
   const [targetOpen, setTargetOpen] = useState<TargetStage | null>(null);
+  const [targetApply, setTargetApply] = useState(false);
   // Review mode after an apply: N walks the frames that need a look.
   const [reviewScene, setReviewScene] = useState<number | null>(null);
   const [cheatOpen, setCheatOpen] = useState(false);
@@ -1168,13 +1170,15 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   // ---- Pick the best N ----
   const openTarget = useCallback(
-    (stage?: TargetStage) => {
+    (stage?: TargetStage, apply = false) => {
       setPlanOpen(false);
       setMode("grid");
       setCmp(null);
-      setTargetOpen(stage ?? (hasTargetRun(target.run) ? "review" : "setup"));
+      setTargetApply(apply);
+      // With a run: the stage with unfinished work (picks not reviewed yet, else the Not sure photos).
+      setTargetOpen(stage ?? (hasTargetRun(target.run) && project ? runProgress(project.id, target.run!.counts).next : hasTargetRun(target.run) ? "review" : "setup"));
     },
-    [target.run],
+    [target.run, project],
   );
   const targetChanged = useCallback(() => {
     void rawLib.refreshAll().catch(reportError);
@@ -1242,6 +1246,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const runKey = (def: NonNullable<ReturnType<typeof matchKey>>, e: KeyboardEvent) => {
     const k = e.key;
     switch (def.id) {
+      case "targetOpen":
+        return step === "cull" && project ? openTarget() : undefined;
       case "stepCull":
         return goStep("cull");
       case "stepEdit":
@@ -1729,11 +1735,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             }
             filters={filtersOpen ? <FilterExtras query={uiQuery} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
-          {project && step === "cull" && cullSum.summary && target.loaded && !hasTargetRun(target.run) && target.run?.state !== "running" && cullSum.summary.picked + cullSum.summary.rejected === 0 && (
+          {project && step === "cull" && cullSum.summary && target.loaded && offerApplies(target.run, project.photoCount, cullSum.summary.picked + cullSum.summary.rejected) && (
             <TargetOffer projectId={project.id} photoCount={project.photoCount} onOpen={() => openTarget("setup")} />
           )}
+          {project && step === "cull" && cullSum.summary && target.loaded && hasTargetRun(target.run) && (
+            <BestRow projectId={project.id} run={target.run!} onContinue={() => openTarget()} onApply={() => openTarget("review", true)} />
+          )}
           {project && step === "cull" && cullSum.summary && (
-            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} strictness={project.rejectStrictness} onStrictness={(v) => void changeRejectStrictness(v)} />
+            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} strictness={project.rejectStrictness} onStrictness={(v) => void changeRejectStrictness(v)} bestN={hasTargetRun(target.run) ? target.run!.settings.targetCount : undefined} />
           )}
         </>
         )
@@ -1791,6 +1800,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               run={target.run}
               refreshRun={target.refresh}
               initialStage={targetOpen}
+              initialApply={targetApply}
               keeperRule={status.catalog?.keeperRule ?? null}
               onKeeperRule={changeKeeperRule}
               onChanged={targetChanged}
@@ -1800,7 +1810,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               }}
               onShowInGrid={showTargetChoices}
               onContinueEdit={() => goStep("edit")}
-              notify={setNotice}
+              notify={(m) => void push(m, { ttl: 3000 })}
               onError={reportError}
             />
           </ErrorBoundary>
@@ -1985,7 +1995,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           }}
         />
       )}
-      <Toasts api={toasts} placement={mode === "develop" ? (devTool ? "tool" : "top") : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <Toasts api={toasts} placement={targetOpen ? "target" : mode === "develop" ? (devTool ? "tool" : "top") : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
       <HelpPanel onShortcuts={() => setCheatOpen(true)} />
       <ActivityWidget behindDialogs={exportOpen != null || modalOpenCount > 0 || helpState.open} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
         <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />

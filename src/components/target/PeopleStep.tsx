@@ -2,8 +2,8 @@
 // person with big cards (Y / N, arrows), then "Re-run with these people".
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Check, Heart, Users } from "lucide-react";
-import { commands, convertFileSrc, faceCropStyle, unwrap, type PeopleOverview, type Person, type PersonRole } from "../../ipc";
-import { plural } from "../../lib/target";
+import { commands, convertFileSrc, DEFAULT_QUERY, faceCropStyle, unwrap, type PeopleOverview, type Person, type PersonRole } from "../../ipc";
+import { loadReviewed, lockReviewedPicks, plural, pruneReviewed } from "../../lib/target";
 import { hint } from "../../lib/keymap";
 import { ActionButton, Key } from "./bits";
 import type { StageRef } from "./SetupStep";
@@ -29,6 +29,10 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
     if (stamp !== lastStamp.current) {
       lastStamp.current = stamp;
       setDirty(false); // a run happened: its selection already used the answers
+      // Reviewed picks that did not survive the re-run no longer count as reviewed.
+      void unwrap(commands.listImageIds({ ...DEFAULT_QUERY, projectId: ctx.projectId, targetChoices: ["deliver"] }))
+        .then((l) => pruneReviewed(ctx.projectId, "review", new Set(l)))
+        .catch(() => undefined);
     }
   }, [stamp]);
 
@@ -50,6 +54,10 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
   const coupleConfirmed = mains.length > 0 && mains.every((p) => p.roleConfirmed);
   const open = ov?.questions.length ?? 0;
   const cur = asked[Math.min(focus, Math.max(0, asked.length - 1))];
+  // The focused card stays fully visible above the sticky footer (P1-8).
+  useEffect(() => {
+    if (cur) document.querySelector(`[data-testid="target-person-${cur.id}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [cur?.id, ov]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setRole = async (ids: number[], role: PersonRole) => {
     setBusy(true);
@@ -84,6 +92,12 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
     if (!ctx.run) return;
     setBusy(true);
     try {
+      // Picks the user approved by moving past them are locked first, so the re-run keeps them (P1-4).
+      const reviewed = loadReviewed(ctx.projectId, "review");
+      if (reviewed.size > 0) {
+        const delivered = await unwrap(commands.listImageIds({ ...DEFAULT_QUERY, projectId: ctx.projectId, targetChoices: ["deliver"] }));
+        await lockReviewedPicks(delivered.filter((i) => reviewed.has(i)));
+      }
       await unwrap(commands.runTargetSelection(ctx.projectId, ctx.run.settings));
       await ctx.refreshRun();
       ctx.go("setup");
@@ -133,7 +147,7 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="target-people" data-open={open}>
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-6" style={{ scrollPaddingBottom: 72 }} data-testid="target-people-scroller">
         <div className="mx-auto flex max-w-4xl flex-col gap-6">
           {mains.length > 0 && (
             <section className="rounded-lg border border-neutral-800 bg-neutral-900 p-4" data-testid="target-couple" data-confirmed={coupleConfirmed}>
@@ -199,7 +213,7 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
                 </span>
               </h2>
               <p className="mt-1 text-xs text-neutral-400">Parents, siblings, friends: say who matters. Photos with important people are favoured. Answer with <Key>Y</Key> or <Key>N</Key>, move with the arrow keys.</p>
-              <div className="mt-3 grid grid-cols-2 gap-4 md:grid-cols-4" data-testid="target-person-cards">
+              <div className="mt-3 grid grid-cols-4 gap-4 xl:grid-cols-5" data-testid="target-person-cards">
                 {asked.map((p, i) => {
                   const state = !p.roleConfirmed ? "open" : p.role === "important" ? "yes" : "no";
                   return (
@@ -211,7 +225,9 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
                       data-focused={i === Math.min(focus, asked.length - 1)}
                       onClick={() => setFocus(i)}
                     >
-                      <Face person={p} />
+                      <div className="mx-auto size-36" data-testid={`target-person-face-${p.id}`}>
+                        <Face person={p} />
+                      </div>
                       <div className="flex gap-1">
                         {p.samples.slice(1, 4).map((_, k) => (
                           <div key={k} className="w-1/3">
@@ -260,7 +276,7 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
       </div>
       <footer className="flex shrink-0 items-center gap-3 border-t border-neutral-800 bg-neutral-950 px-6 py-3" data-testid="target-people-footer">
         <p className="min-w-0 flex-1 text-xs text-neutral-300" data-testid="target-rerun-note">
-          {dirty ? "Your answers apply at the next run. A re-run keeps every keep, reject and swap you made." : "Answers apply at the next run. A re-run keeps every keep, reject and swap you made."}
+          {dirty ? "Your answers apply at the next run. A re-run keeps the picks you have reviewed and every keep, set-aside and swap you made." : "Answers apply at the next run. A re-run keeps the picks you have reviewed and every keep, set-aside and swap you made."}
         </p>
         <ActionButton
           testid="target-rerun"
@@ -268,7 +284,7 @@ export const PeopleStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Peop
           keys={[]}
           tone={dirty ? "primary" : "neutral"}
           disabled={busy || !ctx.run}
-          title="Choose the delivery set again with the people you confirmed. Your own keep, reject and swap decisions are kept"
+          title="Choose the delivery set again with the people you confirmed. Your reviewed picks and your own keep, set-aside and swap decisions are kept"
           onClick={() => void rerun()}
         />
       </footer>

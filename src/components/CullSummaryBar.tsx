@@ -16,6 +16,8 @@ interface Props {
   /** Project's reject strictness (v19) and its setter. */
   strictness?: RejectStrictness;
   onStrictness?: (v: RejectStrictness) => void;
+  /** Target count of the Pick the best N run, when one exists: the Suggestions chip then says it is a different set. */
+  bestN?: number;
 }
 
 export const STRICT_TEXT: Record<RejectStrictness, string> = {
@@ -46,7 +48,7 @@ export function suggestionParts(s: CullSummary): string {
     .join(" · ");
 }
 
-export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions, strictness, onStrictness }: Props) {
+export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onApplySuggestions, strictness, onStrictness, bestN }: Props) {
   const toggle = (...p: string[]) => setQuery((q) => ({ ...q, keepersOnly: false, pickOrigin: null, suggested: null, picks: onlyPicks(q, ...p) ? [] : (p as Query["picks"]) }));
   const toggleRejectedBy = (o: PickOrigin) =>
     setQuery((q) => (onlyRejectedBy(q, o) ? { ...q, picks: [], pickOrigin: null } : { ...q, keepersOnly: false, suggested: null, picks: ["reject"], pickOrigin: o }));
@@ -187,11 +189,11 @@ export function CullSummaryBar({ summary: s, query, setQuery, onKeeperRule, onAp
         <button
           className={`${strictness && onStrictness && wide ? "" : "ml-auto "}flex items-center gap-1 whitespace-nowrap rounded bg-neutral-800 px-1.5 py-0.5 text-sky-200 hover:bg-neutral-700`}
           data-testid="cull-sum-suggest"
-          title="Sieve has an opinion on photos you have not flagged. Apply suggestions copies it to their flags and stars (you review the result in the Rejected view and can undo it)"
+          title={`Sieve has an opinion on photos you have not flagged. Apply suggestions copies it to their flags and stars (you review the result in the Rejected view and can undo it)${bestN ? `. This is separate from Best ${bestN.toLocaleString("en-US")}: it also writes stars` : ""}`}
           onClick={onApplySuggestions}
         >
           <Sparkles className="size-3" />
-          Suggestions: {suggestions} — Apply…
+          Suggestions{bestN ? ` (from Best ${bestN.toLocaleString("en-US")})` : ""}: {suggestions} — Apply…
         </button>
       )}
     </div>

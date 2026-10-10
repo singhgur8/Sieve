@@ -138,7 +138,7 @@ test.describe("Pick the best N", () => {
     await expect(page.getByTestId("target-people-badge")).toHaveCount(0);
     const roles = (await calls(page, "set_person_role")).map((c) => c.args.role);
     expect(roles).toEqual(["important", "other", "other", "important", "other"]);
-    await expect(page.getByTestId("target-rerun-note")).toContainText("keeps every keep, reject and swap");
+    await expect(page.getByTestId("target-rerun-note")).toContainText("keeps the picks you have reviewed and every keep, set-aside and swap");
     await shot(page, "t-06-answered");
 
     // Re-run with these people: back to step 1 with progress, the answers survive, the user's decisions are kept.
@@ -192,7 +192,7 @@ test.describe("Pick the best N", () => {
     const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
     for (let i = 0; i < 12 && (await strip.count()) < 2; i++) await page.keyboard.press("ArrowRight");
     expect(await strip.count()).toBeGreaterThanOrEqual(2);
-    await expect(page.getByTestId("target-strip")).toContainText("Alternatives from this moment");
+    await expect(page.getByTestId("target-strip")).toContainText(/This moment: \d+ picked · \d+ alternatives?/);
     await shot(page, "t-07-pass1");
     const reviewedAfterWalk = await page.getByTestId("target-review-count").innerText();
     expect(reviewedAfterWalk).not.toMatch(/^0 of/);
@@ -243,7 +243,7 @@ test.describe("Pick the best N", () => {
     await page.keyboard.press("Control+z");
     await expect(page.getByTestId("target-review")).toHaveAttribute("data-total", String(run.counts.deliver));
 
-    // X rejects: the photo moves to Set aside and the next one slides in; the flag is the user's. Z keeps and advances.
+    // X sets aside: the photo moves to Set aside and the next one slides in; the flag is the user's. Z keeps and advances.
     const rejectId = await attr(page, "target-cur", "data-id");
     await page.keyboard.press("x");
     await expect.poll(async () => (await selOf(page, rejectId)).choice).toBe("set_aside");
@@ -284,7 +284,7 @@ test.describe("Pick the best N", () => {
     await openTarget(page, "&target=answered");
     await tab(page, "second");
     const run = await inv<{ counts: { notSure: number; setAside: number } }>(page, "get_target_run", { projectId: 1 });
-    const n = run.counts.notSure + run.counts.setAside;
+    const n = run.counts.notSure; // the default pile (P0-1)
     await expect(page.getByTestId("target-second")).toHaveAttribute("data-total", String(n));
     await expect(page.getByTestId("target-second-count")).toHaveText(`0 of ${n} reviewed`);
     const cur = () => attr(page, "target-second", "data-current");
@@ -311,7 +311,7 @@ test.describe("Pick the best N", () => {
     await stepTo(true);
     await expect(page.getByTestId("target-covered-text")).toHaveText(/^Already kept a similar one: DSC\d+$/);
     await expect(page.getByTestId("target-similarity")).toContainText(/\d+% similar/);
-    await expect(page.getByTestId("target-covered-pic").locator("img")).toBeVisible();
+    await expect(page.getByTestId("target-covered-pic").locator("img").last()).toBeVisible();
     await shot(page, "t-08-pass2");
     // Swap (S): keep this instead of the kept one.
     let coverId = attr(page, "target-covered", "data-id");
@@ -416,5 +416,430 @@ test.describe("Pick the best N", () => {
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("target-view")).toHaveCount(0);
     await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// UX review 9 (docs/ux-review-9.md): P0-1, P0-3, P1-1 ... P1-11
+// ---------------------------------------------------------------------------------------------------------------------
+type SelM = Sel & { momentId: number | null; coveredBy: number | null };
+const selM = async (page: Page, id: number) => (await inv<SelM[]>(page, "get_image_selections", { ids: [id] }))[0];
+const deliverIds = (page: Page, projectId = 1) =>
+  inv<number[]>(page, "list_image_ids", { query: { includeTags: [], excludeTags: [], tagMatch: "any", picks: [], minRating: null, maxRating: null, colorLabels: [], burstGroupId: null, sceneId: null, collapseBursts: false, folderId: null, projectId, targetChoices: ["deliver"], sort: "capture_time", sortDescending: false, offset: 0, limit: 100000 } });
+const runCounts = async (page: Page) => (await inv<{ counts: { deliver: number; notSure: number; setAside: number } }>(page, "get_target_run", { projectId: 1 })).counts;
+
+async function openSecond(page: Page, query = "&target=answered", count = 201) {
+  await openHome(page, count, query);
+  await page.getByTestId("project-open-1").click();
+  await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+  await page.getByTestId("target-open").click();
+  await tab(page, "second");
+  await expect(page.getByTestId("target-second")).toBeVisible();
+}
+
+test.describe("Pick the best N: UX review 9", () => {
+  test("P0-1: Second look splits into four piles, Not sure by default, counts add up at scale", async ({ page }) => {
+    await openSecond(page, "&target=answered", 5000);
+    const c = await runCounts(page);
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-pile", "not_sure");
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-total", String(c.notSure));
+    const counts = await Promise.all((["not_sure", "similar", "weaker", "defects"] as const).map((p) => attr(page, `target-pile-${p}`, "data-count")));
+    expect(counts.reduce((a, b) => a + b, 0)).toBe(c.notSure + c.setAside);
+    expect(counts[0]).toBe(c.notSure);
+    for (const n of counts) expect(n).toBeGreaterThan(0);
+    await expect(page.getByTestId("target-pile-similar")).toContainText("Similar to a kept photo");
+    await shot(page, "t-20-piles");
+
+    // Similar: one row per moment, the moment's kept photo on the left; only the rows near the viewport are mounted.
+    await page.getByTestId("target-pile-similar").click();
+    await expect(page.getByTestId("target-similar")).toBeVisible();
+    const rows = await attr(page, "target-second", "data-rows");
+    expect(rows).toBeGreaterThan(20);
+    const mounted = page.locator('[data-testid^="target-sim-row-"]');
+    await expect(mounted.first()).toBeVisible();
+    expect(await mounted.count()).toBeLessThan(25);
+    for (let i = 0; i < Math.min(5, await mounted.count()); i++) {
+      const row = mounted.nth(i);
+      await expect(row.locator('[data-testid="target-sim-kept-photo"]').first()).toBeVisible(); // its moment's delivered photo
+      expect(await row.locator('[data-testid^="target-sim-frame-"]').count()).toBeGreaterThan(0);
+    }
+    await expect(page.locator('[data-testid="target-sim-pct"]').first()).toContainText("%");
+    await shot(page, "t-21-similar");
+
+    // A on the focused frame adds it (add_alternative); Shift+Right goes to the next moment.
+    const focused = page.locator('[data-testid^="target-sim-frame-"][data-focused="true"]');
+    await expect(focused.first()).toBeVisible();
+    const fId = Number((await focused.first().getAttribute("data-testid"))!.replace("target-sim-frame-", ""));
+    await clearCalls(page);
+    await page.keyboard.press("a");
+    await expect.poll(async () => (await selM(page, fId)).choice).toBe("deliver");
+    expect((await calls(page, "add_alternative"))[0].args).toMatchObject({ imageId: fId });
+    const momentOfFocus = async () => Number((await selM(page, Number((await page.getByTestId("target-second").getAttribute("data-current")) ?? 0))).momentId);
+    const m0 = await momentOfFocus();
+    await page.keyboard.press("Shift+ArrowRight");
+    expect(await momentOfFocus()).not.toBe(m0);
+    await expect(page.getByTestId("target-second-count")).toContainText("moments reviewed");
+
+    // Weaker frames and Defects are plain grids with the reason on each cell, and say what Apply does with them.
+    await page.getByTestId("target-pile-defects").click();
+    await expect(page.getByTestId("target-pile-note")).toContainText("Defects are rejected when you apply. Weaker frames stay unflagged.");
+    const cells = page.locator('[data-testid^="target-cell-"]');
+    await expect(cells.first()).toBeVisible();
+    for (const k of await cells.evaluateAll((els) => els.map((e) => e.getAttribute("data-kind")))) expect(["defect", "user_choice"]).toContain(k);
+    await page.getByTestId("target-pile-weaker").click();
+    await expect(cells.first()).toBeVisible();
+    for (const k of await cells.evaluateAll((els) => els.map((e) => e.getAttribute("data-kind")))) expect(["defect", "user_choice", "near_duplicate", "not_best_of_setup"]).not.toContain(k);
+  });
+
+  test("P0-1: Not sure is ordered by moment; Shift+Space skips the rest of a moment; summary button shows the count", async ({ page }) => {
+    await openHome(page, 201, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "setup");
+    const c = await runCounts(page);
+    await expect(page.getByTestId("target-next-second")).toContainText(`Second look · ${c.notSure} not sure`);
+    await page.getByTestId("target-next-second").click();
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-total", String(c.notSure));
+    // Walk the pile: moments are contiguous (ordered by moment, then score).
+    const seen: (number | null)[] = [];
+    const curId = () => attr(page, "target-second", "data-current");
+    await page.keyboard.press("Home");
+    for (let i = 0; i < c.notSure; i++) {
+      seen.push((await selM(page, await curId())).momentId);
+      await page.keyboard.press("ArrowRight");
+    }
+    const closed = new Set<number | null>();
+    seen.forEach((m, i) => {
+      if (i > 0 && m !== seen[i - 1]) {
+        expect(closed.has(m)).toBe(false);
+        closed.add(seen[i - 1]);
+      }
+    });
+    await page.keyboard.press("Home");
+    const m0 = (await selM(page, await curId())).momentId;
+    const inMoment = seen.filter((m) => m === m0).length;
+    await page.keyboard.press("Shift+Space");
+    expect((await selM(page, await curId())).momentId).not.toBe(m0);
+    await expect(page.getByTestId("target-second")).toHaveAttribute("data-reviewed", String(inMoment));
+  });
+
+  test("P0-3: kept-from-this-moment strip marks what you added; the add button turns amber", async ({ page }) => {
+    await openSecond(page);
+    const curId = () => attr(page, "target-second", "data-current");
+    await page.keyboard.press("Home");
+    let prev = await curId();
+    let found = false;
+    for (let i = 0; i < 16 && !found; i++) {
+      const before = await selM(page, prev);
+      await clearCalls(page);
+      await page.keyboard.press("a");
+      await expect.poll(async () => (await selM(page, prev)).choice).toBe("deliver");
+      await expect.poll(curId).not.toBe(prev);
+      const now = await curId();
+      // Covered-by is refetched after the edit.
+      await expect.poll(async () => (await calls(page, "get_covered_by")).some((c) => c.args.imageId === now)).toBe(true);
+      if ((await selM(page, now)).momentId === before.momentId && before.momentId != null) {
+        found = true;
+        const strip = page.getByTestId("target-kept-strip");
+        await expect(strip.getByTestId(`target-kept-${prev}`)).toHaveAttribute("data-added", "true");
+        await expect(strip.getByTestId(`target-kept-${prev}`)).toContainText("you added");
+        const name = `DSC${String(prev).padStart(5, "0")}`;
+        await expect(page.getByTestId("target-already-added")).toContainText(`You already added ${name} from this moment`);
+        const n = Number(await strip.getAttribute("data-count"));
+        const ord = (k: number) => `${k}${["th", "st", "nd", "rd"][k % 10 > 3 || [11, 12, 13].includes(k % 100) ? 0 : k % 10]}`;
+        const add = page.getByTestId("target-second-add");
+        await expect(add).toHaveAttribute("data-amber", "true");
+        await expect(add).toContainText(`Add a ${ord(n + 1)} from this moment`);
+        await shot(page, "t-22-added");
+      }
+      prev = now;
+    }
+    expect(found).toBe(true);
+  });
+
+  test("P1-1 / P1-2 / P1-3: moment strip, accept the moment, resume, unreviewed jumps, undo returns to the photo", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    const list = await deliverIds(page);
+    const cur = () => attr(page, "target-review", "data-current");
+    // A moment with several picks: walk to it. The strip shows the other picks and the alternatives; the header says so.
+    const moments = await inv<{ id: number; deliveredIds: number[]; imageIds: number[] }[]>(page, "list_moments", { projectId: 1 });
+    const mOf = (id: number) => moments.find((m) => m.imageIds.includes(id))!;
+    const multi = list.findIndex((id) => mOf(id).deliveredIds.length >= 2);
+    expect(multi).toBeGreaterThanOrEqual(0);
+    await page.keyboard.press("End");
+    await page.keyboard.press("Home");
+    for (let i = 0; i < multi; i++) await page.keyboard.press("ArrowRight");
+    const here = await cur();
+    const m = mOf(here);
+    await expect(page.getByTestId("target-strip-title")).toContainText(`This moment: ${m.deliveredIds.length} picked`);
+    await expect(page.locator('[data-testid^="target-pick-"]')).toHaveCount(m.deliveredIds.length - 1);
+    await expect(page.getByTestId("target-review-moment-no")).toContainText(/Moment \d+ of \d+/);
+    await shot(page, "t-23-moment");
+    // Clicking another pick of the moment jumps to it.
+    const other = m.deliveredIds.find((i) => i !== here)!;
+    await page.getByTestId(`target-pick-${other}`).click();
+    expect(await cur()).toBe(other);
+    // Shift+Right: every pick of the moment is reviewed, and we are on the first pick of the next moment.
+    await page.keyboard.press("Shift+ArrowRight");
+    const after = await cur();
+    expect(mOf(after).id).not.toBe(m.id);
+    const lastOfMoment = Math.max(...m.deliveredIds.map((i) => list.indexOf(i)));
+    expect(list.indexOf(after)).toBeGreaterThan(lastOfMoment);
+    const doneSet = await page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.review.1") ?? "[]") as number[]);
+    for (const i of m.deliveredIds) expect(doneSet).toContain(i);
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-reviewed", String(doneSet.length));
+
+    // P1-2: close, reopen: the first pick not looked at yet. ] / [ / Home / End.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("target-view")).toHaveCount(0);
+    await page.getByTestId("target-open").click();
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "review");
+    expect(await cur()).toBe(list.find((i) => !doneSet.includes(i)));
+    await page.keyboard.press("End");
+    expect(await cur()).toBe(list[list.length - 1]);
+    await page.keyboard.press("Home");
+    expect(await cur()).toBe(list[0]);
+    const done2 = await page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.review.1") ?? "[]") as number[]);
+    await page.keyboard.press("]");
+    expect(await cur()).toBe(list.find((i) => !done2.includes(i)));
+
+    // P1-3: X on a pick, move on three, Cmd+Z: back on that pick, the count is back.
+    await page.keyboard.press("Home");
+    for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight");
+    const victim = await cur();
+    const total = await attr(page, "target-review", "data-total");
+    await page.keyboard.press("x");
+    await expect.poll(async () => (await selOf(page, victim)).choice).toBe("set_aside");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-total", String(total - 1));
+    for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight");
+    expect(await cur()).not.toBe(victim);
+    await page.keyboard.press("Control+z");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-total", String(total));
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(victim));
+
+    // Undo from another stage returns to the stage of the action.
+    await page.keyboard.press("x");
+    await expect.poll(async () => (await selOf(page, victim)).choice).toBe("set_aside");
+    await tab(page, "second");
+    await page.keyboard.press("Control+z");
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "review");
+    await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(victim));
+  });
+
+  test("P1-3: undo in the Second look selects the photo again and removes its reviewed mark", async ({ page }) => {
+    await openSecond(page);
+    const curId = () => attr(page, "target-second", "data-current");
+    await page.keyboard.press("Home");
+    await page.keyboard.press("ArrowRight");
+    const target = await curId();
+    const sel = await selM(page, target);
+    await page.keyboard.press(sel.choice === "not_sure" ? "x" : "a");
+    await expect.poll(curId).not.toBe(target);
+    await page.keyboard.press(" ");
+    await page.keyboard.press(" ");
+    await page.keyboard.press("Control+z");
+    await expect.poll(curId).toBe(target);
+    const rev = await page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.second.1") ?? "[]") as number[]);
+    expect(rev).not.toContain(target);
+  });
+
+  test("P1-4: reviewed picks are tracked and survive a re-run; the footer says so", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    const list = await deliverIds(page);
+    for (let i = 0; i < 5; i++) await page.keyboard.press("ArrowRight");
+    const stored = async () => page.evaluate(() => JSON.parse(localStorage.getItem("sieve.target.reviewed.review.1") ?? "[]") as number[]);
+    expect(await stored()).toEqual(list.slice(0, 5));
+    await tab(page, "people");
+    await expect(page.getByTestId("target-rerun-note")).toContainText("keeps the picks you have reviewed");
+    await clearCalls(page);
+    await page.getByTestId("target-rerun").click();
+    await expect(page.getByTestId("target-summary")).toBeVisible();
+    expect((await calls(page, "run_target_selection")).length).toBe(1);
+    const nowDelivered = await deliverIds(page);
+    await expect.poll(async () => (await stored()).every((i) => nowDelivered.includes(i))).toBe(true);
+  });
+
+  test("P1-5 / P1-6: X is Set aside (not Reject); Enter keeps in Review, skips in Second look, and never swaps", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    await expect(page.getByTestId("target-reject")).toContainText("Set aside");
+    await expect(page.getByTestId("target-reject")).not.toContainText("Reject");
+    await expect(page.getByTestId("target-reject")).toHaveAttribute("title", /Nothing is rejected or deleted/);
+    const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
+    for (let i = 0; i < 12 && (await strip.count()) < 1; i++) await page.keyboard.press("ArrowRight");
+    await expect(strip.first()).toHaveAttribute("title", /Click to compare; S swaps it in/);
+    const id = await attr(page, "target-review", "data-current");
+    await clearCalls(page);
+    await page.keyboard.press("Enter");
+    await expect.poll(async () => (await calls(page, "set_target_choice")).length).toBe(1);
+    expect((await calls(page, "set_target_choice"))[0].args).toMatchObject({ ids: [id], choice: "deliver" });
+    expect(await calls(page, "swap_alternative")).toHaveLength(0);
+    await tab(page, "second");
+    await clearCalls(page);
+    const cur = await attr(page, "target-second", "data-current");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => attr(page, "target-second", "data-current")).not.toBe(cur);
+    expect(await calls(page, "swap_alternative")).toHaveLength(0);
+    expect(await calls(page, "set_target_choice")).toHaveLength(0);
+    // The keymap says so.
+    await page.keyboard.press("?");
+    await expect(page.getByTestId("cheat-targetReject")).toContainText("Set aside");
+    await expect(page.getByTestId("cheat-targetSwap")).not.toContainText("Enter");
+  });
+
+  test("P2: X in the Second look sets a Not sure photo aside and moves on; empty alternatives flash", async ({ page }) => {
+    await openSecond(page);
+    const curId = () => attr(page, "target-second", "data-current");
+    await page.keyboard.press("Home");
+    const id = await curId();
+    expect((await selM(page, id)).choice).toBe("not_sure");
+    await page.keyboard.press("x");
+    await expect.poll(async () => (await selM(page, id)).choice).toBe("set_aside");
+    await expect.poll(curId).not.toBe(id);
+    await tab(page, "review");
+    // A pick without alternatives flashes the strip's empty text on Tab / S / A.
+    for (let i = 0; i < 40 && (await page.locator('[data-testid^="target-alt-"][data-rank]').count()) > 0; i++) await page.keyboard.press("ArrowRight");
+    if ((await page.locator('[data-testid^="target-alt-"][data-rank]').count()) === 0) {
+      await page.keyboard.press("Tab");
+      await expect(page.getByTestId("target-strip-empty")).toHaveAttribute("data-flash", "true");
+    }
+  });
+
+  test("P1-7: Space zooms both photos to the same point and keeps it across Right; Second look zooms by click", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
+    for (let i = 0; i < 12 && (await strip.count()) < 1; i++) await page.keyboard.press("ArrowRight");
+    const a = page.getByTestId("target-cur-pic");
+    const b = page.getByTestId("target-alt-pic");
+    await expect(a).toHaveAttribute("data-zoom", "fit");
+    await page.keyboard.press(" ");
+    await expect(a).toHaveAttribute("data-zoom", "100");
+    await expect(b).toHaveAttribute("data-zoom", "100");
+    expect(await a.getAttribute("data-cx")).toBe(await b.getAttribute("data-cx"));
+    expect(await a.getAttribute("data-cy")).toBe(await b.getAttribute("data-cy"));
+    await shot(page, "t-24-zoom");
+    await page.keyboard.press("ArrowRight");
+    await expect(a).toHaveAttribute("data-zoom", "100");
+    await page.keyboard.press(" ");
+    await expect(a).toHaveAttribute("data-zoom", "fit");
+
+    await tab(page, "second");
+    for (let i = 0; i < 16 && (await page.getByTestId("target-covered").count()) === 0; i++) await page.keyboard.press(" ");
+    const pic = page.getByTestId("target-second-pic");
+    await expect(pic).toHaveAttribute("data-zoom", "fit");
+    await pic.click();
+    await expect(pic).toHaveAttribute("data-zoom", "100");
+    await expect(page.getByTestId("target-covered-pic")).toHaveAttribute("data-zoom", "100");
+    const id = await attr(page, "target-second", "data-current");
+    await page.keyboard.press(" "); // Space stays Skip
+    await expect.poll(() => attr(page, "target-second", "data-current")).not.toBe(id);
+    await pic.click();
+    await expect(pic).toHaveAttribute("data-zoom", "fit");
+  });
+
+  test("P1-8: at 1280x800 the Yes / No buttons of the focused person card stay above the footer", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openTarget(page, "&target=1");
+    await tab(page, "people");
+    await page.keyboard.press("y"); // the couple
+    const cards = page.locator('[data-testid^="target-person-"][data-state]');
+    await expect(cards).toHaveCount(4);
+    await shot(page, "t-25-people-1280");
+    for (let i = 0; i < 4; i++) {
+      const card = cards.nth(i);
+      await expect(card).toHaveAttribute("data-focused", "true");
+      await page.waitForTimeout(150);
+      const foot = (await page.getByTestId("target-people-footer").boundingBox())!;
+      for (const kind of ["yes", "no"]) {
+        const bb = (await card.locator(`[data-testid^="target-person-${kind}-"]`).boundingBox())!;
+        expect(bb.y + bb.height, `card ${i} ${kind}`).toBeLessThanOrEqual(foot.y + 1);
+      }
+      await page.keyboard.press(i % 2 ? "n" : "y");
+    }
+    const face = (await cards.first().locator('[data-testid^="target-person-face-"]').boundingBox())!;
+    expect(face.width).toBeLessThanOrEqual(145);
+  });
+
+  test("P1-9: the Cull step shows the run (Best N row), B opens it, labelled button at 1280", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openHome(page, 201, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await expect(page.getByTestId("grid-toolbar")).toBeVisible();
+    const c = await runCounts(page);
+    const row = page.getByTestId("target-best-row");
+    await expect(row).toBeVisible();
+    await expect(row).toContainText(`${c.deliver} picked`);
+    await expect(row).toContainText(`reviewed 0 of ${c.deliver}`);
+    await expect(row).toContainText(`second look 0 of ${c.notSure}`);
+    await expect(row).toContainText("not applied yet");
+    await expect(page.getByTestId("target-offer")).toHaveCount(0);
+    await expect(page.getByTestId("target-open")).toContainText(`Best ${c.deliver}`); // labelled at 1280
+    await expect(page.getByTestId("target-open")).toHaveAttribute("title", /\(B\)/);
+    await shot(page, "t-26-best-row");
+    // Live counts after reviewing.
+    await page.getByTestId("target-best-continue").click();
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "review");
+    for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Escape");
+    await expect(row).toContainText(`reviewed 3 of ${c.deliver}`);
+    // B opens the overlay at the stage with unfinished work.
+    await page.keyboard.press("b");
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "review");
+    await page.keyboard.press("Escape");
+    // Apply flags… opens the dialog; afterwards the row says when.
+    await page.getByTestId("target-best-apply").click();
+    await expect(page.getByTestId("target-apply-dialog")).toBeVisible();
+    await page.getByTestId("target-apply-confirm").click();
+    await expect(page.getByTestId("target-apply-result")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await expect(row).toContainText("applied");
+    // The Suggestions chip says it is a different set (when it shows).
+    const chip = page.getByTestId("cull-sum-suggest");
+    if ((await chip.count()) > 0) await expect(chip).toContainText("from Best");
+  });
+
+  test("P1-9: a project with a few flags (under 5 %) still gets the offer; B opens Pick", async ({ page }) => {
+    await openHome(page, 201);
+    const ids = await inv<number[]>(page, "list_image_ids", { query: { includeTags: [], excludeTags: [], tagMatch: "any", picks: [], minRating: null, maxRating: null, colorLabels: [], burstGroupId: null, sceneId: null, collapseBursts: false, folderId: null, projectId: 2, sort: "capture_time", sortDescending: false, offset: 0, limit: 500 } });
+    await inv(page, "set_pick", { ids, pick: "unflagged" });
+    await inv(page, "set_pick", { ids: ids.slice(0, 2), pick: "pick" });
+    await page.getByTestId("project-open-2").click();
+    await expect(page.getByTestId("target-offer")).toBeVisible();
+    await page.keyboard.press("b");
+    await expect(page.getByTestId("target-view")).toHaveAttribute("data-stage", "setup");
+  });
+
+  test("P1-10: the summary explains a shortfall and offers the Second look with its count", async ({ page }) => {
+    await openHome(page, 201, "&target=answered");
+    await page.getByTestId("project-open-1").click();
+    await page.getByTestId("target-open").click();
+    await tab(page, "setup");
+    const c = await runCounts(page);
+    const target = (await inv<{ settings: { targetCount: number } }>(page, "get_target_run", { projectId: 1 })).settings.targetCount;
+    expect(c.deliver).toBeLessThan(0.9 * target);
+    await expect(page.getByTestId("target-shortfall")).toContainText(`${target - c.deliver} short of ${target}`);
+    await expect(page.getByTestId("target-shortfall")).toContainText(`The ${c.notSure} Not sure are the closest`);
+    await expect(page.getByTestId("target-next-review")).toContainText(`Review the ${c.deliver} picks`);
+    await expect(page.getByTestId("target-next-second")).toContainText(`Second look · ${c.notSure} not sure`);
+  });
+
+  test("P1-11: toasts sit top-right under the header while the overlay is open, one at a time", async ({ page }) => {
+    await openTarget(page, "&target=answered");
+    await tab(page, "review");
+    await page.keyboard.press("x");
+    const notice = page.getByTestId("notice");
+    await expect(notice).toHaveCount(1);
+    const bb = (await notice.boundingBox())!;
+    const vp = page.viewportSize()!;
+    expect(bb.y).toBeGreaterThan(90);
+    expect(bb.y).toBeLessThan(160);
+    expect(bb.x + bb.width).toBeGreaterThan(vp.width - 30);
+    await page.keyboard.press("x");
+    await expect(notice).toHaveCount(1); // the newest replaces the older one
+    await expect(notice).toBeHidden({ timeout: 5000 }); // gone after about 3 s
   });
 });
