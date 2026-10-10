@@ -418,7 +418,7 @@ Model (orchestrator decision 2026-10-10, see decisions.md):
   neutral-grey WB vary far less across a scene than plain copy-paste of the anchor's settings and stay within
   tolerance of the anchor's look; preset look keys byte-identical to the preset+anchor on every photo; XMP round
   trip (exiftool) shows the `crs:` values; timings for 2,500 photos recorded.
-- [ ] **Baseline edit UI** (frontend-dev): one obvious entry ("Baseline edit" in Edit): 1) pick a preset from the
+- [x] **Baseline edit UI** (frontend-dev): one obvious entry ("Baseline edit" in Edit): 1) pick a preset from the
   library (previews rendered on the anchor), 2) adjust the anchor in Develop (light + WB first), 3) "Edit the rest"
   with scope + skip / replace + a before/after preview grid of ~12 photos across scenes, 4) apply with progress and
   one Undo, 5) "Finish in Lightroom" panel: sidecars saved, exact Lightroom steps. Mock support. Acceptance:
