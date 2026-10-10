@@ -3,7 +3,7 @@
 // columns. Numeric columns and the capture day are ranges on the wire, so selecting several values selects the range
 // from the lowest to the highest one.
 import { useSyncExternalStore } from "react";
-import type { CameraFilter, MetadataFilter, MetadataFilterOptions, NumberCount, NumberRange } from "../ipc";
+import type { CameraBody, CameraFilter, MetadataFilter, MetadataFilterOptions, NumberCount, NumberRange } from "../ipc";
 
 export type ColumnKey = "extensions" | "cameras" | "lenses" | "iso" | "focalLengthMm" | "aperture" | "shutterSeconds" | "captured" | "edited" | "hasSidecar";
 
@@ -28,6 +28,15 @@ const DAY = 86_400_000;
 const MAKE: Record<string, string> = { sony: "Sony", fujifilm: "Fujifilm", canon: "Canon", other: "" };
 
 export const cameraLabel = (c: CameraFilter) => [MAKE[c.make] ?? c.make, c.model ?? (c.make === "other" ? "Unknown camera" : "")].filter(Boolean).join(" ") || "Unknown camera";
+const sameBody = (a: CameraBody, b: CameraBody) => a.make === b.make && a.model === b.model && a.serial === b.serial;
+/** "Sony ILCE-7M4", plus "(…4567)" (last 4 of the serial) when several bodies of `all` share the model; no serial = "(serial unknown)" in that case. */
+export function bodyLabel(b: CameraBody, all: CameraBody[]): string {
+  const base = cameraLabel(b);
+  const twins = all.filter((x) => x.make === b.make && x.model === b.model);
+  if (twins.length < 2) return base;
+  return `${base} (${b.serial ? `…${b.serial.slice(-4)}` : "serial unknown"})`;
+}
+export { sameBody };
 export const shutterLabel = (s: number) => (s >= 0.4 ? `${Math.round(s * 10) / 10}s` : `1/${Math.round(1 / s)}`);
 export const dayLabel = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
@@ -38,6 +47,7 @@ export function cleanMeta(m: MetadataFilter | undefined): MetadataFilter | undef
   if (m.formats?.length) out.formats = m.formats;
   if (m.extensions?.length) out.extensions = m.extensions;
   if (m.cameras?.length) out.cameras = m.cameras;
+  if (m.bodies?.length) out.bodies = m.bodies;
   if (m.lenses?.length) out.lenses = m.lenses;
   if (m.iso) out.iso = m.iso;
   if (m.focalLengthMm) out.focalLengthMm = m.focalLengthMm;
@@ -95,13 +105,13 @@ export function metaColumns(o: MetadataFilterOptions, m: MetadataFilter): Column
     {
       key: "cameras",
       title: "Camera",
-      options: o.cameras.map((c) => ({
-        id: JSON.stringify(c.camera),
-        label: cameraLabel(c.camera),
+      options: (o.bodies ?? o.cameras.map((c) => ({ body: { ...c.camera, serial: null as string | null }, count: c.count }))).map((c, _i, all) => ({
+        id: JSON.stringify(c.body),
+        label: bodyLabel(c.body, all.map((x) => x.body)),
         count: c.count,
-        selected: !!m.cameras?.some((x) => x.make === c.camera.make && x.model === c.camera.model),
+        selected: !!m.bodies?.some((x) => sameBody(x, c.body)),
       })),
-      toggle: (cur, id) => ({ ...cur, cameras: toggleIn(cur.cameras, JSON.parse(id) as CameraFilter, (a, b) => a.make === b.make && a.model === b.model) }),
+      toggle: (cur, id) => ({ ...cur, bodies: toggleIn(cur.bodies, JSON.parse(id) as CameraBody, sameBody) }),
     },
     {
       key: "lenses",
@@ -148,6 +158,7 @@ export function metaChips(m: MetadataFilter | undefined, cols: Column[] | null):
   };
   if (c.extensions) list("extensions", "File type", c.extensions.map((e) => e.toUpperCase()));
   if (c.cameras) list("cameras", "Camera", c.cameras.map(cameraLabel));
+  if (c.bodies) list("cameras", "Camera", c.bodies.map((b) => bodyLabel(b, c.bodies ?? [])));
   if (c.lenses) list("lenses", "Lens", c.lenses.map((l) => l ?? "Unknown lens"));
   const rng = (key: "iso" | "focalLengthMm" | "aperture" | "shutterSeconds", title: string, f: (v: number) => string) => {
     const r = c[key];
@@ -175,7 +186,10 @@ export const describeMeta = (m: MetadataFilter | undefined): string[] => metaChi
 export function clearColumn(m: MetadataFilter, key: ColumnKey): MetadataFilter | undefined {
   const next: MetadataFilter = { ...m };
   if (key === "extensions") delete next.extensions;
-  else if (key === "cameras") delete next.cameras;
+  else if (key === "cameras") {
+    delete next.cameras;
+    delete next.bodies;
+  }
   else if (key === "lenses") delete next.lenses;
   else delete next[key];
   return cleanMeta(next);

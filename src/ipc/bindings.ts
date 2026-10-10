@@ -102,10 +102,16 @@ export const commands = {
 	 *  Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
 	 *  `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
 	 *  With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
-	 *  photos. Atomic; unknown ids -> `not_found`.
+	 *  photos. v19.2 `kinds` (`null` = all): copy only suggested picks / rejects / stars (see
+	 *  [`SuggestionKinds`]), e.g. `{picks: false, rejects: true, stars: false}` flags only the
+	 *  suggested rejects. Atomic; unknown ids -> `not_found`.
 	 *  For undo, take `get_cull_snapshot(ids)` first.
 	 */
-	applySuggestions: (ids: number[], onlyUnset: boolean) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset })),
+	applySuggestions: (ids: number[], onlyUnset: boolean, kinds: {
+	picks: boolean,
+	rejects: boolean,
+	stars: boolean,
+} | null) => typedError<ApplySuggestionsResult, AppError>(__TAURI_INVOKE("apply_suggestions", { ids, onlyUnset, kinds })),
 	/**
 	 *  Entries for `ids`, in the given order (e.g. to refresh rows after events or batch
 	 *  edits). Atomic: an unknown id fails with `not_found`.
@@ -135,6 +141,12 @@ export const commands = {
 	extensions?: string[],
 	/**  Camera body (make + model) is one of these. */
 	cameras?: CameraFilter[],
+	/**
+	 *  v19.2: camera body (make + model + serial, `CameraBody`) is one of these; the per-body
+	 *  refinement of `cameras` (two ILCE-7M4 bodies are two entries). Values come from
+	 *  `MetadataFilterOptions.bodies`.
+	 */
+	bodies?: CameraBody[],
 	/**  Lens is one of these; `null` = lens unknown. */
 	lenses?: (string | null)[],
 	iso?: NumberRange | null,
@@ -228,14 +240,50 @@ export const commands = {
 	gotoHistory: (id: number, entryId: number) => typedError<EditState, AppError>(__TAURI_INVOKE("goto_history", { id, entryId })),
 	/**
 	 *  Pastes the `fields` groups of `adjustments` (the frontend's copied settings) onto
-	 *  every image in `ids`; one "Paste Settings" history entry per changed image. Atomic.
+	 *  every image in `ids` (any selection; duplicates ignored); one "Paste Settings" history
+	 *  entry per changed image. Atomic. v19: recorded as one undoable edit batch (kind `paste`,
+	 *  `undo_edit_batch(result.batchId)`; `batchId = null` when nothing changed).
 	 */
-	pasteSettings: (ids: number[], adjustments: ParametricAdjustments, fields: AdjustmentField[]) => typedError<null, AppError>(__TAURI_INVOKE("paste_settings", { ids, adjustments, fields })),
+	pasteSettings: (ids: number[], adjustments: ParametricAdjustments, fields: AdjustmentField[]) => typedError<EditBatchResult, AppError>(__TAURI_INVOKE("paste_settings", { ids, adjustments, fields })),
 	/**
 	 *  Copies the `fields` groups of `sourceId`'s stored adjustments onto `targetIds`
-	 *  ("Sync Settings"). Atomic.
+	 *  ("Sync Settings"; any selection, duplicates ignored). Atomic. v19: one undoable edit batch
+	 *  (kind `paste`), like `paste_settings`.
 	 */
-	syncSettings: (sourceId: number, targetIds: number[], fields: AdjustmentField[]) => typedError<null, AppError>(__TAURI_INVOKE("sync_settings", { sourceId, targetIds, fields })),
+	syncSettings: (sourceId: number, targetIds: number[], fields: AdjustmentField[]) => typedError<EditBatchResult, AppError>(__TAURI_INVOKE("sync_settings", { sourceId, targetIds, fields })),
+	/**
+	 *  Auto Sync (v19.2): commits the active photo's edit `before` -> `after` to `sourceId` (its
+	 *  stored settings become `after`) and the same change to every photo in `targetIds`, as one
+	 *  undoable batch of kind `sync` (`undo_edit_batch(result.batch.batchId)` reverts the source
+	 *  and all targets). Only the groups that differ between `before` and `after` are touched
+	 *  (never crop / masks / transform); `options.relative` groups (default exposure + white
+	 *  balance) are applied relatively, the others copied (see [`SyncDeltaOptions`]). In Auto
+	 *  Sync mode the UI commits through this command **instead of** `save_adjustments` (one
+	 *  call per committed edit). Duplicates and the source in `targetIds` are ignored. Resolving
+	 *  an `as_shot` white balance decodes that photo (cached by the develop cache). Atomic;
+	 *  unknown image -> `not_found`; invalid settings / options -> `invalid_argument`.
+	 */
+	syncDelta: (sourceId: number, before: ParametricAdjustments, after: ParametricAdjustments, targetIds: number[], options: {
+	/**
+	 *  Changed groups applied **relatively** (the source's change is added to each target's
+	 *  own value) instead of copied. Only `exposure` (EV added, clamped to -5..=5) and
+	 *  `white_balance` (temperature shifted in mireds, tint added, clamped to the slider
+	 *  ranges; an `as_shot` target is resolved to its camera as-shot values first) can be
+	 *  relative; anything else -> `invalid_argument`. Default both. `[]` = copy everything
+	 *  (Lightroom's Auto Sync).
+	 */
+	relative?: AdjustmentField[],
+	/**
+	 *  Only consider these groups (`null` = every group except the per-frame ones). Groups in
+	 *  [`SyncDeltaOptions::NEVER_SYNCED`] are never synced even when listed.
+	 */
+	fields?: AdjustmentField[] | null,
+	/**
+	 *  History label of the source's and the targets' entries (`null` = "Auto Sync"; 1..=100
+	 *  chars). The UI passes what it would pass to `save_adjustments` (e.g. "Exposure").
+	 */
+	label?: string | null,
+} | null) => typedError<SyncDeltaResult, AppError>(__TAURI_INVOKE("sync_delta", { sourceId, before, after, targetIds, options })),
 	/**  Resets `ids` to neutral adjustments ("Reset" history entry). Atomic. */
 	resetAdjustments: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("reset_adjustments", { ids })),
 	/**
@@ -390,6 +438,11 @@ export const commands = {
 	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
 	 */
 	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
 } | null, region: {
 	x: number,
 	y: number,
@@ -566,6 +619,11 @@ export const commands = {
 	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
 	 */
 	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
 } | null) => typedError<ParametricAdjustments, AppError>(__TAURI_INVOKE("resolve_preset", { id, presetId, adjustments })),
 	/**
 	 *  Lightroom's Basic "Auto": absolute values for the tone + presence sliders in `keys`
@@ -605,6 +663,11 @@ export const commands = {
 	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
 	 */
 	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
 } | null, keys: AdjustmentField[] | null) => typedError<AutoToneValues, AppError>(__TAURI_INVOKE("auto_tone", { id, adjustments, keys })),
 	/**
 	 *  Lightroom's "Auto" white balance: temperature/tint for the live `adjustments` (`null` =
@@ -643,6 +706,11 @@ export const commands = {
 	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
 	 */
 	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
 } | null) => typedError<WhiteBalanceValues, AppError>(__TAURI_INVOKE("auto_white_balance", { id, adjustments })),
 	/**  Guided-workflow step of project `projectId` (also `Project.workflowStep`). */
 	getWorkflowStep: (projectId: number) => typedError<WorkflowStep, AppError>(__TAURI_INVOKE("get_workflow_step", { projectId })),
@@ -742,8 +810,9 @@ export const commands = {
 	 *  `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
 	 *  `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
 	 *  `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+	 *  v19: one undoable edit batch (kind `paste`), like `paste_settings`.
 	 */
-	pastePrevious: (targetIds: number[], previousId: number, fields: AdjustmentField[] | null) => typedError<null, AppError>(__TAURI_INVOKE("paste_previous", { targetIds, previousId, fields })),
+	pastePrevious: (targetIds: number[], previousId: number, fields: AdjustmentField[] | null) => typedError<EditBatchResult, AppError>(__TAURI_INVOKE("paste_previous", { targetIds, previousId, fields })),
 	/**  State of the personal style model ("Auto edit (my style)"). */
 	styleModelStatus: () => typedError<StyleModelStatus, AppError>(__TAURI_INVOKE("style_model_status")),
 	/**
@@ -864,6 +933,121 @@ export const commands = {
 	 *  `not_found`.
 	 */
 	refreshSidecars: (projectId: number | null) => typedError<number[], AppError>(__TAURI_INVOKE("refresh_sidecars", { projectId })),
+	/**
+	 *  Lightroom's "Edit Capture Time" for `ids` (any selection): shift by an offset, set the
+	 *  active photo to an exact time (the others follow by the same offset), sync two cameras
+	 *  from a reference pair (v19.2: the selected photos, or every photo of the target's body /
+	 *  model in its project), or revert to the files' own time (see [`CaptureTimeEdit`]). The
+	 *  original EXIF time is kept (`CaptureMeta.originalCapturedAtMs`); the corrected time is
+	 *  what sorting, bursts, scenes, filters and export naming use, and is written to the
+	 *  sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated`; marks them dirty, notifies
+	 *  auto-sync). Kicks a rescore so bursts regroup. Atomic; undo with
+	 *  `restore_capture_times(result.previous)`.
+	 */
+	editCaptureTime: (ids: number[], mode: CaptureTimeEdit) => typedError<CaptureTimeEditResult, AppError>(__TAURI_INVOKE("edit_capture_time", { ids, mode })),
+	/**
+	 *  Puts corrected capture times back (undo / redo of `edit_capture_time`: pass its
+	 *  `previous`, or snapshots taken before). Atomic (unknown id -> `not_found`). Returns the ids
+	 *  whose time changed (refetch them). Marks sidecars dirty and kicks a rescore like
+	 *  `edit_capture_time`.
+	 */
+	restoreCaptureTimes: (snapshots: CaptureTimeSnapshot[]) => typedError<number[], AppError>(__TAURI_INVOKE("restore_capture_times", { snapshots })),
+	/**
+	 *  Everything the Library Metadata panel shows for photo `id`: file facts, original and
+	 *  corrected capture time, camera, lens, exposure, size, GPS, sidecar. Unknown id ->
+	 *  `not_found`. Catalog values plus a few read from the file (`gps`, `focalLength35mm`,
+	 *  `exposureCompensationEv`, `flashFired`; `cameraSerial` from the catalog since v19.2, else
+	 *  the file).
+	 */
+	getImageMetadata: (id: number) => typedError<ImageMetadata, AppError>(__TAURI_INVOKE("get_image_metadata", { id })),
+	/**
+	 *  Solves Upright `mode` for photo `id` from the live `adjustments` (`null` = stored; Guided
+	 *  uses `adjustments.transform.guides`, the crop is ignored). Nothing is saved: the UI sets
+	 *  `transform.upright` + `transform.solution` and commits one history entry. `off` returns no
+	 *  solution. Body: stub (no solution, `message` says Upright is not available yet) until
+	 *  vision-ml-dev (line detection) / rust-engine-dev (solver) implement it.
+	 */
+	autoUpright: (id: number, mode: UprightMode, adjustments: {
+	/**  Bumped when slider semantics change; stored alongside the JSON. */
+	processVersion: number,
+	whiteBalance: WhiteBalance,
+	/**  EV, -5..=5 (`crs:Exposure2012`). */
+	exposure: number,
+	contrast: number,
+	highlights: number,
+	shadows: number,
+	whites: number,
+	blacks: number,
+	texture: number,
+	clarity: number,
+	dehaze: number,
+	vibrance: number,
+	saturation: number,
+	hsl: HslAdjustments,
+	lut: LutRef | null,
+	toneCurve?: ToneCurve,
+	colorGrading?: ColorGrading,
+	calibration?: CameraCalibration,
+	detail?: DetailAdjustments,
+	effects?: EffectsAdjustments,
+	blackAndWhite?: BlackAndWhite,
+	crop?: CropSettings,
+	/**  Camera profile + look (see [`ProfileSettings`]). */
+	profile?: ProfileSettings,
+	/**
+	 *  Local adjustments (IPC v10): Masks-panel groups in Lightroom's order (see
+	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
+	 */
+	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
+} | null) => typedError<UprightResult, AppError>(__TAURI_INVOKE("auto_upright", { id, mode, adjustments })),
+	/**
+	 *  Renders a temporary variation of the live `adjustments` (no save, no history entry): a
+	 *  preset applied on top (hover preview on the main image) or some groups reset to the
+	 *  format defaults (press-and-hold "without this panel"). Same render path as
+	 *  `render_preview` (latest-wins per (id, slot), `sieve://` URL); use slot `preview` so the
+	 *  edit's `main` render stays valid. Unknown preset / image -> `not_found`; empty
+	 *  `withoutFields.fields` -> `invalid_argument`.
+	 */
+	renderPreviewVariant: (id: number, adjustments: ParametricAdjustments, variant: PreviewVariant, options: RenderOptions) => typedError<{
+	imageId: number,
+	slot: RenderSlot,
+	/**  Monotonic per (image, slot); larger = newer. */
+	seq: number,
+	/**
+	 *  `sieve://localhost/render/<imageId>/<slot>?v=<seq>` on macOS
+	 *  (`http://sieve.localhost/...` on Windows).
+	 */
+	url: string,
+	/**  Output pixel size (orientation applied). */
+	width: number,
+	height: number,
+	histogram: Histogram,
+	/**  Wall time of this request inside the backend (decode if uncached + pipeline + encode). */
+	renderMs: number,
+	/**  `adjustments.lut` refers to a LUT not in the library; rendered without it. */
+	lutMissing: boolean,
+} | null, AppError>(__TAURI_INVOKE("render_preview_variant", { id, adjustments, variant, options })),
+	/**
+	 *  Sets how readily culling suggests reject for the project's photos (conservative /
+	 *  balanced / aggressive) and rescores. Unknown project -> `not_found`. The scorer reads it
+	 *  per image with `db::projects::reject_strictness_of_image` (vision-ml-dev).
+	 */
+	setProjectRejectStrictness: (projectId: number, strictness: RejectStrictness) => typedError<null, AppError>(__TAURI_INVOKE("set_project_reject_strictness", { projectId, strictness })),
+	/**
+	 *  Crop-tool bounds of the live `adjustments` for photo `id` (v19.3, docs/ux-review-8d.md
+	 *  R1-3): the warped image's outline in the uncropped corrected frame as displayed, and what
+	 *  Constrain Crop makes of `adjustments.crop`. Pure geometry, no render (decodes the source
+	 *  on first use, as `get_develop_info`; instant while the photo is open in Develop). Both
+	 *  `null` without a Transform / Upright warp. The crop tool should render with
+	 *  `crop.enabled = false` and `transform.constrainCrop = false`: that frame is the one the
+	 *  quad refers to (full warped image, white outside the quad).
+	 */
+	getTransformBounds: (id: number, adjustments: ParametricAdjustments) => typedError<TransformBounds, AppError>(__TAURI_INVOKE("get_transform_bounds", { id, adjustments })),
 };
 
 /** Events */
@@ -873,6 +1057,7 @@ export const events = {
 	analysisFinished: makeEvent<AnalysisFinished>("analysis-finished"),
 	analysisProgress: makeEvent<AnalysisProgress>("analysis-progress"),
 	analysisReady: makeEvent<AnalysisReady>("analysis-ready"),
+	editedPreviewChanged: makeEvent<EditedPreviewChanged>("edited-preview-changed"),
 	exportFinished: makeEvent<ExportFinished>("export-finished"),
 	exportProgress: makeEvent<ExportProgress>("export-progress"),
 	importProgress: makeEvent<ImportProgress>("import-progress"),
@@ -890,11 +1075,11 @@ export const events = {
 /* Constants */
 export const AUTO_TONE_FIELDS = ["exposure","contrast","highlights","shadows","whites","blacks","vibrance","saturation"] as const;
 
-export const COPY_SETTINGS_GROUPS = [{"id":"white_balance","items":[{"fields":["white_balance"],"label":"White Balance","supported":true}],"label":"White Balance"},{"id":"basic_tone","items":[{"fields":["exposure"],"label":"Exposure","supported":true},{"fields":["contrast"],"label":"Contrast","supported":true},{"fields":["highlights"],"label":"Highlights","supported":true},{"fields":["shadows"],"label":"Shadows","supported":true},{"fields":["whites"],"label":"White Clipping","supported":true},{"fields":["blacks"],"label":"Black Clipping","supported":true}],"label":"Basic Tone"},{"id":"tone_curve","items":[{"fields":["tone_curve"],"label":"Tone Curve","supported":true}],"label":"Tone Curve"},{"id":"presence","items":[{"fields":["texture"],"label":"Texture","supported":true},{"fields":["clarity"],"label":"Clarity","supported":true},{"fields":["dehaze"],"label":"Dehaze","supported":true},{"fields":["vibrance"],"label":"Vibrance","supported":true},{"fields":["saturation"],"label":"Saturation","supported":true}],"label":"Presence"},{"id":"color","items":[{"fields":["hsl_hue"],"label":"Hue","supported":true},{"fields":["hsl_saturation"],"label":"Saturation","supported":true},{"fields":["hsl_luminance"],"label":"Luminance","supported":true}],"label":"Color Adjustments"},{"id":"color_grading","items":[{"fields":["color_grading"],"label":"Color Grading","supported":true}],"label":"Color Grading"},{"id":"detail","items":[{"fields":["sharpening"],"label":"Sharpening","supported":true},{"fields":["noise_reduction_luminance"],"label":"Luminance Noise Reduction","supported":true},{"fields":["noise_reduction_color"],"label":"Color Noise Reduction","supported":true}],"label":"Detail"},{"id":"treatment_profile","items":[{"fields":["black_and_white"],"label":"Treatment & B&W Mix","supported":true},{"fields":["profile","lut"],"label":"Profile","supported":true}],"label":"Treatment & Profile"},{"id":"lens_corrections","items":[{"fields":[],"label":"Lens Profile Corrections","supported":false},{"fields":[],"label":"Chromatic Aberration","supported":false},{"fields":[],"label":"Lens Distortion","supported":false},{"fields":[],"label":"Lens Vignetting","supported":false}],"label":"Lens Corrections"},{"id":"transform","items":[{"fields":[],"label":"Upright & Transform","supported":false}],"label":"Transform"},{"id":"effects","items":[{"fields":["vignette"],"label":"Post-Crop Vignetting","supported":true},{"fields":["grain"],"label":"Grain","supported":true}],"label":"Effects"},{"id":"calibration","items":[{"fields":["calibration"],"label":"Calibration","supported":true}],"label":"Calibration"},{"id":"masking","items":[{"fields":["masks"],"label":"Masks","supported":true}],"label":"Masking"},{"id":"spot_removal","items":[{"fields":[],"label":"Spot Removal","supported":false}],"label":"Spot Removal"},{"id":"crop","items":[{"fields":["crop"],"label":"Crop, Straighten Angle & Aspect Ratio","supported":true}],"label":"Crop"},{"id":"process_version","items":[{"fields":["process_version"],"label":"Process Version","supported":true}],"label":"Process Version"}] as const;
+export const COPY_SETTINGS_GROUPS = [{"id":"white_balance","items":[{"fields":["white_balance"],"label":"White Balance","supported":true}],"label":"White Balance"},{"id":"basic_tone","items":[{"fields":["exposure"],"label":"Exposure","supported":true},{"fields":["contrast"],"label":"Contrast","supported":true},{"fields":["highlights"],"label":"Highlights","supported":true},{"fields":["shadows"],"label":"Shadows","supported":true},{"fields":["whites"],"label":"White Clipping","supported":true},{"fields":["blacks"],"label":"Black Clipping","supported":true}],"label":"Basic Tone"},{"id":"tone_curve","items":[{"fields":["tone_curve"],"label":"Tone Curve","supported":true}],"label":"Tone Curve"},{"id":"presence","items":[{"fields":["texture"],"label":"Texture","supported":true},{"fields":["clarity"],"label":"Clarity","supported":true},{"fields":["dehaze"],"label":"Dehaze","supported":true},{"fields":["vibrance"],"label":"Vibrance","supported":true},{"fields":["saturation"],"label":"Saturation","supported":true}],"label":"Presence"},{"id":"color","items":[{"fields":["hsl_hue"],"label":"Hue","supported":true},{"fields":["hsl_saturation"],"label":"Saturation","supported":true},{"fields":["hsl_luminance"],"label":"Luminance","supported":true}],"label":"Color Adjustments"},{"id":"color_grading","items":[{"fields":["color_grading"],"label":"Color Grading","supported":true}],"label":"Color Grading"},{"id":"detail","items":[{"fields":["sharpening"],"label":"Sharpening","supported":true},{"fields":["noise_reduction_luminance"],"label":"Luminance Noise Reduction","supported":true},{"fields":["noise_reduction_color"],"label":"Color Noise Reduction","supported":true}],"label":"Detail"},{"id":"treatment_profile","items":[{"fields":["black_and_white"],"label":"Treatment & B&W Mix","supported":true},{"fields":["profile","lut"],"label":"Profile","supported":true}],"label":"Treatment & Profile"},{"id":"lens_corrections","items":[{"fields":[],"label":"Lens Profile Corrections","supported":false},{"fields":[],"label":"Chromatic Aberration","supported":false},{"fields":[],"label":"Lens Distortion","supported":false},{"fields":[],"label":"Lens Vignetting","supported":false}],"label":"Lens Corrections"},{"id":"transform","items":[{"fields":["transform"],"label":"Upright & Transform","supported":true}],"label":"Transform"},{"id":"effects","items":[{"fields":["vignette"],"label":"Post-Crop Vignetting","supported":true},{"fields":["grain"],"label":"Grain","supported":true}],"label":"Effects"},{"id":"calibration","items":[{"fields":["calibration"],"label":"Calibration","supported":true}],"label":"Calibration"},{"id":"masking","items":[{"fields":["masks"],"label":"Masks","supported":true}],"label":"Masking"},{"id":"spot_removal","items":[{"fields":[],"label":"Spot Removal","supported":false}],"label":"Spot Removal"},{"id":"crop","items":[{"fields":["crop"],"label":"Crop, Straighten Angle & Aspect Ratio","supported":true}],"label":"Crop"},{"id":"process_version","items":[{"fields":["process_version"],"label":"Process Version","supported":true}],"label":"Process Version"}] as const;
 
-export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+export const DEFAULT_ADJUSTMENTS = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":25.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":40.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":"Adobe Standard","look":{"amount":1.0,"name":"Adobe Color","uuid":"B952C231111CD8E0ECCF14B86BAA7077"}},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"transform":{"aspect":0.0,"constrainCrop":false,"guides":[],"horizontal":0.0,"offsetX":0.0,"offsetY":0.0,"rotate":0.0,"scale":100.0,"solution":null,"upright":"off","vertical":0.0},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
-export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
+export const DEFAULT_ADJUSTMENTS_NON_RAW = {"blackAndWhite":{"enabled":false,"mixer":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"blacks":0.0,"calibration":{"blue":{"hue":0.0,"saturation":0.0},"green":{"hue":0.0,"saturation":0.0},"red":{"hue":0.0,"saturation":0.0},"shadowTint":0.0},"clarity":0.0,"colorGrading":{"balance":0.0,"blending":50.0,"global":{"hue":0.0,"luminance":0.0,"saturation":0.0},"highlights":{"hue":0.0,"luminance":0.0,"saturation":0.0},"midtones":{"hue":0.0,"luminance":0.0,"saturation":0.0},"shadows":{"hue":0.0,"luminance":0.0,"saturation":0.0}},"contrast":0.0,"crop":{"angle":0.0,"bottom":1.0,"enabled":false,"left":0.0,"right":1.0,"top":0.0},"dehaze":0.0,"detail":{"noiseReduction":{"color":0.0,"colorDetail":50.0,"colorSmoothness":50.0,"luminance":0.0,"luminanceContrast":0.0,"luminanceDetail":50.0},"sharpening":{"amount":0.0,"detail":25.0,"masking":0.0,"radius":1.0}},"effects":{"grain":{"amount":0.0,"roughness":50.0,"size":25.0},"vignette":{"amount":0.0,"feather":50.0,"highlights":0.0,"midpoint":50.0,"roundness":0.0,"style":"highlight_priority"}},"exposure":0.0,"highlights":0.0,"hsl":{"hue":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"luminance":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0},"saturation":{"aqua":0.0,"blue":0.0,"green":0.0,"magenta":0.0,"orange":0.0,"purple":0.0,"red":0.0,"yellow":0.0}},"lut":null,"masks":[],"processVersion":1,"profile":{"cameraProfile":null,"look":null},"saturation":0.0,"shadows":0.0,"texture":0.0,"toneCurve":{"parametric":{"darks":0.0,"highlightSplit":75.0,"highlights":0.0,"lights":0.0,"midtoneSplit":50.0,"shadowSplit":25.0,"shadows":0.0},"point":{"blue":[[0.0,0.0],[255.0,255.0]],"green":[[0.0,0.0],[255.0,255.0]],"master":[[0.0,0.0],[255.0,255.0]],"red":[[0.0,0.0],[255.0,255.0]]}},"transform":{"aspect":0.0,"constrainCrop":false,"guides":[],"horizontal":0.0,"offsetX":0.0,"offsetY":0.0,"rotate":0.0,"scale":100.0,"solution":null,"upright":"off","vertical":0.0},"vibrance":0.0,"whiteBalance":{"mode":"as_shot"},"whites":0.0} as const;
 
 export const DEFAULT_KEEPER_RULE = {"minRating":1,"mode":"not_rejected","useSuggestions":true} as const;
 
@@ -908,7 +1093,7 @@ export const MINOR_SCENE_MAX_KEEPERS = 2 as const;
 
 export const MODEL_GROUP_SEGMENTATION = "segmentation" as const;
 
-export const PASTE_PREVIOUS_FIELDS = ["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","crop","profile","process_version"] as const;
+export const PASTE_PREVIOUS_FIELDS = ["white_balance","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","hsl_hue","hsl_saturation","hsl_luminance","lut","tone_curve","color_grading","calibration","sharpening","noise_reduction","vignette","grain","black_and_white","crop","profile","process_version","transform"] as const;
 
 export const USER_PRESETS_GROUP_ID = 1 as const;
 
@@ -1011,7 +1196,14 @@ export type AdjustmentField =
  */
 "noise_reduction_color" | 
 /**  `processVersion` (v14, Lightroom's "Process Version" copy item). */
-"process_version";
+"process_version" | 
+/**
+ *  `transform` (v19: Upright mode, guides, solved Upright values and the manual
+ *  Transform sliders; Lightroom's "Upright Mode" + "Upright Transforms" + "Transform
+ *  Adjustments" copy items). Not in [`AdjustmentField::DEFAULT_SYNC`] (per-frame
+ *  geometry, like `crop`).
+ */
+"transform";
 
 /**
  *  Linear per-image edit history (oldest first) with a cursor. Undo/redo move the cursor
@@ -1025,6 +1217,13 @@ export type AdjustmentHistory = {
 	currentEntryId: number | null,
 	canUndo: boolean,
 	canRedo: boolean,
+	/**
+	 *  v19: the preset last applied to this photo (`apply_preset`) while its settings still
+	 *  carry it: `null` once any setting the preset owns (its `fields`) differs from what the
+	 *  apply produced (a slider change, another preset, undo past the apply...). Redo back
+	 *  to the apply highlights it again. Drives the preset browser's highlight.
+	 */
+	appliedPresetId?: number | null,
 };
 
 /**  Availability of one AI selection family. */
@@ -1340,6 +1539,23 @@ export type BurstGroup = {
 };
 
 /**
+ *  One camera body (v19.2): make + model + body serial. `model = null` = model unknown,
+ *  `serial = null` = serial unknown (not read yet, or the file has none). Matches exactly
+ *  (a `null` field matches only photos where that value is unknown).
+ */
+export type CameraBody = {
+	make: CameraMake,
+	model: string | null,
+	serial: string | null,
+};
+
+/**  v19.2 `MetadataFilterOptions.bodies` entry. */
+export type CameraBodyCount = {
+	body: CameraBody,
+	count: number,
+};
+
+/**
  *  Calibration panel (`crs:RedHue` ... `crs:ShadowTint`), all -100..=100. Applied to the
  *  camera -> working-space matrix (primaries), before every other colour operation.
  */
@@ -1366,6 +1582,13 @@ export type CameraInfo = {
 	make: CameraMake,
 	model: string | null,
 	sensorLayout: SensorLayout,
+	/**
+	 *  v19.2: body serial number from EXIF (`BodySerialNumber`, else DNG `CameraSerialNumber`),
+	 *  read at import / thumbnail re-extraction and backfilled in the background for photos
+	 *  imported before v19.2 (`null` until then, or when the file has none). Tells two bodies
+	 *  of the same model apart (`CameraBody`, Edit Capture Time > sync cameras).
+	 */
+	serial?: string | null,
 };
 
 export type CameraMake = "sony" | "fujifilm" | "canon" | "other";
@@ -1386,6 +1609,18 @@ export type CameraProfileInfo = {
 	styleId: number | null,
 };
 
+/**  Which photos `CaptureTimeEdit::SyncCameras` moves (v19.2). */
+export type CameraSyncScope = 
+/**  The `ids` passed to `edit_capture_time` (v19 behaviour; "The selected photos"). */
+"selected" | 
+/**
+ *  Every photo in the target's project from the target's body (make + model + serial;
+ *  an unknown serial matches photos of that model with an unknown serial).
+ */
+"body" | 
+/**  Every photo in the target's project from the target's make + model (any serial). */
+"model";
+
 /**
  *  EXIF capture metadata. All optional: populated by the ingest pipeline (Phase 2),
  *  in the same pass that extracts the embedded preview.
@@ -1396,14 +1631,95 @@ export type CaptureMeta = {
 	 *  burst grouping. EXIF `DateTimeOriginal` is camera-local wall-clock time with no
 	 *  zone, so it is stored as that wall-clock time *interpreted as UTC* ("naive" ms):
 	 *  display with `timeZone: "UTC"`; differences between frames are exact.
+	 * 
+	 *  v19: this is the **corrected** capture time (Lightroom's "Edit Capture Time"), used by
+	 *  sorting, burst grouping, scenes, filters, export naming and project date ranges. It
+	 *  equals `originalCapturedAtMs` unless `captureTimeSource` is `sidecar` or `user`.
 	 */
 	capturedAtMs: number | null,
+	/**
+	 *  v19: capture time read from the file itself (EXIF `DateTimeOriginal` + sub-seconds),
+	 *  same "naive" ms convention. Never changed by `edit_capture_time` or sidecar reads.
+	 *  `null` when the file has none (or its metadata was not extracted yet).
+	 */
+	originalCapturedAtMs?: number | null,
+	/**  v19: where `capturedAtMs` comes from. */
+	captureTimeSource?: CaptureTimeSource,
 	iso: number | null,
 	shutterSeconds: number | null,
 	aperture: number | null,
 	focalLengthMm: number | null,
 	lens: string | null,
 };
+
+/**
+ *  How `edit_capture_time` changes the selected photos' corrected capture time (Lightroom's
+ *  Metadata > Edit Capture Time). Times are "naive" ms (see `CaptureMeta.capturedAtMs`).
+ *  Photos without a capture time are skipped unless the mode gives them one.
+ */
+export type CaptureTimeEdit = 
+/**  "Shift by set number of hours" (any ms): every photo's time + `offsetMs`. */
+{ kind: "shift"; offsetMs: number } | 
+/**
+ *  "Adjust to a specified date and time": `referenceId` (one of the ids, the active
+ *  photo) gets `capturedAtMs`; the other photos shift by the same offset. A reference
+ *  without a capture time gets it and nothing else changes.
+ */
+{ kind: "set_exact"; referenceId: number; capturedAtMs: number } | 
+/**
+ *  Sync two cameras: `referenceId` (a frame of the camera with the right clock) and
+ *  `targetId` (a frame of the other camera taken at the same moment); the photos of
+ *  `scope` shift by `reference - target`. Both need a capture time; they may be outside
+ *  `ids`. v19.2 `scope` (optional, default `selected` = the v19 behaviour): `selected`
+ *  moves `ids`; `body` / `model` move **every** photo of the target's project taken with
+ *  the target's body (make + model + serial) / model (make + model), whatever the grid
+ *  shows, and ignore `ids` (pass `[]`). With `body` / `model` the reference must not be
+ *  in that set (`invalid_argument`: same camera).
+ */
+{ kind: "sync_cameras"; referenceId: number; targetId: number; scope?: CameraSyncScope } | 
+/**
+ *  "Revert capture time to original": back to the file's EXIF time
+ *  (`originalCapturedAtMs`, source `exif`).
+ */
+{ kind: "revert" };
+
+/**  Result of `edit_capture_time`. */
+export type CaptureTimeEditResult = {
+	/**
+	 *  Photos whose corrected time changed (refetch with `get_images`; sort order, bursts and
+	 *  scene bounds follow).
+	 */
+	changedIds: number[],
+	/**  Photos left alone: no capture time to shift, or already at the target time. */
+	skippedIds: number[],
+	/**  Offset applied (`shift` / `set_exact` / `sync_cameras`); `null` for `revert`. */
+	offsetMs: number | null,
+	/**  The changed photos' times before the edit: pass to `restore_capture_times` to undo. */
+	previous: CaptureTimeSnapshot[],
+};
+
+/**
+ *  One photo's corrected capture time (undo of `edit_capture_time` via
+ *  `restore_capture_times`).
+ */
+export type CaptureTimeSnapshot = {
+	imageId: number,
+	capturedAtMs: number | null,
+	source: CaptureTimeSource,
+};
+
+/**  Origin of `CaptureMeta.capturedAtMs` (IPC v19, `images.capture_time_source`). */
+export type CaptureTimeSource = 
+/**  The file's own EXIF time (`originalCapturedAtMs`). */
+"exif" | 
+/**
+ *  A corrected time read from the XMP sidecar (`exif:DateTimeOriginal`, else
+ *  `photoshop:DateCreated`) that differs from the file's EXIF time, e.g. after
+ *  Lightroom's "Edit Capture Time".
+ */
+"sidecar" | 
+/**  Corrected in Sieve (`edit_capture_time`); written to the sidecar. */
+"user";
 
 /**  One automatic catalog backup. */
 export type CatalogBackup = {
@@ -1572,6 +1888,12 @@ export type CropSettings = {
 	bottom: number,
 	right: number,
 	angle: number,
+};
+
+/**  A `crs:` property kept verbatim (name without the `crs:` prefix, value as written). */
+export type CrsProperty = {
+	name: string,
+	value: string,
 };
 
 /**
@@ -1831,7 +2153,17 @@ export type EditBatchKind =
 /**  `apply_scene_edit` / `apply_all_edited_scenes`. */
 "scene_apply" | 
 /**  `apply_style_prediction` ("Auto edit (my style)"). */
-"style_prediction";
+"style_prediction" | 
+/**
+ *  `paste_settings` / `sync_settings` / `paste_previous` (v19): Copy / Paste / Sync to
+ *  an arbitrary selection.
+ */
+"paste" | 
+/**
+ *  `sync_delta` (v19.2): one Auto Sync commit, the source photo's edit plus the same
+ *  change on every target.
+ */
+"sync";
 
 /**  An undoable multi-image edit (`undo_edit_batch`). */
 export type EditBatchResult = {
@@ -1924,6 +2256,29 @@ export type EditSource =
 export type EditState = {
 	adjustments: ParametricAdjustments,
 	history: AdjustmentHistory,
+};
+
+/**
+ *  Cached renders of one photo's develop settings (IPC v19.1), served by the `sieve://`
+ *  scheme from the app cache dir (never next to the photos). URLs are content-addressed
+ *  (image id + settings hash): a new edit gives new URLs, so they may be cached forever.
+ */
+export type EditedPreview = {
+	/**  Grid thumbnail, long edge 512 px, orientation and crop applied. */
+	thumbUrl: string,
+	/**  Loupe / Develop placeholder, long edge 2048 px, orientation and crop applied. */
+	previewUrl: string,
+};
+
+/**
+ *  The edited preview of an image was rendered (or dropped) in the background (IPC v19.1):
+ *  mirrors `RawImageEntry.editedPreview`. `preview = null`: the photo is unedited again (show
+ *  the embedded thumbnail). Emitted after edits, batches (paste / sync / presets / scene
+ *  apply / undo) and for neighbours prerendered by `prepareDevelop`.
+ */
+export type EditedPreviewChanged = {
+	imageId: number,
+	preview: EditedPreview | null,
 };
 
 export type EffectsAdjustments = {
@@ -2207,6 +2562,14 @@ export type FilterCounts = {
 	burstNonKeepers: number,
 	/**  Images whose original is missing (`ImageQuery.missingOnly`; IPC v13). */
 	missing: number,
+	/**
+	 *  v19.2: pending suggestions (`ImageQuery.suggested`) in the counted images: reject /
+	 *  pick / stars only. Over a project without other constraints they equal
+	 *  `CullSummary.suggestedRejectPending` / `suggestedPickPending` / `suggestedRatingPending`.
+	 */
+	suggestedReject?: number,
+	suggestedPick?: number,
+	suggestedRating?: number,
 };
 
 export type FolderEntry = {
@@ -2220,6 +2583,16 @@ export type FolderEntry = {
 export type FormatCount = {
 	format: ImageFormat,
 	count: number,
+};
+
+/**  GPS position from the file's EXIF (WGS84 decimal degrees). */
+export type GpsLocation = {
+	/**  -90..=90, north positive. */
+	latitude: number,
+	/**  -180..=180, east positive. */
+	longitude: number,
+	/**  Metres above sea level. */
+	altitudeM: number | null,
 };
 
 /**
@@ -2323,6 +2696,59 @@ export type ImageFormat =
 /**  PNG, 8/16-bit. */
 "png";
 
+/**
+ *  Everything the Library "Metadata" panel shows for one photo (`get_image_metadata`, v19).
+ *  Catalog facts plus a few EXIF values read from the file on demand (`null` when absent or
+ *  unreadable).
+ */
+export type ImageMetadata = {
+	imageId: number,
+	/**  Absolute path of the original. */
+	path: string,
+	fileName: string,
+	/**  Directory holding the original. */
+	folderPath: string,
+	format: ImageFormat,
+	/**  Lower-case extension without the dot ("arw"). */
+	extension: string,
+	fileSize: number,
+	fileMtimeMs: number,
+	/**  Corrected capture time (`CaptureMeta.capturedAtMs`). */
+	capturedAtMs: number | null,
+	/**  The file's own EXIF time (`CaptureMeta.originalCapturedAtMs`). */
+	originalCapturedAtMs: number | null,
+	captureTimeSource: CaptureTimeSource,
+	camera: CameraInfo,
+	lens: string | null,
+	iso: number | null,
+	shutterSeconds: number | null,
+	aperture: number | null,
+	focalLengthMm: number | null,
+	/**  From the file (EXIF `FocalLengthIn35mmFormat`). */
+	focalLength35mm: number | null,
+	/**  From the file (EXIF `ExposureBiasValue`), EV. */
+	exposureCompensationEv: number | null,
+	/**  From the file (EXIF `Flash` bit 0). */
+	flashFired: boolean | null,
+	/**  From the file (EXIF `BodySerialNumber` / maker notes). */
+	cameraSerial: string | null,
+	/**  Sensor pixel size (as in `RawImageEntry`). */
+	width: number | null,
+	height: number | null,
+	/**  EXIF orientation 1..=8. */
+	orientation: number | null,
+	/**  From the file; `null` = no GPS data. */
+	gps: GpsLocation | null,
+	/**  Where the XMP sidecar is (or would be written). */
+	sidecarPath: string,
+	/**  The sidecar exists on disk now. */
+	sidecarExists: boolean,
+	/**  Paired camera JPEG/HEIC (`RawImageEntry.companionPath`). */
+	companionPath: string | null,
+	/**  The original is missing at `path` (`RawImageEntry.missingSinceMs` set). */
+	missing: boolean,
+};
+
 export type ImagePage = {
 	items: RawImageEntry[],
 	/**  Total matches ignoring offset/limit. */
@@ -2373,6 +2799,14 @@ export type ImageQuery = {
 	keepersOnly?: boolean,
 	/**  Lightroom-style Library Filter "Metadata" constraints (v18; default: none). */
 	metadata?: MetadataFilter,
+	/**
+	 *  v19.2: only photos with a **pending** suggestion of this kind (`null` = no constraint):
+	 *  analysed, unflagged and 0 stars (what `apply_suggestions(onlyUnset = true)` would change),
+	 *  with `suggestedPick = reject` (`reject`), `pick` (`pick`), or no flag but
+	 *  `suggestedRating > 0` (`rating`). Counts: `CullSummary.suggested*Pending`,
+	 *  `FilterCounts.suggested*`.
+	 */
+	suggested?: PendingSuggestion | null,
 	sort: ImageSort,
 	/**  Reverse the natural order of `sort` (images missing the key stay last). */
 	sortDescending: boolean,
@@ -3021,6 +3455,12 @@ export type MetadataFilter = {
 	extensions?: string[],
 	/**  Camera body (make + model) is one of these. */
 	cameras?: CameraFilter[],
+	/**
+	 *  v19.2: camera body (make + model + serial, `CameraBody`) is one of these; the per-body
+	 *  refinement of `cameras` (two ILCE-7M4 bodies are two entries). Values come from
+	 *  `MetadataFilterOptions.bodies`.
+	 */
+	bodies?: CameraBody[],
 	/**  Lens is one of these; `null` = lens unknown. */
 	lenses?: (string | null)[],
 	iso?: NumberRange | null,
@@ -3051,6 +3491,12 @@ export type MetadataFilterOptions = {
 	formats: FormatCount[],
 	extensions: ExtensionCount[],
 	cameras: CameraCount[],
+	/**
+	 *  v19.2: per body (make + model + serial), ignoring `metadata.bodies`; ordered like
+	 *  `cameras`, then by serial (unknown serial last). Label a body with its serial's last
+	 *  digits when two entries share make + model.
+	 */
+	bodies?: CameraBodyCount[],
 	lenses: LensCount[],
 	isos: NumberCount[],
 	/**  Rounded to 0.1 mm. */
@@ -3273,6 +3719,11 @@ export type ParametricAdjustments = {
 	 *  [`MaskGroup`]). Empty = none. `#[serde(default)]` like the v9 groups.
 	 */
 	masks?: MaskGroup[],
+	/**
+	 *  Transform panel (IPC v19): Upright + manual perspective sliders (see
+	 *  [`TransformSettings`]). `#[serde(default)]` like the v9 groups.
+	 */
+	transform?: TransformSettings,
 };
 
 /**
@@ -3288,6 +3739,15 @@ export type ParametricCurve = {
 	midtoneSplit: number,
 	highlightSplit: number,
 };
+
+/**  Kind of a pending culling suggestion (v19.2, `ImageQuery.suggested`). */
+export type PendingSuggestion = 
+/**  Sieve suggests reject. */
+"reject" | 
+/**  Sieve suggests pick. */
+"pick" | 
+/**  No flag suggested, but stars (`suggestedRating > 0`). */
+"rating";
 
 /**  Body parts of an AI "People" selection (Lightroom's list; empty = entire person). */
 export type PersonPart = "face_skin" | "body_skin" | "eyebrows" | "eye_sclera" | "iris_pupil" | "lips" | "teeth" | "hair" | "clothes";
@@ -3375,6 +3835,22 @@ export type Preset = {
 	settingKeys: string[],
 };
 
+/**
+ *  A temporary variation of the live settings for `render_preview_variant` (v19). Nothing is
+ *  saved and no history entry is written.
+ */
+export type PreviewVariant = 
+/**
+ *  What applying the preset would give (same as `resolve_preset`): hover preview on the
+ *  main image.
+ */
+{ kind: "preset"; presetId: number } | 
+/**
+ *  The live settings with these groups back at the photo's format defaults:
+ *  press-and-hold a panel's "changed" dot to see the photo without that panel. Non-empty.
+ */
+{ kind: "without_fields"; fields: AdjustmentField[] };
+
 /**  Hue / saturation shift of one camera primary, each -100..=100. */
 export type PrimaryCalibration = {
 	hue: number,
@@ -3442,6 +3918,11 @@ export type Project = {
 	coverThumbnailPath: string | null,
 	/**  Culling profile of this shoot (`set_project_shoot_type`). */
 	shootType: ShootType,
+	/**
+	 *  How readily culling suggests reject for this shoot (v19,
+	 *  `set_project_reject_strictness`; default `balanced`).
+	 */
+	rejectStrictness: RejectStrictness,
 	/**  Guided-workflow step (`set_workflow_step`). */
 	workflowStep: WorkflowStep,
 	createdAtMs: number,
@@ -3583,7 +4064,30 @@ export type RawImageEntry = {
 	 *  successful access, a re-import that finds it, or `relocate_folder` (IPC v13).
 	 */
 	missingSinceMs: number | null,
+	/**
+	 *  Rendered previews of the photo's develop settings (IPC v19.1): what Library grid,
+	 *  Loupe, filmstrip and scenes show for an edited photo instead of the embedded
+	 *  thumbnail. `null` when unedited (`hasEdits = false`) or not rendered yet (the
+	 *  `editedPreviewChanged` event follows once it is). May briefly lag the newest edit.
+	 */
+	editedPreview: EditedPreview | null,
 };
+
+/**
+ *  How readily culling turns defects into reject suggestions (v19, per project,
+ *  `set_project_reject_strictness`). Applied by the scorer (vision-ml-dev) on top of the
+ *  shoot type's `CullThresholds`.
+ */
+export type RejectStrictness = 
+/**  Only clear failures are suggested for reject. */
+"conservative" | 
+/**  Default. */
+"balanced" | 
+/**
+ *  Burst duplicates, any closed eyes on the main subject and soft focus are
+ *  suggested for reject.
+ */
+"aggressive";
 
 /**  Result of `relocate_folder` (IPC v13). */
 export type RelocateResult = {
@@ -3636,7 +4140,13 @@ export type RenderSlot =
  *  Navigator panel + preset/profile hover previews (v14): independent of `main`, so a
  *  hover never supersedes the loupe render.
  */
-"navigator";
+"navigator" | 
+/**
+ *  Temporary previews on the main image (v19, `render_preview_variant`): hover preset
+ *  preview and press-and-hold "without this panel". Independent of `main`, so going
+ *  back to the edit is just showing the last `main` URL again (no re-render).
+ */
+"preview";
 
 /**
  *  A rendered overlay: an 8-bit **grayscale JPEG** of the mask (white = 1) served on the
@@ -4197,6 +4707,18 @@ export type StyleValidation = {
 };
 
 /**
+ *  Which suggestions `apply_suggestions` copies (v19.2; `null` = all). A suggested `pick` flag
+ *  is copied with `picks`, a suggested `reject` with `rejects`, a suggested "no flag" (which
+ *  clears a flag, only possible with `onlyUnset = false`) only with both; `suggestedRating`
+ *  is copied with `stars`. Anything not selected stays as it is.
+ */
+export type SuggestionKinds = {
+	picks: boolean,
+	rejects: boolean,
+	stars: boolean,
+};
+
+/**
  *  One human-readable reason behind a suggestion (v18), e.g.
  *  `{kind: "blink", text: "Eyes closed"}` or
  *  `{kind: "duplicate_burst", text: "Duplicate in burst (keeper DSC0123)", relatedImageId: 42}`.
@@ -4226,6 +4748,52 @@ export type SuggestionReasonKind =
 "low_score" | 
 /**  Anything else (the text says what). */
 "other";
+
+/**  Options of `sync_delta` (v19.2; `null` = defaults). */
+export type SyncDeltaOptions = {
+	/**
+	 *  Changed groups applied **relatively** (the source's change is added to each target's
+	 *  own value) instead of copied. Only `exposure` (EV added, clamped to -5..=5) and
+	 *  `white_balance` (temperature shifted in mireds, tint added, clamped to the slider
+	 *  ranges; an `as_shot` target is resolved to its camera as-shot values first) can be
+	 *  relative; anything else -> `invalid_argument`. Default both. `[]` = copy everything
+	 *  (Lightroom's Auto Sync).
+	 */
+	relative?: AdjustmentField[],
+	/**
+	 *  Only consider these groups (`null` = every group except the per-frame ones). Groups in
+	 *  [`SyncDeltaOptions::NEVER_SYNCED`] are never synced even when listed.
+	 */
+	fields?: AdjustmentField[] | null,
+	/**
+	 *  History label of the source's and the targets' entries (`null` = "Auto Sync"; 1..=100
+	 *  chars). The UI passes what it would pass to `save_adjustments` (e.g. "Exposure").
+	 */
+	label?: string | null,
+};
+
+/**  Result of `sync_delta` (v19.2). */
+export type SyncDeltaResult = {
+	/**
+	 *  One batch (kind `sync`) holding the source's edit and every changed target; `batchId =
+	 *  null` when nothing changed. `undo_edit_batch(batch.batchId)` reverts all of them.
+	 */
+	batch: EditBatchResult,
+	/**
+	 *  The groups that differed between `before` and `after` and were synced (in
+	 *  `AdjustmentField` order); empty = nothing to sync.
+	 */
+	fields: AdjustmentField[],
+	/**  Of `fields`, those applied relatively. */
+	relativeFields: AdjustmentField[],
+	/**
+	 *  Targets whose white balance was copied absolutely because their (or the source's)
+	 *  as-shot white balance could not be resolved (file missing / unreadable).
+	 */
+	absoluteWbIds: number[],
+	/**  The source's history after the commit (as `save_adjustments` returns it). */
+	history: AdjustmentHistory,
+};
 
 export type TagCount = {
 	tag: CullTag,
@@ -4298,6 +4866,75 @@ export type ToneCurve = {
 };
 
 /**
+ *  Result of `get_transform_bounds` (v19.3): the Transform / Upright warp's outline for the
+ *  crop tool. Pure geometry of the live `adjustments` (no render).
+ */
+export type TransformBounds = {
+	/**
+	 *  The warped image's outline in the *uncropped corrected frame as displayed* (EXIF
+	 *  orientation applied; fractions 0..=1 of a render with `crop.enabled = false`, the
+	 *  crop tool's frame): the four source corners mapped through the warp, clockwise on
+	 *  screen (y down). Points may lie outside 0..=1 (the warp pushes a corner past the frame
+	 *  edge); the photo's pixels cover the intersection of this quad and the frame, the rest
+	 *  renders white. `null` = no warp (the image covers the whole frame).
+	 */
+	validQuad: ([number, number])[] | null,
+	/**
+	 *  What Constrain Crop makes of `adjustments.crop` (stored crop convention: un-oriented
+	 *  fractions + angle, as `CropSettings`): `adjustments.crop` unchanged when it already
+	 *  fits inside the warped image, else the largest frame of the same aspect and angle
+	 *  that fits; a disabled crop becomes the largest frame of the photo's aspect (enabled),
+	 *  or stays as it is (disabled) when the warp already covers the whole frame (e.g.
+	 *  Scale > 100).
+	 *  Computed whatever `transform.constrainCrop` says (it is what a render shows when that
+	 *  is on). `null` = no warp.
+	 */
+	constrainedCrop: CropSettings | null,
+};
+
+/**
+ *  Lightroom Transform panel (IPC v19). Field <-> `crs:` mapping (Process 2012+; `xmp/crs.rs`
+ *  implements it, rust-engine-dev):
+ * 
+ *  | Field | crs property | Range / format |
+ *  |---|---|---|
+ *  | `upright` | `PerspectiveUpright` | 0..=5, see [`UprightMode`] |
+ *  | `guides` | `UprightFourSegmentsCount` + `UprightFourSegments_0..3` | 0..=4 lines |
+ *  | `vertical` | `PerspectiveVertical` | -100..=100, signed integer |
+ *  | `horizontal` | `PerspectiveHorizontal` | -100..=100, signed integer |
+ *  | `rotate` | `PerspectiveRotate` | -10..=10 degrees, signed, 1 decimal |
+ *  | `aspect` | `PerspectiveAspect` | -100..=100, signed integer |
+ *  | `scale` | `PerspectiveScale` | 50..=150 (default 100), integer |
+ *  | `offsetX` / `offsetY` | `PerspectiveX` / `PerspectiveY` | -100..=100, signed, 2 decimals |
+ *  | `constrainCrop` | `CropConstrainToWarp` | 0 / 1 |
+ *  | `solution.crs` | `UprightVersion`, `UprightTransform_*`, `UprightFocal*`, `UprightCenter*`, `UprightPreview`, `Upright*DependentDigest` | verbatim |
+ * 
+ *  Default = Lightroom's (off, sliders 0, scale 100, constrain off) and neutral. Renders
+ *  (preview, export) apply `solution` (when its mode is current) then the sliders, before
+ *  the crop; with `constrainCrop` the crop is limited to the warped image area.
+ */
+export type TransformSettings = {
+	upright: UprightMode,
+	/**  Guided Upright lines (at most 4; Guided needs 2+ to have an effect). */
+	guides?: UprightGuide[],
+	vertical: number,
+	horizontal: number,
+	/**  Degrees. */
+	rotate: number,
+	aspect: number,
+	/**  Percent. */
+	scale: number,
+	offsetX: number,
+	offsetY: number,
+	constrainCrop: boolean,
+	/**
+	 *  Solved Upright correction (`auto_upright`, or read from the sidecar); `null` for
+	 *  `off` or not solved yet.
+	 */
+	solution?: UprightSolution | null,
+};
+
+/**
  *  Small per-catalog UI preferences. Every field is optional so the struct can grow;
  *  `set_ui_prefs` replaces the whole value (read-modify-write from the frontend).
  */
@@ -4331,6 +4968,76 @@ export type UndoBatchResult = {
 export type UnsupportedMask = {
 	/**  `crs:What` of the item (e.g. `Mask/RangeMask` with a depth range). */
 	what: string,
+};
+
+/**
+ *  One Guided Upright guide line (v19), endpoints in the **sensor frame** (normalized 0..=1
+ *  of the un-oriented, uncropped image, like masks and `crs:UprightFourSegments_N`).
+ */
+export type UprightGuide = {
+	start: NormPoint,
+	end: NormPoint,
+};
+
+/**
+ *  Lightroom Transform panel "Upright" mode (IPC v19). `crs:PerspectiveUpright` stores it
+ *  as an integer: 0 off, 1 auto, 2 full, 3 level, 4 vertical, 5 guided (ExifTool's crs
+ *  table; [`UprightMode::crs_value`] / [`UprightMode::from_crs`]).
+ */
+export type UprightMode = "off" | 
+/**  Balanced level + vertical + aspect correction. */
+"auto" | 
+/**  Horizon / dominant horizontal lines level (rotation only). */
+"level" | 
+/**  Level + converging verticals. */
+"vertical" | 
+/**  Level + vertical + horizontal perspective. */
+"full" | 
+/**  From the user's guide lines (`TransformSettings.guides`, 2..=4). */
+"guided";
+
+/**
+ *  Result of `auto_upright` (v19). Nothing is saved: the UI sets
+ *  `transform.upright = mode`, `transform.solution = solution` and commits one history entry
+ *  ("Upright: Auto"...).
+ */
+export type UprightResult = {
+	mode: UprightMode,
+	/**
+	 *  `null` when the photo has no usable lines for this mode (Lightroom then leaves the
+	 *  photo as it is); `message` says so.
+	 */
+	solution: UprightSolution | null,
+	/**  User-facing note, e.g. "No straight lines found for Vertical"; `null` on success. */
+	message: string | null,
+};
+
+/**
+ *  The perspective correction an Upright mode solved for one photo (v19): from
+ *  `auto_upright` (Sieve's line detection) or read from a Lightroom sidecar.
+ */
+export type UprightSolution = {
+	/**  Mode it was solved for. Rendered only while it equals `TransformSettings.upright`. */
+	mode: UprightMode,
+	/**
+	 *  Row-major 3x3 homography (9 finite values) mapping a point of the corrected frame to
+	 *  the source, both normalized 0..=1 in the sensor frame (un-oriented, before crop); the
+	 *  manual sliders apply on top. Identity = `[1,0,0, 0,1,0, 0,0,1]`.
+	 */
+	matrix: number[],
+	/**
+	 *  In-plane rotation part of the solve, degrees (positive = counter-clockwise), e.g. the
+	 *  horizon angle `level` corrected. Informational (UI readout, tests).
+	 */
+	rotationDeg: number,
+	/**
+	 *  Lightroom's own Upright state read from the sidecar, kept verbatim and written back
+	 *  unchanged while `mode` is still the sidecar's (`UprightVersion`, `UprightTransform_0..5`,
+	 *  `UprightTransformCount`, `UprightFocalMode`, `UprightFocalLength35mm`,
+	 *  `UprightCenterMode`, `UprightCenterNormX/Y`, `UprightPreview`, `UprightDependentDigest`,
+	 *  `UprightGuidedDependentDigest`, `UprightFourSegments*`). Empty when solved by Sieve.
+	 */
+	crs: CrsProperty[],
 };
 
 /**  Post-crop vignette style (`crs:PostCropVignetteStyle` 1 / 2 / 3). */

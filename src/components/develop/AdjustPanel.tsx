@@ -1,7 +1,7 @@
 // Develop right panel, Lightroom order (docs/ux-spec-8b.md 5.4): Histogram, tool strip (Crop, Masking), Basic (Treatment,
 // Profile, WB, Tone with Auto, Presence), Tone Curve, HSL / Color, Color Grading, Detail, Effects, Calibration, bottom bar.
-import { useMemo, useState, type ReactNode } from "react";
-import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History } from "lucide-react";
+import { memo, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import { CircleDashed, Crop as CropIcon, Loader2, Pipette, RotateCcw, RefreshCw, History, Wand2 } from "lucide-react";
 import type { AdjustmentField } from "../../ipc";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
 import type { Editor } from "../../hooks/useEditor";
@@ -32,6 +32,8 @@ import { ToneCurvePanel } from "./ToneCurvePanel";
 import { ColorGradingPanel } from "./ColorGradingPanel";
 import { CalibrationPanel, DetailPanel, EffectsPanel } from "./DetailPanels";
 import { CropPanel, type CropApi } from "./CropPanel";
+import { TransformPanel, type GuidedApi } from "./TransformPanel";
+import type { UprightApi } from "../../hooks/useUpright";
 import { hint } from "../../lib/keymap";
 
 const BASIC_ALL: AdjustmentField[] = [...BASIC_FIELDS, ...PRESENCE_FIELDS, "profile", "black_and_white"];
@@ -41,6 +43,9 @@ export interface BottomBar {
   count: number;
   hasPrevious: boolean;
   onPrevious: () => void;
+  /** Auto Sync (Lightroom): every committed edit also goes to the other selected photos. */
+  autoSync: boolean;
+  onAutoSync: (on: boolean) => void;
   /** Sync… (Alt held: no dialog). */
   onSync: (alt: boolean) => void;
   onReset: () => void;
@@ -49,6 +54,8 @@ export interface BottomBar {
 /** Lightroom's Auto buttons (Tone, WB, Shift+double-click on a slider), driven by DevelopView (v14 `auto_tone` / `auto_white_balance`). */
 export interface AutoApi {
   busy: boolean;
+  /** Generic Auto: tone + white balance from the photo (no learned style needed), one history entry. */
+  all: () => void;
   tone: () => void;
   wb: () => void;
   /** Shift+double-click: auto for one slider (temp / tint use the white balance, the rest `auto_tone` with that key). */
@@ -65,9 +72,14 @@ interface Props {
   onImportStyles: () => void;
   hover: ProfileHover;
   auto: AutoApi;
+  /** Press-and-hold of a section's changed dot: the photo without that section's changes (renderPreviewVariant). */
+  hold: { start: (title: string, fields: AdjustmentField[]) => void; stop: () => void };
   imageId: number | null;
   onError: (e: unknown) => void;
   crop: CropApi;
+  /** Transform section: Upright buttons / Guided tool. */
+  upright: UprightApi;
+  guided: GuidedApi;
   /** White balance eyedropper (W). */
   picker: { active: boolean; toggle: () => void };
   /** Masking tool: the strip button toggles the Masks panel, which replaces the section list while open. */
@@ -90,7 +102,135 @@ const stripBtn = (on: boolean) => `relative flex size-7 items-center justify-cen
 
 const AUTO_KEYS: SimpleKey[] = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "vibrance", "saturation"];
 
-export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, auto, imageId, onError, crop, picker, masks, browser, exif, bar }: Props) {
+type EditFn = Editor["edit"];
+type ChangeFn = Editor["change"];
+interface RowCbs {
+  edit: EditFn;
+  commit: () => void;
+  change: ChangeFn;
+}
+
+// Slider rows take only primitives and the editor's stable callbacks, so a frame of a drag re-renders just the row
+// being dragged (Phase 8d: the rest of the panel is skipped by memo).
+const SimpleRow = memo(function SimpleRow({ d, value, def, auto, edit, commit, change }: RowCbs & { d: SliderDef; value: number; def: number; auto?: (key: SimpleKey) => void }) {
+  return (
+    <Slider
+      id={d.key}
+      label={d.label}
+      value={value}
+      min={d.min}
+      max={d.max}
+      step={d.step}
+      digits={d.digits}
+      defaultValue={def}
+      onInput={(v) => edit((a) => ({ ...a, [d.key]: v }), d.label)}
+      onCommit={commit}
+      onReset={() => change((a) => ({ ...a, [d.key]: def }), d.label)}
+      onAuto={auto ? () => auto(d.key) : undefined}
+    />
+  );
+});
+
+const BwRow = memo(function BwRow({ band, value, def, edit, commit, change }: RowCbs & { band: (typeof BANDS)[number]; value: number; def: number }) {
+  return (
+    <Slider
+      id={`bw-${band}`}
+      label={band[0].toUpperCase() + band.slice(1)}
+      value={value}
+      min={-100}
+      max={100}
+      step={1}
+      accent={BAND_COLOR[band]}
+      onInput={(v) => edit((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [band]: v } } }), `B&W: ${band}`)}
+      onCommit={commit}
+      onReset={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [band]: def } } }), `B&W: ${band}`)}
+    />
+  );
+});
+
+const HslRow = memo(function HslRow({ kind, band, value, edit, commit, change }: RowCbs & { kind: HslKind; band: (typeof BANDS)[number]; value: number }) {
+  const name = `${kind[0].toUpperCase()}${kind.slice(1)}: ${band}`;
+  return (
+    <Slider
+      id={`hsl-${kind}-${band}`}
+      label={band[0].toUpperCase() + band.slice(1)}
+      value={value}
+      min={-100}
+      max={100}
+      step={1}
+      accent={BAND_COLOR[band]}
+      onInput={(v) => edit((a) => ({ ...a, hsl: { ...a.hsl, [kind]: { ...a.hsl[kind], [band]: v } } }), name)}
+      onCommit={commit}
+      onReset={() => change((a) => ({ ...a, hsl: { ...a.hsl, [kind]: { ...a.hsl[kind], [band]: 0 } } }), name)}
+    />
+  );
+});
+
+const tempDisplay = (p: number) => `${posToTemp(p)} K`;
+const tempEditText = (p: number) => String(posToTemp(p));
+const tempParse = (t: string) => {
+  const k = Number.parseFloat(t);
+  return Number.isFinite(k) ? tempToPos(Math.min(TEMP_MAX, Math.max(TEMP_MIN, k))) : null;
+};
+
+interface WbRowProps extends RowCbs {
+  kind: "temp" | "tint";
+  /** Slider position (temp) or tint value. */
+  value: number;
+  /** As-shot default in slider units. */
+  def: number;
+  /** The other WB component (Kelvin for tint rows, tint for temp rows). */
+  other: number;
+  asShot: { temperatureK: number; tint: number };
+  disabled: boolean;
+  onAuto: (key: "temp" | "tint") => void;
+}
+const WbRow = memo(function WbRow({ kind, value, def, other, asShot, disabled, onAuto, edit, commit, change }: WbRowProps) {
+  const isTemp = kind === "temp";
+  const label = isTemp ? "Temp" : "Tint";
+  const setWb = (t: number, ti: number) => edit((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: t, tint: ti } }), label);
+  const resetWb = (t: number, ti: number) =>
+    change((a) => ({ ...a, whiteBalance: t === asShot.temperatureK && ti === asShot.tint ? { mode: "as_shot" } : { mode: "custom", temperatureK: t, tint: ti } }), label);
+  return isTemp ? (
+    <Slider
+      id="temp"
+      label={label}
+      value={value}
+      min={0}
+      max={1}
+      step={0.001}
+      display={tempDisplay}
+      defaultValue={def}
+      editText={tempEditText}
+      parse={tempParse}
+      textStep={50}
+      accent="#fbbf24"
+      onInput={(p) => setWb(posToTemp(p), other)}
+      onCommit={commit}
+      onReset={() => resetWb(asShot.temperatureK, other)}
+      onAuto={() => onAuto("temp")}
+      disabled={disabled}
+    />
+  ) : (
+    <Slider
+      id="tint"
+      label={label}
+      value={value}
+      min={-150}
+      max={150}
+      step={1}
+      defaultValue={def}
+      accent="#e879f9"
+      onInput={(v) => setWb(other, v)}
+      onCommit={commit}
+      onReset={() => resetWb(other, asShot.tint)}
+      onAuto={() => onAuto("tint")}
+      disabled={disabled}
+    />
+  );
+});
+
+export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, hover, hold, auto, imageId, onError, crop, upright, guided, picker, masks, browser, exif, bar }: Props) {
   const syncing = useActivityRunning("paste_sync");
   const { adj, info, edit, commit, change } = editor;
   const [hslTab, setHslTab] = useState<HslKind>("hue");
@@ -105,35 +245,20 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
     return v;
   };
 
+  const holdOf = (title: string, fields: AdjustmentField[]) => (down: boolean) => (down ? hold.start(title, fields) : hold.stop());
+
+  const autoRef = useRef(auto);
+  autoRef.current = auto;
+  const autoSlider = useCallback((key: "temp" | "tint" | SimpleKey) => autoRef.current.slider(key), []);
   const simple = (d: SliderDef) => (
-    <Slider
-      key={d.key}
-      id={d.key}
-      label={d.label}
-      value={adj[d.key]}
-      min={d.min}
-      max={d.max}
-      step={d.step}
-      digits={d.digits}
-      defaultValue={editor.defaults[d.key]}
-      onInput={(v) => edit((a) => ({ ...a, [d.key]: v }), d.label)}
-      onCommit={commit}
-      onReset={() => change((a) => ({ ...a, [d.key]: editor.defaults[d.key] }), d.label)}
-      onAuto={AUTO_KEYS.includes(d.key) ? () => auto.slider(d.key) : undefined}
-    />
+    <SimpleRow key={d.key} d={d} value={adj[d.key]} def={editor.defaults[d.key]} auto={AUTO_KEYS.includes(d.key) ? autoSlider : undefined} edit={edit} commit={commit} change={change} />
   );
 
   const wb = adj.whiteBalance;
   const asShot = info?.asShot ?? { temperatureK: 5500, tint: 0 };
   const temp = wb.mode === "custom" ? wb.temperatureK : asShot.temperatureK;
   const tint = wb.mode === "custom" ? wb.tint : asShot.tint;
-  const setWb = (t: number, ti: number, label: string) => edit((a) => ({ ...a, whiteBalance: { mode: "custom", temperatureK: t, tint: ti } }), label);
   const wbReady = info !== null;
-  const resetWb = (t: number, ti: number, label: string) =>
-    change(
-      (a) => ({ ...a, whiteBalance: t === asShot.temperatureK && ti === asShot.tint ? { mode: "as_shot" } : { mode: "custom", temperatureK: t, tint: ti } }),
-      label,
-    );
 
   return (
     <div className="flex h-full flex-col" data-testid="adjust-panel">
@@ -161,13 +286,24 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
       {masks.open ? (
         <div className="min-h-0 flex-1">{masks.panel}</div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" data-testid="adjust-scroll">
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" style={{ overflowAnchor: "none" }} data-testid="adjust-scroll">
           <CropPanel crop={crop} />
           {browser.open ? (
             <ProfileBrowser editor={editor} catalog={catalog} importing={importing} onImport={onImportStyles} hover={hover} onClose={() => browser.setOpen(false)} />
           ) : (
             <>
-              <Section id="basic" dirty={dirty(BASIC_ALL)} title="Basic" onReset={() => resetFields(BASIC_ALL, "Reset Basic")}>
+              <Section id="basic" dirty={dirty(BASIC_ALL)} onHold={holdOf("Basic", BASIC_ALL)} title="Basic" onReset={() => resetFields(BASIC_ALL, "Reset Basic")}>
+                <div className="flex h-7 items-center gap-2" data-testid="auto-row">
+                  <button
+                    className="flex h-6 items-center gap-1 rounded bg-sky-800 px-3 text-xs font-medium text-sky-50 hover:bg-sky-700 disabled:opacity-60"
+                    disabled={auto.busy}
+                    onClick={auto.all}
+                    title={`Auto: set exposure, contrast, highlights, shadows and white balance from this photo's analysis. Works on any photo, no learned style needed. Not the same as "Auto edit (my style)", which applies your own editing style to a whole scene.`}
+                    data-testid="auto-all"
+                  >
+                    {auto.busy ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} Auto
+                  </button>
+                </div>
                 <div className="flex h-7 items-center gap-2" data-testid="bw-mode">
                   <span className="w-[72px] shrink-0 text-xs text-neutral-300">Treatment</span>
                   <div className="flex flex-1 gap-1">
@@ -208,53 +344,18 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                     <option value="custom">Custom</option>
                   </select>
                 </div>
-                <Slider
-                  id="temp"
-                  label="Temp"
-                  value={tempToPos(temp)}
-                  min={0}
-                  max={1}
-                  step={0.001}
-                  display={(p) => `${posToTemp(p)} K`}
-                  defaultValue={tempToPos(asShot.temperatureK)}
-                  editText={(p) => String(posToTemp(p))}
-                  parse={(t) => {
-                    const k = Number.parseFloat(t);
-                    return Number.isFinite(k) ? tempToPos(Math.min(TEMP_MAX, Math.max(TEMP_MIN, k))) : null;
-                  }}
-                  textStep={50}
-                  accent="#fbbf24"
-                  onInput={(p) => setWb(posToTemp(p), tint, "Temp")}
-                  onCommit={commit}
-                  onReset={() => resetWb(asShot.temperatureK, tint, "Temp")}
-                  onAuto={() => auto.slider("temp")}
-                  disabled={!wbReady}
-                />
-                <Slider
-                  id="tint"
-                  label="Tint"
-                  value={tint}
-                  min={-150}
-                  max={150}
-                  step={1}
-                  defaultValue={asShot.tint}
-                  accent="#e879f9"
-                  onInput={(v) => setWb(temp, v, "Tint")}
-                  onCommit={commit}
-                  onReset={() => resetWb(temp, asShot.tint, "Tint")}
-                  onAuto={() => auto.slider("tint")}
-                  disabled={!wbReady}
-                />
+                <WbRow kind="temp" value={tempToPos(temp)} def={tempToPos(asShot.temperatureK)} other={tint} asShot={asShot} disabled={!wbReady} onAuto={autoSlider} edit={edit} commit={commit} change={change} />
+                <WbRow kind="tint" value={tint} def={asShot.tint} other={temp} asShot={asShot} disabled={!wbReady} onAuto={autoSlider} edit={edit} commit={commit} change={change} />
                 <SubHead
                   action={
                     <button
                       className="flex h-5 items-center gap-1 rounded bg-neutral-800 px-2 text-[11px] hover:bg-neutral-700 disabled:opacity-40"
                       disabled={auto.busy}
                       onClick={auto.tone}
-                      title={`Auto${hint("autoTone")}`}
+                      title={`Auto tone only: exposure, contrast, highlights, shadows, whites, blacks (white balance is untouched)${hint("autoTone")}`}
                       data-testid="auto-tone"
                     >
-                      {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto
+                      {auto.busy && <Loader2 className="size-3 animate-spin" />} Auto tone
                     </button>
                   }
                 >
@@ -265,27 +366,15 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                 {PRESENCE.map(simple)}
               </Section>
 
-              <Section id="tone-curve" dirty={dirty(["tone_curve"])} title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
+              <Section id="tone-curve" dirty={dirty(["tone_curve"])} onHold={holdOf("Tone Curve", ["tone_curve"])} title="Tone Curve" onReset={() => resetFields(["tone_curve"], "Reset Tone Curve")}>
                 <ToneCurvePanel editor={editor} />
               </Section>
 
-              <Section id="hsl" dirty={dirty(HSL_BW_FIELDS)} title={adj.blackAndWhite.enabled ? "B&W" : "HSL / Color"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
+              <Section id="hsl" dirty={dirty(HSL_BW_FIELDS)} onHold={holdOf("Color", HSL_BW_FIELDS)} title={adj.blackAndWhite.enabled ? "B&W" : "HSL / Color"} onReset={() => resetFields(HSL_BW_FIELDS, "Reset Color Mixer")}>
                 {adj.blackAndWhite.enabled ? (
                   <div data-testid="bw-mixer">
                     {BANDS.map((b) => (
-                      <Slider
-                        key={b}
-                        id={`bw-${b}`}
-                        label={b[0].toUpperCase() + b.slice(1)}
-                        value={adj.blackAndWhite.mixer[b]}
-                        min={-100}
-                        max={100}
-                        step={1}
-                        accent={BAND_COLOR[b]}
-                        onInput={(v) => edit((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [b]: v } } }), `B&W: ${b}`)}
-                        onCommit={commit}
-                        onReset={() => change((a) => ({ ...a, blackAndWhite: { ...a.blackAndWhite, mixer: { ...a.blackAndWhite.mixer, [b]: editor.defaults.blackAndWhite.mixer[b] } } }), `B&W: ${b}`)}
-                      />
+                      <BwRow key={b} band={b} value={adj.blackAndWhite.mixer[b]} def={editor.defaults.blackAndWhite.mixer[b]} edit={edit} commit={commit} change={change} />
                     ))}
                   </div>
                 ) : (
@@ -301,37 +390,29 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                       Reset {hslTab}
                     </button>
                     {BANDS.map((b) => (
-                      <Slider
-                        key={b}
-                        id={`hsl-${hslTab}-${b}`}
-                        label={b[0].toUpperCase() + b.slice(1)}
-                        value={adj.hsl[hslTab][b]}
-                        min={-100}
-                        max={100}
-                        step={1}
-                        accent={BAND_COLOR[b]}
-                        onInput={(v) => edit((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: v } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
-                        onCommit={commit}
-                        onReset={() => change((a) => ({ ...a, hsl: { ...a.hsl, [hslTab]: { ...a.hsl[hslTab], [b]: 0 } } }), `${hslTab[0].toUpperCase()}${hslTab.slice(1)}: ${b}`)}
-                      />
+                      <HslRow key={`${hslTab}-${b}`} kind={hslTab} band={b} value={adj.hsl[hslTab][b]} edit={edit} commit={commit} change={change} />
                     ))}
                   </>
                 )}
               </Section>
 
-              <Section id="color-grading" dirty={dirty(["color_grading"])} title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
+              <Section id="color-grading" dirty={dirty(["color_grading"])} onHold={holdOf("Color Grading", ["color_grading"])} title="Color Grading" onReset={() => resetFields(["color_grading"], "Reset Color Grading")}>
                 <ColorGradingPanel editor={editor} />
               </Section>
 
-              <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
+              <Section id="detail" dirty={dirty(["sharpening", "noise_reduction"])} onHold={holdOf("Detail", ["sharpening", "noise_reduction"])} title="Detail" onReset={() => resetFields(["sharpening", "noise_reduction"], "Reset Detail")}>
                 <DetailPanel editor={editor} />
               </Section>
 
-              <Section id="effects" dirty={dirty(["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
+              <Section id="transform" dirty={dirty(["transform"])} onHold={holdOf("Transform", ["transform"])} title="Transform" onReset={() => resetFields(["transform"], "Reset Transform")}>
+                <TransformPanel editor={editor} upright={upright} guided={guided} />
+              </Section>
+
+              <Section id="effects" dirty={dirty(["vignette", "grain"])} onHold={holdOf("Effects", ["vignette", "grain"])} title="Effects" onReset={() => resetFields(["vignette", "grain"], "Reset Effects")}>
                 <EffectsPanel editor={editor} />
               </Section>
 
-              <Section id="calibration" dirty={dirty(["calibration"])} title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
+              <Section id="calibration" dirty={dirty(["calibration"])} onHold={holdOf("Calibration", ["calibration"])} title="Calibration" onReset={() => resetFields(["calibration"], "Reset Calibration")}>
                 <CalibrationPanel editor={editor} />
               </Section>
             </>
@@ -339,13 +420,33 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
         </div>
       )}
 
+      {bar.count > 1 && bar.autoSync && (
+        <p className="shrink-0 border-t border-neutral-800 px-3 py-1 text-[11px] leading-tight text-neutral-400" data-testid="auto-sync-note">
+          Auto Sync is on: changes go to all {bar.count} photos. Exposure and white balance are applied as a change (each photo keeps its own difference).
+        </p>
+      )}
       <div className="flex h-9 shrink-0 gap-2 border-t border-neutral-800 px-3 py-1" data-testid="right-bar">
+        {bar.count > 1 && (
+          <button
+            role="switch"
+            aria-checked={bar.autoSync}
+            onClick={() => bar.onAutoSync(!bar.autoSync)}
+            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-2 text-xs ${bar.autoSync ? "bg-sky-800 text-sky-50" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+            title={`Every change goes to all ${bar.count} selected photos${hint("autoSync")}. Exposure and white balance move by the same amount on each photo (relative); everything else is copied`}
+            data-testid="auto-sync-switch"
+          >
+            <span className={`relative inline-block h-3 w-6 rounded-full ${bar.autoSync ? "bg-sky-300" : "bg-neutral-600"}`} aria-hidden>
+              <span className={`absolute top-0.5 size-2 rounded-full bg-neutral-950 transition-all ${bar.autoSync ? "left-3.5" : "left-0.5"}`} />
+            </span>
+            {bar.autoSync ? `Auto Sync · ${bar.count}` : "Auto Sync"}
+          </button>
+        )}
         {bar.count > 1 ? (
           <button
-            className="flex flex-1 items-center justify-center gap-1 rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
+            className="flex flex-1 items-center justify-center gap-1 whitespace-nowrap rounded bg-neutral-800 text-xs hover:bg-neutral-700 disabled:opacity-40"
             disabled={syncing}
             onClick={(e) => bar.onSync(e.altKey)}
-            title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
+            title={syncing ? BUSY_WHY.paste_sync : `Synchronize settings with the ${bar.count - 1} other selected photos${bar.autoSync ? " once (Auto Sync does it for every change)" : ""} (Alt: no dialog, Cmd+Alt+S)${hint("sync")}`}
             data-testid="sync-settings"
           >
             <RefreshCw className="size-3.5" /> Sync…

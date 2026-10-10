@@ -4,6 +4,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { neutralAdjustments, copyFields } from "../lib/adjust";
+import { toStored } from "../lib/crop";
 import { completeAdjustments, lerpAdjustments, orientPoint } from "../ipc";
 import type {
   EditBatchInfo,
@@ -80,8 +81,24 @@ import type {
   MetadataFilterOptions,
   NumberRange,
   SuggestionReason,
+  CaptureTimeEdit,
+  CaptureTimeEditResult,
+  CaptureTimeSnapshot,
+  ImageMetadata,
+  PreviewVariant,
+  RejectStrictness,
+  UprightMode,
+  UprightResult,
+  CameraBody,
+  EditBatchKind,
+  PendingSuggestion,
+  SuggestionKinds,
+  SyncDeltaOptions,
+  SyncDeltaResult,
+  TransformBounds,
+  WhiteBalance,
 } from "../ipc";
-import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS } from "../ipc";
+import { isKeeperValues, DEFAULT_SCENE_APPLY_OPTIONS as DEFAULT_APPLY, MINOR_SCENE_MAX_KEEPERS, ALL_ADJUSTMENT_FIELDS } from "../ipc";
 
 const TAGS: CullTag[] = ["blink", "missed_focus", "motion_blur", "creative_blur", "underexposed", "overexposed", "duplicate_burst"];
 const LABELS = [null, null, null, "red", "yellow", "green", "blue", "purple"] as const;
@@ -227,6 +244,8 @@ declare global {
     __ipcLog: MockCall[];
     /** Test hook: delay (ms) before a `render_preview` call with this per-slot sequence number resolves. */
     __mockRenderDelay?: (seq: number, slot: string) => number;
+    /** Test hook (IPC v19.1): delay (ms) before the mock's edited preview of a changed photo is ready. */
+    __mockEditedDelay?: number;
     /** Render concurrency observed by the mock (max renders awaiting a result at once). */
     __mockRenderStats?: { inflight: number; maxInflight: number };
     /** Test hook: when true, export jobs only advance through `__mockExportStep`. */
@@ -369,7 +388,7 @@ export function installMockBackend(count: number) {
       path: `/shoot/DSC${String(id).padStart(5, "0")}.ARW`,
       fileName: `DSC${String(id).padStart(5, "0")}.ARW`,
       format: "arw",
-      camera: { make: "sony", model: "ILCE-7M4", sensorLayout: "bayer" },
+      camera: { make: "sony", model: "ILCE-7M4", sensorLayout: "bayer", serial: "06258214" },
       capture: {
         capturedAtMs: base + i * 300 + group * 20000,
         iso: 100 * (1 + (i % 6)),
@@ -410,6 +429,7 @@ export function installMockBackend(count: number) {
         reasons: [],
       },
       hasEdits: false,
+      editedPreview: null,
       // v18: every 4th frame came with a sidecar.
       xmp: { dirty: false, syncedAtMs: null, error: null, hasSidecar: id % 4 === 0 },
       pickOrigin: null,
@@ -437,6 +457,7 @@ export function installMockBackend(count: number) {
       if (r.id % 10 === 3) r.missingSinceMs = base + 3_600_000;
     }
   }
+  const params0 = new URLSearchParams(location.search);
   // A few pre-set flags so screenshots show something (v18: set by the user).
   for (let i = 0; i < count; i += 7) {
     rows[i].pick = i % 14 === 0 ? "pick" : "reject";
@@ -451,11 +472,29 @@ export function installMockBackend(count: number) {
         Object.assign(r, { fileName: `${stem}.JPG`, path: r.path.replace(/\.[^.]+$/, ".JPG"), format: "jpeg" });
       } else if (r.id % 4 === 1) {
         Object.assign(r, { fileName: `${stem}.RAF`, path: r.path.replace(/\.[^.]+$/, ".RAF"), format: "raf" });
-        r.camera = { make: "fujifilm", model: "X-T5", sensorLayout: "x_trans" };
+        r.camera = { make: "fujifilm", model: "X-T5", sensorLayout: "x_trans", serial: "61000657" };
         r.capture = { ...r.capture, lens: "XF33mmF1.4 R LM WR", focalLengthMm: 33, aperture: 1.4 };
       }
       if (r.id % 6 === 0) r.capture = { ...r.capture, lens: null };
     }
+  }
+  // v19: original EXIF time = corrected time until edited. `?twocams=1`: every 3rd frame is a Canon whose
+  // clock ran 1 h ahead (Edit Capture Time > sync cameras fixture); default data stays one Sony body.
+  // v19.2 `?twobodies=1`: every 3rd frame comes from a second ILCE-7M4 (serial 05119876) whose clock ran
+  // 1 h ahead (same model, different body).
+  for (const r of rows) {
+    if (params0.get("twobodies") === "1" && r.id % 3 === 0) {
+      r.camera = { ...r.camera, serial: "05119876" };
+      r.capture = { ...r.capture, capturedAtMs: (r.capture.capturedAtMs ?? 0) + 3_600_000 };
+    }
+    if (params0.get("twocams") === "1" && r.id % 3 === 0) {
+      r.camera = { make: "canon", model: "EOS R5", sensorLayout: "bayer", serial: "032021001234" };
+      r.fileName = r.fileName.replace("DSC", "IMG_").replace(/\.ARW$/, ".CR3");
+      r.path = `/shoot/${r.fileName}`;
+      r.format = "cr3";
+      r.capture = { ...r.capture, capturedAtMs: (r.capture.capturedAtMs ?? 0) + 3_600_000 };
+    }
+    r.capture = { ...r.capture, originalCapturedAtMs: r.capture.capturedAtMs, captureTimeSource: "exif" };
   }
   for (let i = 0; i < count; i += 5) rows[i].rating = (i / 5) % 6;
   for (let i = 0; i < count; i += 11) rows[i].colorLabel = LABELS[i % LABELS.length];
@@ -535,6 +574,8 @@ export function installMockBackend(count: number) {
     workflowStep: WorkflowStep;
     createdAtMs: number;
     lastOpenedAtMs: number | null;
+    /** v19 (`set_project_reject_strictness`); missing = balanced. */
+    rejectStrictness?: RejectStrictness;
   }
   let projects: MockProject[] =
     params.get("projects") === "0"
@@ -552,6 +593,7 @@ export function installMockBackend(count: number) {
     if (!p) throw { kind: "not_found", message: `project ${id}` };
     return p;
   };
+  const baseSuggest = new Map<number, PickFlag>();
   const keeper = (r: RawImageEntry) => params.get("nokeepers") !== "1" && isKeeperValues(catalog.keeperRule, r.pick, r.rating, r.quality?.suggestedPick);
   function projectDto(p: MockProject): Project {
     const photos = rows.filter((r) => p.folderIds.includes(r.folderId));
@@ -575,6 +617,7 @@ export function installMockBackend(count: number) {
       coverChosen: p.coverImageId != null,
       coverThumbnailPath: coverRow?.thumbnail.status === "ready" ? coverRow.thumbnail.path : null,
       shootType: p.shootType,
+      rejectStrictness: p.rejectStrictness ?? "balanced",
       workflowStep: p.workflowStep,
       createdAtMs: p.createdAtMs,
       lastOpenedAtMs: p.lastOpenedAtMs,
@@ -622,6 +665,13 @@ export function installMockBackend(count: number) {
   const originOk = (r: RawImageEntry, o: PickOrigin | null | undefined) =>
     o == null || (r.pick !== "unflagged" && (o === "auto" ? r.pickOrigin === "auto" : r.pickOrigin !== "auto"));
 
+  /** v19.2 `ImageQuery.suggested` (Rust `repo::suggested_sql`): untouched (analysed, unflagged, 0 stars) with that suggestion. */
+  const pendingOk = (r: RawImageEntry, kind: PendingSuggestion) => {
+    if (!r.quality || r.pick !== "unflagged" || r.rating !== 0) return false;
+    if (kind === "reject") return r.quality.suggestedPick === "reject";
+    if (kind === "pick") return r.quality.suggestedPick === "pick";
+    return r.quality.suggestedPick === "unflagged" && r.quality.suggestedRating > 0;
+  };
   function query(q: ImageQuery): number[] {
     let out = rows.filter((r) => {
       if (!inScope(r, q.folderId, q.projectId)) return false;
@@ -640,6 +690,7 @@ export function installMockBackend(count: number) {
       if (q.sceneId != null && r.sceneId !== q.sceneId) return false;
       if (q.missingOnly && r.missingSinceMs == null) return false;
       if (q.keepersOnly && !keeper(r)) return false;
+      if (q.suggested != null && !pendingOk(r, q.suggested)) return false;
       if (!metaOk(r, q.metadata)) return false;
       return true;
     });
@@ -678,6 +729,7 @@ export function installMockBackend(count: number) {
       if (!m.extensions.map((e) => e.toLowerCase()).includes(extOf(r))) return false;
     }
     if (on("cameras") && m.cameras?.length && !m.cameras.some((c) => c.make === r.camera.make && (blank(c.model) ?? null) === blank(r.camera.model))) return false;
+    if (on("bodies") && m.bodies?.length && !m.bodies.some((b) => b.make === r.camera.make && blank(b.model) === blank(r.camera.model) && blank(b.serial) === blank(r.camera.serial))) return false;
     if (on("lenses") && m.lenses?.length && !m.lenses.some((l) => (l == null ? null : l.trim()) === blank(r.capture.lens))) return false;
     if (on("iso") && !inRange(r.capture.iso, m.iso)) return false;
     if (on("focalLengthMm") && !inRange(round1(r.capture.focalLengthMm), m.focalLengthMm)) return false;
@@ -729,6 +781,17 @@ export function installMockBackend(count: number) {
       cameras: tally("cameras", (r) => ({ make: r.camera.make, model: blank(r.camera.model) }))
         .map(({ key, count }) => ({ camera: key, count }))
         .sort((a, b) => Number(a.camera.model == null) - Number(b.camera.model == null) || a.camera.make.localeCompare(b.camera.make) || (a.camera.model ?? "").localeCompare(b.camera.model ?? "")),
+      // v19.2: per body (Rust `metadata_filter_options` order: known models by make/model, then serial, unknown last).
+      bodies: tally("bodies", (r): CameraBody => ({ make: r.camera.make, model: blank(r.camera.model), serial: blank(r.camera.serial) }))
+        .map(({ key, count }) => ({ body: key, count }))
+        .sort(
+          (a, b) =>
+            Number(a.body.model == null) - Number(b.body.model == null) ||
+            (a.body.make < b.body.make ? -1 : a.body.make > b.body.make ? 1 : 0) ||
+            (a.body.model ?? "").localeCompare(b.body.model ?? "") ||
+            Number(a.body.serial == null) - Number(b.body.serial == null) ||
+            (a.body.serial ?? "").localeCompare(b.body.serial ?? ""),
+        ),
       lenses: tally("lenses", (r) => blank(r.capture.lens))
         .map(({ key, count }) => ({ lens: key, count }))
         .sort((a, b) => nullsLast(a.lens, b.lens, (x, y) => x.localeCompare(y))),
@@ -809,6 +872,9 @@ export function installMockBackend(count: number) {
       burstGroups: new Set(scope.map((r) => r.burstGroupId).filter((g) => g != null)).size,
       burstNonKeepers: scope.filter((r) => r.burstGroupId != null && !r.isBurstKeeper).length,
       missing: scope.filter((r) => r.missingSinceMs != null).length,
+      suggestedReject: scope.filter((r) => pendingOk(r, "reject")).length,
+      suggestedPick: scope.filter((r) => pendingOk(r, "pick")).length,
+      suggestedRating: scope.filter((r) => pendingOk(r, "rating")).length,
     };
   }
 
@@ -864,7 +930,17 @@ export function installMockBackend(count: number) {
       currentEntryId: h.cursor < 0 ? null : h.entries[h.cursor].id,
       canUndo: h.cursor > 0,
       canRedo: h.cursor >= 0 && h.cursor < h.entries.length - 1,
+      appliedPresetId: appliedPresetOf(id),
     };
+  };
+  /** v19 (Rust `history::applied_preset`): the last applied preset while its fields still match the apply. */
+  const appliedPresets = new Map<number, { presetId: number; snap: ParametricAdjustments }>();
+  const appliedPresetOf = (id: number): number | null => {
+    const a = appliedPresets.get(id);
+    const p = a && presets.find((x) => x.id === a.presetId);
+    if (!a || !p || p.fields.length === 0) return null;
+    const cur = completeAdjustments(getAdj(id));
+    return JSON.stringify(copyFields(cur, a.snap, p.fields)) === JSON.stringify(cur) ? p.id : null;
   };
   const isNeutral = (a: ParametricAdjustments) => JSON.stringify(completeAdjustments(a)) === JSON.stringify(neutral());
   /** IPC v15 `adjustment_history.source` mirror (Rust `history::source_for_label`). */
@@ -875,6 +951,25 @@ export function installMockBackend(count: number) {
     if (label === "Paste Settings" || label === "Sync Settings" || label === "Paste from Previous") return "pasted";
     return "user";
   };
+  /**
+   * IPC v19.1 edited previews: like the backend's background worker, renders the photo's edited preview after a
+   * delay (`window.__mockEditedDelay`, default 120 ms) unless the settings changed meanwhile, then emits
+   * `editedPreviewChanged`. URLs are content-addressed: `/mock/edited/<id>/<hash>/{thumb,preview}.jpg`.
+   */
+  function renderEdited(id: number) {
+    const key = JSON.stringify(adjs.get(id) ?? null);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0;
+    const hash = h.toString(16).padStart(8, "0").repeat(2);
+    setTimeout(() => {
+      const r = byId.get(id);
+      if (!r || JSON.stringify(adjs.get(id) ?? null) !== key) return;
+      const preview = r.hasEdits ? { thumbUrl: `/mock/edited/${id}/${hash}/thumb.jpg`, previewUrl: `/mock/edited/${id}/${hash}/preview.jpg` } : null;
+      if (JSON.stringify(preview) === JSON.stringify(r.editedPreview ?? null)) return;
+      r.editedPreview = preview;
+      void emit("edited-preview-changed", { imageId: id, preview });
+    }, window.__mockEditedDelay ?? 120);
+  }
   function commit(id: number, next0: ParametricAdjustments, label: string, coalesce = true) {
     const next = completeAdjustments(next0);
     const cur = getAdj(id);
@@ -897,6 +992,7 @@ export function installMockBackend(count: number) {
     adjs.set(id, next);
     const r = byId.get(id);
     if (r) r.hasEdits = !isNeutral(next);
+    renderEdited(id);
   }
   function jump(id: number, cursor: number) {
     const h = histOf(id);
@@ -907,6 +1003,7 @@ export function installMockBackend(count: number) {
     adjs.set(id, snap);
     const r = byId.get(id);
     if (r) r.hasEdits = !isNeutral(snap);
+    renderEdited(id);
     return { adjustments: snap, history: historyDto(id) };
   }
   function histogram(a: ParametricAdjustments) {
@@ -1045,7 +1142,7 @@ export function installMockBackend(count: number) {
   // v17: `bases` = representatives the batch (an apply) was made from, with the batch that wrote their settings.
   const batches = new Map<
     number,
-    { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[]; bases: { imageId: number; base: number }[] }
+    { label: string; items: MockBatchItem[]; undone: boolean; undoneAt: number | null; createdAt: number; sceneIds: number[]; bases: { imageId: number; base: number }[]; kind?: EditBatchKind }
   >();
   let batchSeq = 0;
   // IPC v15: skipped scenes, frames the last apply covered, apply cancel flag.
@@ -1131,7 +1228,13 @@ export function installMockBackend(count: number) {
     return {
       batchId,
       label: b.label,
-      kind: b.label === "Auto Edit (My Style)" ? "style_prediction" : "scene_apply",
+      kind:
+        b.kind ??
+        (b.label === "Auto Edit (My Style)"
+          ? "style_prediction"
+          : b.label === "Paste Settings" || b.label === "Sync Settings" || b.label === "Paste from Previous"
+            ? "paste"
+            : "scene_apply"),
       createdAtMs: b.createdAt,
       undoneAtMs: b.undoneAt,
       imageCount: b.items.length,
@@ -1200,6 +1303,53 @@ export function installMockBackend(count: number) {
       });
     }
     return out;
+  }
+  /**
+   * v19.2 `sync_delta` (Rust `develop::sync_delta`): the source gets `after`, every target the changed groups (never
+   * crop / masks / transform), exposure and white balance relatively by default; one batch of kind `sync`.
+   * As-shot white balance resolves to the mock's as-shot value (5200 K, +8).
+   */
+  function syncDelta(sourceId: number, before0: ParametricAdjustments, after0: ParametricAdjustments, targetIds: number[], options: SyncDeltaOptions | null): SyncDeltaResult {
+    const before = completeAdjustments(before0);
+    const after = completeAdjustments(after0);
+    const relative = options?.relative ?? (["exposure", "white_balance"] as AdjustmentField[]);
+    const bad = relative.find((f) => f !== "exposure" && f !== "white_balance");
+    if (bad) throw { kind: "invalid_argument", message: `${bad} cannot be synced relatively (only exposure and white_balance)` };
+    const label = options?.label ?? "Auto Sync";
+    if (label.length === 0 || label.length > 100) throw { kind: "invalid_argument", message: "label must be 1..=100 characters" };
+    for (const id of [sourceId, ...targetIds]) if (!byId.get(id)) throw { kind: "not_found", message: `image ${id}` };
+    const NEVER: AdjustmentField[] = ["crop", "masks", "transform", "noise_reduction_luminance", "noise_reduction_color"];
+    const all = ALL_ADJUSTMENT_FIELDS;
+    const only = options?.fields ?? null;
+    const fields = all.filter((f) => !NEVER.includes(f) && (!only || only.includes(f)) && JSON.stringify(copyFields(after, before, [f])) !== JSON.stringify(after));
+    const relFields = fields.filter((f) => relative.includes(f));
+    const asShot = { temperatureK: 5200, tint: 8 };
+    const vals = (wb: WhiteBalance) => (wb.mode === "custom" ? { temperatureK: wb.temperatureK, tint: wb.tint } : asShot);
+    const shiftWb = (t: WhiteBalance): WhiteBalance => {
+      if (JSON.stringify(before.whiteBalance) === JSON.stringify(after.whiteBalance)) return t;
+      if (after.whiteBalance.mode === "as_shot") return after.whiteBalance;
+      const [b, a, c] = [vals(before.whiteBalance), vals(after.whiteBalance), vals(t)];
+      const m = Math.max(1e6 / c.temperatureK + 1e6 / a.temperatureK - 1e6 / b.temperatureK, 20);
+      return { mode: "custom", temperatureK: Math.round(Math.min(50000, Math.max(2000, 1e6 / m))), tint: Math.round(Math.min(150, Math.max(-150, c.tint + a.tint - b.tint))) };
+    };
+    const items: MockBatchItem[] = [];
+    const src = batchCommit(sourceId, after, label, null, null);
+    if (src) items.push(src);
+    const seen = new Set([sourceId]);
+    if (fields.length)
+      for (const id of targetIds) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const cur = completeAdjustments(getAdj(id));
+        let next = copyFields(cur, after, fields.filter((f) => !relFields.includes(f)));
+        if (relFields.includes("exposure")) next = { ...next, exposure: Math.round(Math.min(5, Math.max(-5, cur.exposure + after.exposure - before.exposure)) * 100) / 100 };
+        if (relFields.includes("white_balance")) next = { ...next, whiteBalance: shiftWb(cur.whiteBalance) };
+        const it = batchCommit(id, next, label, null, null);
+        if (it) items.push(it);
+      }
+    const batchId = recordItems(label, items, []);
+    if (batchId != null) batches.get(batchId)!.kind = "sync";
+    return { batch: { batchId, label, changedIds: items.map((i) => i.id) }, fields, relativeFields: relFields, absoluteWbIds: [], history: historyDto(sourceId) };
   }
   /** Commits `fn` on every image as one undoable batch (only images that change are recorded). */
   function recordBatch(label: string, ids: number[], fn: (a: ParametricAdjustments) => ParametricAdjustments, sceneIds: number[] = []): EditBatchResult {
@@ -1554,17 +1704,24 @@ export function installMockBackend(count: number) {
         case "read_xmp":
           return { ...ok, skipped: ids.length };
         case "apply_suggestions": {
+          // v19.2 `kinds` (null = all): picks / rejects / stars; a suggested "no flag" needs both flag kinds.
+          const kinds = (args.kinds as SuggestionKinds | null | undefined) ?? { picks: true, rejects: true, stars: true };
+          for (const i of ids) if (!byId.get(i)) throw { kind: "not_found", message: `image ${i}` };
           let applied = 0;
           ids.forEach((i) => {
             const r = byId.get(i);
             if (!r?.quality) return;
             if (args.onlyUnset && (r.pick !== "unflagged" || r.rating !== 0)) return;
+            const sp = r.quality.suggestedPick;
+            const takeFlag = sp === "pick" ? kinds.picks : sp === "reject" ? kinds.rejects : kinds.picks && kinds.rejects;
+            const nextPick = takeFlag ? sp : r.pick;
+            const nextRating = kinds.stars ? r.quality.suggestedRating : r.rating;
             // v18.1: only real changes count as applied.
-            if (r.pick === r.quality.suggestedPick && r.rating === r.quality.suggestedRating) return;
-            r.rating = r.quality.suggestedRating;
+            if (r.pick === nextPick && r.rating === nextRating) return;
+            r.rating = nextRating;
             // v18: a flag "Auto" changes is `auto`; an unchanged flag keeps its origin.
-            if (r.pick !== r.quality.suggestedPick) r.pickOrigin = r.quality.suggestedPick === "unflagged" ? null : "auto";
-            r.pick = r.quality.suggestedPick;
+            if (r.pick !== nextPick) r.pickOrigin = nextPick === "unflagged" ? null : "auto";
+            r.pick = nextPick;
             r.xmp = { ...r.xmp, dirty: true };
             applied++;
           });
@@ -1784,18 +1941,27 @@ export function installMockBackend(count: number) {
         case "render_preview":
           guardOriginal(args.id as number);
           return render(args.id as number, args.adjustments as ParametricAdjustments, args.options as RenderOptions);
+        // v19: Paste / Sync / Paste from Previous are one undoable batch (kind `paste`) over any selection.
         case "paste_settings":
-          return batch(ids, "Paste Settings", (a) => copyFields(a, args.adjustments as ParametricAdjustments, args.fields as AdjustmentField[]));
+          guardWrite();
+          return recordBatch("Paste Settings", [...new Set(ids)], (a) => copyFields(a, args.adjustments as ParametricAdjustments, args.fields as AdjustmentField[]));
         case "sync_settings": {
+          guardWrite();
           const src = getAdj(args.sourceId as number);
-          return batch(args.targetIds as number[], "Sync Settings", (a) => copyFields(a, src, args.fields as AdjustmentField[]));
+          return recordBatch("Sync Settings", [...new Set(args.targetIds as number[])], (a) => copyFields(a, src, args.fields as AdjustmentField[]));
+        }
+        case "sync_delta": {
+          guardWrite();
+          return syncDelta(args.sourceId as number, args.before as ParametricAdjustments, args.after as ParametricAdjustments, args.targetIds as number[], (args.options as SyncDeltaOptions | null) ?? null);
         }
         case "reset_adjustments":
           return batch(ids, "Reset", () => neutral());
         case "apply_preset": {
           const p = presets.find((x) => x.id === args.presetId);
           if (!p) throw { kind: "not_found", message: "preset" };
-          return batch(ids, `Preset: ${p.name}`, (a) => copyFields(a, p.adjustments, p.fields));
+          batch(ids, `Preset: ${p.name}`, (a) => copyFields(a, p.adjustments, p.fields));
+          for (const i of ids) appliedPresets.set(i, { presetId: p.id, snap: completeAdjustments(getAdj(i)) });
+          return null;
         }
         case "list_presets":
           return [...presets].sort((a, b) => a.name.localeCompare(b.name));
@@ -2285,9 +2451,9 @@ export function installMockBackend(count: number) {
           return recordBatch("Auto Edit (My Style)", ids, (a) => styleAdj(a));
         }
         case "paste_previous":
-          return batch(
-            (args.targetIds as number[]).filter((i) => i !== args.previousId),
+          return recordBatch(
             "Paste from Previous",
+            [...new Set((args.targetIds as number[]).filter((i) => i !== args.previousId))],
             (a) => copyFields(a, getAdj(args.previousId as number), (args.fields as AdjustmentField[] | null) ?? DEFAULT_PASTE_PREVIOUS),
           );
         case "undo_edit_batch": {
@@ -2371,6 +2537,174 @@ export function installMockBackend(count: number) {
         }
         case "get_render_stats":
           return mockStats(args.id as number, 0.5, 0.01);
+        // ---- IPC v19 ----
+        case "edit_capture_time": {
+          guardWrite();
+          const list = args.ids as number[];
+          const mode = args.mode as CaptureTimeEdit;
+          if (new Set(list).size !== list.length) throw { kind: "invalid_argument", message: "image listed twice" };
+          const rowOf = (i: number) => {
+            const r = byId.get(i);
+            if (!r) throw { kind: "not_found", message: `image ${i}` };
+            return r;
+          };
+          let targets = list.map(rowOf);
+          // v19.2: sync by body / model moves every photo of the target's project with that camera (ids ignored).
+          if (mode.kind === "sync_cameras" && mode.scope && mode.scope !== "selected") {
+            const t = rowOf(mode.targetId);
+            rowOf(mode.referenceId);
+            const proj = projectOfFolder(t.folderId);
+            const same = (r: RawImageEntry) =>
+              r.camera.make === t.camera.make && blank(r.camera.model) === blank(t.camera.model) && (mode.scope === "model" || blank(r.camera.serial) === blank(t.camera.serial));
+            targets = rows
+              .filter((r) => projectOfFolder(r.folderId) === proj && same(r))
+              .sort((a, b) => Number(a.capture.capturedAtMs == null) - Number(b.capture.capturedAtMs == null) || (a.capture.capturedAtMs ?? 0) - (b.capture.capturedAtMs ?? 0) || a.id - b.id);
+            if (targets.some((r) => r.id === mode.referenceId))
+              throw { kind: "invalid_argument", message: "the reference photo is from the camera being moved; pick a frame from the other camera" };
+          }
+          let offset: number | null = null;
+          if (mode.kind === "shift") offset = mode.offsetMs;
+          else if (mode.kind === "set_exact") {
+            const ref = targets.find((r) => r.id === mode.referenceId);
+            if (!ref) throw { kind: "invalid_argument", message: "the reference photo must be one of the selected photos" };
+            offset = ref.capture.capturedAtMs != null ? mode.capturedAtMs - ref.capture.capturedAtMs : null;
+          } else if (mode.kind === "sync_cameras") {
+            const a = rowOf(mode.referenceId).capture.capturedAtMs;
+            const b = rowOf(mode.targetId).capture.capturedAtMs;
+            if (a == null || b == null) throw { kind: "invalid_argument", message: "both photos used to sync the cameras need a capture time" };
+            offset = a - b;
+          }
+          const result: CaptureTimeEditResult = { changedIds: [], skippedIds: [], offsetMs: offset, previous: [] };
+          for (const r of targets) {
+            const cur = r.capture.capturedAtMs;
+            let next: { ms: number | null; source: "exif" | "user" } | null = null;
+            if (mode.kind === "revert") next = { ms: r.capture.originalCapturedAtMs ?? null, source: "exif" };
+            else if (mode.kind === "set_exact" && mode.referenceId === r.id && cur == null) next = { ms: mode.capturedAtMs, source: "user" };
+            else if (cur != null && offset != null) next = { ms: cur + offset, source: "user" };
+            if (!next || (next.ms === cur && next.source === (r.capture.captureTimeSource ?? "exif"))) {
+              result.skippedIds.push(r.id);
+              continue;
+            }
+            result.previous.push({ imageId: r.id, capturedAtMs: cur, source: r.capture.captureTimeSource ?? "exif" });
+            r.capture = { ...r.capture, capturedAtMs: next.ms, captureTimeSource: next.source };
+            r.xmp = { ...r.xmp, dirty: true };
+            result.changedIds.push(r.id);
+          }
+          return result;
+        }
+        case "restore_capture_times": {
+          guardWrite();
+          const snaps = args.snapshots as CaptureTimeSnapshot[];
+          for (const sn of snaps) if (!byId.get(sn.imageId)) throw { kind: "not_found", message: `image ${sn.imageId}` };
+          const changed: number[] = [];
+          for (const sn of snaps) {
+            const r = byId.get(sn.imageId)!;
+            if (r.capture.capturedAtMs === sn.capturedAtMs && r.capture.captureTimeSource === sn.source) continue;
+            r.capture = { ...r.capture, capturedAtMs: sn.capturedAtMs, captureTimeSource: sn.source };
+            r.xmp = { ...r.xmp, dirty: true };
+            changed.push(r.id);
+          }
+          return changed;
+        }
+        case "get_image_metadata": {
+          const r = byId.get(args.id as number);
+          if (!r) throw { kind: "not_found", message: `image ${args.id}` };
+          const ext = r.fileName.split(".").pop()!.toLowerCase();
+          const sidecarPath = r.format === "jpeg" ? `${r.path}.xmp` : r.path.replace(/\.[^.]+$/, ".xmp");
+          const meta: ImageMetadata = {
+            imageId: r.id,
+            path: r.path,
+            fileName: r.fileName,
+            folderPath: r.path.slice(0, r.path.lastIndexOf("/")),
+            format: r.format,
+            extension: ext,
+            fileSize: r.fileSize,
+            fileMtimeMs: r.fileMtimeMs,
+            capturedAtMs: r.capture.capturedAtMs,
+            originalCapturedAtMs: r.capture.originalCapturedAtMs ?? null,
+            captureTimeSource: r.capture.captureTimeSource ?? "exif",
+            camera: r.camera,
+            lens: r.capture.lens,
+            iso: r.capture.iso,
+            shutterSeconds: r.capture.shutterSeconds,
+            aperture: r.capture.aperture,
+            focalLengthMm: r.capture.focalLengthMm,
+            focalLength35mm: r.capture.focalLengthMm,
+            exposureCompensationEv: r.id % 4 === 0 ? -0.7 : 0,
+            flashFired: false,
+            cameraSerial: r.camera.serial ?? null,
+            width: r.width,
+            height: r.height,
+            orientation: r.orientation,
+            // Every 5th frame carries GPS.
+            gps: r.id % 5 === 0 ? { latitude: 51.500729, longitude: -0.124625, altitudeM: 12 } : null,
+            sidecarPath,
+            sidecarExists: r.xmp.hasSidecar,
+            companionPath: r.companionPath,
+            missing: r.missingSinceMs != null,
+          };
+          return meta;
+        }
+        case "auto_upright": {
+          if (!byId.get(args.id as number)) throw { kind: "not_found", message: `image ${args.id}` };
+          const mode = args.mode as UprightMode;
+          const live = completeAdjustments((args.adjustments as ParametricAdjustments | null) ?? getAdj(args.id as number));
+          // `?upright=none`: no usable lines (Lightroom leaves the photo as it is).
+          if (mode === "off") return { mode, solution: null, message: null } satisfies UprightResult;
+          if (params.get("upright") === "none" || (mode === "guided" && (live.transform.guides ?? []).length < 2))
+            return { mode, solution: null, message: mode === "guided" ? "Draw at least two guides" : `No straight lines found for ${mode}` } satisfies UprightResult;
+          const deg = mode === "level" ? 1.2 : mode === "vertical" ? 1.0 : 0.8;
+          const rad = (deg * Math.PI) / 180;
+          const k = mode === "level" ? 0 : 0.04;
+          return {
+            mode,
+            solution: { mode, matrix: [Math.cos(rad), -Math.sin(rad), 0, Math.sin(rad), Math.cos(rad), 0, 0, k, 1], rotationDeg: deg, crs: [] },
+            message: null,
+          } satisfies UprightResult;
+        }
+        // v19.3: the mock does not warp pixels; it reports a keystone-like trapezoid (bottom corners pulled in by
+        // d = 0.06 with Upright on, plus |vertical| / 100 * 0.2) so the crop overlay's warp outline can be tested.
+        case "get_transform_bounds": {
+          guardOriginal(args.id as number);
+          const live = completeAdjustments(args.adjustments as ParametricAdjustments);
+          const t = live.transform;
+          const d = Math.min(0.3, (t.upright !== "off" ? 0.06 : 0) + (Math.abs(t.vertical) / 100) * 0.2);
+          if (d <= 0) return { validQuad: null, constrainedCrop: null } satisfies TransformBounds;
+          // Clockwise on screen (y down), display (oriented) fractions.
+          const validQuad: [number, number][] = [[0, 0], [1, 0], [1 - d, 1], [d, 1]];
+          // Mock simplification: an enabled crop is returned as is; a disabled one becomes the largest frame of the
+          // photo's aspect inside the trapezoid (height 1 - 2d, touching the bottom edge).
+          const o = byId.get(args.id as number)?.orientation ?? 1;
+          const constrainedCrop = live.crop.enabled ? live.crop : toStored({ l: d, t: 2 * d, r: 1 - d, b: 1 }, o, 0);
+          return { validQuad, constrainedCrop } satisfies TransformBounds;
+        }
+        case "render_preview_variant": {
+          guardOriginal(args.id as number);
+          const v = args.variant as PreviewVariant;
+          const live = completeAdjustments(args.adjustments as ParametricAdjustments);
+          let resolved: ParametricAdjustments;
+          if (v.kind === "preset") {
+            const p = presets.find((x) => x.id === v.presetId);
+            // Imported style presets are not stored in the mock (like `resolve_preset`): they preview as the live settings.
+            resolved = p ? copyFields(live, p.adjustments, p.fields) : live;
+          } else {
+            if (!v.fields.length) throw { kind: "invalid_argument", message: "fields must not be empty" };
+            resolved = copyFields(live, neutral(), v.fields);
+          }
+          return render(args.id as number, resolved, args.options as RenderOptions);
+        }
+        case "set_project_reject_strictness":
+          guardWrite();
+          requireProject(args.projectId as number).rejectStrictness = args.strictness as RejectStrictness;
+          // The scorer re-evaluates suggestions: conservative drops borderline rejects, aggressive adds every non-best burst frame.
+          for (const r of rows) {
+            if (!r.quality || projectOfFolder(r.folderId) !== (args.projectId as number)) continue;
+            const base = (baseSuggest.get(r.id) ?? (baseSuggest.set(r.id, r.quality.suggestedPick), r.quality.suggestedPick)) as PickFlag;
+            const st = args.strictness as RejectStrictness;
+            const next: PickFlag = st === "conservative" ? (base === "reject" && r.quality.overall >= 0.1 ? "unflagged" : base) : st === "aggressive" ? (base === "unflagged" && r.burstGroupId != null && !r.isBurstKeeper ? "reject" : base) : base;
+            r.quality = { ...r.quality, suggestedPick: next };
+          }
+          return null;
         case "plugin:dialog|open":
           return (args.options as { directory?: boolean } | undefined)?.directory ? (window.__mockPickDir !== undefined ? window.__mockPickDir : "/mock/export/Smith Wedding") : "/mock/import/Moody Blue.cube";
         default:

@@ -215,7 +215,7 @@ test.describe("crop straighten preview", () => {
     await page.mouse.up();
     await expect(page.getByTestId("crop-grid-line")).toHaveCount(0);
     // Clockwise photo rotation = a negative crs:CropAngle.
-    await expect(page.getByTestId("cropbar-angle-value")).toHaveText("-8.0°");
+    await expect(page.getByTestId("slider-value-crop-angle")).toHaveText("-8.0°");
     expect(insideRotated(await rectOf(page), 1.5, 8)).toBe(true);
     await page.keyboard.press("Enter");
     await expect.poll(async () => (await saved(page)).length).toBe(1);
@@ -244,7 +244,7 @@ test.describe("crop straighten preview", () => {
     await expect(page.getByTestId("crop-straighten-line")).toHaveCount(0);
     // Levelling a line that slopes clockwise turns the photo counter-clockwise (rotation -4, crs:CropAngle +4).
     await expect(page.getByTestId("view-main")).toHaveAttribute("data-rotation", "-4.00");
-    await expect(page.getByTestId("cropbar-angle-value")).toHaveText("+4.0°");
+    await expect(page.getByTestId("slider-value-crop-angle")).toHaveText("+4.0°");
     await shot(page, `${P}05-straightened`);
   });
 

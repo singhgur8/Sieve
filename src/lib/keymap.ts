@@ -22,6 +22,11 @@ export type ActionId =
   | "developEscape"
   | "cropSwap"
   | "cropLock"
+  | "cropOverlay"
+  | "cropOverlayRotate"
+  | "cropReset"
+  | "cropStraightenDrag"
+  | "cropAutoStraighten"
   | "panelsToggle"
   | "panelsHide"
   | "bwToggle"
@@ -39,6 +44,8 @@ export type ActionId =
   | "zoomDevelop"
   | "face"
   | "info"
+  | "photoInfo"
+  | "captureTime"
   | "keeper"
   | "keeperSet"
   | "anchor"
@@ -55,14 +62,18 @@ export type ActionId =
   | "split"
   | "crop"
   | "cropCommit"
+  | "guided"
   | "undoAdj"
   | "redoAdj"
   | "undoCull"
   | "redoCull"
   | "copy"
+  | "copyAll"
+  | "pasteAll"
   | "paste"
   | "sync"
   | "syncQuiet"
+  | "autoSync"
   | "autoTone"
   | "autoWb"
   | "reset"
@@ -137,6 +148,11 @@ const digits = (from: number, to: number) => Array.from({ length: to - from + 1 
 export const KEYMAP: KeyDef[] = [
   // ---- crop tool (must come before the culling keys: X swaps the orientation, A locks the aspect, only while cropping) ----
   { id: "cropSwap", group: "Develop", label: "Swap crop orientation (landscape / portrait)", chords: [c("x")], modes: ["develop"], display: ["X"], where: "While cropping", needs: "crop" },
+  { id: "cropOverlay", group: "Develop", label: "Cycle the crop guide overlay (thirds, grid, golden ratio / spiral, diagonal, triangle, aspect ratios)", chords: [c("o")], modes: ["develop"], display: ["O"], where: "While cropping", needs: "crop" },
+  { id: "cropOverlayRotate", group: "Develop", label: "Rotate the crop guide overlay", chords: [c("o", { shift: true })], modes: ["develop"], display: ["Shift+O"], where: "While cropping", needs: "crop" },
+  { id: "cropReset", group: "Develop", label: "Reset the crop", chords: [c("r", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+R"], where: "Develop (resets only the crop, one history entry)" },
+  { id: "cropStraightenDrag", group: "Develop", label: "Draw a straighten line on the photo", chords: [], modes: ["develop"], display: ["Cmd-drag"], where: "While cropping", needs: "crop" },
+  { id: "cropAutoStraighten", group: "Develop", label: "Auto straighten (level the horizon)", chords: [], modes: ["develop"], display: ["Shift+double-click Angle"], where: "While cropping", needs: "crop" },
   { id: "cropLock", group: "Develop", label: "Lock / unlock the crop aspect ratio", chords: [c("a")], modes: ["develop"], display: ["A"], where: "While cropping", needs: "crop" },
 
   // ---- culling ----
@@ -188,10 +204,12 @@ export const KEYMAP: KeyDef[] = [
   { id: "filterBar", group: "Navigate", label: "Show / hide the filter bar", chords: [c("f", { mod: true })], modes: ALL, display: ["Cmd+F"], where: "Library" },
 
   // ---- view ----
-  { id: "zoomLoupe", group: "View", label: "Zoom Fit / 1:1 (never leaves the view)", chords: [c(" ")], modes: ["loupe", "compare"], display: ["Space"], where: "Loupe, Compare" },
-  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100%", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
+  { id: "zoomLoupe", group: "View", label: "Zoom Fit / 1:1 at the cursor (never leaves the view; zoom stays while you step with the arrows)", chords: [c(" ")], modes: ["loupe", "compare"], display: ["Space"], where: "Loupe, Compare" },
+  { id: "zoomDevelop", group: "View", label: "Zoom Fit / 100% at the cursor (stays while you step with the arrows)", chords: [c(" ")], modes: ["develop"], display: ["Space"], where: "Develop" },
   { id: "faceDevelop", group: "View", label: "Zoom to each face at 100% (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["develop"], display: ["F", "Shift+F"], where: "Develop" },
   { id: "face", group: "View", label: "Cycle face zoom (Shift = backwards)", chords: [c("f", { shift: "any" })], modes: ["loupe", "compare"], display: ["F", "Shift+F"], where: "Loupe, Compare" },
+  { id: "photoInfo", group: "View", label: "Show / hide the photo info panel (time, camera, exposure, file)", chords: [c("i", { mod: true })], modes: ALL, display: ["Cmd+I"], where: "Library, Develop" },
+  { id: "captureTime", group: "Library", label: "Edit capture time: shift, set or sync two cameras", chords: [c("t", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+T"], where: "Library, Develop" },
   { id: "info", group: "View", label: "Cycle info overlay (full / filename / hidden)", chords: [c("i")], modes: ["loupe", "compare"], display: ["I"], where: "Loupe, Compare" },
 
   // ---- develop ----
@@ -199,16 +217,22 @@ export const KEYMAP: KeyDef[] = [
   { id: "split", group: "Develop", label: "Split view", chords: [c("y")], modes: ["develop"], display: ["Y"], where: "Develop" },
   { id: "crop", group: "Develop", label: "Crop tool (again: apply)", chords: [c("r")], modes: ["develop"], display: ["R"], where: "Develop" },
   { id: "cropCommit", group: "Develop", label: "Apply crop (Esc cancels it)", chords: [c("Enter")], modes: ["develop"], display: ["Enter"], where: "While cropping" },
+  { id: "guided", group: "Develop", label: "Guided Upright tool: draw up to 4 guide lines (Esc exits)", chords: [c("t", { shift: true })], modes: ["develop"], display: ["Shift+T"], where: "Develop" },
   { id: "undoAdj", group: "Develop", label: "Undo (culling or adjustment, newest first)", chords: [c("z", { mod: true })], modes: ["develop"], display: ["Cmd+Z"], where: "Develop" },
   { id: "redoAdj", group: "Develop", label: "Redo (culling or adjustment)", chords: [c("z", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+Z"], where: "Develop" },
   { id: "bwToggle", group: "Develop", label: "Toggle Black & White", chords: [c("v")], modes: ["develop"], display: ["V"], where: "Develop" },
   { id: "wbPicker", group: "Develop", label: "White balance picker (click a neutral grey)", chords: [c("w")], modes: ["develop"], display: ["W"], where: "Develop" },
-  { id: "pastePrev", group: "Develop", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
+  { id: "pastePrev", group: "Copy & paste settings", label: "Paste settings from the previous photo (not crop / masks)", chords: [c("v", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+V"], where: "Develop" },
   { id: "savePreset", group: "Develop", label: "Save preset...", chords: [c("n", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+N"], where: "Develop" },
-  { id: "copy", group: "Develop", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
-  { id: "paste", group: "Develop", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
-  { id: "sync", group: "Develop", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
-  { id: "syncQuiet", group: "Develop", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
+  { id: "copy", group: "Copy & paste settings", label: "Copy settings...", chords: [c("c", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+C"], where: "Develop" },
+  { id: "paste", group: "Copy & paste settings", label: "Paste settings (Grid: to the selection)", chords: [c("v", { mod: true, shift: true })], modes: ["develop", "grid"], display: ["Cmd+Shift+V"], where: "Develop, Grid" },
+  // Plain Cmd+C / Cmd+V: copy EVERY setting of the active photo (not crop / masks) and paste to every selected photo, one undoable
+  // batch. Work in the Library and in Develop.
+  { id: "copyAll", group: "Copy & paste settings", label: "Copy all settings of the active photo", chords: [c("c", { mod: true })], modes: ALL, display: ["Cmd+C"], where: "Everywhere (not while typing)" },
+  { id: "pasteAll", group: "Copy & paste settings", label: "Paste the copied settings to every selected photo (one Undo)", chords: [c("v", { mod: true })], modes: ALL, display: ["Cmd+V"], where: "Everywhere (not while typing)" },
+  { id: "sync", group: "Copy & paste settings", label: "Synchronize settings...", chords: [c("s", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+S"], where: "Develop" },
+  { id: "syncQuiet", group: "Copy & paste settings", label: "Sync settings without the dialog (remembered fields)", chords: [c("s", { mod: true, alt: true })], modes: ["develop"], display: ["Cmd+Alt+S"], where: "Develop" },
+  { id: "autoSync", group: "Copy & paste settings", label: "Auto Sync on / off (2+ photos selected: every change goes to all of them)", chords: [c("a", { mod: true, alt: true, shift: true })], modes: ["develop"], display: ["Cmd+Alt+Shift+A"], where: "Develop" },
   { id: "autoTone", group: "Develop", label: "Auto tone (Basic: Tone > Auto)", chords: [c("u", { mod: true })], modes: ["develop"], display: ["Cmd+U"], where: "Develop" },
   { id: "autoWb", group: "Develop", label: "Auto white balance", chords: [c("u", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+U"], where: "Develop" },
   { id: "reset", group: "Develop", label: "Reset all adjustments", chords: [c("r", { mod: true, shift: true })], modes: ["develop"], display: ["Cmd+Shift+R"], where: "Develop" },

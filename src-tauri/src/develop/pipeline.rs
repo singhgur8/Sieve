@@ -1061,7 +1061,11 @@ fn develop(
     let lops_c = lops.filter(|o| o.any_local_operator());
     let lops_base = lops.is_some_and(LocalOps::has_tone_local);
     let adapt_ctx = ctx.filter(|_| local.tone_local.is_some() || lops_base);
+    let cancel = super::cancel::Cancel::current();
     rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        if cancel.is_set() {
+            return;
+        }
         let fy = (y as f32 + 0.5 - view.frame_y) / view.frame_h.max(1e-3);
         for x in 0..w {
             let p = &mut row[x * 3..x * 3 + 3];
@@ -1140,7 +1144,11 @@ fn to_working_with<F: Fn(f32, f32) -> (f32, f32) + Sync>(
     let mut rgb = vec![0.0f32; w * h * 3];
     let Some((field, to_field)) = field else {
         let mul = setup.mul.map(|m| m / 65535.0);
+        let cancel = super::cancel::Cancel::current();
         rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).for_each(|(out, inp)| {
+            if cancel.is_set() {
+                return;
+            }
             for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0) {
                 let c = [
                     (f32::from(p[0]) * mul[0]).min(1.0),
@@ -1154,7 +1162,11 @@ fn to_working_with<F: Fn(f32, f32) -> (f32, f32) + Sync>(
     };
     let mul = setup.mul;
     let lo = (highlights::CLIP_LO * 65535.0) as u16;
+    let cancel = super::cancel::Cancel::current();
     rgb.par_chunks_mut(w * 3).zip(input.pixels.par_chunks(w * 3)).enumerate().for_each(|(y, (out, inp))| {
+        if cancel.is_set() {
+            return;
+        }
         let yc = y as f32 + 0.5;
         for (x, (o, p)) in out.as_chunks_mut::<3>().0.iter_mut().zip(inp.as_chunks::<3>().0).enumerate() {
             let mut c = [0, 1, 2].map(|k| f32::from(p[k]) / 65535.0 * mul[k]);
@@ -1204,8 +1216,10 @@ pub struct ToneContext {
     highlights: Option<HighlightField>,
     bw: usize,
     bh: usize,
-    /// Render frame (normalized, oriented, cropped) -> context grid (normalized).
+    /// Render frame (normalized, oriented, cropped) -> corrected frame (normalized).
     map: [f32; 6],
+    /// Corrected frame -> context grid (the source) for a Transform warp.
+    warp: Option<super::transform::Mat3>,
 }
 
 /// Grid long edge of the adaptation field (and size of the source it is computed from).
@@ -1230,20 +1244,25 @@ impl ToneContext {
     #[inline]
     fn to_source(&self, u: f32, v: f32) -> (f32, f32) {
         let m = &self.map;
-        (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5])
+        let p = (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+        match &self.warp {
+            Some(w) => super::transform::apply(w, f64::from(p.0), f64::from(p.1))
+                .map_or((-1.0, -1.0), |(x, y)| (x as f32, y as f32)),
+            None => p,
+        }
     }
 
     /// Maps render frames of `crop` + EXIF `orientation` (un-oriented source `src_w` x
     /// `src_h`) into this context (which must be of the un-oriented, uncropped source).
-    pub fn with_crop(
-        mut self,
-        crop: &crate::ipc::types::CropSettings,
-        src_w: u32,
-        src_h: u32,
-        orientation: u8,
-    ) -> Self {
-        let g = parity::crop_geometry(crop, src_w, src_h, orientation);
+    pub fn with_crop(self, crop: &crate::ipc::types::CropSettings, src_w: u32, src_h: u32, orientation: u8) -> Self {
+        self.with_geometry(&super::transform::Geometry::from(crop), src_w, src_h, orientation)
+    }
+
+    /// [`Self::with_crop`] for a render geometry (effective crop + Transform warp).
+    pub fn with_geometry(mut self, geo: &super::transform::Geometry, src_w: u32, src_h: u32, orientation: u8) -> Self {
+        let g = parity::frame_geometry(geo, src_w, src_h, orientation);
         self.map = g.to_source.map(|v| v as f32);
+        self.warp = g.warp;
         self
     }
 
@@ -1308,7 +1327,16 @@ impl ToneContext {
             || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_FINE), ld::RANGE, ld::RANGE_POWER),
             || parity::bilateral_grid(&grid, gw, gh, sigma(ld::SIGMA_COARSE), ld::RANGE, ld::RANGE_POWER),
         );
-        ToneContext { stats, fine, coarse, highlights: None, bw: gw, bh: gh, map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] }
+        ToneContext {
+            stats,
+            fine,
+            coarse,
+            highlights: None,
+            bw: gw,
+            bh: gh,
+            map: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            warp: None,
+        }
     }
 
     /// Fine and coarse bases (log2 Y) at render-frame coordinates `u`, `v` (0..=1).
@@ -1358,12 +1386,8 @@ pub fn tone_context_prepared(
     adjustments: &ParametricAdjustments,
     profile: &Profile,
 ) -> ToneContext {
-    tone_context_uncropped(whole, src, adjustments, profile).with_crop(
-        &adjustments.crop,
-        src.width,
-        src.height,
-        orientation,
-    )
+    let geo = super::transform::Geometry::of(adjustments, src.full_width, src.full_height);
+    tone_context_uncropped(whole, src, adjustments, profile).with_geometry(&geo, src.width, src.height, orientation)
 }
 
 /// The context before [`ToneContext::with_crop`]: depends only on the source and the white
@@ -1495,11 +1519,15 @@ pub fn render_masked(
     let (w, h) = (dev.width, dev.height);
     const BAND: usize = 8;
     let mut rgb = vec![0u8; w * h * 3];
+    let cancel = super::cancel::Cancel::current();
     let hist = rgb
         .par_chunks_mut(w * 3 * BAND)
         .zip(dev.rgb.par_chunks(w * 3 * BAND))
         .map(|(out, src)| {
             let mut hist = [[0u32; 256]; 4];
+            if cancel.is_set() {
+                return hist;
+            }
             for (o, s) in out.as_chunks_mut::<3>().0.iter_mut().zip(src.as_chunks::<3>().0) {
                 let q = [s[0], s[1], s[2]].map(|c| (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
                 o.copy_from_slice(&q);

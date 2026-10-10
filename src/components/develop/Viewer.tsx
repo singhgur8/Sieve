@@ -8,6 +8,8 @@ export interface Zoom {
   /** Centre of the visible area, normalised 0..1 of the full frame. */
   cx: number;
   cy: number;
+  /** Zoom factor relative to 100% (1 or unset = 100%; 2 = 200%). */
+  s?: number;
 }
 
 export interface Size {
@@ -52,7 +54,10 @@ interface Props {
   onSize: (s: Size) => void;
   onPan: (z: Zoom) => void;
   onPanEnd: () => void;
+  /** `at` is a position inside the viewer in px (double click). */
   onToggleZoom: (at?: { x: number; y: number }) => void;
+  /** Last pointer position over the viewer in px (null outside): Space zooms to the point under the cursor. */
+  hoverRef?: React.MutableRefObject<{ x: number; y: number } | null>;
   /** Margin (px) around the fitted image (crop tool: handles must not sit on the panel borders). */
   inset?: number;
   /** Live straighten preview: rotates the displayed frame about its centre (degrees, CSS sense). Crop tool only. */
@@ -90,6 +95,10 @@ export function Viewer(p: Props) {
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onMove = (e: React.PointerEvent) => {
+    if (p.hoverRef) {
+      const r = ref.current!.getBoundingClientRect();
+      p.hoverRef.current = { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
     if (splitDrag.current) {
       const r = ref.current!.getBoundingClientRect();
       p.onSplitPos(Math.min(0.98, Math.max(0.02, (e.clientX - r.left) / r.width)));
@@ -97,7 +106,7 @@ export function Viewer(p: Props) {
     }
     const d = drag.current;
     if (!d) return;
-    p.onPan({ on: true, cx: d.cx - (e.clientX - d.sx) / p.fw, cy: d.cy - (e.clientY - d.sy) / p.fh });
+    p.onPan({ ...p.zoom, on: true, cx: d.cx - (e.clientX - d.sx) / p.fw, cy: d.cy - (e.clientY - d.sy) / p.fh });
   };
   const onUp = () => {
     splitDrag.current = false;
@@ -118,17 +127,21 @@ export function Viewer(p: Props) {
       ref={ref}
       data-testid="viewer"
       data-zoomed={zoomed}
+      data-zoom-s={zoomed ? (p.zoom.s ?? 1) : undefined}
+      data-zoom-cx={zoomed ? p.zoom.cx.toFixed(4) : undefined}
+      data-zoom-cy={zoomed ? p.zoom.cy.toFixed(4) : undefined}
       className={`relative size-full overflow-hidden bg-black ${zoomed ? "cursor-grab active:cursor-grabbing" : ""}`}
       onPointerDown={onDown}
       onPointerMove={onMove}
       onPointerUp={onUp}
+      onPointerLeave={() => p.hoverRef && (p.hoverRef.current = null)}
       onDoubleClick={(e) => {
         const r = ref.current!.getBoundingClientRect();
-        p.onToggleZoom({ x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height });
+        p.onToggleZoom({ x: e.clientX - r.left, y: e.clientY - r.top });
       }}
     >
       {zoomed ? (
-        <div className="absolute" style={{ left: off.x, top: off.y, width: p.fw, height: p.fh }}>
+        <div className="absolute left-0 top-0" style={{ transform: `translate3d(${off.x}px, ${off.y}px, 0)`, width: p.fw, height: p.fh }}>
           {shown && <img src={shown.url} alt={alt(shown)} draggable={false} className={`${img} inset-0 size-full`} data-testid="view-main" />}
           {!p.showBefore && detail && p.detailRegion && (
             <img

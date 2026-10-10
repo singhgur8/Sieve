@@ -185,7 +185,7 @@ test.describe("rejected pile with reasons", () => {
     const auto = page.locator('[data-testid^="reject-reason-"][data-origin="auto"]').first();
     await expect(auto).toContainText("Auto-rejected");
     expect(((await auto.getAttribute("title")) ?? "").length).toBeGreaterThan("Auto-rejected".length); // a reason follows
-    await expect(page.getByTestId("cull-sum-auto")).not.toHaveText(/^0 auto/);
+    await expect(page.getByTestId("cull-sum-auto")).not.toHaveText(/^Auto 0/);
     await shot(page, "clarity-rejected-pile");
     // Loupe info shows the reason too.
     const id = Number((await auto.getAttribute("data-testid"))!.replace("reject-reason-", ""));

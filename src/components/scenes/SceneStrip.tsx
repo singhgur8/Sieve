@@ -29,6 +29,13 @@ export function SceneStrip({ api, filterId, onFilter, targets, activeId, onMatch
   const isAnchor = activeId != null && !!activeScene?.anchorIds.includes(activeId);
   const detectPct = progress && progress.task === "detect" && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : 0;
   const distinctScenes = new Set(targets.map((t) => api.sceneOfImage(t)?.id).filter((x) => x != null)).size;
+  const matchWhy = !focus
+    ? "Pick a scene (or a photo in one) first"
+    : focus.anchorIds.length === 0
+      ? "Mark 1-2 graded anchors first"
+      : focus.imageIds.length <= focus.anchorIds.length
+        ? "No other photos in this scene"
+        : null;
   const canSplit = !!activeScene && activeId != null && activeScene.imageIds[0] !== activeId;
 
   return (
@@ -109,6 +116,16 @@ export function SceneStrip({ api, filterId, onFilter, targets, activeId, onMatch
           );
         }}
       </Menu>
+      {matchWhy && (
+        <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-amber-300" data-testid="scene-match-why">
+          {matchWhy}
+          {focus && focus.anchorIds.length === 0 && activeScene && activeId != null && (
+            <button className="text-sky-300 hover:underline" data-testid="scene-match-why-fix" onClick={() => void api.toggleAnchor(activeId)}>
+              Mark this photo as anchor
+            </button>
+          )}
+        </span>
+      )}
       <button
         className="flex h-6 items-center gap-1 whitespace-nowrap rounded bg-emerald-800 px-2.5 text-xs font-medium text-emerald-100 hover:bg-emerald-700 disabled:bg-neutral-800 disabled:font-normal disabled:text-neutral-400"
         disabled={!focus || focus.anchorIds.length === 0 || focus.imageIds.length <= focus.anchorIds.length}

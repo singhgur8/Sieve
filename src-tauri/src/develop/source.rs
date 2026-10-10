@@ -13,6 +13,8 @@ use rayon::prelude::*;
 
 use crate::ipc::error::{AppError, AppResult};
 use crate::ipc::types::{CropSettings, NormRect};
+
+use super::transform::Geometry;
 use crate::raw::libraw;
 use crate::raw::raster::{self, SourceColorSpace};
 
@@ -290,12 +292,46 @@ pub struct Prepared {
     pub frame_long_edge: f32,
     /// Frame placement and scale (px per full-resolution frame px).
     pub view: super::pipeline::View,
+    /// Per pixel, how much of it shows the image (255 = all, 0 = nothing): `Some` only when
+    /// the frame leaves the (warped / rotated) image somewhere. The rest is filled with
+    /// [`FILL`] after the pipeline ([`fill_outside_rgb8`] / [`fill_outside_rgb16`]), as
+    /// Lightroom does, instead of repeating edge pixels.
+    pub coverage: Option<Vec<u8>>,
 }
 
 impl Prepared {
     pub fn bytes(&self) -> usize {
-        self.pixels.len() * 2
+        self.pixels.len() * 2 + self.coverage.as_ref().map_or(0, Vec::len)
     }
+}
+
+/// Fill of the area outside the image (Lightroom Classic shows and exports it white).
+pub const FILL: f32 = 1.0;
+
+/// Blends uncovered pixels of an RGB8 render towards [`FILL`].
+pub fn fill_outside_rgb8(rgb: &mut [u8], coverage: &[u8]) {
+    let fill = (FILL * 255.0).round();
+    rgb.par_chunks_mut(3).zip(coverage.par_iter()).for_each(|(p, &c)| {
+        if c < 255 {
+            let k = f32::from(c) / 255.0;
+            for v in p.iter_mut() {
+                *v = (f32::from(*v) * k + fill * (1.0 - k)).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+}
+
+/// Blends uncovered pixels of an RGB16 render (any output encoding) towards [`FILL`].
+pub fn fill_outside_rgb16(rgb: &mut [u16], coverage: &[u8]) {
+    let fill = (FILL * 65535.0).round();
+    rgb.par_chunks_mut(3).zip(coverage.par_iter()).for_each(|(p, &c)| {
+        if c < 255 {
+            let k = f32::from(c) / 255.0;
+            for v in p.iter_mut() {
+                *v = (f32::from(*v) * k + fill * (1.0 - k)).round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+    });
 }
 
 /// Oriented size of a `w x h` image.
@@ -344,7 +380,8 @@ pub fn fit_region(frame: (u32, u32), region: Option<NormRect>, max_edge: u32) ->
 
 const FULL: NormRect = NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
 
-/// Oriented size of the cropped frame of `src` (source pixels).
+/// Oriented size of the cropped frame of `src` (source pixels). With a Transform, pass the
+/// effective crop of the render [`Geometry`] (the corrected frame has the source's size).
 pub fn frame_size(src_w: u32, src_h: u32, orientation: u8, crop: &CropSettings) -> (u32, u32) {
     let g = super::parity::crop_geometry(crop, src_w, src_h, orientation);
     (g.width, g.height)
@@ -359,10 +396,21 @@ pub fn prepare(
     region: Option<NormRect>,
     max_edge: u32,
 ) -> Prepared {
+    prepare_geo(src, orientation, &Geometry::from(crop), region, max_edge)
+}
+
+/// [`prepare`] for a render [`Geometry`] (effective crop + Transform warp).
+pub fn prepare_geo(
+    src: &LinearImage,
+    orientation: u8,
+    geo: &Geometry,
+    region: Option<NormRect>,
+    max_edge: u32,
+) -> Prepared {
     let orientation = if (1..=8).contains(&orientation) { orientation } else { 1 };
-    let frame = frame_size(src.width, src.height, orientation, crop);
+    let frame = frame_size(src.width, src.height, orientation, &geo.crop);
     let (out_w, out_h) = fit_region(frame, region, max_edge);
-    prepare_sized(src, orientation, crop, region, out_w, out_h)
+    prepare_sized_geo(src, orientation, geo, region, out_w, out_h)
 }
 
 /// As [`prepare`] with an explicit output size (exports).
@@ -374,12 +422,43 @@ pub fn prepare_sized(
     out_w: u32,
     out_h: u32,
 ) -> Prepared {
+    prepare_sized_geo(src, orientation, &Geometry::from(crop), region, out_w, out_h)
+}
+
+/// [`prepare_sized`] for a render [`Geometry`] (effective crop + Transform warp).
+pub fn prepare_sized_geo(
+    src: &LinearImage,
+    orientation: u8,
+    geo: &Geometry,
+    region: Option<NormRect>,
+    out_w: u32,
+    out_h: u32,
+) -> Prepared {
+    let crop = &geo.crop;
     let orientation = if (1..=8).contains(&orientation) { orientation } else { 1 };
-    let g = super::parity::crop_geometry(crop, src.width, src.height, orientation);
+    let g = super::parity::frame_geometry(geo, src.width, src.height, orientation);
     let r_or = region.unwrap_or(FULL);
     let (sw, sh) = (src.width as usize, src.height as usize);
     let rotated = crop.enabled && crop.angle.abs() > 1e-4;
-    let pixels = if !rotated {
+    // Output (u, v) -> crop frame -> corrected frame (the source without a warp).
+    let a = g.to_source;
+    let rr = [r_or.x as f64, r_or.y as f64, r_or.width as f64, r_or.height as f64];
+    let affine = [
+        a[0] * rr[2],
+        a[1] * rr[3],
+        a[0] * rr[0] + a[1] * rr[1] + a[2],
+        a[3] * rr[2],
+        a[4] * rr[3],
+        a[3] * rr[0] + a[4] * rr[1] + a[5],
+    ];
+    let affine3 = [affine[0], affine[1], affine[2], affine[3], affine[4], affine[5], 0.0, 0.0, 1.0];
+    let mut coverage = None;
+    let pixels = if let Some(warp) = geo.warp {
+        // Transform: then corrected frame -> source (projective).
+        let m = super::transform::mul(&warp, &affine3);
+        coverage = coverage_map(&m, sw, sh, out_w as usize, out_h as usize);
+        resample_projective(&src.pixels, sw, sh, m, out_w as usize, out_h as usize)
+    } else if !rotated {
         // Axis-aligned: the frame is an un-oriented source rectangle; exact separable path.
         let (l, t) = g.map(0.0, 0.0);
         let (r, b) = g.map(1.0, 1.0);
@@ -405,17 +484,9 @@ pub fn prepare_sized(
         }
     } else {
         // Output (u, v) -> frame -> source (normalized).
-        let a = g.to_source;
-        let rr = [r_or.x as f64, r_or.y as f64, r_or.width as f64, r_or.height as f64];
-        let m = [
-            a[0] * rr[2],
-            a[1] * rr[3],
-            a[0] * rr[0] + a[1] * rr[1] + a[2],
-            a[3] * rr[2],
-            a[4] * rr[3],
-            a[3] * rr[0] + a[4] * rr[1] + a[5],
-        ];
-        resample_affine(&src.pixels, sw, sh, m, out_w as usize, out_h as usize)
+        // A straightened crop may leave the image when it is not constrained to it.
+        coverage = coverage_map(&affine3, sw, sh, out_w as usize, out_h as usize);
+        resample_affine(&src.pixels, sw, sh, affine, out_w as usize, out_h as usize)
     };
     // Frame placement in output px and scale (output px per full-resolution frame px).
     let frame_w = out_w as f32 / r_or.width.max(1e-6);
@@ -424,21 +495,60 @@ pub fn prepare_sized(
     let scale = frame_w / g.width.max(1) as f32 * half;
     let view =
         super::pipeline::View { frame_x: -r_or.x * frame_w, frame_y: -r_or.y * frame_h, frame_w, frame_h, scale };
-    Prepared { width: out_w, height: out_h, pixels, frame_long_edge: frame_w.max(frame_h), view }
+    Prepared { width: out_w, height: out_h, pixels, frame_long_edge: frame_w.max(frame_h), view, coverage }
 }
 
 /// Resamples the parallelogram `m` (normalized output (u, v) -> normalized source) of an
 /// interleaved RGB16 image to `dw x dh`: a Lanczos pre-resample of the bounding box to the
 /// output's pixel pitch, then Catmull-Rom interpolation along the rotated grid.
 pub fn resample_affine(src: &[u16], sw: usize, sh: usize, m: [f64; 6], dw: usize, dh: usize) -> Vec<u16> {
-    let map = |u: f64, v: f64| (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
-    let corners = [map(0.0, 0.0), map(1.0, 0.0), map(0.0, 1.0), map(1.0, 1.0)];
-    let x0 = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min).max(0.0) * sw as f64;
-    let x1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).min(1.0) * sw as f64;
-    let y0 = corners.iter().map(|c| c.1).fold(f64::MAX, f64::min).max(0.0) * sh as f64;
-    let y1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).min(1.0) * sh as f64;
-    // Output px per source px along the output x axis.
+    // Source px per output px along the output x axis.
     let du = ((m[0] * sw as f64).powi(2) + (m[3] * sh as f64).powi(2)).sqrt() / dw as f64;
+    let map = move |u: f64, v: f64| (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+    resample_mapped(src, sw, sh, map, du, dw, dh)
+}
+
+/// [`resample_affine`] for a projective map `m` (normalized output (u, v) -> normalized
+/// source, row-major 3x3): the Transform warp. The pre-resample pitch follows the finest
+/// sampling over the frame (corners and centre), so no detail is lost where the warp
+/// magnifies.
+pub fn resample_projective(
+    src: &[u16],
+    sw: usize,
+    sh: usize,
+    m: super::transform::Mat3,
+    dw: usize,
+    dh: usize,
+) -> Vec<u16> {
+    let map = move |u: f64, v: f64| super::transform::apply(&m, u, v).unwrap_or((-1.0, -1.0));
+    let mut du = f64::MAX;
+    let e = 1e-3;
+    for (u, v) in [(0.0, 0.0), (1.0 - e, 0.0), (0.0, 1.0), (1.0 - e, 1.0), (0.5, 0.5)] {
+        let (a, b) = (map(u, v), map(u + e, v));
+        let d = (((b.0 - a.0) * sw as f64).powi(2) + ((b.1 - a.1) * sh as f64).powi(2)).sqrt() / (e * dw as f64);
+        if d.is_finite() && d > 0.0 {
+            du = du.min(d);
+        }
+    }
+    resample_mapped(src, sw, sh, map, if du == f64::MAX { 1.0 } else { du }, dw, dh)
+}
+
+/// Shared body of [`resample_affine`] / [`resample_projective`]: `du` = source px per output
+/// px (pre-resample pitch).
+fn resample_mapped(
+    src: &[u16],
+    sw: usize,
+    sh: usize,
+    map: impl Fn(f64, f64) -> (f64, f64) + Sync,
+    du: f64,
+    dw: usize,
+    dh: usize,
+) -> Vec<u16> {
+    let corners = [map(0.0, 0.0), map(1.0, 0.0), map(0.0, 1.0), map(1.0, 1.0)];
+    let x0 = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min).clamp(0.0, 1.0) * sw as f64;
+    let x1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).clamp(0.0, 1.0) * sw as f64;
+    let y0 = corners.iter().map(|c| c.1).fold(f64::MAX, f64::min).clamp(0.0, 1.0) * sh as f64;
+    let y1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).clamp(0.0, 1.0) * sh as f64;
     let s = (1.0 / du.max(1e-9)).min(1.0);
     let (bw, bh) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
     let (iw, ih) = (((bw * s).ceil() as usize).max(2), ((bh * s).ceil() as usize).max(2));
@@ -459,6 +569,43 @@ pub fn resample_affine(src: &[u16], sw: usize, sh: usize, m: [f64; 6], dw: usize
         }
     });
     out
+}
+
+/// Per output pixel coverage of the source by the map `m` (normalized output -> normalized
+/// source, 3x3): 255 inside, 0 outside, anti-aliased over about one output pixel. `None`
+/// when every pixel is inside (the output rectangle maps to a convex quad, so its four
+/// corners decide).
+pub fn coverage_map(m: &super::transform::Mat3, sw: usize, sh: usize, dw: usize, dh: usize) -> Option<Vec<u8>> {
+    use super::transform::apply;
+    let (sw, sh) = (sw as f64, sh as f64);
+    // Half a source pixel of slack: resampling covers the border pixels.
+    let (ex, ey) = (0.5 / sw, 0.5 / sh);
+    let inside =
+        |p: Option<(f64, f64)>| p.is_some_and(|(x, y)| (-ex..=1.0 + ex).contains(&x) && (-ey..=1.0 + ey).contains(&y));
+    if [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].iter().all(|&(u, v)| inside(apply(m, u, v))) {
+        return None;
+    }
+    // Source px per output px at the centre (the anti-aliasing width).
+    let du = match (apply(m, 0.5, 0.5), apply(m, 0.5 + 1.0 / dw.max(1) as f64, 0.5)) {
+        (Some(a), Some(b)) => (((b.0 - a.0) * sw).powi(2) + ((b.1 - a.1) * sh).powi(2)).sqrt().max(1e-6),
+        _ => 1.0,
+    };
+    let mut out = vec![0u8; dw * dh];
+    out.par_chunks_mut(dw.max(1)).enumerate().for_each(|(y, row)| {
+        let v = (y as f64 + 0.5) / dh as f64;
+        for (x, c) in row.iter_mut().enumerate() {
+            let u = (x as f64 + 0.5) / dw as f64;
+            *c = match apply(m, u, v) {
+                Some((sx, sy)) => {
+                    // Distance inside the source border, in output px.
+                    let d = (sx * sw).min((1.0 - sx) * sw).min(sy * sh).min((1.0 - sy) * sh) / du;
+                    ((d + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8
+                }
+                None => 0,
+            };
+        }
+    });
+    Some(out)
 }
 
 fn catmull_rom(img: &[u16], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
@@ -675,6 +822,82 @@ mod tests {
             let full = NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
             assert_eq!(unorient_rect(full, o), full);
         }
+    }
+
+    /// Vertical -50 on a photo of converging verticals (built as the image of two vertical
+    /// lines through the inverse warp) renders them vertical: same column at top and bottom.
+    #[test]
+    fn keystone_warp_straightens_converging_lines() {
+        use crate::develop::transform::{self, Geometry};
+        use crate::ipc::types::{ParametricAdjustments, TransformSettings};
+        let (w, h) = (600u32, 400u32);
+        let t = TransformSettings { vertical: -50.0, ..Default::default() };
+        let adj = ParametricAdjustments { transform: t, ..Default::default() };
+        let geo = Geometry::of(&adj, w * 2, h * 2);
+        let to_corr = transform::invert(&geo.warp.unwrap()).unwrap();
+        let img = image(w, h, |x, y| {
+            let (cx, _) =
+                transform::apply(&to_corr, (f64::from(x) + 0.5) / f64::from(w), (f64::from(y) + 0.5) / f64::from(h))
+                    .unwrap();
+            if (cx - 0.3).abs() < 0.004 || (cx - 0.7).abs() < 0.004 {
+                [60000; 3]
+            } else {
+                [1000; 3]
+            }
+        });
+        // Column centroid of the left line on a row.
+        let centroid = |px: &[u16], width: u32, y: u32| {
+            let (mut s, mut n) = (0.0, 0.0);
+            for x in 0..width / 2 {
+                let v = f64::from(px[((y * width + x) * 3) as usize]);
+                if v > 20000.0 {
+                    s += f64::from(x) * v;
+                    n += v;
+                }
+            }
+            s / n
+        };
+        let (src_top, src_bottom) = (centroid(&img.pixels, w, 40), centroid(&img.pixels, w, 360));
+        assert!(src_top - src_bottom > 15.0, "source converges upwards: {src_top} vs {src_bottom}");
+        let p = prepare_sized_geo(&img, 1, &geo, None, w, h);
+        let (top, bottom) = (centroid(&p.pixels, w, 40), centroid(&p.pixels, w, 360));
+        assert!((top - bottom).abs() < 1.0, "vertical after the warp: {top} vs {bottom}");
+        assert!((top - 0.3 * f64::from(w)).abs() < 2.0, "{top}");
+        // Widening the top pulls the bottom corners off the image: white there after the
+        // pipeline.
+        let cov = p.coverage.as_ref().expect("corners outside the image");
+        let bl = ((h - 1) * w) as usize;
+        assert_eq!((cov[0], cov[bl]), (255, 0));
+        assert_eq!(cov[(h / 2 * w + w / 2) as usize], 255);
+        let mut rgb = vec![10u8; (w * h * 3) as usize];
+        fill_outside_rgb8(&mut rgb, cov);
+        assert_eq!(&rgb[bl * 3..bl * 3 + 3], &[255, 255, 255]);
+        assert_eq!(rgb[((h / 2 * w + w / 2) * 3) as usize], 10);
+    }
+
+    /// A straightened crop that leaves the image is filled (coverage), not edge-repeated;
+    /// Constrain Crop leaves no empty pixel.
+    #[test]
+    fn rotated_frame_coverage_and_constrain() {
+        use crate::develop::transform::Geometry;
+        use crate::ipc::types::{ParametricAdjustments, TransformSettings};
+        let img = image(300, 200, |_, _| [5000; 3]);
+        let mut t = TransformSettings { rotate: 8.0, ..Default::default() };
+        let adj = ParametricAdjustments { transform: t.clone(), ..Default::default() };
+        let p = prepare_geo(&img, 1, &Geometry::of(&adj, 600, 400), None, 300);
+        let cov = p.coverage.expect("rotated image leaves corners empty");
+        assert!(cov[0] == 0 && cov[cov.len() - 1] == 0);
+        t.constrain_crop = true;
+        let adj = ParametricAdjustments { transform: t, ..Default::default() };
+        let p = prepare_geo(&img, 1, &Geometry::of(&adj, 600, 400), None, 300);
+        assert!(p.coverage.is_none(), "constrained: no empty pixels");
+        assert!(p.width < 300 && p.height < 200);
+        // Straightened crop (no transform) running off the image.
+        let crop = CropSettings { enabled: true, left: 0.0, top: 0.0, right: 1.0, bottom: 1.0, angle: 6.0 };
+        let p = prepare(&img, 1, &crop, None, 300);
+        assert!(p.coverage.is_some_and(|c| c.contains(&0)));
+        let inside = CropSettings { left: 0.2, top: 0.2, right: 0.8, bottom: 0.8, ..crop };
+        assert!(prepare(&img, 1, &inside, None, 300).coverage.is_none());
     }
 
     #[test]

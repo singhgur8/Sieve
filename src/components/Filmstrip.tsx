@@ -2,11 +2,12 @@
 import { memo, useCallback, useEffect, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Flag, X } from "lucide-react";
-import { convertFileSrc, type RawImageEntry } from "../ipc";
+import { type RawImageEntry } from "../ipc";
 import type { Library } from "../hooks/useLibrary";
 import { LABEL_COLOR } from "../lib/format";
 import { SceneBadge, Stars } from "./Cell";
 import { flagTitle } from "../lib/cull";
+import { thumbSrc } from "../lib/entryImage";
 
 interface Props {
   lib: Library;
@@ -109,7 +110,7 @@ const FilmCell = memo(FilmCellImpl, cellPropsEqual);
 function entrySig(e: RawImageEntry | undefined): string {
   if (!e) return "";
   const t = e.thumbnail;
-  return `${e.id}|${e.pick}|${e.pickOrigin}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}`;
+  return `${e.id}|${e.pick}|${e.pickOrigin}|${e.colorLabel}|${e.rating}|${e.sceneId}|${e.isSceneAnchor}|${e.hasEdits}|${t.status}|${t.status === "ready" ? t.path : ""}|${e.editedPreview?.thumbUrl ?? ""}`;
 }
 function cellPropsEqual(a: CellProps, b: CellProps): boolean {
   for (const k of Object.keys(a) as (keyof CellProps)[]) if (k !== "e" && a[k] !== b[k]) return false;
@@ -130,9 +131,11 @@ function FilmCellImpl({ fid, e, v, active, isSel, isMarked, left, top, cellW, ce
     className={`absolute cursor-pointer overflow-hidden rounded bg-neutral-800 ${isSel ? "ring-2 ring-sky-500" : ""} ${isMarked ? "ring-2 ring-amber-400" : ""} ${active ? "outline outline-2 outline-white" : ""} ${e?.pick === "reject" && !active ? "opacity-50" : ""}`}
     style={{ left, top, width: cellW, height: cellH }}
   >
-    {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${v}`} alt="" draggable={false} className="size-full object-cover" />}
+    {t?.status === "ready" && <img src={thumbSrc(e, v)!} alt="" draggable={false} className="size-full object-cover" />}
+    {/* Top-left stack: flag / label, then the scene badge (it used to sit on the stars). */}
+    <div className="absolute left-0.5 top-0.5 flex flex-col items-start gap-0.5">
     {e && (e.pick !== "unflagged" || e.colorLabel) && (
-      <span className="absolute left-0.5 top-0.5 flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
+      <span className="flex items-center gap-0.5" data-testid={`film-flag-${fid}`} data-pick={e.pick}>
         {e.pick === "pick" && (
           <span title={flagTitle(e)} aria-label={flagTitle(e)}>
             <Flag className="size-3 fill-green-500 text-green-500" />
@@ -146,17 +149,14 @@ function FilmCellImpl({ fid, e, v, active, isSel, isMarked, left, top, cellW, ce
         {e.colorLabel && <span className={`size-2 rounded-full ${LABEL_COLOR[e.colorLabel]}`} title={`Color label: ${e.colorLabel}`} aria-label={`Color label ${e.colorLabel}`} />}
       </span>
     )}
+    {e && e.sceneId != null && <SceneBadge entry={e} testPrefix={scenePrefix} />}
+    </div>
     {e && e.rating > 0 && (
       <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-0.5" title={`Rated ${e.rating} star${e.rating === 1 ? "" : "s"}`} data-testid={`film-rating-${fid}`} data-rating={e.rating}>
         <Stars n={e.rating} className="size-2.5" onRate={onRate && ((r) => onRate(fid, r))} testId={`film-stars-${fid}`} />
       </span>
     )}
     {badge?.(fid)}
-    {e && e.sceneId != null && (
-      <span className="absolute bottom-0.5 left-0.5">
-        <SceneBadge entry={e} testPrefix={scenePrefix} />
-      </span>
-    )}
     {e?.hasEdits && <span className="absolute right-0.5 top-0.5 size-2 rounded-full bg-sky-400" title="Edited: this photo has develop adjustments" aria-label="Edited" data-testid={`film-edited-${fid}`} />}
   </div>
   );

@@ -98,3 +98,8 @@ export function saveFields(key: string, fields: readonly AdjustmentField[]) {
 
 /** Fields a Copy / Sync uses without asking (remembered choice, else everything except crop and masks). */
 export const rememberedCopyFields = (): AdjustmentField[] => loadFields(COPY_FIELDS_KEY) ?? DEFAULT_SYNC_FIELDS;
+
+/** Setting groups that differ between two states of the same photo (what one committed edit changed). Crop, masks and transform are never listed. */
+export function changedFields(prev: ParametricAdjustments, next: ParametricAdjustments): AdjustmentField[] {
+  return DEFAULT_SYNC_FIELDS.filter((f) => !sameAdjustments(copyFields(prev, next, [f]), prev));
+}

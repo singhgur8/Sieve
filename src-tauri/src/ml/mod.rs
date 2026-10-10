@@ -38,6 +38,7 @@ pub mod store;
 pub mod style;
 pub mod style_model;
 pub mod thresholds;
+pub mod upright;
 pub mod worker;
 
 use std::path::{Path, PathBuf};
@@ -118,6 +119,19 @@ impl Analysis {
     /// rescore pass (no ML). Clears a previous cancel request.
     pub fn start(&self, app: &AppHandle, scope: AnalysisScope) -> AppResult<()> {
         worker::kick(&self.config, &self.flags(), scope, app.clone())
+    }
+
+    /// Starts a rescore (no ML, only suggestions / auto tags / bursts; user flags and stars
+    /// are never touched) when the catalog's suggestions come from older scoring rules
+    /// ([`scoring::SCORING_RULES_VERSION`]). For app startup when auto-analysis is off; with
+    /// auto-analysis on, the startup `Pending` run does the same refresh by itself.
+    pub fn start_if_rules_changed(&self, app: &AppHandle) -> AppResult<bool> {
+        let conn = crate::db::open(&self.config.catalog_path)?;
+        if !store::rules_version_stale(&conn)? {
+            return Ok(false);
+        }
+        self.start(app, AnalysisScope::Rescore)?;
+        Ok(true)
     }
 
     /// Asks the worker to stop after the images in flight. Unprocessed work stays

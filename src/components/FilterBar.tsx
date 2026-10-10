@@ -6,6 +6,7 @@ import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
 import { BASE_QUERY } from "../hooks/useLibrary";
 import { describeMeta, metaActive, metaChips, setMetaRowOpen, useMetaRowOpen } from "../lib/metaFilter";
 import { MetaChips } from "./MetadataFilterRow";
+import { useWide } from "./edit/bits";
 
 const LABELS: ColorLabel[] = ["red", "yellow", "green", "blue", "purple"];
 const PICKS: { key: PickFlag; label: string }[] = [
@@ -32,6 +33,7 @@ export function isFiltered(q: Query): boolean {
     q.excludeTags.length > 0 ||
     q.picks.length > 0 ||
     q.pickOrigin != null ||
+    q.suggested != null ||
     q.minRating != null ||
     q.maxRating != null ||
     q.colorLabels.length > 0 ||
@@ -82,11 +84,11 @@ function MetaToggle({ query }: Pick<Props, "query">) {
         data-testid="meta-toggle"
         aria-pressed={open}
         onClick={() => setMetaRowOpen(!open)}
-        aria-label="Metadata"
-        title="Metadata: filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar"
+        aria-label="Metadata filter"
+        title="Metadata filter (all photos in view): filter by file type, camera, lens, ISO, focal length, aperture, shutter, capture date, edited, sidecar. For one photo's details open Photo info (Info button)"
         className={`${chip} flex items-center gap-1 ${open ? "bg-sky-800 text-sky-100" : off}`}
       >
-        <ListFilter className="size-3" /> <span className="hidden min-[1440px]:inline">Metadata</span>
+        <ListFilter className="size-3" /> <span className="hidden min-[1440px]:inline">Metadata filter</span>
         {n > 0 && <span className="opacity-80" data-testid="meta-active-count">{n}</span>}
       </button>
     </>
@@ -149,6 +151,16 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
             {p.label} <span className="opacity-70">{pickCount(p.key)}</span>
           </button>
         ))}
+        {query.suggested != null && (
+          <button
+            data-testid="filter-suggested"
+            onClick={() => setQuery((q) => ({ ...q, suggested: null }))}
+            title="Only photos Sieve suggests rejecting (nothing is flagged yet). Click to show every photo"
+            className={`${chip} flex items-center gap-1 bg-sky-800 text-sky-100 ring-1 ring-white/30`}
+          >
+            {query.suggested === "reject" ? "Suggested rejects" : query.suggested === "pick" ? "Suggested picks" : "Suggested stars"} <X className="size-3" aria-label="Remove" />
+          </button>
+        )}
         {query.pickOrigin != null && (
           <button
             data-testid="filter-origin"
@@ -204,6 +216,7 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
 
 /** Rating / label / burst / folder filters (row 2 of the Library chrome, left of the view controls). */
 export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { query: Query; setQuery: Props["setQuery"]; counts: FilterCounts | null; catalog: CatalogState | null; onLocate?: () => void }) {
+  const roomy = useWide("(min-width: 1440px)"); // below this the burst checkbox label is shortened so the grid toolbar never overflows
   return (
     <>
       <div className="flex items-center gap-1">
@@ -257,7 +270,8 @@ export function FilterExtras({ query, setQuery, counts, catalog, onLocate }: { q
           onChange={(e) => setQuery((q) => ({ ...q, collapseBursts: e.target.checked }))}
         />
         <Layers className="size-3.5" />
-        Collapse bursts{counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers} hidden)` : ""}
+        {roomy ? "Collapse bursts" : "Bursts"}
+        {counts && counts.burstNonKeepers > 0 && query.collapseBursts ? ` (${counts.burstNonKeepers}${roomy ? " hidden" : ""})` : ""}
       </label>
 
       {catalog && catalog.folders.length > 1 && (
@@ -290,6 +304,7 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   const parts: string[] = [];
   q.includeTags.forEach((t) => parts.push(tagName(t)));
   q.excludeTags.forEach((t) => parts.push(`no ${tagName(t)}`));
+  if (q.suggested) parts.push(q.suggested === "reject" ? "suggested rejects" : q.suggested === "pick" ? "suggested picks" : "suggested stars");
   const origin = originLabel(q);
   if (origin) parts.push(origin);
   else q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));

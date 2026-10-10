@@ -824,9 +824,9 @@ fn export_one(
     })?;
     check()?;
     let orientation = item.entry.orientation;
-    let crop = &item.adjustments.crop;
-    let size = develop::planned_size(&src, orientation, crop, &settings.resize);
-    let scale = develop::export_scale(&src, orientation, crop, size);
+    let geo = crate::develop::transform::Geometry::of(&item.adjustments, src.full_width, src.full_height);
+    let size = develop::planned_size(&src, orientation, &geo.crop, &settings.resize);
+    let scale = develop::export_scale(&src, orientation, &geo.crop, size);
     let profile = crate::develop::camera::resolve(
         &meta,
         &item.adjustments.profile,
@@ -848,15 +848,15 @@ fn export_one(
         mattes.refine(|| Some(develop::sensor_guide(&src, &profile)));
     }
     let (sensor_width, sensor_height) = (src.full_width, src.full_height);
-    let prepared = develop::prepare_output(&src, orientation, crop, size)?;
+    let prepared = develop::prepare_output(&src, orientation, &geo, size)?;
     // Free the full-size decode as soon as the resampled copy exists.
     let crate::develop::source::LinearImage { pixels: decoded, color, .. } = src;
-    let pixels = match prepared {
-        Some(p) => {
+    let (pixels, coverage) = match prepared {
+        Some((p, c)) => {
             drop(decoded);
-            p
+            (p, c)
         }
-        None => decoded,
+        None => (decoded, None),
     };
     check()?;
     let lut = match &item.adjustments.lut {
@@ -864,15 +864,15 @@ fn export_one(
         None => None,
     };
     let (local, _) = if masked {
-        let geom = dmasks::MaskGeometry {
+        let geom = dmasks::MaskGeometry::of(
+            &geo,
             sensor_width,
             sensor_height,
-            orientation: orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1),
-            crop: *crop,
-            region: None,
-            width: size.0,
-            height: size.1,
-        };
+            orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1),
+            None,
+            size.0,
+            size.1,
+        );
         mrender::local_planes(
             &item.adjustments.masks,
             &geom,
@@ -893,8 +893,12 @@ fn export_one(
         tone: Some(&tone),
         masks: local.as_ref(),
     };
-    let encoded = develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
+    let mut encoded =
+        develop::develop_prepared(&pixels, size, &color, &item.adjustments, lut.as_deref(), settings, &ctx);
     drop(pixels);
+    if let Some(c) = &coverage {
+        crate::develop::source::fill_outside_rgb16(&mut encoded, c);
+    }
     check()?;
     let image = develop::finish(encoded, size, settings);
     let meta = metadata::collect(raw, &settings.metadata)?;

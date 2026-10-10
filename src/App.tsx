@@ -1,7 +1,7 @@
 // Library shell: virtualized grid, filter bars, loupe / compare / develop, and the single keymap-driven shortcut handler.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands, unwrap, type ActivityKind, type ColorLabel, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type UiPrefs, type WorkflowStep } from "./ipc";
+import { commands, DEFAULT_SYNC_FIELDS, unwrap, type ActivityKind, type CaptureTimeEdit, type ColorLabel, type RejectStrictness, type KeeperRule, type Project, type Scene, type PickFlag, type RawImageEntry, type ShootType, type SuggestionKinds, type UiPrefs, type WorkflowStep } from "./ipc";
 import { BASE_QUERY, useLibrary, type Library, type Query } from "./hooks/useLibrary";
 import { useSelection } from "./hooks/useSelection";
 import { useBackendStatus } from "./hooks/useBackendStatus";
@@ -27,6 +27,7 @@ import { ExportJobsPanel } from "./components/export/ExportJobsPanel";
 import { useExportJobs } from "./hooks/useExportJobs";
 import { useScenes } from "./hooks/useScenes";
 import { SceneStrip } from "./components/scenes/SceneStrip";
+import { SelectionBar } from "./components/scenes/SelectionBar";
 import { StepBar } from "./components/StepBar";
 import { AnalyzeSplit, ShootSelect } from "./components/AnalyzeControls";
 import { PlanView } from "./components/edit/PlanView";
@@ -44,10 +45,14 @@ import { HelpPanel } from "./components/HelpPanel";
 import { openHelp, useHelpState } from "./lib/helpStore";
 import { isActivityRunning } from "./lib/activity";
 import { ChevronRight } from "lucide-react";
+import { PhotoInfoPanel } from "./components/PhotoInfoPanel";
+import { CaptureTimeDialog } from "./components/CaptureTimeDialog";
+import { formatOffset } from "./lib/captureTime";
 import { ApplySuggestionsDialog } from "./components/ApplySuggestionsDialog";
 import { matchKey } from "./lib/keymap";
 import { modalCount, useModalCount } from "./lib/modal";
-import { getClipboard } from "./lib/clipboard";
+import { getClipboard, setClipboard, useClipboard } from "./lib/clipboard";
+import { flushEdits } from "./lib/editFlush";
 import { clearFileHealth, describeReason, noteFailure } from "./lib/errors";
 import { HealthBanner, RestoreBackupDialog } from "./components/CatalogHealth";
 import { toggleChrome, toggleSidePanels, usePanels } from "./lib/panels";
@@ -90,7 +95,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const metaOpen = useMetaRowOpen();
   const [exportOpen, setExportOpen] = useState<{ sel: number[]; keepers?: number[] } | null>(null);
   const [exportedCount, setExportedCount] = useState<number | null>(null);
-  const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[] } | null>(null);
+  const [applyOpen, setApplyOpen] = useState<{ selected: number[]; all: number[]; onlyRejects: boolean } | null>(null);
   // Scenes are an Edit-step concept inside a project: the strip starts hidden there (Shift+S shows it).
   const [scenesOpen, setScenesOpen] = useState(projectProp == null);
   // Edit step overview (the plan) replaces the grid while open; a project that was left in the Edit step reopens on it.
@@ -102,6 +107,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [healthDismissed, setHealthDismissed] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [captureOpen, setCaptureOpen] = useState<number[] | null>(null);
   useModels(); // keeps the download listeners alive so mask capabilities refresh even when no panel is open
   const [matchOpen, setMatchOpen] = useState<number | null>(null);
   const [devEpoch, setDevEpoch] = useState(0);
@@ -141,6 +148,11 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const lib: Library = idFilter ? { ...rawLib, ids: scopedIds } : rawLib;
   const { ids } = lib;
   const sel = useSelection(ids);
+  const clip = useClipboard();
+  // Auto Sync (Develop): remembered for the session; switched on by "Edit N selected" / "Edit all in scene".
+  const [autoSync, setAutoSync] = useState(false);
+  // A crop / mask tool is active in Develop: toasts move off the viewer's corner handles.
+  const [devTool, setDevTool] = useState(false);
   const counts = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep, query.metadata, query.pickOrigin);
   // "of M" in the readouts is the unfiltered total (the metadata filter changes `counts`, not this).
   const totals = useFilterCounts(query.folderId, projectId, lib.epoch, keepersStep);
@@ -152,7 +164,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.pickOrigin != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
+    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -331,7 +343,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (!cmp) setCmp(null);
   }, [sel, ids, cmp]);
 
-  const changeMode = useCallback(
+  /** Run `fn` after a running crop tool was applied (clicks that leave the photo / view). */
+  const leave = useCallback(
+    (fn: () => void) => {
+      const d = develop.current;
+      if (mode === "develop" && d?.isCropping()) void d.commitPendingTool().then(fn);
+      else fn();
+    },
+    [mode],
+  );
+  const changeModeNow = useCallback(
     (m: Mode) => {
       setPlanOpen(false);
       if (m === "grid") {
@@ -344,6 +365,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     },
     [openLoupe, openDevelop, enterCompare, mode, cmp],
   );
+  const changeMode = useCallback((m: Mode) => leave(() => changeModeNow(m)), [leave, changeModeNow]);
 
   // ---- culling actions (batch over targets), all undoable ----
   const onRestored = useCallback(
@@ -729,7 +751,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [rowOfScene],
   );
 
-  const goStep = useCallback(
+  const goStepNow = useCallback(
     (s: WorkflowStep) => {
       if (projectId == null) return;
       if (s === "cull") {
@@ -750,6 +772,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [projectId, step, setStep, openPlan, wf.loadPlan],
   );
+  const goStep = useCallback((s: WorkflowStep) => leave(() => goStepNow(s)), [leave, goStepNow]);
 
   /** G / Esc: back to the overview of the step (the Plan in the Edit step, the Grid otherwise). */
   const goOverview = useCallback(() => {
@@ -908,13 +931,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const askApplySuggestions = () => {
     if (ids.length === 0) return;
-    setApplyOpen({ selected: [...sel.selected], all: ids });
+    setApplyOpen({ selected: [...sel.selected], all: ids, onlyRejects: query.suggested === "reject" });
   };
 
-  const applySuggestions = (t: number[], onlyUnset: boolean) =>
+  const applySuggestions = (t: number[], onlyUnset: boolean, kinds: SuggestionKinds) => {
+    const reviewing = query.suggested === "reject";
     void run(async () => {
       const before = await unwrap(commands.getCullSnapshot(t));
-      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset));
+      const { applied, skipped } = await unwrap(commands.applySuggestions(t, onlyUnset, kinds.picks && kinds.rejects && kinds.stars ? null : kinds));
       await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
       if (membershipSensitive) void lib.reload();
       status.refreshXmp();
@@ -923,12 +947,69 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return;
       }
       const entry = cull.record(`Apply suggestions to ${plural(applied, "photo")}`, before);
+      if (reviewing && kinds.rejects && !kinds.picks && !kinds.stars) {
+        // The review filter just emptied itself: show what was rejected instead (Rejected, by Auto).
+        setQuery((q) => ({ ...q, suggested: null, keepersOnly: false, picks: ["reject"], pickOrigin: "auto" }));
+        push(`Rejected ${plural(applied, "photo")}, shown here`, { action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) } });
+        return;
+      }
       push(`Applied suggestions to ${applied} of ${t.length} photos${skipped ? ` (${skipped} skipped)` : ""}. Review the result in the Rejected view`, {
         action: { label: "Undo", testid: "apply-undo", onClick: () => void cull.undoEntry(entry) },
       });
     });
+  };
 
   /** Keeper rule changed from the Cull summary / Export dialog (the Edit plan has its own path through `wf`). */
+  /** Edit Capture Time: apply, refresh order / entries / panel, and offer Undo (restore_capture_times). */
+  const applyCaptureTime = useCallback(
+    async (target: number[], mode: CaptureTimeEdit, label: string) => {
+      try {
+        const res = await unwrap(commands.editCaptureTime(target, mode));
+        setCaptureOpen(null);
+        await rawLib.reload();
+        await rawLib.refreshAll();
+        status.refreshXmp();
+        if (res.changedIds.length === 0) return setNotice("No capture times changed");
+        const undo = async () => {
+          try {
+            await unwrap(commands.restoreCaptureTimes(res.previous));
+            await rawLib.reload();
+            await rawLib.refreshAll();
+            status.refreshXmp();
+            setNotice(`Undid: ${label}`);
+          } catch (e) {
+            reportError(e);
+          }
+        };
+        const off = res.offsetMs != null ? ` (${formatOffset(res.offsetMs)})` : "";
+        push(`${mode.kind === "revert" ? "Reverted" : "Changed"} capture time of ${plural(res.changedIds.length, "photo")}${mode.kind === "shift" || mode.kind === "revert" ? "" : off}${mode.kind === "shift" ? off : ""}`, {
+          action: { label: "Undo", testid: "capture-undo", onClick: () => void undo() },
+        });
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rawLib, status.refreshXmp, setNotice, push, reportError],
+  );
+
+  const changeRejectStrictness = useCallback(
+    async (strictness: RejectStrictness) => {
+      if (projectId == null) return;
+      try {
+        await unwrap(commands.setProjectRejectStrictness(projectId, strictness));
+        await refreshProject();
+        cullSum.refresh();
+        await rawLib.refreshAll();
+        setNotice(`Reject strictness: ${strictness}. Suggestions are being updated`);
+      } catch (e) {
+        reportError(e);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, refreshProject, cullSum.refresh, rawLib, setNotice, reportError],
+  );
+
   const changeKeeperRule = useCallback(
     async (rule: KeeperRule) => {
       try {
@@ -981,19 +1062,79 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const revealInFinder = (path: string) => void run(() => unwrap(commands.revealInFinder(path)));
 
+  /** Cmd+V / Cmd+Shift+V in the Library: the copied settings go to every selected photo as one undoable batch. */
   const pasteToSelection = useCallback(async () => {
     const c = getClipboard();
-    if (!c) return setNotice("Nothing copied yet (Cmd+Shift+C in Develop)");
+    if (!c) return setNotice("Nothing copied yet. Cmd+C copies all settings of the active photo");
     const t = targets();
     if (t.length === 0) return;
     try {
-      await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
-      setNotice(`Pasted ${plural(c.fields.length, "setting group")} to ${plural(t.length, "photo")}`);
-      await lib.refresh(t.filter((id) => lib.getEntry(id)).slice(0, 2000));
+      await flushEdits();
+      const r = await unwrap(commands.pasteSettings(t, c.adjustments, c.fields));
+      await wf.reportBatch(r, `Pasted ${plural(c.fields.length, "setting group")}${c.fromName ? ` from ${c.fromName}` : ""}`, t.length);
     } catch (e) {
       reportError(e);
     }
-  }, [targets, lib, reportError, setNotice]);
+  }, [targets, wf, reportError, setNotice]);
+
+  /** Cmd+C in the Library: every setting of the active photo (not crop / masks) onto the clipboard. */
+  const copyActive = useCallback(async () => {
+    const id = active;
+    if (id == null) return setNotice("Select a photo first");
+    try {
+      await flushEdits();
+      const adjustments = await unwrap(commands.getAdjustments(id));
+      const fromName = lib.getEntry(id)?.fileName;
+      setClipboard({ adjustments, fields: [...DEFAULT_SYNC_FIELDS], fromName });
+      const n = Math.max(0, targets().filter((t) => t !== id).length);
+      setNotice(`Copied all settings of ${fromName ?? "the photo"} (not crop / masks). ${n > 0 ? `Cmd+V pastes to the ${plural(n, "other selected photo")}` : "Select photos and press Cmd+V to paste"}`);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [active, lib, targets, reportError, setNotice]);
+
+  /** Sync: the active photo's settings onto the rest of the selection (one undoable batch). */
+  const syncSelection = useCallback(async () => {
+    const id = active;
+    const t = targets().filter((x) => x !== id);
+    if (id == null || t.length === 0) return setNotice("Select the photos to sync to (Shift / Cmd-click), the active photo is the source");
+    try {
+      await flushEdits();
+      const r = await unwrap(commands.syncSettings(id, t, [...DEFAULT_SYNC_FIELDS]));
+      await wf.reportBatch(r, `Synchronized settings of ${lib.getEntry(id)?.fileName ?? "the photo"}`, t.length);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [active, targets, wf, lib, reportError, setNotice]);
+
+  /** "Show" on an apply toast: leave the Plan and list exactly these photos, selected. */
+  const showIds = useCallback(
+    (list: number[], label: string) => {
+      if (list.length === 0) return;
+      setPlanOpen(false);
+      setCmp(null);
+      setMode("grid");
+      setIdFilter({ ids: new Set(list), label });
+      sel.set(list, list[0]);
+    },
+    [sel],
+  );
+
+  /** "Edit all in scene": the whole scene selected, Develop on `startId`. Auto Sync is on. */
+  const editAllInScene = useCallback(
+    (sceneIds: number[], startId: number) => {
+      if (sceneIds.length === 0) return;
+      sel.set(sceneIds, startId);
+      setCmp(null);
+      setPlanOpen(false);
+      setMode("develop");
+      if (sceneIds.length > 1) {
+        setAutoSync(true);
+        setNotice(`Editing ${sceneIds.length} photos. Auto Sync is on: every change goes to all ${sceneIds.length}; exposure and white balance move by the same amount on each. Turn Auto Sync off (Cmd+Alt+Shift+A) to edit one`);
+      }
+    },
+    [sel, setNotice],
+  );
 
   const selectBurst = useCallback(async () => {
     const id = active;
@@ -1019,6 +1160,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   }, [scenesOpen]);
 
   // ---- keyboard: one handler driven by the shared keymap ----
+  const LEAVES_CROP = ["stepCull", "stepEdit", "stepExport", "nextScene", "prevScene", "navH", "navV", "gridJump", "toggleLoupe", "devToLoupe", "toGrid", "escape", "develop", "compare", "filterBar", "gridLoupe", "export", "import", "saveXmp", "copy"];
   useKeyboard((e) => {
     if (modalCount() > 0) return; // dialogs and menus own the keyboard
     const inPlan = planOpen && projectId != null && step === "edit";
@@ -1048,9 +1190,19 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     }
     const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
-    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste"];
+    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste", "copyAll", "pasteAll"];
     if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
+    // Leaving the crop tool any way but Esc / Cancel applies it first (Lightroom), then the key does its job.
+    if (mode === "develop" && LEAVES_CROP.includes(def.id) && develop.current?.isCropping()) {
+      const d = def;
+      const ev = e;
+      void develop.current.commitPendingTool(def.id === "saveXmp").then(() => runKey(d, ev));
+      return;
+    }
+    return runKey(def, e);
+  });
+  const runKey = (def: NonNullable<ReturnType<typeof matchKey>>, e: KeyboardEvent) => {
     const k = e.key;
     switch (def.id) {
       case "stepCull":
@@ -1070,7 +1222,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
         if (!row || row.ui === "todo" || row.ui === "reset" || row.targets === 0) return setNotice("Edit this scene's representative first");
         if (row.skipped) return setNotice("This scene is skipped. Include it first (S in the Plan)");
-        return void wf.applyScene(row.entry.sceneId, "match", reviewFrames);
+        return void wf.applyScene(row.entry.sceneId, "match", reviewFrames, showIds);
       }
       case "autoEdit": {
         if (step !== "edit") return;
@@ -1137,6 +1289,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return develop.current?.cropSwap();
       case "cropLock":
         return develop.current?.cropLock();
+      case "cropOverlay":
+        return develop.current?.cropOverlay();
+      case "cropOverlayRotate":
+        return develop.current?.cropOverlayRotate();
+      case "cropReset":
+        return develop.current?.cropReset();
       case "panelsToggle":
         return toggleSidePanels();
       case "panelsHide":
@@ -1166,6 +1324,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return cmp ? focusPane(cmp.focus === "a" ? "b" : "a") : undefined;
       case "scenesToggle":
         return toggleScenes();
+      case "photoInfo":
+        return setInfoOpen((v) => !v);
+      case "captureTime": {
+        const t = targets();
+        if (t.length > 0) setCaptureOpen(t);
+        return;
+      }
       case "selectAll":
         return sel.selectAll();
       case "selectNone":
@@ -1189,6 +1354,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         return loupe.current?.cycleInfo();
       case "crop":
         return develop.current?.toggleCrop();
+      case "guided":
+        return develop.current?.toggleGuided();
       case "cropCommit":
         return void develop.current?.commitCrop();
       case "before":
@@ -1198,7 +1365,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "undoAdj": {
         // One undo in Develop: the newest of the last culling change and the last adjustment.
         const d = develop.current;
-        if (wf.lastBatch && wf.lastBatch.at > Math.max(cull.undoAt(), d?.lastCommitAt() ?? 0)) return wf.undoLast();
+        if (d?.revertTool(Math.max(cull.undoAt(), wf.lastBatch?.at ?? 0, d?.lastCommitAt() ?? 0))) return; // uncommitted crop tool changes go first (R2-1)
+        // `>=` against the commit: an Auto Sync batch's own history entry is stamped by the backend in the same
+        // millisecond the batch is remembered, and a tie must undo the batch (it includes that commit).
+        if (wf.lastBatch && wf.lastBatch.at > cull.undoAt() && wf.lastBatch.at >= (d?.lastCommitAt() ?? 0)) {
+          return wf.undoLast();
+        }
         if (cull.undoAt() > (d?.lastCommitAt() ?? 0)) {
           lastUndone.current = "cull";
           return void cull.undo();
@@ -1217,10 +1389,17 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         if (mode === "develop") develop.current?.paste();
         else void pasteToSelection();
         return;
+      case "copyAll":
+        return void copyActive();
+      case "pasteAll":
+        if (mode === "develop") return develop.current?.paste();
+        return void pasteToSelection();
       case "sync":
         return develop.current?.sync();
       case "syncQuiet":
         return develop.current?.sync(true);
+      case "autoSync":
+        return develop.current?.toggleAutoSync();
       case "autoTone":
         return develop.current?.autoTone();
       case "autoWb":
@@ -1254,7 +1433,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "help":
         return openHelp();
     }
-  });
+  };
 
   const importActive = status.progress !== null && status.progress.done < status.progress.total;
   const analysisBarShown = !!status.analysis && (status.analysis.running || status.analysis.failed > 0 || status.analysis.done < status.analysis.total);
@@ -1373,6 +1552,12 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         onExport={() => void openExport()}
         onCheatSheet={() => setCheatOpen(true)}
         onModels={() => setModelsOpen(true)}
+        infoOpen={infoOpen}
+        onInfo={() => setInfoOpen((v) => !v)}
+        onCaptureTime={() => {
+          const t = targets();
+          if (t.length > 0) setCaptureOpen(t);
+        }}
         onLocate={() => locateFolder()}
         onRegenerate={() =>
           void run(async () => {
@@ -1405,14 +1590,30 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       )}
       {restoreOpen && catalog && <RestoreBackupDialog backups={catalog.health.backups} onCancel={() => setRestoreOpen(false)} onRestore={restoreBackup} />}
       {modelsOpen && <ModelsDialog onClose={() => setModelsOpen(false)} />}
+      {infoOpen && (
+        <PhotoInfoPanel
+          imageId={mode === "compare" && cmp ? cmp[cmp.focus] : (active ?? null)}
+          side={mode === "develop" ? "left" : "right"}
+          refetchKey={`${lib.epoch}:${active != null ? lib.version(active) : 0}`}
+          onClose={() => setInfoOpen(false)}
+          onEditTime={() => {
+            const t = targets();
+            if (t.length > 0) setCaptureOpen(t);
+          }}
+          onRevert={(id) => void applyCaptureTime([id], { kind: "revert" }, "Reverted capture time to original")}
+        />
+      )}
+      {captureOpen && <CaptureTimeDialog targetIds={captureOpen} activeId={active ?? null} viewIds={ids} projectId={projectId} onApply={applyCaptureTime} onCancel={() => setCaptureOpen(null)} />}
       {applyOpen && (
         <ApplySuggestionsDialog
           selected={applyOpen.selected}
           all={applyOpen.all}
+          projectId={projectId}
+          onlyRejects={applyOpen.onlyRejects}
           onCancel={() => setApplyOpen(null)}
-          onConfirm={(t, onlyUnset) => {
+          onConfirm={(t, onlyUnset, kinds) => {
             setApplyOpen(null);
-            applySuggestions(t, onlyUnset);
+            applySuggestions(t, onlyUnset, kinds);
           }}
         />
       )}
@@ -1489,7 +1690,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             filters={filtersOpen ? <FilterExtras query={uiQuery} setQuery={setQuery} counts={counts} catalog={scopedCatalog} onLocate={() => locateFolder()} /> : null}
           />
           {project && step === "cull" && cullSum.summary && (
-            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} />
+            <CullSummaryBar summary={cullSum.summary} query={uiQuery} setQuery={setQuery} onKeeperRule={(r) => void changeKeeperRule(r)} onApplySuggestions={askApplySuggestions} strictness={project.rejectStrictness} onStrictness={(v) => void changeRejectStrictness(v)} />
           )}
         </>
         )
@@ -1519,10 +1720,25 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       />
       )}
 
-      <div className="relative flex min-h-0 flex-1 flex-col" data-mode={mode}>
+      <div className="relative flex min-h-0 flex-1 flex-col has-[[data-testid=selection-bar]]:[&_[data-testid=grid-scroll]]:pb-14" data-mode={mode}>
         <ErrorBoundary view="Library" onReload={() => void lib.reset()}>
         <PhotoGrid {...gridProps} />
         </ErrorBoundary>
+        {mode === "grid" && !planOpen && (query.sceneId != null || sel.selected.size > 1) && !(project && step === "cull" && !clip && query.sceneId == null) && (
+          <SelectionBar
+            selected={sel.selected.size}
+            sceneCount={query.sceneId != null ? ids.length : null}
+            hasActive={active != null}
+            onSelectAll={sel.selectAll}
+            onCopy={() => void copyActive()}
+            onPaste={() => void pasteToSelection()}
+            onSync={() => void syncSelection()}
+            onEditAll={() => {
+              const list = sel.selected.size > 1 ? ids.filter((i) => sel.selected.has(i)) : ids;
+              if (list.length > 0) editAllInScene(list, active != null && list.includes(active) ? active : list[0]);
+            }}
+          />
+        )}
         {planOpen && project && step === "edit" && (
           <ErrorBoundary view="Plan" overlay onExit={() => setPlanOpen(false)}>
             <PlanView
@@ -1545,6 +1761,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 setNotice("Press Shift+A on the photo you want as the representative");
               }}
               onApplyOptions={(id) => setMatchOpen(id)}
+              onShowIds={showIds}
               onBackToCull={() => goStep("cull")}
               onContinueExport={() => goStep("export")}
               onRegroup={() => void wf.regroup()}
@@ -1557,12 +1774,16 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           <DevelopView
             key={devEpoch}
             ref={develop}
+            autoSync={autoSync}
+            onToolActive={setDevTool}
+            onAutoSync={setAutoSync}
             lib={lib}
             sel={sel}
             onError={reportError}
             onNotice={setNotice}
             onCommitted={wf.noteCommit}
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
+            onBatch={wf.reportBatch}
             onBack={() => changeMode("grid")}
             onLocate={locateFolder}
             compare={cmp}
@@ -1588,13 +1809,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   rows={wf.rows}
                   activeId={active ?? null}
                   fileName={(id) => lib.getEntry(id)?.fileName ?? `#${id}`}
-                  onJump={(id) => openScene(id)}
-                  onStepScene={(dir) => stepScene(dir, dir === 1)}
-                  onPlan={openPlan}
+                  onJump={(id) => leave(() => openScene(id))}
+                  onStepScene={(dir) => leave(() => stepScene(dir, dir === 1))}
+                  onPlan={() => leave(openPlan)}
                   onMakeRep={makeRepresentative}
                   onApplyOptions={(id) => setMatchOpen(id)}
+                  onShowIds={showIds}
                   onReview={reviewFrames}
-                  onNextReview={nextReview}
+                  onNextReview={() => leave(nextReview)}
                 />
               ) : undefined
             }
@@ -1691,13 +1913,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           onApply={(options) => {
             const id = matchScene.id;
             setMatchOpen(null);
-            void wf.applyScene(id, options, reviewFrames).then(() => {
+            void wf.applyScene(id, options, reviewFrames, showIds).then(() => {
               setDevEpoch((n) => n + 1);
             });
           }}
         />
       )}
-      <Toasts api={toasts} placement={mode === "develop" ? "top" : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
+      <Toasts api={toasts} placement={mode === "develop" ? (devTool ? "tool" : "top") : "bottom"} error={status.error} onDismissError={() => setError(null)} onLocate={() => locateFolder(active ?? undefined)} />
       <HelpPanel onShortcuts={() => setCheatOpen(true)} />
       <ActivityWidget behindDialogs={exportOpen != null || modalOpenCount > 0 || helpState.open} hasChildren={exportJobs.jobs.length > 0} hideKinds={hiddenActivityKinds}>
         <ExportJobsPanel jobs={exportJobs.jobs} onCancel={(id) => void exportJobs.cancel(id)} onDismiss={exportJobs.dismiss} onReveal={revealInFinder} />

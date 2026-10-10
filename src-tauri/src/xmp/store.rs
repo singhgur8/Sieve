@@ -6,7 +6,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::now_ms;
 use crate::ipc::error::{AppError, AppResult};
-use crate::ipc::types::{ColorLabel, DevelopWarning, FolderId, ImageId, ParametricAdjustments, PickFlag};
+use crate::ipc::types::{
+    CaptureTimeSource, ColorLabel, DevelopWarning, FolderId, ImageId, ParametricAdjustments, PickFlag,
+};
 
 /// XMP-relevant catalog state of one image.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,12 +20,18 @@ pub struct ImageRow {
     pub color_label: Option<ColorLabel>,
     pub meta_updated_at: Option<i64>,
     pub xmp_mtime_ms: Option<i64>,
+    /// Corrected capture time, the file's EXIF time and which one applies (v19).
+    pub captured_at_ms: Option<i64>,
+    pub exif_captured_at_ms: Option<i64>,
+    pub capture_time_source: CaptureTimeSource,
 }
 
 pub fn load(conn: &Connection, id: ImageId) -> AppResult<Option<ImageRow>> {
     Ok(conn
         .query_row(
-            "SELECT id, path, rating, pick, color_label, meta_updated_at, xmp_mtime_ms FROM images WHERE id = ?1",
+            "SELECT id, path, rating, pick, color_label, meta_updated_at, xmp_mtime_ms, captured_at_ms,
+                    exif_captured_at_ms, capture_time_source
+             FROM images WHERE id = ?1",
             [id],
             |r| {
                 let pick: String = r.get(3)?;
@@ -36,6 +44,9 @@ pub fn load(conn: &Connection, id: ImageId) -> AppResult<Option<ImageRow>> {
                     color_label: label.as_deref().and_then(ColorLabel::parse),
                     meta_updated_at: r.get(5)?,
                     xmp_mtime_ms: r.get(6)?,
+                    captured_at_ms: r.get(7)?,
+                    exif_captured_at_ms: r.get(8)?,
+                    capture_time_source: CaptureTimeSource::parse(&r.get::<_, String>(9)?).unwrap_or_default(),
                 })
             },
         )

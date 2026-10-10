@@ -726,6 +726,60 @@ mod tests {
         assert_eq!(b.white_balance, custom);
     }
 
+    /// Scene apply must carry every setting of the representative (grain, clarity, texture, dehaze, vignette,
+    /// detail, HSL, curves, grading, calibration, profile, LUT, ...); only crop / masks / transform stay the target's.
+    #[test]
+    fn base_copies_every_non_geometry_field_of_the_representative() {
+        fn bump(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Number(n) => {
+                    *v = serde_json::json!(n.as_f64().unwrap() + 3.0);
+                }
+                serde_json::Value::Bool(b) => *b = !*b,
+                serde_json::Value::Array(a) => a.iter_mut().for_each(bump),
+                serde_json::Value::Object(o) => o.values_mut().for_each(bump),
+                _ => {}
+            }
+        }
+        let mut v = serde_json::to_value(ParametricAdjustments::default()).unwrap();
+        v.as_object_mut().unwrap().iter_mut().for_each(|(k, x)| {
+            if k != "processVersion" {
+                bump(x)
+            }
+        });
+        v["lut"] = serde_json::json!({ "id": "film", "amount": 80.0 });
+        let rep: ParametricAdjustments = serde_json::from_value(v).unwrap();
+        let target = ParametricAdjustments::default();
+        let out = base_adjustments(&target, &rep, None, &MatchOptions::default());
+        let (o, r, t) = (
+            serde_json::to_value(&out).unwrap(),
+            serde_json::to_value(&rep).unwrap(),
+            serde_json::to_value(&target).unwrap(),
+        );
+        for (k, rv) in r.as_object().unwrap() {
+            if ["crop", "masks", "transform"].contains(&k.as_str()) {
+                assert_eq!(o[k], t[k], "{k} must stay the target's");
+            } else {
+                assert_eq!(&o[k], rv, "{k} must equal the representative's after apply");
+            }
+        }
+        for k in [
+            "effects",
+            "clarity",
+            "texture",
+            "dehaze",
+            "detail",
+            "hsl",
+            "toneCurve",
+            "colorGrading",
+            "calibration",
+            "profile",
+            "lut",
+        ] {
+            assert_ne!(o[k], t[k], "{k} was not exercised");
+        }
+    }
+
     #[test]
     fn anchor_choice_nearest_or_between() {
         assert_eq!(choose_anchors(&[Some(10)], Some(99)), AnchorChoice { primary: 0, second: None });

@@ -102,21 +102,62 @@ pub fn crop_frame(crop: &CropSettings, sw: u32, sh: u32, orientation: u8) -> (u3
     (w, h, m)
 }
 
-/// Output pixel -> sensor frame for `g`.
+/// Output pixel -> sensor frame for `g` (with a Transform warp: the least-squares affine fit
+/// of the projective map over a 5 x 5 grid of the output).
 pub fn geometry_affine(g: &MaskGeometry) -> Affine {
     let (_, _, m) = crop_frame(&g.crop, g.sensor_width, g.sensor_height, g.orientation);
     let r = g.region.unwrap_or(NormRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
     let sx = f64::from(r.width) / f64::from(g.width.max(1));
     let sy = f64::from(r.height) / f64::from(g.height.max(1));
     let (ox, oy) = (f64::from(r.x) + 0.5 * sx, f64::from(r.y) + 0.5 * sy);
-    Affine {
+    let t = Affine {
         a: m[0] * sx,
         b: m[1] * sy,
         c: m[0] * ox + m[1] * oy + m[2],
         d: m[3] * sx,
         e: m[4] * sy,
         f: m[3] * ox + m[4] * oy + m[5],
+    };
+    match &g.warp {
+        Some(w) => fit_affine(g, |px, py| {
+            let (x, y) = t.apply(px, py);
+            crate::develop::transform::apply(w, x, y)
+        })
+        .unwrap_or(t),
+        None => t,
     }
+}
+
+/// Least-squares affine `(px, py) -> (u, v)` of `map` sampled on a 5 x 5 grid of `g`'s output.
+fn fit_affine(g: &MaskGeometry, map: impl Fn(f64, f64) -> Option<(f64, f64)>) -> Option<Affine> {
+    // Normal equations of [px py 1] -> u (and -> v).
+    let mut ata = [0.0f64; 9];
+    let (mut atu, mut atv) = ([0.0f64; 3], [0.0f64; 3]);
+    let (w, h) = (f64::from(g.width.max(1)) - 1.0, f64::from(g.height.max(1)) - 1.0);
+    for j in 0..5 {
+        for i in 0..5 {
+            let (px, py) = (w * f64::from(i) / 4.0, h * f64::from(j) / 4.0);
+            let Some((u, v)) = map(px, py) else { continue };
+            let row = [px, py, 1.0];
+            for a in 0..3 {
+                for b in 0..3 {
+                    ata[a * 3 + b] += row[a] * row[b];
+                }
+                atu[a] += row[a] * u;
+                atv[a] += row[a] * v;
+            }
+        }
+    }
+    let inv = crate::develop::transform::invert(&ata)?;
+    let solve = |rhs: [f64; 3]| {
+        [
+            inv[0] * rhs[0] + inv[1] * rhs[1] + inv[2] * rhs[2],
+            inv[3] * rhs[0] + inv[4] * rhs[1] + inv[5] * rhs[2],
+            inv[6] * rhs[0] + inv[7] * rhs[1] + inv[8] * rhs[2],
+        ]
+    };
+    let (cu, cv) = (solve(atu), solve(atv));
+    Some(Affine { a: cu[0], b: cu[1], c: cu[2], d: cv[0], e: cv[1], f: cv[2] })
 }
 
 /// Sensor px per output px (the map is a similarity up to rounding).

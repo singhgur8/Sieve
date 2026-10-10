@@ -11,7 +11,7 @@ import { Menu, menuItem } from "../Menu";
 import { KeeperRuleMenu, RuleItems, ruleLabel } from "../KeeperRule";
 import { keeperEquation } from "../../lib/cull";
 import { Dialog } from "../Dialog";
-import { AutoEditButton, StatusIcon, statusLine, Thumb, useWide } from "./bits";
+import { AutoEditButton, ApplyWhy, applyBlock, StatusIcon, statusLine, Thumb, useWide } from "./bits";
 
 const TABS: { id: PlanTab; label: string }[] = [
   { id: "all", label: "All" },
@@ -38,6 +38,8 @@ interface Props {
   onEdit: (sceneId: number) => void;
   onReview: (sceneId: number, ids?: number[]) => void;
   onShowScene: (sceneId: number) => void;
+  /** "Show" on the apply toast: list these photos in the grid, selected. */
+  onShowIds: (ids: number[], label: string) => void;
   onChangeRep: (sceneId: number) => void;
   onApplyOptions: (sceneId: number) => void;
   onBackToCull: () => void;
@@ -178,12 +180,12 @@ export function PlanView(p: Props) {
               </Menu>
             )}
             {rows.length > 0 && (
-              <div className="flex shrink-0 items-center gap-2 text-xs text-neutral-300" data-testid="plan-progress">
+              <div className="flex min-w-0 shrink items-center gap-2 text-xs text-neutral-300" data-testid="plan-progress">
                 <span className="flex h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-neutral-800 min-[1600px]:w-[200px]" aria-hidden>
                   <span className="h-full bg-emerald-500" style={{ width: `${((counts?.applied ?? 0) / rows.length) * 100}%` }} />
                   <span className="h-full bg-sky-500" style={{ width: `${(((counts?.edited ?? 0) + (counts?.outdated ?? 0)) / rows.length) * 100}%` }} />
                 </span>
-                <span className="whitespace-nowrap" data-testid="plan-counts">
+                <span className="min-w-0 truncate whitespace-nowrap" data-testid="plan-counts">
                   {(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · {counts?.applied ?? 0} applied · {counts?.toEdit ?? 0} to do{(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}
                 </span>
               </div>
@@ -213,18 +215,27 @@ export function PlanView(p: Props) {
               Continue to Export <ArrowRight className="size-3.5" /> {keeperCount}
             </button>
           ) : (pending.length === 0 && (counts?.toEdit ?? 0) === 0) || (pending.length === 0 && rows.some((r) => r.ui === "applied" || r.ui === "reset")) ? null : (
+            <div className="flex shrink-0 items-center gap-2 max-[1439px]:flex-col-reverse max-[1439px]:items-end max-[1439px]:gap-0.5" data-testid="plan-apply-block">
+            {pending.length === 0 && busy == null && !applying && (
+              <ApplyWhy
+                block={{ reason: "Edit a scene's representative first", fix: todo.length > 0 ? "open" : undefined }}
+                testid="plan-apply-all-why"
+                onFix={() => todo.length > 0 && p.onEdit(todo[0].entry.sceneId)}
+              />
+            )}
             <button
               className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
               data-testid="plan-apply-all"
               disabled={pending.length === 0 || busy != null || applying}
               title={applying ? BUSY_WHY.apply_scene : pending.length === 0 ? "Edit or auto edit a scene first" : "Copies each edited scene's edit to the rest of its scene, matching exposure and white balance per photo"}
-              onClick={() => void wf.applyAll(p.onReview, p.onFocus)}
+              onClick={() => void wf.applyAll(p.onReview, p.onFocus, p.onShowIds)}
             >
               Apply {plural(pending.length, "edited scene")} ({pendingTargets})
               <ArrowRight className="size-3.5" />
             </button>
+            </div>
           )}
-          <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-2 hover:bg-neutral-700" triggerTestId="plan-more" title="More" align="right">
+          <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 shrink-0 items-center rounded-md bg-neutral-800 px-2 hover:bg-neutral-700" triggerTestId="plan-more" title="More" align="right">
             {(close) => (
               <div className="w-72 py-1">
                 <button
@@ -410,9 +421,27 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           {plural(e.imageIds.length, "keeper")}
         </p>
         <p className={`text-xs ${line.cls}`} data-testid={`plan-status-${id}`}>
-          {busyHere ? (wf.busy!.total > 0 ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : "Applying…") : line.text}
+          {busyHere ? (
+            wf.busy!.total > 0 ? `Applying… ${wf.busy!.done}/${wf.busy!.total}` : "Applying…"
+          ) : r.ui === "todo" && !r.skipped ? (
+            <>
+              To do:{" "}
+              <button className="text-sky-300 underline-offset-2 hover:underline" data-testid={`plan-todo-edit-${id}`} onClick={(ev) => (ev.stopPropagation(), p.onEdit(id))}>
+                edit this photo
+              </button>
+            </>
+          ) : (
+            line.text
+          )}
           {!busyHere && line.extra && <span className="text-amber-300">{line.extra}</span>}
         </p>
+        {!busyHere && !(r.ui === "todo" && !r.skipped) && (
+          <ApplyWhy
+            block={applyBlock(r)}
+            testid={`plan-apply-why-${id}`}
+            onFix={(fix) => (fix === "open" ? p.onEdit(id) : void wf.setSkipped(id, false))}
+          />
+        )}
         <p className="truncate text-[11px] text-neutral-400" title={e.representativeReason}>
           {repEntry?.fileName ?? `#${e.representativeId}`}
         </p>
@@ -442,7 +471,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
             data-testid={`plan-apply-${id}`}
             disabled={!canApply || anyBusy}
             title={applying ? BUSY_WHY.apply_scene : canApply ? (newKeepers > 0 ? `Copies this edit to the ${newKeepers} keepers added since it was applied.` : `Copies this edit to ${r.targets} photos, matching exposure and white balance to each.`) : "No other keepers in this scene"}
-            onClick={() => void wf.applyScene(id, "match", p.onReview)}
+            onClick={() => void wf.applyScene(id, "match", p.onReview, p.onShowIds)}
           >
             {applyLabel}
           </button>
@@ -473,7 +502,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         {!r.skipped && (r.ui === "todo" || r.ui === "reset" || r.ui === "edited") && (
           <AutoEditButton style={wf.style} testid={`plan-auto-${id}`} label="Auto edit" disabled={anyBusy} onClick={() => wf.requestAutoEdit([id])} className="px-2" />
         )}
-        <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
+        <Menu trigger={<MoreHorizontal className="size-4" />} triggerClass="flex h-7 shrink-0 items-center rounded-md bg-neutral-800 px-1.5 hover:bg-neutral-700" triggerTestId={`plan-menu-${id}`} title="More for this scene" align="right">
           {(close) => {
             const item = (testid: string, label: string, fn: () => void, disabled = false, why?: string) => (
               <button

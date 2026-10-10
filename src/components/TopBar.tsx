@@ -1,6 +1,6 @@
 // One 44 px application bar: import / shoot / analyze on the left, module switcher in the middle,
 // XMP state, save and export on the right. Rarely used actions live in the Analyze and "more" menus.
-import { Aperture, Check, CircleHelp, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, LayoutList, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
+import { Aperture, Clock, Info, Check, CircleHelp, ChevronDown, CloudUpload, Columns2, Cpu, DownloadCloud, FolderOpen, FolderSearch, Grid3x3, Keyboard, LayoutList, Maximize, MoreHorizontal, RefreshCw, Share, SlidersHorizontal, Layers3 } from "lucide-react";
 import type { CatalogState, ImportOptions, Project, ShootType, XmpStatus } from "../ipc";
 import type { AnalysisView } from "../hooks/useBackendStatus";
 import { hint, type Mode } from "../lib/keymap";
@@ -56,6 +56,10 @@ interface Props {
   onExport: () => void;
   onCheatSheet: () => void;
   onModels: () => void;
+  /** Per-photo info panel (time, camera, exposure, file) and Edit Capture Time. */
+  infoOpen: boolean;
+  onInfo: () => void;
+  onCaptureTime: () => void;
   onLocate: () => void;
   onRegenerate: () => void;
   /** 0-100 while export jobs run, otherwise null. */
@@ -162,6 +166,10 @@ export function TopBar(p: Props) {
         {p.exportPct != null ? <Ring pct={p.exportPct} /> : <Share className="size-4" />}
         Export
       </button>}
+      <button onClick={p.onInfo} className={`${btn} ${p.infoOpen ? "bg-neutral-700" : ""}`} aria-pressed={p.infoOpen} data-testid="info-toggle" title={`Photo info: capture date and time, camera, exposure and file of the selected photo${hint("photoInfo")}`} aria-label="Photo info">
+        <Info className="size-4" />
+        <span className={p.steps ? labelHide : ""}>Info</span>
+      </button>
       <button onClick={() => openHelp()} className={btn} data-testid="help-button" title="Help and FAQ (F1 / Cmd+?)" aria-label="Help">
         <CircleHelp className="size-4" />
         <span className={p.steps ? labelHide : ""}>Help</span>
@@ -232,6 +240,18 @@ export function TopBar(p: Props) {
               }}
             >
               <FolderSearch className="size-4" /> Locate folder…
+            </button>
+            <button
+              className={menuItem}
+              disabled={!p.hasSelection}
+              data-testid="edit-capture-time-menu"
+              title="Fix a camera clock: shift the selection, set an exact time or sync two cameras"
+              onClick={() => {
+                close();
+                p.onCaptureTime();
+              }}
+            >
+              <Clock className="size-4" /> Edit capture time… <span className="ml-auto text-xs text-neutral-400">{hint("captureTime").replace(/[()]/g, "").trim()}</span>
             </button>
             <button
               className={menuItem}

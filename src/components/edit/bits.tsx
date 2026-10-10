@@ -1,8 +1,9 @@
 // Small shared pieces of the Edit step: scene status icons and copy, the style-aware "Auto edit (my style)" button, a thumbnail.
 import { useEffect, useState } from "react";
 import { CheckCircle2, Circle, CircleDot, Loader2, RefreshCw, Sparkles, Wand2 } from "lucide-react";
-import { convertFileSrc, type RawImageEntry, type StyleModelStatus } from "../../ipc";
+import { type RawImageEntry, type StyleModelStatus } from "../../ipc";
 import { styleGate, type SceneRow, type SceneUi } from "../../hooks/useWorkflow";
+import { thumbSrc } from "../../lib/entryImage";
 
 export const STATUS_ICON: Record<SceneUi, { icon: typeof Circle; cls: string }> = {
   todo: { icon: Circle, cls: "text-neutral-400" },
@@ -40,6 +41,36 @@ export function statusLine(r: SceneRow): { text: string; cls: string; extra?: st
   }
 }
 
+export type ApplyFix = "open" | "include";
+
+/** Why Apply to scene is unavailable for this scene (null = it can run). `soft`: informational only, the button still works. */
+export function applyBlock(r: SceneRow | undefined): { reason: string; fix?: ApplyFix; soft?: boolean } | null {
+  if (!r) return { reason: "This photo is not in a scene" };
+  if (r.skipped) return { reason: "This scene is skipped", fix: "include" };
+  if (r.ui === "todo") return { reason: "Edit the representative first", fix: "open" };
+  if (r.ui === "reset") return { reason: "Edit the representative first (it was reset)", fix: "open" };
+  if (r.targets === 0) return { reason: "No keepers in this scene" };
+  if (r.ui === "applied" && r.unapplied.length === 0) return { reason: "Already applied", soft: true };
+  return null;
+}
+
+export const FIX_LABEL: Record<ApplyFix, string> = { open: "Open representative", include: "Include scene" };
+
+/** The reason a scene cannot be applied, in place, with its one-click fix. */
+export function ApplyWhy({ block, onFix, testid, className = "" }: { block: { reason: string; fix?: ApplyFix; soft?: boolean } | null; onFix?: (fix: ApplyFix) => void; testid: string; className?: string }) {
+  if (!block) return null;
+  return (
+    <span className={`flex min-w-0 items-center gap-1.5 text-[11px] ${block.soft ? "text-neutral-400" : "text-amber-300"} ${className}`} data-testid={testid}>
+      <span className="truncate">{block.reason}</span>
+      {block.fix && onFix && (
+        <button className="shrink-0 whitespace-nowrap text-sky-300 hover:underline" data-testid={`${testid}-fix`} onClick={() => onFix(block.fix!)}>
+          {FIX_LABEL[block.fix]}
+        </button>
+      )}
+    </span>
+  );
+}
+
 interface AutoProps {
   style: StyleModelStatus | null;
   onClick: () => void;
@@ -55,7 +86,9 @@ export function AutoEditButton({ style, onClick, label = "Auto edit (my style)",
   const training = g.kind === "training";
   const off = g.kind === "insufficient";
   const pct = style?.progress != null ? Math.round(style.progress * 100) : 0;
+  const need = style ? Math.max(0, style.minExamples - style.availableExamples) : 0;
   return (
+    <>
     <button
       onClick={onClick}
       disabled={disabled || training || off}
@@ -67,6 +100,12 @@ export function AutoEditButton({ style, onClick, label = "Auto edit (my style)",
       {training ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5 text-amber-400" />}
       {training ? `Learning your style… ${pct}%` : label}
     </button>
+    {off && style && (
+      <span className="whitespace-nowrap text-[11px] text-amber-300" data-testid={testid ? `${testid}-why` : undefined}>
+        {need > 0 ? `Edit ${need} more photo${need === 1 ? "" : "s"} first` : "Not trained yet"}
+      </span>
+    )}
+    </>
   );
 }
 
@@ -75,7 +114,7 @@ export function Thumb({ entry, version = 0, className = "" }: { entry: RawImageE
   const t = entry?.thumbnail;
   return (
     <div className={`overflow-hidden bg-neutral-800 ${className}`}>
-      {t?.status === "ready" && <img src={`${convertFileSrc(t.path)}?v=${version}`} alt="" draggable={false} className="size-full object-cover" />}
+      {t?.status === "ready" && <img src={thumbSrc(entry, version)!} alt="" draggable={false} className="size-full object-cover" />}
     </div>
   );
 }

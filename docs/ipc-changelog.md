@@ -839,6 +839,244 @@ Who updates what
   style model (untrained) emulated; `set_scene_representative` / `apply_scene_edit` / `apply_all_edited_scenes`
   not emulated yet.
 
+## v19.3 — 2026-10-05 (UX 8d R1-3: crop tool after Upright / Transform)
+
+Additive (one new command + type), no schema change. `src/ipc/bindings.ts` regenerated.
+
+- `get_transform_bounds(id, adjustments: ParametricAdjustments) -> TransformBounds` (TS
+  `commands.getTransformBounds`). Pure geometry of the live settings, no render, no save (decodes the source on first
+  use like `get_develop_info`; instant while the photo is open in Develop). Unknown id -> `not_found`, missing
+  original -> `file_missing`.
+- `TransformBounds { validQuad: [number, number][] | null, constrainedCrop: CropSettings | null }`, both `null` when
+  the transform is neutral (no Upright solution for the current mode, neutral sliders):
+  - `validQuad`: the warped image outline, 4 points = the source corners mapped into the corrected frame, as
+    **fractions of the uncropped corrected frame as displayed** (EXIF orientation applied; the same frame as a render
+    with `crop.enabled = false` and the crop tool's displayed rects in `src/lib/crop.ts`). Clockwise on screen (y
+    down). Not clipped: points may lie outside 0..1. Image pixels = quad ∩ frame; the rest renders white.
+  - `constrainedCrop`: what Constrain Crop makes of `adjustments.crop` (`develop::transform::constrain_crop`), in the
+    **stored** convention (un-oriented fractions + angle; convert with `fromStored(c, orientation, aspect)`). The crop
+    unchanged when it fits; else the largest frame of the same aspect / angle that fits; a disabled crop becomes the
+    largest frame of the photo's aspect (`enabled: true`), or stays disabled when the warp covers the whole frame
+    (e.g. Scale > 100). Computed regardless of `transform.constrainCrop`; equals the crop a render uses when that is on.
+- Confirmed (no change): a render with `crop.enabled = false` and `transform.constrainCrop = false` keeps the full
+  warped frame (same output size as the uncropped photo) with white outside `validQuad`
+  (`Geometry::of` leaves a disabled crop alone unless `constrainCrop`; tests `bounds_identity_is_null`,
+  `develop::source` `keystone_warp_straightens_converging_lines`). With `constrainCrop = true` a disabled crop
+  renders as the auto-constrained frame, which is why the crop tool must turn it off while cropping.
+
+Mock backend (`src/testing/mockBackend.ts`): no pixel warp; with `transform.upright != "off"` or a non-zero
+`vertical`, `validQuad = [[0,0],[1,0],[1-d,1],[d,1]]` (d = 0.06 with Upright + |vertical|/100 * 0.2, max 0.3) and
+`constrainedCrop` = the stored form of the displayed rect `{l: d, t: 2d, r: 1-d, b: 1}` for a disabled crop (an enabled
+crop is returned as is). Otherwise both `null`. Contract check: `tests/ui/ipc-v19-3-mock.spec.ts`.
+
+Who updates what
+- architect (done): type, `develop::transform::bounds`, `DevelopCache::transform_bounds`, command + registration,
+  Rust tests (`develop::transform::tests::bounds_*`), bindings, mock.
+- frontend-dev (R1-3):
+  1. While cropping, render with `crop: {...a.crop, enabled: false}` **and** `transform: {...a.transform,
+     constrainCrop: false}`.
+  2. On crop-tool start and whenever `transform` changes while it is open, call
+     `getTransformBounds(id, liveAdjustments)` (debounce slider drags). "Constrain to image" keeps the rectangle inside
+     the rotated frame ∩ `validQuad` (convex polygon test replacing `insideRotated`; `fitInsideRotated` / `approach`
+     use it); `PaperFill` paints outside `validQuad`. `validQuad = null` -> today's behaviour.
+  3. Starting the tool with `transform.constrainCrop` on and `validQuad != null`: initial rect =
+     `fromStored(constrainedCrop, orientation, aspect)` when `constrainedCrop.enabled` (for a stored crop too: that is
+     what the photo currently shows).
+- rust-engine-dev, vision-ml-dev: nothing.
+
+## v19.2 — 2026-10-05 (Phase 8d feedback: camera bodies, project-wide camera sync, suggestion filter, Auto Sync)
+
+Driven by `docs/ux-review-8d.md` P1-1, P1-3, P1-4, P1-5 ([ARCH] items). Additive on the wire except one TS call
+signature (`applySuggestions` has a third argument). Schema v18 (`migrations/0018_camera_serial_sync.sql`):
+`images.camera_serial`, `images.camera_serial_read` (+ indexes `idx_images_folder_body`, partial
+`idx_images_serial_unread`); `edit_batches.kind` CHECK accepts `sync` (writable_schema edit, as 0009 / 0017).
+`src/ipc/bindings.ts` regenerated.
+
+Camera bodies (P1-4)
+- `CameraInfo.serial: string | null` (`#[serde(default)]`, optional in TS, always sent): EXIF `BodySerialNumber`
+  (else DNG `CameraSerialNumber`), trimmed; all-zero / blank values read as `null`. Written by thumbnail extraction
+  (`raw::meta::ImageMeta.serial`, `repo::record_extraction`: new imports and `regenerate_thumbnails`). Photos
+  imported before v19.2 are read by a background thread at startup (`db::camera_serial::backfill`, ~1-3 ms per
+  file, never blocks; missing originals are retried next launch). Until then their serial is `null`: refetch
+  entries (or the facet) when opening the capture-time dialog rather than caching serials for the session.
+- `ImageMetadata.cameraSerial` = the catalog's serial, else read from the file.
+- New `CameraBody {make, model | null, serial | null}`; `MetadataFilter.bodies?: CameraBody[]` (exact match; a
+  `null` model / serial matches only unknown values; blank = unknown); `MetadataFilterOptions.bodies?:
+  CameraBodyCount[]` (`{body, count}`; ignores `metadata.bodies`, like every facet ignores its own constraint;
+  order: known models by make / model, then serial, unknown serial last, unknown model last). `cameras` /
+  `CameraFilter` are unchanged (model level).
+
+Project-wide sync cameras (P1-3, P1-4)
+- `CaptureTimeEdit.sync_cameras` gains `scope?: CameraSyncScope` (`"selected"` default = v19 behaviour, moves
+  `ids`; `"body"` = every photo of the target's **project** with the target's make + model + serial; `"model"` =
+  make + model, any serial). With `body` / `model` the command ignores `ids` (pass `[]`) and the grid's filters,
+  and fails with `invalid_argument` ("the reference photo is from the camera being moved; ...") when the reference
+  is in that set. Result / undo unchanged (`changedIds`, `previous` -> `restore_capture_times`).
+- Preview counts for the dialog: `list_image_ids({projectId, metadata: {bodies: [targetBody]}})` (or `cameras` for
+  model scope) = exactly the photos that move; "including N hidden by the current filters" = that count minus the
+  same query with the grid's filters.
+
+Suggestion filter + apply per kind (P1-5)
+- `PendingSuggestion = "reject" | "pick" | "rating"`; `ImageQuery.suggested?: PendingSuggestion | null`: analysed,
+  unflagged, 0 stars, with that suggestion (`rating` = no flag suggested but stars) = the
+  `CullSummary.suggested*Pending` rule. Honoured by `list_images`, `list_image_ids`, `get_metadata_filter_options`.
+- `FilterCounts.suggestedReject / suggestedPick / suggestedRating` (`#[serde(default)]`): pending suggestions among
+  the counted images (follow `keepersOnly` / `metadata` / `pickOrigin`).
+- `apply_suggestions(ids, onlyUnset, kinds: SuggestionKinds | null)` — **new third argument** (`null` = all, the
+  v18.1 behaviour). `SuggestionKinds {picks, rejects, stars}`: suggested pick flags with `picks`, rejects with
+  `rejects`, a suggested "no flag" (clears a flag; only reachable with `onlyUnset = false`) only with both, the
+  suggested stars with `stars`. `{picks: false, rejects: true, stars: false}` over the project flags exactly the
+  `suggested: "reject"` photos and changes no rating. Counts for the dialog's checkboxes: `CullSummary`
+  `suggestedRejectPending` / `suggestedPickPending` / `suggestedRatingPending` (unchanged).
+
+Auto Sync / relative sync (P1-1)
+- `sync_delta(sourceId, before, after, targetIds, options: SyncDeltaOptions | null) -> SyncDeltaResult`. Writes
+  `after` to the source and the `before` -> `after` change to every target, as **one** undoable batch of new kind
+  `EditBatchKind::Sync` (`"sync"`) that includes the source: `undo_edit_batch(result.batch.batchId)` reverts all
+  photos (P1-1 item 5). Only groups that differ between `before` and `after` are touched (never `crop`, `masks`,
+  `transform`; `SyncDeltaResult.fields` lists them). `SyncDeltaOptions {relative?: AdjustmentField[] (default
+  ["exposure", "white_balance"]; anything else -> invalid_argument; [] = absolute copy like Lightroom), fields?:
+  AdjustmentField[] | null (limit), label?: string | null (history label of every entry, default "Auto Sync")}`.
+  Relative exposure: target + (after - before), clamped -5..5, 0.01 EV. Relative WB: temperature shifted in mireds,
+  tint added, clamped, rounded to whole K / tint; `as_shot` sides resolved to the camera as-shot values (the
+  command decodes those photos through the develop cache); a change *to* as-shot is copied; unresolvable as-shot ->
+  absolute copy, listed in `absoluteWbIds`. `SyncDeltaResult {batch: EditBatchResult, fields, relativeFields,
+  absoluteWbIds, history: AdjustmentHistory (the source's, as save_adjustments returns)}`. Duplicates / the source in
+  `targetIds` are ignored; atomic; unknown id -> `not_found`. Reports a `paste_sync` activity for 2+ photos.
+- With relative exposure / WB the matched-scene restriction of P1-1 item 4 is no longer needed: frames keep their
+  per-frame differences.
+
+Mock backend (`src/testing/mockBackend.ts`)
+- Entries carry `camera.serial` (Sony 06258214, Fuji 61000657, Canon 032021001234); new `?twobodies=1`: every 3rd
+  frame from a second ILCE-7M4 (serial 05119876) whose clock is 1 h ahead. `bodies` filter + facet, `suggested`
+  filter, `FilterCounts.suggested*`, `apply_suggestions` kinds, sync-cameras scopes (project-wide), `sync_delta`
+  (as-shot = 5200 K / +8, batch kind `sync`), `get_image_metadata.cameraSerial` from the entry.
+  Contract check: `tests/ui/ipc-v19-2-mock.spec.ts`.
+
+Who updates what
+- architect (done): types, schema v18, `raw::meta` / `raw::tiff` serial tags, `repo` (entry serial, bodies
+  filter / facet, suggested filter, filter counts, `apply_suggestions_kinds`, extraction), `db::camera_serial`
+  (backfill, started in `lib.rs`), `db::capture_time::{camera_scope_ids, edit}` scopes, `develop::sync_delta` +
+  command + registration, Rust tests, bindings, mock, `App.tsx` compile fix (`applySuggestions(t, onlyUnset, null)`).
+- frontend-dev:
+  1. P1-1: Auto Sync switch (`autoSync` keymap Cmd+Alt+Shift+A). While on with 2+ selected, commit each edit with
+     `commands.syncDelta(activeId, beforeCommit, afterCommit, otherSelectedIds, {label})` **instead of**
+     `saveAdjustments` (the source is written by it; use `result.history` like the save result). Cmd+Z right after:
+     `undoEditBatch(result.batch.batchId)`. Drop the matched-scene exclusion of exposure / WB (relative by default).
+  2. P1-3 / P1-4: group cameras by make + model + serial (`entry.camera.serial`, label `ILCE-7M4 (…8214)` when two
+     bodies share a model; `MetadataFilterOptions.bodies` has the project's bodies with counts); Sync tab sends
+     `{kind: "sync_cameras", referenceId, targetId, scope: "body"}` with `ids: []` (or `"model"` when serials are
+     unknown / the user picks the model; `"selected"` for "The selected photos"). Summary counts via
+     `listImageIds({projectId, metadata: {bodies: [body]}})`. Metadata filter Camera column: use `bodies`.
+  3. P1-5: `Review N suggested rejects` = grid query `suggested: "reject"`; `isFiltered` / `describeFilters` /
+     chips / `membershipSensitive` must know `suggested`; Apply dialog checkboxes -> `applySuggestions(ids, true,
+     {picks, rejects, stars})`, counts from `CullSummary` (or `FilterCounts.suggested*` for a filtered scope).
+- rust-engine-dev: nothing required; `raw::exif_info` keeps its own serial read for the Metadata panel fallback.
+  New extraction paths must keep filling `ImageMeta.serial`.
+- vision-ml-dev: nothing required.
+
+## v19 — 2026-10-05 (Phase 8d: capture time, metadata panel, Transform / Upright, preset tracking, paste batches, reject strictness)
+
+Schema v17 (`migrations/0017_capture_transform.sql`): `images.exif_captured_at_ms` (backfilled from
+`captured_at_ms`), `images.capture_time_source` (`exif` | `sidecar` | `user`, default `exif`);
+`adjustments.applied_preset_id` (FK presets, `ON DELETE SET NULL`) + `adjustments.applied_preset_json`;
+`projects.reject_strictness` (`conservative` | `balanced` | `aggressive`, default `balanced`); `edit_batches.kind`
+CHECK accepts `paste` (writable_schema edit, as 0009).
+
+Capture time (a)
+- `CaptureMeta.capturedAtMs` is now the **corrected** time (what sort, bursts, scenes, metadata filters, export
+  naming and project ranges use; no query changed). New `CaptureMeta.originalCapturedAtMs` (the file's EXIF time,
+  never edited) and `CaptureMeta.captureTimeSource: CaptureTimeSource` (`exif` | `sidecar` | `user`); both
+  `#[serde(default)]` (optional in TS, always sent).
+- `edit_capture_time(ids, mode: CaptureTimeEdit) -> CaptureTimeEditResult {changedIds, skippedIds, offsetMs,
+  previous: CaptureTimeSnapshot[]}`. Modes (tagged `kind`): `shift {offsetMs}`, `set_exact {referenceId,
+  capturedAtMs}` (reference must be in `ids`; others shift by the same offset; a reference without a time just
+  gets it), `sync_cameras {referenceId, targetId}` (offset = reference - target, applied to `ids`; both need a
+  time), `revert` (back to the EXIF time). Photos without a time are skipped. Atomic; duplicate id / out of
+  1900..2200 (`MIN_CAPTURE_TIME_MS` / `MAX_CAPTURE_TIME_MS`) -> `invalid_argument`. Marks sidecars dirty,
+  notifies auto-sync, refreshes scene bounds, kicks a rescore (bursts regroup).
+- `restore_capture_times(snapshots: CaptureTimeSnapshot[]) -> number[]` (undo / redo; changed ids).
+- Extraction (`repo::record_extraction`) writes `exif_captured_at_ms` and touches `captured_at_ms` only while the
+  source is `exif`, so re-extraction keeps corrections.
+- Helper for the XMP read path: `db::capture_time::apply_sidecar_time(conn, id, Option<naive ms>)` (equal to EXIF
+  or `None` -> `exif`; different -> `sidecar`; does not mark dirty).
+
+Per-photo metadata (b)
+- `get_image_metadata(id) -> ImageMetadata {imageId, path, fileName, folderPath, format, extension, fileSize,
+  fileMtimeMs, capturedAtMs, originalCapturedAtMs, captureTimeSource, camera, lens, iso, shutterSeconds, aperture,
+  focalLengthMm, focalLength35mm, exposureCompensationEv, flashFired, cameraSerial, width, height, orientation,
+  gps: GpsLocation {latitude, longitude, altitudeM} | null, sidecarPath, sidecarExists, companionPath, missing}`.
+  Catalog values are filled now; `focalLength35mm`, `exposureCompensationEv`, `flashFired`, `cameraSerial`, `gps`
+  are `null` until rust-engine-dev reads them from the file.
+
+Transform / Upright (c)
+- `ParametricAdjustments.transform: TransformSettings` (`#[serde(default)]`) = `{upright: UprightMode, guides:
+  UprightGuide[] (<= 4, sensor frame), vertical, horizontal (-100..100), rotate (-10..10 deg), aspect (-100..100),
+  scale (50..150, default 100), offsetX, offsetY (-100..100), constrainCrop, solution: UprightSolution | null}`.
+  `UprightMode` = `off | auto | level | vertical | full | guided` (`crs:PerspectiveUpright` 0 / 1 / 3 / 4 / 2 / 5:
+  `crs_value` / `from_crs`). `UprightSolution {mode, matrix: number[9] (row-major homography, corrected ->
+  source, sensor frame normalized), rotationDeg, crs: CrsProperty[] (Lightroom's Upright* values verbatim)}`.
+  `crs:` mapping table on `TransformSettings` (rust doc) and in architecture.md. Default is neutral, so `hasEdits`
+  / `neutral` are unchanged for existing rows.
+- `AdjustmentField::Transform` (`"transform"`): in `ALL`, `PASTE_PREVIOUS` and the Copy Settings "Transform" item
+  (now supported); not in `DEFAULT_SYNC` (per-frame geometry, like crop). `lerp`: the nearer side's.
+- `auto_upright(id, mode, adjustments | null) -> UprightResult {mode, solution | null, message | null}` (nothing
+  saved). **Stub**: no solution, message "Upright is not available yet".
+- TS mirrors updated (`completeAdjustments`, `ADJUSTMENT_FIELD_SET` / labels, `copyAdjustmentFields`,
+  `DEFAULT_SYNC_FIELDS`, `lerpAdjustments`).
+
+Applied preset + preview variants (d)
+- `AdjustmentHistory.appliedPresetId: number | null` (`#[serde(default)]`): set by `apply_preset`, reported while
+  every group in the preset's `fields` still equals what the apply produced (any owned change, undo past it, or
+  another preset clears it; redo restores it; deleting the preset clears it). Returned by `save_adjustments`,
+  `get_history`, undo / redo / goto.
+- `render_preview_variant(id, adjustments, variant: PreviewVariant, options) -> RenderedPreview | null`, variant
+  `preset {presetId}` (= `resolve_preset` on top of the live settings) or `without_fields {fields}` (those groups
+  back at the format defaults). No save, no history. Same latest-wins / `sieve://` path as `render_preview`.
+- `RenderSlot::Preview` (`"preview"`): use it for these renders so the `main` render stays (hover-out /
+  release = show the last `main` URL). TS `Record<RenderSlot, ...>` literals need a `preview` key (fixed in
+  `useEditor.ts`).
+
+Batch edits (e)
+- `paste_settings`, `sync_settings`, `paste_previous` now return `EditBatchResult` (was `null`) and record one
+  undoable batch of new kind `EditBatchKind::Paste` (`"paste"`); duplicates in the id list are ignored (were
+  applied twice); `batchId = null` when nothing changed; `undo_edit_batch(batchId)` takes the whole paste back
+  (linear-undo rules as for scene applies). History labels / `EditSource::Pasted` unchanged.
+
+Reject strictness (f)
+- `RejectStrictness` (`conservative | balanced | aggressive`, default `balanced`); `Project.rejectStrictness`;
+  `set_project_reject_strictness(projectId, strictness) -> null` (kicks a rescore; unknown -> `not_found`).
+  `db::projects::reject_strictness_of_image(conn, id)` for the scorer.
+
+Mock backend (`src/testing/mockBackend.ts`)
+- All new commands; capture times carry `originalCapturedAtMs` / `captureTimeSource`; `?twocams=1` makes every 3rd
+  frame a Canon EOS R5 (`IMG_xxxxx.CR3`) whose clock is 1 h ahead (sync-cameras fixture); `get_image_metadata`
+  gives GPS on every 5th frame; `auto_upright` returns a small rotation homography (`?upright=none` = no lines;
+  Guided needs 2 guides); paste / sync / paste previous record `paste` batches; `appliedPresetId` tracked;
+  projects carry `rejectStrictness`.
+
+Who updates what
+- architect (done): types, schema v17, commands + registration, `db::capture_time` (edit / restore / sidecar helper
+  / catalog metadata), extraction keeps corrections, `history::applied_preset` + `record_applied_preset`
+  (`styles::apply_preset` records), `styles::resolve_preview_variant`, `batches::apply_fields_recorded`, projects
+  SQL, Rust tests, bindings, TS mirrors, mock, `useEditor.ts` compile fix.
+- rust-engine-dev: XMP read: corrected time from `exif:DateTimeOriginal` (else `photoshop:DateCreated`; naive ms
+  incl. fractional seconds, ignore the zone offset like EXIF) via `db::capture_time::apply_sidecar_time`; XMP write:
+  when `capture_time_source != 'exif'` write `exif:DateTimeOriginal` + `photoshop:DateCreated`
+  (`YYYY-MM-DDTHH:MM:SS.ss`), when `exif` remove only values Sieve wrote (never clobber Lightroom's). `crs:` read /
+  write of `transform` per the mapping table (drop Perspective / Upright from `crs::unsupported_warnings` and from
+  the preserved-only list; keep `solution.crs` verbatim while the mode is unchanged; imported presets' Perspective
+  keys -> `AdjustmentField::Transform` in `styles/preset_file.rs`). Render + export: apply `solution` (when
+  `solution.mode == upright`) and the manual sliders before the crop, `constrainCrop`. Fill the file-read fields of
+  `get_image_metadata`. Upright solver (homography from detected lines) for `auto_upright`.
+- vision-ml-dev: line detection for `auto_upright` (Level / Vertical / Full / Auto / Guided); reject strictness in
+  the scorer (`projects::reject_strictness_of_image`, memoize like `ShootTypes` in `ml/worker.rs`).
+- frontend-dev: Metadata panel (`getImageMetadata`), Edit Capture Time dialog (`editCaptureTime` + undo via
+  `restoreCaptureTimes(result.previous)`; refetch `changedIds`); Transform panel (`transform`, `autoUpright`); preset
+  highlight from `AdjustmentHistory.appliedPresetId`; hover preview / press-and-hold via `renderPreviewVariant` in
+  slot `preview`; paste / sync results (`EditBatchResult`) into the batch undo UI; reject strictness control
+  (`Project.rejectStrictness`, `setProjectRejectStrictness`).
+
 ## v18.1 — 2026-10-03 (UX review 8c P1-1, P1-6)
 
 Suggestions pending = what Apply changes (P1-1)
@@ -1191,3 +1429,32 @@ Who updates what
 - rust-engine-dev / vision-ml-dev: nothing required. New multi-image write paths that should count as an apply or
   auto edit must go through `develop::batches::commit_recorded` (it stamps the history entries); labels decide the
   source of everything else (`history::source_for_label`).
+
+## v19.1 — 2026-10-05 (Phase 8d: edited previews; additive, no schema change)
+
+Types
+- `RawImageEntry.editedPreview: EditedPreview | null` — cached renders of the photo's current develop settings
+  (`null` when `hasEdits = false` or not rendered yet; may briefly lag the newest edit).
+- New `EditedPreview { thumbUrl, previewUrl }`: 512 px / 2048 px JPEGs, orientation + crop applied, served by the
+  `sieve` scheme at `sieve://localhost/edited/<id>/<hash>/{thumb,preview}.jpg` (`http://sieve.localhost/...` on
+  Windows). Content-addressed (image id + settings hash): a new edit = new URLs; responses are
+  `Cache-Control: public, max-age=31536000, immutable`; a missing file answers 404 and queues a render.
+
+Events
+- New `editedPreviewChanged { imageId, preview: EditedPreview | null }` (`edited-preview-changed`): a background
+  render finished (after edits, paste / sync / presets / scene apply / undo batches, XMP reads, `prepareDevelop`
+  neighbours, or a listed photo whose preview was missing / stale); `null` = the photo is unedited again.
+
+Behaviour (rust-engine-dev, `develop::edited`)
+- Files live in `<cacheDir>/edited/` only (never next to the photos), one settings hash per image, LRU-bounded by
+  bytes (default 1024 MB, `SIEVE_EDITED_CACHE_MB`); `remove_project` deletes the removed images' files.
+- Every committed adjustments write (`repo::save_adjustments`) queues a regeneration (350 ms debounce, waits for the
+  transaction to commit; rolled-back writes render nothing); a low-priority worker (QoS utility, own pool, yields
+  while interactive renders run) renders it, reusing Develop's settled full-quality render when it matches.
+
+Frontend
+- Use `src/lib/entryImage.ts` (`thumbSrc`, `previewSrc`, `developPlaceholder`) for any image of a photo; listen to
+  `editedPreviewChanged` (done in `useLibrary`). Develop never uses the embedded preview of an edited photo as the
+  placeholder (spinner until its render lands when no edited preview exists yet).
+- Mock: entries carry `editedPreview`; edits emit the event after `window.__mockEditedDelay` ms (default 120);
+  URLs `/mock/edited/<id>/<hash>/{thumb,preview}.jpg` (routed in `tests/ui/helpers.ts`).

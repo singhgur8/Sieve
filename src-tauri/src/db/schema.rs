@@ -18,4 +18,6 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0014_linear_undo.sql"),
     include_str!("../../migrations/0015_apply_bases.sql"),
     include_str!("../../migrations/0016_cull_clarity.sql"),
+    include_str!("../../migrations/0017_capture_transform.sql"),
+    include_str!("../../migrations/0018_camera_serial_sync.sql"),
 ];

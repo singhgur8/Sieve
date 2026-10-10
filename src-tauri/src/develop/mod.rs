@@ -26,6 +26,8 @@
 pub mod auto;
 pub mod batches;
 pub mod camera;
+pub mod cancel;
+pub mod edited;
 pub mod fastmath;
 pub mod highlights;
 pub mod history;
@@ -37,14 +39,17 @@ pub mod parity;
 pub mod pipeline;
 pub mod presets;
 pub mod source;
+pub mod sync_delta;
 pub mod tone;
 mod tone_data;
+pub mod transform;
 pub mod wb;
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use tauri::http;
@@ -60,6 +65,7 @@ use crate::profiles::ProfileLibrary;
 
 use camera::Profile;
 use source::{LinearImage, Prepared, SourceMeta};
+use transform::Geometry;
 
 /// Tone contexts kept per image (white balance / calibration / profile variants: toggling
 /// between a few, e.g. before/after or presets, stays cached; ~1 MB each).
@@ -69,6 +75,8 @@ const TONE_CONTEXTS: usize = 4;
 pub const RENDER_SCHEME: &str = "sieve";
 /// JPEG quality of served previews (4:4:4).
 pub const JPEG_QUALITY: u8 = 90;
+/// JPEG quality of draft renders (slider drags; 4:2:0).
+pub const DRAFT_JPEG_QUALITY: u8 = 75;
 /// Prepared (cropped/resampled) inputs kept per cached image.
 pub const PREPARED_PER_IMAGE: usize = 3;
 /// Encoded renders kept for the protocol handler (oldest dropped first).
@@ -134,15 +142,17 @@ struct PrepKey {
     orientation: u8,
     max_edge: u32,
     region: Option<[u32; 4]>,
-    /// Crop (enabled flag + rect + angle bits); `None` = whole frame.
+    /// Effective crop (enabled flag + rect + angle bits); `None` = whole frame.
     crop: Option<[u32; 5]>,
+    /// Transform warp bits.
+    warp: Option<[u64; 9]>,
 }
 
 impl PrepKey {
-    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>, crop: &CropSettings) -> Self {
+    fn new(orientation: u8, max_edge: u32, region: Option<NormRect>, geo: &Geometry) -> Self {
         let region = region.map(|r| [r.x.to_bits(), r.y.to_bits(), r.width.to_bits(), r.height.to_bits()]);
-        let crop = crop.enabled.then(|| [crop.top, crop.left, crop.bottom, crop.right, crop.angle].map(f32::to_bits));
-        PrepKey { orientation, max_edge, region, crop }
+        let (crop, warp) = geo.key();
+        PrepKey { orientation, max_edge, region, crop, warp }
     }
 }
 
@@ -171,8 +181,8 @@ impl Entry {
     }
 
     /// Prepared input for the key (computed and cached if needed).
-    fn prepared(&self, orientation: u8, crop: &CropSettings, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
-        let key = PrepKey::new(orientation, max_edge, region, crop);
+    fn prepared(&self, orientation: u8, geo: &Geometry, region: Option<NormRect>, max_edge: u32) -> Arc<Prepared> {
+        let key = PrepKey::new(orientation, max_edge, region, geo);
         {
             let mut list = lock(&self.prepared);
             if let Some(i) = list.iter().position(|(k, _)| *k == key) {
@@ -182,13 +192,18 @@ impl Entry {
                 return p;
             }
         }
-        let p = Arc::new(source::prepare(&self.image, orientation, crop, region, max_edge));
+        let p = Arc::new(source::prepare_geo(&self.image, orientation, geo, region, max_edge));
         let mut list = lock(&self.prepared);
         if list.len() >= PREPARED_PER_IMAGE {
             list.remove(0);
         }
         list.push((key, p.clone()));
         p
+    }
+
+    /// Geometry `adjustments` render with on this source (effective crop + Transform warp).
+    fn geometry(&self, adjustments: &ParametricAdjustments) -> Geometry {
+        Geometry::of(adjustments, self.image.full_width, self.image.full_height)
     }
 
     /// Camera profile + look for `settings` (cached for the last settings).
@@ -256,6 +271,7 @@ impl Entry {
         &self,
         orientation: u8,
         adjustments: &ParametricAdjustments,
+        geo: &Geometry,
         profile: &Profile,
     ) -> Option<pipeline::ToneContext> {
         let key: ToneKey = (adjustments.white_balance, adjustments.calibration, adjustments.profile.clone());
@@ -287,7 +303,7 @@ impl Entry {
             }
         };
         let (w, h) = (self.image.width, self.image.height);
-        Some((*base).clone().with_crop(&adjustments.crop, w, h, orientation))
+        Some((*base).clone().with_geometry(geo, w, h, orientation))
     }
 }
 
@@ -301,6 +317,47 @@ fn decode_source(path: &std::path::Path) -> AppResult<(LinearImage, SourceMeta)>
             crate::raw::access::decode_failed(path, e.message.strip_prefix(&prefix).unwrap_or(&e.message))
         }
         _ => e,
+    })
+}
+
+/// Decodes `src` into a fresh (uncached) entry.
+fn load_entry(src: &SourceImage) -> AppResult<Entry> {
+    let (image, meta) = decode_source(&src.path)?;
+    Ok(Entry {
+        path: src.path.clone(),
+        image,
+        meta,
+        prepared: Mutex::new(Vec::new()),
+        profile: Mutex::new(None),
+        tone_src: Mutex::new(None),
+        tone_ctx: Mutex::new(Vec::new()),
+    })
+}
+
+/// Rayon pool of interactive preview renders: leaves two cores to the UI (WebView main thread, compositor), so a
+/// slider drag does not starve the page it is dragged in. Min 2 threads.
+fn preview_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cores.saturating_sub(2).max(2))
+            .thread_name(|i| format!("develop-preview-{i}"))
+            .build()
+            .expect("preview thread pool")
+    })
+}
+
+/// Background work (prefetch decode): at most half the cores, so it never competes with a render.
+fn background_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cores / 4).max(2))
+            .thread_name(|i| format!("develop-background-{i}"))
+            .build()
+            .expect("background thread pool")
     })
 }
 
@@ -325,6 +382,8 @@ struct Prefetch {
 }
 
 type SlotKey = (ImageId, RenderSlot);
+/// Newest ticket seq per stream; shared with running renders so they can abort ([`cancel`]).
+type LatestMap = HashMap<SlotKey, Arc<AtomicU32>>;
 /// Newest JPEG per key `(seq, bytes)` + insertion order (for bounding).
 type EncodedStore = (HashMap<SlotKey, (u32, Arc<Vec<u8>>)>, VecDeque<SlotKey>);
 
@@ -339,6 +398,8 @@ struct Inner {
     prefetch: Mutex<Prefetch>,
     /// Evaluated mask weights of recent renders (Phase 7c).
     weights: masks::render::WeightCache,
+    /// Edited-preview cache (IPC v19.1), once enabled by the app.
+    edited: OnceLock<edited::EditedPreviews>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -351,7 +412,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct DevelopCache {
     config: DevelopConfig,
     /// Newest ticket issued per (image, slot).
-    latest: Arc<Mutex<HashMap<(ImageId, RenderSlot), u32>>>,
+    latest: Arc<Mutex<LatestMap>>,
     /// Catalog facts (path, orientation) of recently edited images, so slider renders skip
     /// the catalog (and its lock) entirely. Filled by the commands; see [`Self::source`].
     sources: Arc<Mutex<HashMap<ImageId, SourceImage>>>,
@@ -393,6 +454,7 @@ impl DevelopCache {
                 encoded: Mutex::new((HashMap::new(), VecDeque::new())),
                 prefetch: Mutex::new(Prefetch::default()),
                 weights: masks::render::WeightCache::default(),
+                edited: OnceLock::new(),
             }),
             auto_faces: None,
         }
@@ -411,6 +473,23 @@ impl DevelopCache {
     /// The on-demand face detector, if enabled.
     pub fn auto_faces(&self) -> Option<&crate::ml::auto_faces::AutoFaces> {
         self.auto_faces.as_ref()
+    }
+
+    /// Starts the edited-preview cache (IPC v19.1; files in `config.dir`, renders through this
+    /// cache with `luts`, changes reported to `emit`). Idempotent: later calls return the
+    /// first instance.
+    pub fn enable_edited_previews(
+        &self,
+        config: edited::EditedConfig,
+        luts: LutLibrary,
+        emit: edited::Emitter,
+    ) -> edited::EditedPreviews {
+        self.inner.edited.get_or_init(|| edited::EditedPreviews::start(config, luts, emit, self.clone())).clone()
+    }
+
+    /// The edited-preview cache, if enabled.
+    pub fn edited(&self) -> Option<&edited::EditedPreviews> {
+        self.inner.edited.get()
     }
 
     /// The remembered catalog facts of image `id` (see [`Self::remember_source`]).
@@ -467,21 +546,26 @@ impl DevelopCache {
         if let Some(m) = &self.config.mask_cache {
             m.forget_images(ids);
         }
+        if let Some(e) = self.edited() {
+            e.forget(ids);
+        }
     }
 
     /// Issues the next ticket for (image, slot). Call on the async side, before any
     /// blocking work, so tickets follow request arrival order.
     pub fn ticket(&self, image_id: ImageId, slot: RenderSlot) -> RenderTicket {
         let mut latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = latest.entry((image_id, slot)).or_insert(0);
-        *seq = seq.wrapping_add(1);
-        RenderTicket { image_id, slot, seq: *seq }
+        let cell = latest.entry((image_id, slot)).or_default();
+        // Also what running renders of this stream poll to abort mid-loop ([`cancel`]).
+        let seq = cell.load(Ordering::Relaxed).wrapping_add(1);
+        cell.store(seq, Ordering::Relaxed);
+        RenderTicket { image_id, slot, seq }
     }
 
     /// `ticket` is still the newest for its (image, slot).
     pub fn is_current(&self, ticket: RenderTicket) -> bool {
         let latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
-        latest.get(&(ticket.image_id, ticket.slot)) == Some(&ticket.seq)
+        latest.get(&(ticket.image_id, ticket.slot)).is_some_and(|c| c.load(Ordering::Relaxed) == ticket.seq)
     }
 
     /// Cached entry, touching its LRU stamp.
@@ -508,23 +592,13 @@ impl DevelopCache {
         if let Some(e) = self.cached(src) {
             return Ok(e);
         }
-        let decoded = decode_source(&src.path);
-        let (image, meta) = match decoded {
-            Ok(d) => d,
+        let entry = match load_entry(src) {
+            Ok(e) => Arc::new(e),
             Err(e) => {
                 lock(&self.inner.decoding).remove(&src.id);
                 return Err(e);
             }
         };
-        let entry = Arc::new(Entry {
-            path: src.path.clone(),
-            image,
-            meta,
-            prepared: Mutex::new(Vec::new()),
-            profile: Mutex::new(None),
-            tone_src: Mutex::new(None),
-            tone_ctx: Mutex::new(Vec::new()),
-        });
         {
             let mut lru = lock(&self.inner.lru);
             lru.clock += 1;
@@ -571,34 +645,69 @@ impl DevelopCache {
         if !self.is_current(ticket) {
             return Ok(None);
         }
+        if let Some(e) = self.edited() {
+            e.note_interactive();
+        }
         let key = (ticket.image_id, ticket.slot);
         let render_lock = lock(&self.inner.rendering).entry(key).or_default().clone();
         let _guard = lock(&render_lock);
         if !self.is_current(ticket) {
             return Ok(None);
         }
-        let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), &adjustments.crop, options.region, options.max_edge);
-        self.evict(src.id);
-        let lut = match &adjustments.lut {
-            Some(l) => luts.load(&l.id)?,
-            None => None,
+        let cell = lock(&self.latest).get(&key).cloned();
+        // Everything heavy runs on the dedicated preview pool; only the uncached final stages are cancellable.
+        let rendered = preview_pool().install(|| -> AppResult<Option<(pipeline::RenderedImage, bool)>> {
+            let entry = self.entry(src)?;
+            let geo = entry.geometry(adjustments);
+            let prepared = entry.prepared(src.orientation(), &geo, options.region, options.max_edge);
+            self.evict(src.id);
+            let lut = match &adjustments.lut {
+                Some(l) => luts.load(&l.id)?,
+                None => None,
+            };
+            let lut_missing = adjustments.lut.is_some() && lut.is_none();
+            if !self.is_current(ticket) {
+                return Ok(None);
+            }
+            let profile = entry.profile(&adjustments.profile);
+            let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
+            let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
+            let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, options.region);
+            let run = || pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+            let mut img = match cell {
+                Some(c) => cancel::scope(c, ticket.seq, run),
+                None => run(),
+            };
+            if let Some(c) = &prepared.coverage {
+                source::fill_outside_rgb8(&mut img.rgb, c);
+            }
+            Ok(Some((img, lut_missing)))
+        })?;
+        let Some((img, lut_missing)) = rendered else {
+            return Ok(None);
         };
-        let lut_missing = adjustments.lut.is_some() && lut.is_none();
         if !self.is_current(ticket) {
             return Ok(None);
         }
-        let profile = entry.profile(&adjustments.profile);
-        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
-        let input = entry.input(&prepared, &profile, src.id, quality_for(options.max_edge), tone.as_ref());
-        let (local, _) = self.local_planes(&entry, src, adjustments, &input, options.region);
-        let img = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
-        if !self.is_current(ticket) {
-            return Ok(None);
+        let jpeg = if quality_for(options.max_edge) == pipeline::Quality::Draft {
+            crate::raw::turbo::encode_rgb(&img.rgb, img.width, img.height, DRAFT_JPEG_QUALITY)
+        } else {
+            crate::raw::turbo::encode_rgb_444(&img.rgb, img.width, img.height, JPEG_QUALITY)
         }
-        let jpeg = crate::raw::turbo::encode_rgb_444(&img.rgb, img.width, img.height, JPEG_QUALITY)
-            .map_err(AppError::internal)?;
-        drop(img.rgb);
+        .map_err(AppError::internal)?;
+        // A settled full-quality render of the whole frame becomes the edited preview if these
+        // are the stored settings (edited cache, IPC v19.1); otherwise it is dropped here.
+        let settled = ticket.slot == RenderSlot::Main
+            && options.region.is_none()
+            && quality_for(options.max_edge) == pipeline::Quality::Preview;
+        match self.edited() {
+            Some(e) if settled => e.note_settled(
+                ticket.image_id,
+                adjustments,
+                crate::raw::preview::Rgb { width: img.width, height: img.height, pixels: img.rgb },
+            ),
+            _ => drop(img.rgb),
+        }
         if !self.is_current(ticket) {
             return Ok(None);
         }
@@ -649,6 +758,18 @@ impl DevelopCache {
         Ok(DevelopInfo { image_id: src.id, as_shot, source_width, source_height, full_width, full_height, warnings })
     }
 
+    /// Crop-tool bounds of the live `adjustments` (IPC v19.3): pure geometry on the develop
+    /// source's aspect (decodes the source if not cached, as `info`).
+    pub fn transform_bounds(
+        &self,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+    ) -> AppResult<crate::ipc::types::TransformBounds> {
+        let entry = self.entry(src)?;
+        let img = &entry.image;
+        Ok(transform::bounds(adjustments, img.full_width, img.full_height, src.orientation()))
+    }
+
     /// Warms the cache for `sources` in the background (e.g. filmstrip neighbours) and
     /// returns immediately. Lower priority than `render`; must never panic.
     pub fn prefetch(&self, sources: Vec<SourceImage>) {
@@ -672,11 +793,15 @@ impl DevelopCache {
                 }
             };
             if this.cached(&next).is_none() {
-                match catch_unwind(AssertUnwindSafe(|| this.entry(&next))) {
+                match catch_unwind(AssertUnwindSafe(|| background_pool().install(|| this.entry(&next)))) {
                     Ok(Err(e)) => eprintln!("develop prefetch {}: {}", next.path.display(), e.message),
                     Err(_) => eprintln!("develop prefetch {}: panicked", next.path.display()),
                     Ok(Ok(_)) => {}
                 }
+            }
+            // Prerender the neighbour's edited preview (no-op when unedited or current).
+            if let Some(e) = this.edited() {
+                e.ensure(&[next.id], true);
             }
         });
         if spawned.is_err() {
@@ -714,7 +839,8 @@ impl DevelopCache {
         luts: &LutLibrary,
     ) -> AppResult<RenderedPixels> {
         let entry = self.entry(src)?;
-        let prepared = entry.prepared(src.orientation(), &adjustments.crop, region, max_edge);
+        let geo = entry.geometry(adjustments);
+        let prepared = entry.prepared(src.orientation(), &geo, region, max_edge);
         self.evict(src.id);
         let lut = match &adjustments.lut {
             Some(l) => luts.load(&l.id)?,
@@ -722,12 +848,47 @@ impl DevelopCache {
         };
         let lut_missing = adjustments.lut.is_some() && lut.is_none();
         let profile = entry.profile(&adjustments.profile);
-        let tone = entry.tone_context(src.orientation(), adjustments, &profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
         let input = entry.input(&prepared, &profile, src.id, quality_for(max_edge), tone.as_ref());
-        let (local, _) = self.local_planes(&entry, src, adjustments, &input, region);
-        let image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, region);
+        let mut image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        if let Some(c) = &prepared.coverage {
+            source::fill_outside_rgb8(&mut image.rgb, c);
+        }
         let as_shot = camera::as_shot_values(&entry.image.color, &profile);
         Ok(RenderedPixels { image, lut_missing, as_shot })
+    }
+
+    /// Blocking. Full-quality render of the whole (cropped) frame for the edited-preview cache:
+    /// uses the cached source if there is one, else decodes a temporary one that is *not*
+    /// inserted into the LRU (a batch of hundreds must not evict what the user is editing);
+    /// never touches the cached prepared inputs. A missing LUT renders without it.
+    pub fn render_detached(
+        &self,
+        src: &SourceImage,
+        adjustments: &ParametricAdjustments,
+        max_edge: u32,
+        luts: &LutLibrary,
+    ) -> AppResult<pipeline::RenderedImage> {
+        let entry = match self.cached(src) {
+            Some(e) => e,
+            None => Arc::new(load_entry(src)?),
+        };
+        let geo = entry.geometry(adjustments);
+        let prepared = source::prepare_geo(&entry.image, src.orientation(), &geo, None, max_edge);
+        let lut = match &adjustments.lut {
+            Some(l) => luts.load(&l.id).ok().flatten(),
+            None => None,
+        };
+        let profile = entry.profile(&adjustments.profile);
+        let tone = entry.tone_context(src.orientation(), adjustments, &geo, &profile);
+        let input = entry.input(&prepared, &profile, src.id, pipeline::Quality::Preview, tone.as_ref());
+        let (local, _) = self.local_planes(&entry, src, adjustments, &geo, &input, None);
+        let mut image = pipeline::render_masked(&input, adjustments, lut.as_deref(), local.as_ref());
+        if let Some(c) = &prepared.coverage {
+            source::fill_outside_rgb8(&mut image.rgb, c);
+        }
+        Ok(image)
     }
 }
 
@@ -740,6 +901,7 @@ impl DevelopCache {
         entry: &Entry,
         src: &SourceImage,
         adjustments: &ParametricAdjustments,
+        geo: &Geometry,
         input: &pipeline::RenderInput,
         region: Option<NormRect>,
     ) -> (Option<masks::LocalPlanes>, Vec<DevelopWarning>) {
@@ -751,15 +913,15 @@ impl DevelopCache {
         if mattes.needs_guide() {
             mattes.refine(|| Some(entry.sensor_guide()));
         }
-        let geom = masks::MaskGeometry {
-            sensor_width: entry.image.full_width,
-            sensor_height: entry.image.full_height,
-            orientation: src.orientation(),
-            crop: adjustments.crop,
+        let geom = masks::MaskGeometry::of(
+            geo,
+            entry.image.full_width,
+            entry.image.full_height,
+            src.orientation(),
             region,
-            width: input.width,
-            height: input.height,
-        };
+            input.width,
+            input.height,
+        );
         masks::render::local_planes(
             &adjustments.masks,
             &geom,
@@ -915,6 +1077,20 @@ fn parse_render_path(path: &str, query: Option<&str>) -> Option<(ImageId, Render
 /// dedicated thread per request (see `lib.rs`); must not panic.
 pub fn handle_protocol(cache: &DevelopCache, request: &http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
     let uri = request.uri();
+    if let Some((id, hash, thumb)) = edited::parse_path(uri.path()) {
+        return match cache.edited().and_then(|e| e.read(id, hash, thumb)) {
+            Some(bytes) => {
+                let mut resp = respond(http::StatusCode::OK, "image/jpeg", bytes);
+                // Content-addressed (image id + settings hash): never changes.
+                resp.headers_mut().insert(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+                );
+                resp
+            }
+            None => respond(http::StatusCode::NOT_FOUND, "text/plain", b"edited preview not available".to_vec()),
+        };
+    }
     match parse_render_path(uri.path(), uri.query()) {
         None => respond(http::StatusCode::BAD_REQUEST, "text/plain", b"bad render path".to_vec()),
         Some((id, slot, seq)) => match cache.encoded(id, slot, seq) {

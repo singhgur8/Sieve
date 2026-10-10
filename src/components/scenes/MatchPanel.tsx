@@ -6,7 +6,6 @@ import {
   ALL_ADJUSTMENT_FIELDS,
   DEFAULT_SYNC_FIELDS,
   commands,
-  convertFileSrc,
   DEFAULT_MATCH_OPTIONS,
   DEFAULT_SCENE_APPLY_OPTIONS,
   lerpAdjustments,
@@ -23,6 +22,8 @@ import {
 import { SettingsFieldsDialog } from "../develop/SettingsFieldsDialog";
 import { Dialog } from "../Dialog";
 import { formatError } from "../../lib/format";
+import { flushEdits } from "../../lib/editFlush";
+import { thumbSrc } from "../../lib/entryImage";
 
 interface Props {
   scene: Scene;
@@ -124,6 +125,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
     setSolving(true);
     setError(null);
     try {
+      await flushEdits();
       const res = await unwrap(commands.matchScene(scene.anchorIds, targetIds, opts));
       setPreviews(res);
       setExcluded(new Set(res.filter((p) => editedByUser.has(p.targetId)).map((p) => p.targetId)));
@@ -144,6 +146,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
     if (selected.length === 0) return;
     setApplying(true);
     setError(null);
+    await flushEdits().catch(() => {});
     if (!onApplied) {
       const keep = new Set(selected.map((p) => p.targetId));
       // The Edit step: one `apply_scene_edit` batch with the panel's options. Every frame of the scene the user left
@@ -175,6 +178,9 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
       return n;
     });
 
+  const nothingChosen = !opts.matchExposure && !opts.matchWhiteBalance && !opts.matchTone && opts.copyFields.length === 0;
+  const runWhy = solving ? null : targetIds.length === 0 ? (keeperSet ? "No keepers in this scene to apply to" : "No other photos in this scene") : nothingChosen ? "Tick something to match or copy" : null;
+  const applyWhy = applying || solving ? null : !previews ? "Run Preview match first" : stale ? "Options changed: re-run the preview" : selected.length === 0 ? "No photos are ticked" : null;
   const pct = solving && progress?.task === "match" && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : 0;
   const check = (label: string, key: "matchExposure" | "matchWhiteBalance" | "matchTone", testid: string) => (
     <label className="flex items-center gap-1.5">
@@ -200,7 +206,7 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
               return (
                 <div key={id} className="flex items-center gap-1.5" data-testid={`match-anchor-${id}`}>
                   <span className="block size-16 shrink-0 overflow-hidden rounded bg-neutral-800">
-                    {t?.status === "ready" && <img src={convertFileSrc(t.path)} alt="" className="size-full object-cover" draggable={false} />}
+                    {t?.status === "ready" && <img src={thumbSrc(rows.get(id))!} alt="" className="size-full object-cover" draggable={false} />}
                   </span>
                   <span className="max-w-28 truncate text-xs text-neutral-300">{fileName(id)}</span>
                 </div>
@@ -268,12 +274,17 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
           </label>
           <button
             className={`rounded px-3 py-1 text-white disabled:opacity-40 ${stale || !previews ? "bg-emerald-700 hover:bg-emerald-600" : "bg-neutral-700 hover:bg-neutral-600"}`}
-            disabled={solving || targetIds.length === 0 || (!opts.matchExposure && !opts.matchWhiteBalance && !opts.matchTone && opts.copyFields.length === 0)}
+            disabled={solving || targetIds.length === 0 || nothingChosen}
             onClick={() => void solve()}
             data-testid="match-run"
           >
             {solving ? "Matching..." : previews ? (stale ? "Re-run (options changed)" : "Re-run") : "Preview match"}
           </button>
+          {runWhy && (
+            <span className="text-[11px] text-amber-300" data-testid="match-run-why">
+              {runWhy}
+            </span>
+          )}
           {solving && (
             <div className="h-1.5 w-40 overflow-hidden rounded bg-neutral-800" data-testid="match-progress" data-pct={Math.round(pct)}>
               <div className="h-full bg-emerald-400 transition-[width]" style={{ width: `${pct}%` }} />
@@ -318,6 +329,11 @@ export function MatchPanel({ scene, sceneNumber, progress, fileName: libName, ke
           <button className="ml-auto rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700" onClick={onClose} data-testid="match-cancel">
             Cancel
           </button>
+          {applyWhy && (
+            <span className="text-[11px] text-amber-300" data-testid="match-apply-why">
+              {applyWhy}
+            </span>
+          )}
           <button
             className="rounded bg-emerald-700 px-3 py-1.5 text-white hover:bg-emerald-600 disabled:opacity-40"
             disabled={selected.length === 0 || applying || stale || solving}

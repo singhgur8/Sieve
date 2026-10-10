@@ -583,7 +583,9 @@ pub async fn goto_history(
 }
 
 /// Pastes the `fields` groups of `adjustments` (the frontend's copied settings) onto
-/// every image in `ids`; one "Paste Settings" history entry per changed image. Atomic.
+/// every image in `ids` (any selection; duplicates ignored); one "Paste Settings" history
+/// entry per changed image. Atomic. v19: recorded as one undoable edit batch (kind `paste`,
+/// `undo_edit_batch(result.batchId)`; `batchId = null` when nothing changed).
 #[tauri::command]
 #[specta::specta]
 pub async fn paste_settings(
@@ -593,18 +595,22 @@ pub async fn paste_settings(
     ids: Vec<ImageId>,
     adjustments: ParametricAdjustments,
     fields: Vec<AdjustmentField>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     require_fields(&fields)?;
     adjustments.validate().map_err(AppError::invalid)?;
     let n = ids.len() as u32;
     let activity = start_multi_activity(&app, n, "Pasting settings to");
     let result = catalog
-        .run(move |c| develop::history::apply_fields(c, &ids, &adjustments, &fields, develop::history::LABEL_PASTE))
+        .run(move |c| {
+            develop::batches::apply_fields_recorded(c, &ids, &adjustments, &fields, develop::history::LABEL_PASTE)
+        })
         .await;
     end_activity(activity, &result, |_| format!("Pasted settings to {}", super::activity::photos(n)));
-    result?;
-    xmp.notify(&app);
-    Ok(())
+    let r = result?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// A `paste_sync` activity (IPC v18) for writes to more than one photo ("Pasting settings to
@@ -632,7 +638,8 @@ fn end_activity<T>(
 }
 
 /// Copies the `fields` groups of `sourceId`'s stored adjustments onto `targetIds`
-/// ("Sync Settings"). Atomic.
+/// ("Sync Settings"; any selection, duplicates ignored). Atomic. v19: one undoable edit batch
+/// (kind `paste`), like `paste_settings`.
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_settings(
@@ -642,20 +649,78 @@ pub async fn sync_settings(
     source_id: ImageId,
     target_ids: Vec<ImageId>,
     fields: Vec<AdjustmentField>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     require_fields(&fields)?;
     let n = target_ids.len() as u32;
     let activity = start_multi_activity(&app, n, "Syncing settings to");
     let result = catalog
         .run(move |c| {
             let src = repo::get_adjustments(c, source_id)?;
-            develop::history::apply_fields(c, &target_ids, &src, &fields, develop::history::LABEL_SYNC)
+            develop::batches::apply_fields_recorded(c, &target_ids, &src, &fields, develop::history::LABEL_SYNC)
         })
         .await;
     end_activity(activity, &result, |_| format!("Synced settings to {}", super::activity::photos(n)));
-    result?;
-    xmp.notify(&app);
-    Ok(())
+    let r = result?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
+}
+
+/// Auto Sync (v19.2): commits the active photo's edit `before` -> `after` to `sourceId` (its
+/// stored settings become `after`) and the same change to every photo in `targetIds`, as one
+/// undoable batch of kind `sync` (`undo_edit_batch(result.batch.batchId)` reverts the source
+/// and all targets). Only the groups that differ between `before` and `after` are touched
+/// (never crop / masks / transform); `options.relative` groups (default exposure + white
+/// balance) are applied relatively, the others copied (see [`SyncDeltaOptions`]). In Auto
+/// Sync mode the UI commits through this command **instead of** `save_adjustments` (one
+/// call per committed edit). Duplicates and the source in `targetIds` are ignored. Resolving
+/// an `as_shot` white balance decodes that photo (cached by the develop cache). Atomic;
+/// unknown image -> `not_found`; invalid settings / options -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_delta(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    xmp: State<'_, XmpSync>,
+    source_id: ImageId,
+    before: ParametricAdjustments,
+    after: ParametricAdjustments,
+    target_ids: Vec<ImageId>,
+    options: Option<SyncDeltaOptions>,
+) -> AppResult<SyncDeltaResult> {
+    let options = options.unwrap_or_default();
+    let (b, a, t, o) = (before.clone(), after.clone(), target_ids.clone(), options.clone());
+    let need = catalog.run(move |c| develop::sync_delta::as_shot_needed(c, source_id, &b, &a, &t, &o)).await?;
+    let mut as_shot = std::collections::HashMap::new();
+    if !need.is_empty() {
+        let sources = source_images(&catalog, need).await?;
+        let cache = develop.inner().clone();
+        let found = blocking(move || {
+            use rayon::prelude::*;
+            Ok(sources
+                .par_iter()
+                .filter_map(|src| cache.info(src).ok().and_then(|i| i.as_shot).map(|v| (src.id, v)))
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        as_shot.extend(found);
+    }
+    let n = target_ids.len() as u32 + 1;
+    let activity = start_multi_activity(&app, n, "Syncing settings to");
+    let result = catalog
+        .run(move |c| {
+            develop::sync_delta::sync_delta_recorded(c, source_id, &before, &after, &target_ids, &options, &as_shot)
+        })
+        .await;
+    end_activity(activity, &result, |_| format!("Synced settings to {}", super::activity::photos(n)));
+    let r = result?;
+    if !r.batch.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// Resets `ids` to neutral adjustments ("Reset" history entry). Atomic.
@@ -970,7 +1035,9 @@ pub async fn list_burst_groups(
 /// Unanalyzed images and images already matching their suggestion (v18.1) are skipped; with
 /// `onlyUnset`, so are images already flagged or rated (`pick != unflagged` or `rating != 0`).
 /// With `onlyUnset` over a project it changes exactly the `CullSummary.suggested*Pending`
-/// photos. Atomic; unknown ids -> `not_found`.
+/// photos. v19.2 `kinds` (`null` = all): copy only suggested picks / rejects / stars (see
+/// [`SuggestionKinds`]), e.g. `{picks: false, rejects: true, stars: false}` flags only the
+/// suggested rejects. Atomic; unknown ids -> `not_found`.
 /// For undo, take `get_cull_snapshot(ids)` first.
 #[tauri::command]
 #[specta::specta]
@@ -980,8 +1047,10 @@ pub async fn apply_suggestions(
     xmp: State<'_, XmpSync>,
     ids: Vec<ImageId>,
     only_unset: bool,
+    kinds: Option<SuggestionKinds>,
 ) -> AppResult<ApplySuggestionsResult> {
-    let result = catalog.run(move |c| repo::apply_suggestions(c, &ids, only_unset)).await?;
+    let kinds = kinds.unwrap_or_default();
+    let result = catalog.run(move |c| repo::apply_suggestions_kinds(c, &ids, only_unset, kinds)).await?;
     if result.applied > 0 {
         xmp.notify(&app);
     }
@@ -1248,9 +1317,11 @@ pub async fn list_xmp_failures(
 #[tauri::command]
 #[specta::specta]
 pub async fn refresh_sidecars(
+    app: AppHandle,
     catalog: State<'_, Catalog>,
     xmp: State<'_, XmpSync>,
     develop: State<'_, DevelopCache>,
+    analysis: State<'_, Analysis>,
     project_id: Option<ProjectId>,
 ) -> AppResult<Vec<ImageId>> {
     let folders: Vec<FolderId> = catalog
@@ -1270,6 +1341,10 @@ pub async fn refresh_sidecars(
     if !changed.is_empty() {
         // Like import's sidecar read: cached develop state of these images is stale.
         develop.forget_sources(Some(&changed));
+    }
+    if xmp.take_capture_time_changes() {
+        // Lightroom-corrected capture times: bursts and scenes regroup on the new order.
+        analysis.start(&app, AnalysisScope::Rescore)?;
     }
     Ok(changed)
 }
@@ -2187,6 +2262,7 @@ pub async fn undo_edit_batch(
 /// `previousId` (the previously selected photo, tracked by the UI) onto `targetIds` (`fields`
 /// `null` = `AdjustmentField::PASTE_PREVIOUS`, everything but masks). `previousId` in
 /// `targetIds` is skipped. One "Paste from Previous" entry per changed image. Atomic.
+/// v19: one undoable edit batch (kind `paste`), like `paste_settings`.
 #[tauri::command]
 #[specta::specta]
 pub async fn paste_previous(
@@ -2196,18 +2272,20 @@ pub async fn paste_previous(
     target_ids: Vec<ImageId>,
     previous_id: ImageId,
     fields: Option<Vec<AdjustmentField>>,
-) -> AppResult<()> {
+) -> AppResult<EditBatchResult> {
     let fields = fields.unwrap_or_else(|| AdjustmentField::PASTE_PREVIOUS.to_vec());
     require_fields(&fields)?;
     let targets: Vec<ImageId> = target_ids.into_iter().filter(|&id| id != previous_id).collect();
-    catalog
+    let r = catalog
         .run(move |c| {
             let src = repo::get_adjustments(c, previous_id)?;
-            develop::history::apply_fields(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
+            develop::batches::apply_fields_recorded(c, &targets, &src, &fields, develop::history::LABEL_PASTE_PREVIOUS)
         })
         .await?;
-    xmp.notify(&app);
-    Ok(())
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+    }
+    Ok(r)
 }
 
 /// State of the personal style model ("Auto edit (my style)").
@@ -2445,4 +2523,233 @@ pub async fn remove_project(
     })
     .await?;
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// IPC v19 (Phase 8d): capture time, per-photo metadata, Upright, preview variants, reject
+// strictness. Paste / Sync / Paste from Previous return `EditBatchResult` (see above).
+// ---------------------------------------------------------------------------
+
+/// Lightroom's "Edit Capture Time" for `ids` (any selection): shift by an offset, set the
+/// active photo to an exact time (the others follow by the same offset), sync two cameras
+/// from a reference pair (v19.2: the selected photos, or every photo of the target's body /
+/// model in its project), or revert to the files' own time (see [`CaptureTimeEdit`]). The
+/// original EXIF time is kept (`CaptureMeta.originalCapturedAtMs`); the corrected time is
+/// what sorting, bursts, scenes, filters and export naming use, and is written to the
+/// sidecars (`exif:DateTimeOriginal` / `photoshop:DateCreated`; marks them dirty, notifies
+/// auto-sync). Kicks a rescore so bursts regroup. Atomic; undo with
+/// `restore_capture_times(result.previous)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_capture_time(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    analysis: State<'_, Analysis>,
+    ids: Vec<ImageId>,
+    mode: CaptureTimeEdit,
+) -> AppResult<CaptureTimeEditResult> {
+    let r = catalog.run(move |c| db::capture_time::edit(c, &ids, &mode)).await?;
+    if !r.changed_ids.is_empty() {
+        xmp.notify(&app);
+        analysis.start(&app, AnalysisScope::Rescore)?;
+    }
+    Ok(r)
+}
+
+/// Puts corrected capture times back (undo / redo of `edit_capture_time`: pass its
+/// `previous`, or snapshots taken before). Atomic (unknown id -> `not_found`). Returns the ids
+/// whose time changed (refetch them). Marks sidecars dirty and kicks a rescore like
+/// `edit_capture_time`.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_capture_times(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    xmp: State<'_, XmpSync>,
+    analysis: State<'_, Analysis>,
+    snapshots: Vec<CaptureTimeSnapshot>,
+) -> AppResult<Vec<ImageId>> {
+    let changed = catalog.run(move |c| db::capture_time::restore(c, &snapshots)).await?;
+    if !changed.is_empty() {
+        xmp.notify(&app);
+        analysis.start(&app, AnalysisScope::Rescore)?;
+    }
+    Ok(changed)
+}
+
+/// Everything the Library Metadata panel shows for photo `id`: file facts, original and
+/// corrected capture time, camera, lens, exposure, size, GPS, sidecar. Unknown id ->
+/// `not_found`. Catalog values plus a few read from the file (`gps`, `focalLength35mm`,
+/// `exposureCompensationEv`, `flashFired`; `cameraSerial` from the catalog since v19.2, else
+/// the file).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_image_metadata(catalog: State<'_, Catalog>, id: ImageId) -> AppResult<ImageMetadata> {
+    let mut m = catalog.run(move |c| db::capture_time::image_metadata(c, id)).await?;
+    if m.missing {
+        return Ok(m);
+    }
+    // File EXIF outside the catalog lock (a few hundred KB of the original at most).
+    let path = std::path::PathBuf::from(&m.path);
+    let f = blocking(move || Ok(crate::raw::exif_info::read(&path))).await?;
+    m.focal_length_35mm = f.focal_length_35mm;
+    m.exposure_compensation_ev = f.exposure_compensation_ev;
+    m.flash_fired = f.flash_fired;
+    // v19.2: the catalog's serial (read at import) wins; the file's for photos not read yet.
+    m.camera_serial = m.camera_serial.or(f.camera_serial);
+    m.gps = f.gps;
+    Ok(m)
+}
+
+/// Solves Upright `mode` for photo `id` from the live `adjustments` (`null` = stored; Guided
+/// uses `adjustments.transform.guides`, the crop is ignored). Nothing is saved: the UI sets
+/// `transform.upright` + `transform.solution` and commits one history entry. `off` returns no
+/// solution. Body: stub (no solution, `message` says Upright is not available yet) until
+/// vision-ml-dev (line detection) / rust-engine-dev (solver) implement it.
+// Implemented (vision-ml-dev, `ml::upright`): LSD-style line detection on a ~1024 px render,
+// vanishing points, Level / Vertical / Full / Auto / Guided solve. "Auto straighten" for the
+// crop tool = `level`, crop angle = `ml::upright::crop_angle_for_rotation(rotationDeg, o)`.
+// A plain comment so `bindings.ts` is unchanged.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_upright(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    id: ImageId,
+    mode: UprightMode,
+    adjustments: Option<ParametricAdjustments>,
+) -> AppResult<UprightResult> {
+    if let Some(a) = &adjustments {
+        a.validate().map_err(AppError::invalid)?;
+    }
+    // Line detection + solve: `ml::upright` (vision-ml-dev). Detection runs on a ~1024 px
+    // render of the live colour settings without crop / transform / masks / LUT.
+    let (adjustments, entry) = catalog
+        .run(move |c| {
+            let e = repo::get_image(c, id)?;
+            let a = match adjustments {
+                Some(a) => a,
+                None => repo::get_adjustments(c, id)?,
+            };
+            Ok((a, e))
+        })
+        .await?;
+    if mode == UprightMode::Off {
+        return Ok(UprightResult { mode, solution: None, message: None });
+    }
+    // A photo Lightroom already solved stores every mode's matrix: switching modes reuses
+    // Lightroom's own solve (matches what Lightroom shows) instead of detecting lines again.
+    if mode != UprightMode::Guided {
+        let lightroom = adjustments.transform.solution.as_ref().filter(|s| !s.crs.is_empty());
+        if let Some(solution) = lightroom.and_then(|s| develop::transform::lightroom_solution(&s.crs, mode)) {
+            return Ok(UprightResult { mode, solution: Some(solution), message: None });
+        }
+    }
+    let f35 = ml::upright::focal_35mm_estimate(
+        entry.camera.make,
+        entry.camera.model.as_deref(),
+        entry.capture.focal_length_mm,
+    );
+    let orientation = entry.orientation.filter(|o| (1..=8).contains(o)).unwrap_or(1);
+    let guides = adjustments.transform.guides.clone();
+    let outcome = if mode == UprightMode::Guided {
+        // Guides only: no render needed.
+        let (w, h) = match (entry.width, entry.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => develop::source::oriented_size(w, h, orientation),
+            _ => (3, 2),
+        };
+        ml::upright::solve_rgb8(&[], w, h, orientation, mode, &guides, f35)
+    } else {
+        let src = develop_source(&catalog, &develop, id).await?;
+        let cache = develop.inner().clone();
+        let luts = luts.inner().clone();
+        let r = blocking(move || {
+            let a = ml::upright::detection_adjustments(&adjustments);
+            let px = cache.render_image(&src, &a, None, ml::upright::DETECT_EDGE, &luts)?;
+            let img = px.image;
+            Ok(ml::upright::solve_rgb8(&img.rgb, img.width, img.height, orientation, mode, &guides, f35))
+        })
+        .await;
+        note_if_missing(&catalog, id, r).await?
+    };
+    Ok(UprightResult { mode, solution: outcome.solution, message: outcome.message })
+}
+
+/// Crop-tool bounds of the live `adjustments` for photo `id` (v19.3, docs/ux-review-8d.md
+/// R1-3): the warped image's outline in the uncropped corrected frame as displayed, and what
+/// Constrain Crop makes of `adjustments.crop`. Pure geometry, no render (decodes the source
+/// on first use, as `get_develop_info`; instant while the photo is open in Develop). Both
+/// `null` without a Transform / Upright warp. The crop tool should render with
+/// `crop.enabled = false` and `transform.constrainCrop = false`: that frame is the one the
+/// quad refers to (full warped image, white outside the quad).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_transform_bounds(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+) -> AppResult<TransformBounds> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let bounds = blocking(move || cache.transform_bounds(&src, &adjustments)).await;
+    note_if_missing(&catalog, id, bounds).await
+}
+
+/// Renders a temporary variation of the live `adjustments` (no save, no history entry): a
+/// preset applied on top (hover preview on the main image) or some groups reset to the
+/// format defaults (press-and-hold "without this panel"). Same render path as
+/// `render_preview` (latest-wins per (id, slot), `sieve://` URL); use slot `preview` so the
+/// edit's `main` render stays valid. Unknown preset / image -> `not_found`; empty
+/// `withoutFields.fields` -> `invalid_argument`.
+#[tauri::command]
+#[specta::specta]
+pub async fn render_preview_variant(
+    catalog: State<'_, Catalog>,
+    develop: State<'_, DevelopCache>,
+    luts: State<'_, LutLibrary>,
+    id: ImageId,
+    adjustments: ParametricAdjustments,
+    variant: PreviewVariant,
+    options: RenderOptions,
+) -> AppResult<Option<RenderedPreview>> {
+    adjustments.validate().map_err(AppError::invalid)?;
+    options.validate().map_err(AppError::invalid)?;
+    if let PreviewVariant::WithoutFields { fields } = &variant {
+        require_fields(fields)?;
+    }
+    // Ticket first: arrival order decides latest-wins, as in `render_preview`.
+    let ticket = develop.ticket(id, options.slot);
+    let resolved = catalog.run(move |c| styles::resolve_preview_variant(c, id, &adjustments, &variant)).await?;
+    resolved.validate().map_err(AppError::invalid)?;
+    let src = develop_source(&catalog, &develop, id).await?;
+    let cache = develop.inner().clone();
+    let luts = luts.inner().clone();
+    let rendered = blocking(move || {
+        if !cache.is_current(ticket) {
+            return Ok(None);
+        }
+        cache.render(ticket, &src, &resolved, &options, &luts)
+    })
+    .await;
+    note_if_missing(&catalog, id, rendered).await
+}
+
+/// Sets how readily culling suggests reject for the project's photos (conservative /
+/// balanced / aggressive) and rescores. Unknown project -> `not_found`. The scorer reads it
+/// per image with `db::projects::reject_strictness_of_image` (vision-ml-dev).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_project_reject_strictness(
+    app: AppHandle,
+    catalog: State<'_, Catalog>,
+    analysis: State<'_, Analysis>,
+    project_id: ProjectId,
+    strictness: RejectStrictness,
+) -> AppResult<()> {
+    catalog.run(move |c| projects::set_project_reject_strictness(c, project_id, strictness)).await?;
+    analysis.start(&app, AnalysisScope::Rescore)
 }

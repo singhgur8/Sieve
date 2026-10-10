@@ -22,6 +22,8 @@
 //!   later use [`write_tx`] (`BEGIN IMMEDIATE`): in WAL mode a deferred transaction whose
 //!   snapshot went stale cannot wait for the lock and fails at once.
 
+pub mod camera_serial;
+pub mod capture_time;
 pub mod projects;
 pub mod repo;
 pub mod schema;

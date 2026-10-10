@@ -57,6 +57,7 @@ fn write(adj: &ParametricAdjustments, format: Option<ImageFormat>) -> Desired {
         seqs,
         profile: Some(packet::ProfileWrite { settings: adj.profile.clone(), look_source: None }),
         format,
+        capture_time: None,
     }
 }
 
@@ -182,6 +183,9 @@ fn real_masked_sidecars_minimal_diff() {
             color_label,
             meta_updated_at: None,
             xmp_mtime_ms: None,
+            captured_at_ms: None,
+            exif_captured_at_ms: None,
+            capture_time_source: crate::ipc::types::CaptureTimeSource::Exif,
         };
         let stem = f.file_stem().unwrap().to_string_lossy().into_owned();
         let run = |adj: &ParametricAdjustments, keys: &[&str], what: &str| {

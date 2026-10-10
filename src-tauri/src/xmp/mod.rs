@@ -193,6 +193,9 @@ pub struct XmpSync {
     /// Where Lightroom AI mattes read from sidecars go (v10); `None` = masks import without
     /// their mattes (AI components then report `needs_update`).
     mask_cache: Option<develop::masks::MaskCache>,
+    /// A sidecar read changed some photo's capture time since the last
+    /// [`Self::take_capture_time_changes`] (v19: bursts / scenes need a rescore).
+    capture_times_changed: Arc<AtomicBool>,
 }
 
 impl XmpSync {
@@ -205,6 +208,7 @@ impl XmpSync {
             io_lock: Arc::new(Mutex::new(())),
             explicit_waiting: Arc::new(AtomicUsize::new(0)),
             mask_cache: None,
+            capture_times_changed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -222,6 +226,13 @@ impl XmpSync {
 
     pub fn config(&self) -> &XmpSyncConfig {
         &self.config
+    }
+
+    /// Whether sidecar reads changed any capture time since the last call (clears the flag).
+    /// Callers that read sidecars (`refresh_sidecars`, import) kick a rescore when set, so
+    /// bursts regroup on Lightroom-corrected times.
+    pub fn take_capture_time_changes(&self) -> bool {
+        self.capture_times_changed.swap(false, Ordering::SeqCst)
     }
 
     /// The auto-sync writer is working.
@@ -673,7 +684,12 @@ impl XmpSync {
                     if values.develop_error.is_none() {
                         store::clear_masks_pending(conn, row.id)?;
                     }
-                    let changed = store::apply_read(conn, row.id, rating, pick, label, mtime)?;
+                    // Capture time (v19): a Lightroom-corrected time in the sidecar.
+                    let time_changed = db::capture_time::apply_sidecar_time(conn, row.id, values.capture_time_ms)?;
+                    if time_changed {
+                        self.capture_times_changed.store(true, Ordering::SeqCst);
+                    }
+                    let changed = store::apply_read(conn, row.id, rating, pick, label, mtime)? || time_changed;
                     // NewerWins: rating/pick/label came from the sidecar; if our tags differ
                     // from the sidecar's, write them too (a no-op for the values just read).
                     let write_back =
@@ -797,6 +813,11 @@ fn desired(row: &ImageRow, tags: &[String], develop: Option<&ParametricAdjustmen
         seqs,
         profile,
         format: crate::raw::format_from_extension(&row.path),
+        capture_time: Some(packet::CaptureTimeWrite {
+            corrected_ms: row.captured_at_ms,
+            exif_ms: row.exif_captured_at_ms,
+            source: row.capture_time_source,
+        }),
     }
 }
 
@@ -916,5 +937,7 @@ mod tests;
 
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod tests_capture;
 #[cfg(test)]
 mod tests_minimal;

@@ -141,7 +141,7 @@ export const HELP: HelpEntry[] = [
           "Z picks, X rejects, U clears the flag. P also picks.",
           "0 to 5 sets the stars. 6 to 9 set a color label.",
           "Shift+Z and Shift+X flag and then move to the next photo.",
-          "Left / Right move between photos. Space opens the Loupe, and in the Loupe it zooms between Fit and 1:1.",
+          "Left / Right move between photos. Space opens the Loupe. In the Loupe, Compare and Develop, Space (or a click in the Loupe) zooms between Fit and 1:1 at the point under the cursor, and the zoom and position stay while you step with Left / Right. The zoom buttons add Fill, 50%, 200% and 400%; drag to pan.",
           "C opens Compare: two photos side by side. Tab switches the active pane. K makes the active frame the best of its burst and picks it.",
           "Cmd+Z undoes the last culling change.",
         ],
@@ -242,18 +242,67 @@ export const HELP: HelpEntry[] = [
     ],
   },
   {
+    id: "capture-time",
+    title: "Capture time and photo info",
+    keywords: "date time clock camera sync shift hours timezone daylight saving two cameras edit capture time metadata exif info panel",
+    blocks: [
+      { p: "Open Photo info (the Info button, or Cmd+I) to see the selected photo's capture date and time, camera, lens, exposure, size, GPS and sidecar. It follows your selection. The Metadata filter in the filter bar is different: it filters the whole gallery by camera, lens, ISO and so on." },
+      { p: "Camera clock wrong? Edit capture time (Photo info, More menu or Cmd+Shift+T) works like Lightroom's Edit Capture Time:" },
+      {
+        ul: [
+          "Shift by hours / minutes: moves the selected photos by the same amount (for example -1 h after forgetting daylight saving).",
+          "Set exact time: gives the active photo its true time; the other selected photos move by the same amount.",
+          "Sync two cameras: pick one frame from each camera that was taken at the same moment. Every photo of the second camera moves so its frame matches the first camera. A preview shows before and after.",
+          "Revert to original: back to the time stored in the file.",
+        ],
+      },
+      { p: "Sorting, bursts and scenes use the corrected time, so a mixed two-camera shoot falls into the right order. The original files are never changed; the correction is saved in the XMP sidecars (Lightroom corrections are picked up from them). Undo from the message, or Revert to original. The original time is shown next to the corrected one." },
+    ],
+  },
+  {
+    id: "reject-strictness",
+    title: "Reject strictness",
+    keywords: "conservative balanced aggressive suggestions reject auto cull strict",
+    blocks: [
+      { p: "In the Cull step, Reject strictness sets how readily Sieve suggests rejecting a photo, per project. Conservative: only unusable frames (nothing in focus, far too dark or blown out, or several defects at once); closed eyes and burst duplicates are never rejected. Balanced (default): also missed focus or motion blur on the main subject, closed eyes on the main subject, and burst frames clearly worse than the best one. Aggressive: also any closed eyes or soft focus, and weaker burst frames even when the difference is small; expect some keepers among the suggestions." },
+      { p: "Changing it re-evaluates the suggestions (the count next to it updates). Nothing is rejected until you press Apply suggestions, and you can undo that." },
+    ],
+  },
+  {
     id: "editing",
     title: "Editing basics",
-    keywords: "develop sliders exposure scene apply copy paste sync auto edit export",
+    keywords: "develop sliders exposure scene apply copy paste sync auto edit export type value arrow keys blue dot preset preview highlight",
     blocks: [
       {
         ul: [
           "Press D to open Develop. Sliders (Exposure, Contrast, Highlights, Shadows, White balance, ...) are non-destructive and saved to the sidecar. Double-click a slider's name to reset it.",
           "In the Edit step, keepers are grouped into scenes by lighting. Edit one photo per scene, then Apply to scene copies that edit to the others, matched for exposure and white balance.",
           "Auto edit (my style) edits a scene's photo with your learned style. Review it, then apply.",
-          "Copy, Paste and Sync move settings between photos. Cmd+Shift+C copies, Cmd+Shift+V pastes.",
+          "Copy, Paste and Sync move settings between photos. Cmd+C (or Ctrl+C) copies every setting, Cmd+V (Ctrl+V) pastes them as one undoable step. Cmd+Shift+C picks which settings to copy.",
+          "Type a slider value: click the number, type, Enter applies, Esc cancels, Tab moves to the next slider. Hover a slider and press Up / Down to nudge it (Shift = x10, Alt = fine). Left / Right still move between photos unless a slider has focus.",
+          "Auto (top of Basic) sets tone and white balance from the photo itself, on any photo. It is not Auto edit (my style), which applies your learned style to a scene.",
+          "A blue dot next to a panel's name (Basic, Detail, Effects, ...) means it was changed. Press and hold the dot to see the photo without those changes; release to come back. Nothing is saved.",
+          "The preset the photo carries is highlighted in the Presets list. Hover a preset to preview it on the photo; click to apply it.",
           "Backslash shows before / after. Cmd+Shift+R resets all adjustments.",
           "Export (Cmd+Shift+E) renders JPEG, TIFF or PNG with your preset. The originals stay untouched.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "upright",
+    title: "Crop, straighten and Upright",
+    keywords: "crop straighten angle horizon level vertical perspective keystone transform guided auto upright lines",
+    blocks: [
+      {
+        ul: [
+          "Press R to crop. Drag the corners, edges or the frame; drag outside the frame to rotate. A locks the aspect ratio, X swaps landscape / portrait, O cycles the guides. Enter applies, Esc cancels.",
+          "Auto (in the crop panel) straightens the photo: it finds the horizon or the vertical lines and sets the Angle for you. Shift+double-click the Angle slider does the same. If it finds no straight lines it tells you; draw the angle yourself with the Angle tool.",
+          "Constrain to image keeps the crop inside the straightened photo. Turn it off to crop past the edge: the empty corners are filled white, as in Lightroom.",
+          "Transform (right panel, below Detail) fixes perspective. Upright Level levels the horizon, Vertical also straightens converging verticals, Full corrects horizontal perspective too, and Auto picks a balanced correction. One click, one undo step.",
+          "Guided (Shift+T) lets you draw 2 to 4 lines along things that should be straight, such as door frames or walls. Sieve corrects the photo as soon as there are two. Drag a line's ends to adjust it, click the x to delete it, Esc to finish.",
+          "The sliders below (Vertical, Horizontal, Rotate, Aspect, Scale, Offset) adjust by hand. Constrain Crop keeps the crop inside the corrected image. The blue dot shows the transform was changed; hold it to see the photo without it.",
+          "Transform is written to the sidecar so Lightroom shows the same Upright mode and sliders. A photo you already straightened with Upright in Lightroom keeps Lightroom's own correction.",
         ],
       },
     ],

@@ -30,6 +30,7 @@ fn want(rating: i32, label: Option<&'static str>, tags: &[&str]) -> Desired {
         seqs: Vec::new(),
         profile: None,
         format: None,
+        capture_time: None,
     }
 }
 
@@ -249,6 +250,9 @@ fn row(rating: u8, pick: PickFlag, label: Option<ColorLabel>) -> ImageRow {
         color_label: label,
         meta_updated_at: None,
         xmp_mtime_ms: None,
+        captured_at_ms: None,
+        exif_captured_at_ms: None,
+        capture_time_source: crate::ipc::types::CaptureTimeSource::Exif,
     }
 }
 

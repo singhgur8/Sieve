@@ -23,9 +23,9 @@ use export::{ExportConfig, Exporter};
 use ingest::{Ingest, IngestConfig};
 use ipc::commands::{self, Catalog};
 use ipc::events::{
-    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, ExportFinished, ExportProgress,
-    ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress, StyleModelFinished,
-    StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
+    ActivityEvent, AnalysisFailed, AnalysisFinished, AnalysisProgress, AnalysisReady, EditedPreviewChanged,
+    ExportFinished, ExportProgress, ImportProgress, ModelDownloadFinished, ModelDownloadProgress, SceneProgress,
+    StyleModelFinished, StyleModelProgress, ThumbnailFailed, ThumbnailReady, XmpSynced, XmpWriteFailed,
 };
 use ipc::types::AnalysisScope;
 use lut::LutLibrary;
@@ -95,6 +95,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::goto_history,
             commands::paste_settings,
             commands::sync_settings,
+            commands::sync_delta,
             commands::reset_adjustments,
             commands::apply_preset,
             commands::list_presets,
@@ -183,6 +184,15 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             commands::get_cull_summary,
             commands::get_metadata_filter_options,
             commands::refresh_sidecars,
+            // IPC v19
+            commands::edit_capture_time,
+            commands::restore_capture_times,
+            commands::get_image_metadata,
+            commands::auto_upright,
+            commands::render_preview_variant,
+            commands::set_project_reject_strictness,
+            // IPC v19.3
+            commands::get_transform_bounds,
         ])
         .events(collect_events![
             ImportProgress,
@@ -201,7 +211,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
             ModelDownloadFinished,
             StyleModelProgress,
             StyleModelFinished,
-            ActivityEvent
+            ActivityEvent,
+            // IPC v19.1
+            EditedPreviewChanged
         ])
         // Lightroom defaults (IPC v9): the frontend's source of truth for neutral settings.
         .constant("DEFAULT_ADJUSTMENTS", ipc::types::ParametricAdjustments::default())
@@ -296,6 +308,7 @@ pub fn run() {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DevelopConfig::DEFAULT_CACHE_MB);
             let export_memory_mb = std::env::var(EXPORT_MEMORY_ENV).ok().and_then(|v| v.parse::<u64>().ok());
+            let config_cache_dir = cache_dir.clone();
             let config = IngestConfig { catalog_path: path.clone(), cache_dir };
             std::fs::create_dir_all(config.thumbs_dir())?;
             // tauri.conf.json scopes the asset protocol to `$APPCACHE/thumbs/**`; this also
@@ -333,11 +346,40 @@ pub fn run() {
             // Adobe DCPs / looks installed on this Mac, read in place (never copied).
             app.manage(profiles::ProfileLibrary::new(profiles::ProfileConfig::from_env()));
             let luts = LutLibrary::new(luts_dir);
+            // Edited previews (IPC v19.1): `<cacheDir>/edited/`, regenerated in the background.
+            {
+                let handle = app.handle().clone();
+                app.state::<DevelopCache>().enable_edited_previews(
+                    develop::edited::EditedConfig::new(&config_cache_dir, path.clone()),
+                    luts.clone(),
+                    std::sync::Arc::new(move |ev: EditedPreviewChanged| {
+                        let _ = ev.emit(&handle);
+                    }),
+                );
+            }
             let exporter = Exporter::new(
                 ExportConfig { catalog_path: path.clone(), memory_budget_mb: export_memory_mb },
                 luts.clone(),
             )
             .with_masks(mask_cache.clone(), segmenter.clone());
+            // Camera serials of photos imported before v19.2 (migration 0018), off the startup path.
+            {
+                let catalog_path = path.clone();
+                let _ = std::thread::Builder::new().name("serial-backfill".into()).spawn(move || {
+                    let run = || -> ipc::error::AppResult<u32> {
+                        let conn = db::open(&catalog_path)?;
+                        if db::camera_serial::unread_count(&conn)? == 0 {
+                            return Ok(0);
+                        }
+                        db::camera_serial::backfill(&conn)
+                    };
+                    match run() {
+                        Ok(n) if n > 0 => eprintln!("read camera serials of {n} photo(s)"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("camera serial backfill: {}", e.message),
+                    }
+                });
+            }
             // Masks catch-up (migration 0010) + orphaned matte sweep, off the startup path.
             {
                 let xmp = app.state::<XmpSync>().inner().clone();
@@ -369,6 +411,9 @@ pub fn run() {
             app.state::<Ingest>().start(app.handle())?;
             if auto_analyze {
                 app.state::<Analysis>().start(app.handle(), AnalysisScope::Pending)?;
+            } else {
+                // Suggestions scored by older rules are refreshed once (never the user's flags).
+                app.state::<Analysis>().start_if_rules_changed(app.handle())?;
             }
             // Flush sidecar changes left dirty by a previous session (no-op unless auto-sync).
             app.state::<XmpSync>().notify(app.handle());

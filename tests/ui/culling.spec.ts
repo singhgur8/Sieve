@@ -275,7 +275,7 @@ test.describe("loupe", () => {
     await page.mouse.move(box.x + box.width / 2 + 80, box.y + box.height / 2 + 40, { steps: 4 });
     await page.mouse.up();
     expect(await img.evaluate((el) => el.style.transform)).not.toBe(before);
-    await pane.dblclick();
+    await pane.click(); // a click zooms back to Fit (Lightroom)
     await expect(pane).toHaveAttribute("data-scale", "1");
   });
 });

@@ -16,9 +16,12 @@ use rusqlite::{Connection, TransactionBehavior};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_specta::Event;
 
-use super::bursts::{add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts};
+use super::bursts::{
+    add_reason, annotate_soft_face, apply_pins, demote, duplicate_reason, group_bursts, reject_if_clearly_worse,
+};
+use super::scoring::{score_with, RejectStrictness};
 use super::store::{self, BurstRow};
-use super::{score, AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
+use super::{AnalysisConfig, Analyzer, BurstFrame, ImageMetrics, WorkerFlags};
 use crate::db::{self, now_ms, projects, repo};
 use crate::ingest::Ingest;
 use crate::ipc::error::{AppError, AppResult};
@@ -262,7 +265,8 @@ fn run_queue(
                 std::thread::sleep(INGEST_POLL);
                 continue;
             }
-            if dirty || flags.rescore.swap(false, Ordering::SeqCst) {
+            // Suggestions from older scoring rules are refreshed once (rules version).
+            if flags.rescore.swap(false, Ordering::SeqCst) || dirty || store::rules_version_stale(conn)? {
                 stats.burst_groups = rescore_all(conn)?;
                 dirty = false;
             }
@@ -280,6 +284,10 @@ fn run_queue(
             // stay pending and are picked up once `scripts/fetch-models.sh` has run.
             if let Err(e) = measurer.check() {
                 eprintln!("[analysis] models unavailable, analysis stopped: {e}");
+                // Already analysed photos still get this build's suggestions (no models needed).
+                if store::rules_version_stale(conn)? {
+                    stats.burst_groups = rescore_all(conn)?;
+                }
                 stats.cancelled = true;
                 return Ok(End::ModelsMissing);
             }
@@ -312,7 +320,8 @@ fn run_queue(
                 let recorded = match out.result {
                     Ok(metrics) => {
                         let (shoot_type, thresholds) = shoot.of_image(conn, out.id)?;
-                        let scored = score(&metrics, &thresholds, shoot_type);
+                        let strictness = projects::reject_strictness_of_image(conn, out.id)?;
+                        let scored = score_with(&metrics, &thresholds, shoot_type, strictness);
                         let recorded = store::record_measured(conn, out.id, &metrics, &scored)?;
                         if recorded {
                             stats.analyzed += 1;
@@ -375,7 +384,8 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     let mut scored = Vec::with_capacity(analyzed.len());
     for a in &analyzed {
         let (shoot_type, thresholds) = shoot.of_folder(conn, a.folder_id, a.id)?;
-        scored.push(score(&a.metrics, &thresholds, shoot_type));
+        let strictness = shoot.strictness_of_folder(conn, a.folder_id, a.id)?;
+        scored.push(score_with(&a.metrics, &thresholds, shoot_type, strictness));
     }
 
     let mut by_folder: BTreeMap<i64, Vec<(BurstFrame, usize)>> = BTreeMap::new();
@@ -391,6 +401,8 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
     for (folder, frames) in &by_folder {
         let Some((first, _)) = frames.first() else { continue };
         let burst_hash_distance = shoot.of_folder(conn, *folder, first.id)?.1.burst_hash_distance;
+        // A folder belongs to one project: one strictness for its bursts.
+        let burst_rule = shoot.strictness_of_folder(conn, *folder, first.id)?.rules().burst;
         let index: std::collections::HashMap<ImageId, usize> = frames.iter().map(|(f, i)| (f.id, *i)).collect();
         let times: std::collections::HashMap<ImageId, i64> =
             frames.iter().map(|(f, _)| (f.id, f.captured_at_ms)).collect();
@@ -407,8 +419,14 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
                 annotate_soft_face(q, best_face);
                 if m != b.keeper {
                     demote(q, keeper.suggested_rating);
+                    let rejected = reject_if_clearly_worse(q, &keeper, burst_rule);
                     let reason = duplicate_reason(q, &keeper, b.keeper, &keeper_name, pinned);
-                    add_reason(q, reason);
+                    if rejected {
+                        // What made it a reject comes first.
+                        q.reasons.insert(0, reason);
+                    } else {
+                        add_reason(q, reason);
+                    }
                 }
             }
             rows.push(BurstRow {
@@ -425,6 +443,7 @@ pub fn rescore_all(conn: &mut Connection) -> AppResult<u32> {
         store::write_scored(&tx, a.id, s, now)?;
     }
     let n = store::write_bursts(&tx, &rows)?;
+    store::set_rules_version(&tx)?;
     tx.commit()?;
     Ok(n)
 }
@@ -444,6 +463,7 @@ struct ShootTypes {
     by_image: HashMap<ImageId, ShootType>,
     by_folder: HashMap<i64, ShootType>,
     thresholds: HashMap<ShootType, CullThresholds>,
+    strictness_by_folder: HashMap<i64, RejectStrictness>,
 }
 
 impl ShootTypes {
@@ -466,6 +486,17 @@ impl ShootTypes {
             }
         };
         self.thresholds(conn, st)
+    }
+
+    /// Reject strictness of `folder`'s project (IPC v19), resolved through one of its
+    /// images (`image`); `balanced` outside a project.
+    fn strictness_of_folder(&mut self, conn: &Connection, folder: i64, image: ImageId) -> AppResult<RejectStrictness> {
+        if let Some(s) = self.strictness_by_folder.get(&folder) {
+            return Ok(*s);
+        }
+        let s = projects::reject_strictness_of_image(conn, image)?;
+        self.strictness_by_folder.insert(folder, s);
+        Ok(s)
     }
 
     /// Shoot type of `folder`, resolved through one of its images (`image`).
@@ -494,7 +525,7 @@ mod tests {
     use super::*;
     use crate::ipc::types::{ShootType, SuggestionReason, SuggestionReasonKind};
     use crate::ml::scoring::tests::{face, metrics};
-    use crate::ml::MODEL_VERSION;
+    use crate::ml::{score, MODEL_VERSION};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -594,6 +625,80 @@ mod tests {
         .unwrap();
     }
 
+    /// Runs a startup-style `Pending` pass to completion.
+    fn run_pending(config: &AnalysisConfig) {
+        let rec = Arc::new(Recorder::default());
+        let flags = WorkerFlags::default();
+        kick(config, &flags, AnalysisScope::Pending, rec.clone()).unwrap();
+        let t = Instant::now();
+        while rec.finished.lock().unwrap().is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while flags.running.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn older_scoring_rules_are_rescored_once_without_touching_user_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 3, &[]);
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        repo::set_shoot_type(&conn, ShootType::Wedding).unwrap();
+        // Analysed under the pre-8d rules: the stored suggestion is stale ("pick" on a frame
+        // whose whole frame is soft, which balanced now rejects), and no rules version.
+        let mut soft = metrics(vec![]);
+        soft.global_sharpness = 0.3;
+        soft.phash = 0;
+        let mut m2 = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m2.phash = !0;
+        let mut m3 = metrics(vec![face(0.4, 0.15, 0.7, 0.28)]);
+        m3.phash = 0x0F0F_0F0F_0F0F_0F0F;
+        for (id, m) in [(1, &soft), (2, &m2), (3, &m3)] {
+            store_metrics(&conn, id, m);
+        }
+        rescore_all(&mut conn).unwrap();
+        conn.execute("UPDATE quality_scores SET suggested_pick = 'pick' WHERE image_id = 1", []).unwrap();
+        conn.execute("DELETE FROM catalog_meta WHERE key = ?1", [store::RULES_VERSION_KEY]).unwrap();
+        // The user's own decisions (catalog() sets 2 stars + pick; make 3 a user reject).
+        conn.execute("UPDATE images SET pick = 'reject', rating = 4 WHERE id = 3", []).unwrap();
+        let user = |conn: &Connection| -> Vec<(String, i64, String)> {
+            conn.prepare("SELECT pick, rating, pick_origin FROM images ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = user(&conn);
+        let sugg = |conn: &Connection| -> String {
+            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = 1", [], |r| r.get(0)).unwrap()
+        };
+        assert!(store::rules_version_stale(&conn).unwrap());
+
+        // First start: nothing to analyse, but the old suggestions are refreshed.
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "reject");
+        assert!(!store::rules_version_stale(&conn).unwrap());
+        let v: String = conn
+            .query_row("SELECT value FROM catalog_meta WHERE key = ?1", [store::RULES_VERSION_KEY], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, crate::ml::scoring::SCORING_RULES_VERSION.to_string());
+        assert_eq!(user(&conn), before, "user flags, stars and origins are never touched");
+
+        // Second start: no rescore (a marker written into the stored suggestion survives).
+        conn.execute("UPDATE quality_scores SET suggested_pick = 'unflagged' WHERE image_id = 1", []).unwrap();
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "unflagged");
+
+        // An older stored version (e.g. "1") is stale again.
+        conn.execute("UPDATE catalog_meta SET value = '1' WHERE key = ?1", [store::RULES_VERSION_KEY]).unwrap();
+        run_pending(&config);
+        assert_eq!(sugg(&conn), "reject");
+        assert_eq!(user(&conn), before);
+    }
+
     #[test]
     fn rescore_scores_each_image_with_its_project_shoot_type() {
         let dir = tempfile::tempdir().unwrap();
@@ -634,6 +739,48 @@ mod tests {
             .unwrap();
         rescore_all(&mut db::open(&config.catalog_path).unwrap()).unwrap();
         assert!((overall(3) - wedding).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rescore_rejects_clearly_worse_burst_frames_per_strictness() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 3, &[]);
+        let mut conn = db::open(&config.catalog_path).unwrap();
+        repo::set_shoot_type(&conn, ShootType::Wedding).unwrap();
+        // One burst: 2 is the sharp keeper, 1 has a clearly softer face (still above the
+        // missed-focus threshold), 3 is nearly as good as the keeper.
+        let mut m1 = metrics(vec![face(0.4, 0.15, 0.55, 0.28)]);
+        m1.phash = 0xFFFF_0000;
+        let mut m2 = metrics(vec![face(0.4, 0.15, 0.8, 0.28)]);
+        m2.phash = 0xFFFF_0001;
+        let mut m3 = metrics(vec![face(0.4, 0.15, 0.78, 0.28)]);
+        m3.phash = 0xFFFF_0003;
+        for (id, m) in [(1, &m1), (2, &m2), (3, &m3)] {
+            store_metrics(&conn, id, m);
+        }
+        let pick = |conn: &Connection, id: i64| -> String {
+            conn.query_row("SELECT suggested_pick FROM quality_scores WHERE image_id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        // Default (balanced): the clearly softer frame is a reject, its burst reason first.
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, shoot_type, created_at) VALUES (10, 'w', 'wedding', 0);
+             UPDATE folders SET project_id = 10 WHERE id = 1;",
+        )
+        .unwrap();
+        assert_eq!(projects::reject_strictness_of_image(&conn, 1).unwrap(), RejectStrictness::Balanced);
+        rescore_all(&mut conn).unwrap();
+        assert_eq!(repo::list_burst_groups(&conn, None).unwrap()[0].keeper_image_id, Some(2));
+        assert_eq!(pick(&conn, 1), "reject");
+        let r = reasons_of(&conn, 1);
+        assert_eq!((r[0].kind, r[0].related_image_id), (SuggestionReasonKind::DuplicateBurst, Some(2)));
+        assert_eq!(r[0].text, "Similar to 2 in this burst \u{2014} that one is sharper");
+        assert_eq!(pick(&conn, 3), "unflagged", "a near-equal frame stays a candidate");
+        assert_eq!(pick(&conn, 2), "pick");
+        // Conservative: burst frames are never rejected for being worse duplicates.
+        projects::set_project_reject_strictness(&conn, 10, RejectStrictness::Conservative).unwrap();
+        rescore_all(&mut conn).unwrap();
+        assert_eq!(pick(&conn, 1), "unflagged");
+        assert_eq!(reasons_of(&conn, 1)[0].kind, SuggestionReasonKind::DuplicateBurst);
     }
 
     #[test]
@@ -749,6 +896,22 @@ mod tests {
         let s = store::analysis_status(&conn, false).unwrap();
         assert_eq!((s.pending, s.failed, s.analyzed), (2, 0, 0));
         assert!(rec.finished.lock().unwrap()[0].cancelled);
+    }
+
+    #[test]
+    fn missing_models_still_refresh_stale_suggestions_of_analysed_photos() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = catalog(dir.path(), 2, &[]);
+        let conn = db::open(&config.catalog_path).unwrap();
+        // 1 is analysed (no suggestion yet, rules version missing); 2 still needs the models.
+        store_metrics(&conn, 1, &metrics(vec![face(0.4, 0.15, 0.7, 0.28)]));
+        let stats = run_blocking(&config, &Recorder::default()).unwrap();
+        assert!(stats.cancelled);
+        let n: u32 =
+            conn.query_row("SELECT COUNT(*) FROM quality_scores WHERE image_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        assert!(!store::rules_version_stale(&conn).unwrap());
+        assert_eq!(store::count_needs(&conn).unwrap(), 1, "the other photo stays pending");
     }
 
     /// Stub measurer: the first `measure` call runs `removal` (every other call waits for

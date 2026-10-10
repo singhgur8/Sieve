@@ -13,21 +13,24 @@ export const FULL: Rect = { l: 0, t: 0, r: 1, b: 1 };
 export const MIN_SIZE = 0.02;
 
 /** "custom" = locked to the ratio the free rectangle had when X / the swap button was used (not offered in the list). */
-export type AspectId = "free" | "original" | "custom" | "1:1" | "4:5" | "5:7" | "3:2" | "16:9";
-export const ASPECTS: { id: Exclude<AspectId, "custom">; label: string; ratio: number | null }[] = [
+export type AspectId = "free" | "asShot" | "original" | "custom" | "1:1" | "4:5" | "5:7" | "3:2" | "16:9";
+/** Lightroom's list. As Shot / Original both lock to the frame's own ratio (no earlier crop exists in Sieve). Custom is last. */
+export const ASPECTS: { id: AspectId; label: string; ratio: number | null }[] = [
   { id: "free", label: "Free", ratio: null },
+  { id: "asShot", label: "As Shot", ratio: null },
   { id: "original", label: "Original", ratio: null },
   { id: "1:1", label: "1 x 1", ratio: 1 },
-  { id: "4:5", label: "4 x 5", ratio: 4 / 5 },
+  { id: "4:5", label: "4 x 5 / 8 x 10", ratio: 4 / 5 },
   { id: "5:7", label: "5 x 7", ratio: 5 / 7 },
-  { id: "3:2", label: "3 x 2", ratio: 3 / 2 },
+  { id: "3:2", label: "2 x 3 / 4 x 6", ratio: 3 / 2 },
   { id: "16:9", label: "16 x 9", ratio: 16 / 9 },
+  { id: "custom", label: "Custom...", ratio: null },
 ];
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Display -> stored (un-oriented) point mapping for EXIF orientation 1..8. */
-function toStoredPoint(o: number, u: number, v: number): [number, number] {
+export function toStoredPoint(o: number, u: number, v: number): [number, number] {
   switch (o) {
     case 2: return [1 - u, v];
     case 3: return [1 - u, 1 - v];
@@ -39,7 +42,7 @@ function toStoredPoint(o: number, u: number, v: number): [number, number] {
     default: return [u, v];
   }
 }
-function fromStoredPoint(o: number, x: number, y: number): [number, number] {
+export function fromStoredPoint(o: number, x: number, y: number): [number, number] {
   switch (o) {
     case 2: return [1 - x, y];
     case 3: return [1 - x, 1 - y];
@@ -157,30 +160,83 @@ export function insideRotated(rect: Rect, aspect: number, rotation: number, eps 
   return rect.l >= -eps && rect.t >= -eps && rect.r <= 1 + eps && rect.b <= 1 + eps;
 }
 
-/** Shrinks `rect` about its centre (same aspect ratio) until it lies inside the rotated image and the frame. */
-export function fitInsideRotated(rect: Rect, aspect: number, rotation: number): Rect {
-  if (insideRotated(rect, aspect, rotation)) return rect;
+/** Clamps a centre (display fractions) so a rect of half sizes (hu, hv) fits the frame and the rotated image: alternating projections. */
+function slideCentre(cu: number, cv: number, hu: number, hv: number, aspect: number, rotation: number): [number, number] {
   const th = rotation * RAD;
   const [sn, cs] = [Math.sin(th), Math.cos(th)];
-  const hw = ((rect.r - rect.l) * aspect) / 2; // half sizes in height units
-  const hh = (rect.b - rect.t) / 2;
-  const toLocal = (x: number, y: number): [number, number] => [cs * x + sn * y, -sn * x + cs * y];
-  // Centre in the image's frame, pulled inside first.
-  let [qx, qy] = toLocal(((rect.l + rect.r) / 2 - 0.5) * aspect, (rect.t + rect.b) / 2 - 0.5);
-  qx = clamp(qx, -aspect / 2, aspect / 2);
-  qy = clamp(qy, -0.5, 0.5);
-  // Corner extents in the image's frame (worst case over the four corners).
-  const ex = Math.max(Math.abs(toLocal(hw, hh)[0]), Math.abs(toLocal(-hw, hh)[0]));
-  const ey = Math.max(Math.abs(toLocal(hw, hh)[1]), Math.abs(toLocal(-hw, hh)[1]));
-  let s = Math.min(1, ex > 1e-9 ? (aspect / 2 - Math.abs(qx)) / ex : 1, ey > 1e-9 ? (0.5 - Math.abs(qy)) / ey : 1);
-  // Back to displayed coordinates (rotate by +rotation).
-  const cu = (cs * qx - sn * qy) / aspect + 0.5;
-  const cv = sn * qx + cs * qy + 0.5;
-  // The frame itself bounds the rect too.
-  const fu = hw / aspect;
-  s = Math.min(s, fu > 1e-9 ? Math.min(cu, 1 - cu) / fu : 1, hh > 1e-9 ? Math.min(cv, 1 - cv) / hh : 1);
-  s = Math.max(0, s - 1e-6);
-  return { l: cu - fu * s, r: cu + fu * s, t: cv - hh * s, b: cv + hh * s };
+  // Half extents of the rect's corners in the image's own frame (height units).
+  const hw = hu * aspect;
+  const ex = Math.abs(cs) * hw + Math.abs(sn) * hv;
+  const ey = Math.abs(sn) * hw + Math.abs(cs) * hv;
+  for (let i = 0; i < 60; i++) {
+    const dx = (cu - 0.5) * aspect;
+    const dy = cv - 0.5;
+    const qx = clamp(cs * dx + sn * dy, -(aspect / 2 - ex), aspect / 2 - ex);
+    const qy = clamp(-sn * dx + cs * dy, -(0.5 - ey), 0.5 - ey);
+    cu = (cs * qx - sn * qy) / aspect + 0.5;
+    cv = sn * qx + cs * qy + 0.5;
+    cu = clamp(cu, hu, 1 - hu);
+    cv = clamp(cv, hv, 1 - hv);
+  }
+  return [cu, cv];
+}
+
+/**
+ * Lightroom "constrain to image": the largest rect of `rect`'s aspect and centre-preference that lies inside the rotated
+ * image. The centre first slides inward (keeping the size) and only then does the rect shrink. Always computed from the
+ * user's intended rect, so returning toward 0 degrees grows it back.
+ */
+export function fitInsideRotated(rect: Rect, aspect: number, rotation: number): Rect {
+  if (insideRotated(rect, aspect, rotation)) return rect;
+  const cu0 = (rect.l + rect.r) / 2;
+  const cv0 = (rect.t + rect.b) / 2;
+  const hu = (rect.r - rect.l) / 2;
+  const hv = (rect.b - rect.t) / 2;
+  const at = (s: number): Rect => {
+    const [cu, cv] = slideCentre(cu0, cv0, hu * s, hv * s, aspect, rotation);
+    return { l: cu - hu * s, r: cu + hu * s, t: cv - hv * s, b: cv + hv * s };
+  };
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 32; i++) {
+    const m = (lo + hi) / 2;
+    if (insideRotated(at(m), aspect, rotation, 1e-9)) lo = m;
+    else hi = m;
+  }
+  return at(Math.max(0, lo - 1e-7));
+}
+
+/** Area (fractions of the frame) of `rect`. */
+export const rectArea = (r: Rect) => (r.r - r.l) * (r.b - r.t);
+
+// ---- composition overlays (O cycles, Shift+O rotates) ----
+export type OverlayId = "thirds" | "grid" | "goldenRatio" | "goldenSpiral" | "diagonal" | "triangle" | "aspects";
+export const OVERLAYS: { id: OverlayId; label: string }[] = [
+  { id: "thirds", label: "Rule of thirds" },
+  { id: "grid", label: "Grid" },
+  { id: "goldenRatio", label: "Golden ratio" },
+  { id: "goldenSpiral", label: "Golden spiral" },
+  { id: "diagonal", label: "Diagonal" },
+  { id: "triangle", label: "Triangle" },
+  { id: "aspects", label: "Aspect ratios" },
+];
+export const nextOverlay = (id: OverlayId): OverlayId => OVERLAYS[(OVERLAYS.findIndex((o) => o.id === id) + 1) % OVERLAYS.length].id;
+const OVERLAY_KEY = "sieve.crop.overlay";
+export function loadOverlay(): OverlayId {
+  try {
+    const v = localStorage.getItem(OVERLAY_KEY) as OverlayId | null;
+    if (v && OVERLAYS.some((o) => o.id === v)) return v;
+  } catch {
+    /* private mode */
+  }
+  return "thirds";
+}
+export function saveOverlay(id: OverlayId) {
+  try {
+    localStorage.setItem(OVERLAY_KEY, id);
+  } catch {
+    /* private mode */
+  }
 }
 
 export const isFull = (r: Rect) => r.l <= 0.0005 && r.t <= 0.0005 && r.r >= 0.9995 && r.b >= 0.9995;
@@ -260,7 +316,7 @@ export function fitRatio(rect: Rect, fr: number): Rect {
 export const fractionRatio = (pixelRatio: number, imageAspect: number) => pixelRatio / imageAspect;
 
 const ASPECT_KEY = "sieve.crop.aspect";
-const VALID: AspectId[] = ["free", "original", "1:1", "4:5", "5:7", "3:2", "16:9"];
+const VALID: AspectId[] = ["free", "asShot", "original", "1:1", "4:5", "5:7", "3:2", "16:9"];
 let lastLocked: AspectId = "original";
 
 /** Aspect the crop tool starts with: the last one used (Lightroom starts locked to Original). */

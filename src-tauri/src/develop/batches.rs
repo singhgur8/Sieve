@@ -87,6 +87,32 @@ pub fn commit_recorded(
     commit_recorded_with_bases(conn, items, label, kind, &[])
 }
 
+/// Paste / Sync / Paste from Previous as one undoable batch (IPC v19, kind `paste`): copies
+/// the `fields` groups of `src` onto every image of `ids` (duplicates ignored, first
+/// occurrence kept), one `label` history entry per changed image. Atomic like
+/// [`commit_recorded`]; empty `fields` -> `invalid_argument`.
+pub fn apply_fields_recorded(
+    conn: &mut Connection,
+    ids: &[ImageId],
+    src: &ParametricAdjustments,
+    fields: &[crate::ipc::types::AdjustmentField],
+    label: &str,
+) -> AppResult<EditBatchResult> {
+    if fields.is_empty() {
+        return Err(AppError::invalid("fields must not be empty"));
+    }
+    let mut items: Vec<BatchItem> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if items.iter().any(|it| it.image_id == id) {
+            continue;
+        }
+        let mut next = repo::get_adjustments(conn, id)?;
+        next.copy_fields(src, fields);
+        items.push(BatchItem { image_id: id, adjustments: next, scene_id: None, review_reason: None });
+    }
+    commit_recorded(conn, &items, label, BatchKind::Paste)
+}
+
 /// What a new batch was made from (v17): image `image_id`'s settings, written by batch
 /// `base_batch_id` (a scene apply from its representative). Recorded only when one of
 /// `for_ids` (the items made from it) changed.
@@ -668,5 +694,31 @@ mod tests {
         // An edit that happens to land on the batch's settings again is not a conflict.
         history::commit(&mut conn, ids[0], &adj(0.5), "Exposure").unwrap();
         assert!(batch_info(&conn, a).unwrap().undoable);
+    }
+
+    #[test]
+    fn paste_batch_is_one_undoable_batch() {
+        let mut conn = fixture();
+        let ids = image_ids(&conn);
+        history::commit(&mut conn, ids[0], &adj(0.7), "Exposure").unwrap();
+        let src = ParametricAdjustments { exposure: 1.5, contrast: 20.0, ..ParametricAdjustments::default() };
+        let fields = [crate::ipc::types::AdjustmentField::Exposure];
+        // Duplicates are ignored; contrast is not in `fields`.
+        let dup = [ids[0], ids[1], ids[0], ids[2]];
+        let r = apply_fields_recorded(&mut conn, &dup, &src, &fields, history::LABEL_PASTE).unwrap();
+        assert_eq!(r.changed_ids, ids);
+        let batch = r.batch_id.unwrap();
+        let info = batch_info(&conn, batch).unwrap();
+        assert_eq!((info.kind, info.image_count, info.undoable), (BatchKind::Paste, 3, true));
+        let a = repo::get_adjustments(&conn, ids[1]).unwrap();
+        assert_eq!((a.exposure, a.contrast), (1.5, 0.0));
+        assert_eq!(undo(&mut conn, batch).unwrap().restored_ids, ids);
+        assert_eq!(repo::get_adjustments(&conn, ids[0]).unwrap().exposure, 0.7);
+        assert!(repo::get_adjustments(&conn, ids[1]).unwrap().is_neutral());
+        // Nothing changed -> no batch.
+        let r = apply_fields_recorded(&mut conn, &ids[..1], &adj(0.7), &fields, history::LABEL_PASTE).unwrap();
+        assert_eq!((r.batch_id, r.changed_ids.len()), (None, 0));
+        let e = apply_fields_recorded(&mut conn, &ids, &src, &[], history::LABEL_PASTE).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidArgument);
     }
 }

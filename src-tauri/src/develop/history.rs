@@ -313,7 +313,48 @@ pub fn history(conn: &Connection, id: ImageId) -> AppResult<AdjustmentHistory> {
         can_redo: idx.is_some_and(|i| i + 1 < entries.len()),
         current_entry_id: idx.map(|i| entries[i].id),
         entries,
+        applied_preset_id: applied_preset(conn, id)?,
     })
+}
+
+/// Records that preset `preset_id` was just applied to `ids` (v19, migration 0017): the
+/// snapshot is each image's current settings. Images without an adjustments row (the preset
+/// changed nothing on a never-edited photo) are skipped.
+pub fn record_applied_preset(conn: &Connection, ids: &[ImageId], preset_id: i64) -> AppResult<()> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE adjustments SET applied_preset_id = ?2, applied_preset_json = params_json WHERE image_id = ?1",
+    )?;
+    for &id in ids {
+        stmt.execute(params![id, preset_id])?;
+    }
+    Ok(())
+}
+
+/// `AdjustmentHistory.appliedPresetId` (v19): the recorded preset while every group it owns
+/// (`presets.fields_json`) still equals the snapshot taken when it was applied.
+pub fn applied_preset(conn: &Connection, id: ImageId) -> AppResult<Option<i64>> {
+    let row: Option<(i64, String, String)> = conn
+        .prepare_cached(
+            "SELECT a.applied_preset_id, a.applied_preset_json, p.fields_json
+             FROM adjustments a JOIN presets p ON p.id = a.applied_preset_id
+             WHERE a.image_id = ?1 AND a.applied_preset_json IS NOT NULL",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((preset_id, snapshot, fields)) = row else {
+        return Ok(None);
+    };
+    let fields: Vec<AdjustmentField> = serde_json::from_str(&fields).unwrap_or_default();
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    let Ok(snapshot) = parse_snapshot(&snapshot) else {
+        return Ok(None);
+    };
+    let current = repo::get_adjustments(conn, id)?;
+    let mut probe = current.clone();
+    probe.copy_fields(&snapshot, &fields);
+    Ok((probe == current).then_some(preset_id))
 }
 
 #[cfg(test)]
@@ -480,5 +521,50 @@ mod tests {
         assert!(repo::get_adjustments(&conn, 1).unwrap().is_neutral());
         assert_eq!(history(&conn, 2).unwrap().entries.last().unwrap().label, "Reset");
         assert_eq!(apply_fields(&mut conn, &[1], &src, &[], LABEL_PASTE).unwrap_err().kind, ErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn applied_preset_is_tracked_until_an_owned_setting_changes() {
+        use crate::ipc::types::{ImageFormat, PreviewVariant};
+        let mut conn = setup();
+        let warm = ParametricAdjustments { exposure: 0.5, vibrance: 30.0, ..Default::default() };
+        let preset = crate::develop::presets::save(
+            &conn,
+            None,
+            "Warm",
+            &warm,
+            &[AdjustmentField::Exposure, AdjustmentField::Vibrance],
+        )
+        .unwrap();
+        assert_eq!(history(&conn, 1).unwrap().applied_preset_id, None);
+        crate::styles::apply_preset(&mut conn, &[1, 2], preset.id).unwrap();
+        assert_eq!(history(&conn, 1).unwrap().applied_preset_id, Some(preset.id));
+        // A setting the preset does not own keeps the highlight.
+        commit(&mut conn, 1, &ParametricAdjustments { contrast: 10.0, ..warm.clone() }, "Contrast").unwrap();
+        assert_eq!(history(&conn, 1).unwrap().applied_preset_id, Some(preset.id));
+        // An owned one clears it; undo brings it back.
+        let h =
+            commit(&mut conn, 1, &ParametricAdjustments { contrast: 10.0, exposure: 1.0, ..warm.clone() }, "Exposure")
+                .unwrap();
+        assert_eq!(h.applied_preset_id, None);
+        assert_eq!(undo(&mut conn, 1).unwrap().history.applied_preset_id, Some(preset.id));
+        assert_eq!(history(&conn, 2).unwrap().applied_preset_id, Some(preset.id));
+        // Deleting the preset forgets it.
+        crate::develop::presets::delete(&conn, preset.id).unwrap();
+        assert_eq!(history(&conn, 2).unwrap().applied_preset_id, None);
+
+        // Preview variants: nothing saved.
+        let preset = crate::develop::presets::save(&conn, None, "Warm 2", &warm, &[AdjustmentField::Vibrance]).unwrap();
+        let base = ParametricAdjustments { exposure: 0.2, clarity: 15.0, ..Default::default() };
+        let v =
+            crate::styles::resolve_preview_variant(&conn, 3, &base, &PreviewVariant::Preset { preset_id: preset.id })
+                .unwrap();
+        assert_eq!((v.exposure, v.vibrance, v.clarity), (0.2, 30.0, 15.0));
+        let without = PreviewVariant::WithoutFields { fields: vec![AdjustmentField::Clarity] };
+        let v = crate::styles::resolve_preview_variant(&conn, 3, &base, &without).unwrap();
+        assert_eq!((v.exposure, v.clarity), (0.2, 0.0));
+        assert!(repo::get_adjustments(&conn, 3).unwrap().is_neutral_for(ImageFormat::Arw));
+        let e = crate::styles::resolve_preview_variant(&conn, 99, &base, &without).unwrap_err();
+        assert_eq!(e.kind, crate::ipc::error::ErrorKind::NotFound);
     }
 }

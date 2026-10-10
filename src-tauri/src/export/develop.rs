@@ -24,6 +24,7 @@ use super::color;
 use crate::develop::camera::Profile;
 use crate::develop::pipeline::{self, Quality, RenderInput, View};
 use crate::develop::source::{self, ColorInfo, LinearImage};
+use crate::develop::transform::Geometry;
 use crate::ipc::error::AppResult;
 use crate::ipc::types::{
     BitDepth, CropSettings, ExportSettings, OutputSharpening, ParametricAdjustments, ResizeMode, ResizeOptions,
@@ -103,7 +104,8 @@ fn orientation(o: Option<u8>) -> u8 {
     o.filter(|o| (1..=8).contains(o)).unwrap_or(1)
 }
 
-/// Oriented output size of `src`'s cropped frame under `resize`.
+/// Oriented output size of `src`'s cropped frame under `resize` (`crop`: the effective crop of
+/// the render [`Geometry`]).
 pub fn planned_size(
     src: &LinearImage,
     orientation_tag: Option<u8>,
@@ -121,20 +123,24 @@ pub fn resample_lanczos(src: &[u16], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<
     source::resample(src, sw as usize, sh as usize, [0.0, 0.0, f64::from(sw), f64::from(sh)], dw as usize, dh as usize)
 }
 
-/// Crops/straightens `src` (unrotated) and resamples it to the oriented output size `out`
-/// with orientation applied, like the editor preview (`source::prepare_sized`). `None` when
-/// the decode can be used as is (no crop, same size, orientation 1).
+/// Resampled export input: pixels + the coverage of the image (`source::Prepared::coverage`).
+pub type PreparedOutput = (Vec<u16>, Option<Vec<u8>>);
+
+/// Crops/straightens/warps `src` (unrotated) and resamples it to the oriented output size
+/// `out` with orientation applied, like the editor preview (`source::prepare_sized`). `None`
+/// when the decode can be used as is (no crop, no warp, same size, orientation 1).
 pub fn prepare_output(
     src: &LinearImage,
     orientation_tag: Option<u8>,
-    crop: &CropSettings,
+    geo: &Geometry,
     out: (u32, u32),
-) -> AppResult<Option<Vec<u16>>> {
+) -> AppResult<Option<PreparedOutput>> {
     let o = orientation(orientation_tag);
-    if !crop.enabled && o == 1 && out == (src.width, src.height) {
+    if !geo.crop.enabled && geo.warp.is_none() && o == 1 && out == (src.width, src.height) {
         return Ok(None);
     }
-    Ok(Some(source::prepare_sized(src, o, crop, None, out.0, out.1).pixels))
+    let p = source::prepare_sized_geo(src, o, geo, None, out.0, out.1);
+    Ok(Some((p.pixels, p.coverage)))
 }
 
 /// Output px per full-resolution frame px for an export of `size` from `src`.
@@ -159,17 +165,21 @@ pub fn render_full(
     profile: &Profile,
     seed: u64,
 ) -> AppResult<ExportImage> {
-    let size = planned_size(src, orientation, &adjustments.crop, &settings.resize);
-    let scale = export_scale(src, orientation, &adjustments.crop, size);
-    let prepared = prepare_output(src, orientation, &adjustments.crop, size)?;
-    let pixels: Cow<[u16]> = match prepared {
-        Some(p) => Cow::Owned(p),
-        None => Cow::Borrowed(&src.pixels),
+    let geo = Geometry::of(adjustments, src.full_width, src.full_height);
+    let size = planned_size(src, orientation, &geo.crop, &settings.resize);
+    let scale = export_scale(src, orientation, &geo.crop, size);
+    let prepared = prepare_output(src, orientation, &geo, size)?;
+    let (pixels, coverage): (Cow<[u16]>, _) = match prepared {
+        Some((p, c)) => (Cow::Owned(p), c),
+        None => (Cow::Borrowed(&src.pixels[..]), None),
     };
     let tone = crate::develop::pipeline::tone_context(src, orientation_code(orientation), adjustments, profile);
     let ctx = DevelopContext { profile, scale, seed, tone: Some(&tone), masks: None };
-    let encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings, &ctx);
+    let mut encoded = develop_prepared(&pixels, size, &src.color, adjustments, lut, settings, &ctx);
     drop(pixels);
+    if let Some(c) = &coverage {
+        source::fill_outside_rgb16(&mut encoded, c);
+    }
     Ok(finish(encoded, size, settings))
 }
 

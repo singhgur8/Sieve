@@ -411,13 +411,34 @@ pub struct MaskGeometry {
     pub sensor_height: u32,
     /// EXIF orientation 1..=8.
     pub orientation: u8,
-    /// Crop in effect (sensor frame, as `ParametricAdjustments.crop`).
+    /// Crop in effect (the effective crop of `develop::transform::Geometry`: corrected frame,
+    /// which is the sensor frame without a Transform warp).
     pub crop: CropSettings,
     /// `RenderOptions.region` of the (cropped, oriented) frame, if any.
     pub region: Option<NormRect>,
     /// Output grid size.
     pub width: u32,
     pub height: u32,
+    /// Transform warp (corrected frame -> sensor frame, `develop::transform`). Masks stay in
+    /// the sensor frame (they follow the image content, as in Lightroom); with a warp the
+    /// output -> sensor map is approximated by its best affine fit over the grid.
+    pub warp: Option<crate::develop::transform::Mat3>,
+}
+
+impl MaskGeometry {
+    /// Geometry of an output grid rendered with `geo` (crop + warp).
+    #[allow(clippy::too_many_arguments)]
+    pub fn of(
+        geo: &crate::develop::transform::Geometry,
+        sensor_width: u32,
+        sensor_height: u32,
+        orientation: u8,
+        region: Option<NormRect>,
+        width: u32,
+        height: u32,
+    ) -> MaskGeometry {
+        MaskGeometry { sensor_width, sensor_height, orientation, crop: geo.crop, region, width, height, warp: geo.warp }
+    }
 }
 
 impl MaskGeometry {

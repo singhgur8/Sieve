@@ -44,6 +44,7 @@ fn geom(w: u32, h: u32) -> MaskGeometry {
         region: None,
         width: w,
         height: h,
+        warp: None,
     }
 }
 
@@ -771,6 +772,7 @@ fn real_lightroom_masks() {
             region: None,
             width: img.width,
             height: img.height,
+            warp: None,
         };
         let t = std::time::Instant::now();
         let w = evaluate(&r.groups, &g, 1, &mem, None);

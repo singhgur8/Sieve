@@ -63,6 +63,7 @@ src-tauri/
     xmp/crs.rs                 develop settings <-> crs:/sieve: properties (mapping table)
     xmp/masks.rs               crs:MaskGroupBasedCorrections <-> masks (mapping tables, Lightroom mattes) (v10)
     develop/mod.rs             DevelopCache (decoded-source LRU, latest-wins tickets, encoded renders), sieve:// protocol
+    develop/edited.rs          edited-preview disk cache + low-priority regeneration worker (IPC v19.1)
       source.rs pipeline.rs    half-size linear LibRaw decode; parametric pipeline (shared with Phase 6 export)
       wb.rs                    temperature/tint <-> camera multipliers
       history.rs presets.rs    edit history + all command-path adjustment writes; presets (catalog SQL)
@@ -212,6 +213,7 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `apply_all_edited_scenes` / `applyAllEditedScenes` (v14) | `projectId: number, options: SceneApplyOptions \| null` | `ApplyScenesResult` (v17: scenes it cannot apply are left out and listed in `skippedScenes`) |
 | `undo_edit_batch` / `undoEditBatch` (v14; linear since v16: `conflict` when photos were edited after the batch, v17: or a scene apply was made from its settings) | `batchId: number` | `UndoBatchResult` |
 | `get_edit_batches` / `getEditBatches` (v16) | `batchIds: number[]` | `EditBatchInfo[]` |
+| `sync_delta` / `syncDelta` (v19.2, Auto Sync) | `sourceId: number, before: ParametricAdjustments, after: ParametricAdjustments, targetIds: number[], options: SyncDeltaOptions \| null` | `SyncDeltaResult` (source + targets in one `sync` batch; exposure / WB relative by default) |
 | `paste_previous` / `pastePrevious` (v14) | `targetIds: number[], previousId: number, fields: AdjustmentField[] \| null` | `null` |
 | `import_style_folder` / `importStyleFolder` (v14) | `path: string` | `ImportStyleReport` |
 | `list_styles` / `listStyles` (v14) | – | `StyleLibrary` |
@@ -231,6 +233,17 @@ All commands are `async`, return `Result<T, AppError>`, and in TS resolve to
 | `get_cull_summary` / `getCullSummary` (v18) | `projectId: number \| null` | `CullSummary` (picked / unflagged / rejected by you vs auto / keepers + `keeperBreakdown` / suggestions pending; `keepers` = `keepersOnly` total) |
 | `refresh_sidecars` / `refreshSidecars` (v18) | `projectId: number \| null` | `number[]` (images changed by sidecars another app edited; call on project open / window focus) |
 | `get_metadata_filter_options` / `getMetadataFilterOptions` (v18) | `query: ImageQuery` | `MetadataFilterOptions` (distinct values + counts per metadata facet; each facet ignores its own constraint) |
+| `edit_capture_time` / `editCaptureTime` (v19) | `ids: number[], mode: CaptureTimeEdit` (`shift` / `set_exact` / `sync_cameras` / `revert`) | `CaptureTimeEditResult` (`changedIds`, `skippedIds`, `offsetMs`, `previous` for undo; marks sidecars dirty, kicks a rescore) |
+| `restore_capture_times` / `restoreCaptureTimes` (v19) | `snapshots: CaptureTimeSnapshot[]` | `number[]` (changed ids; undo / redo of `edit_capture_time`) |
+| `get_image_metadata` / `getImageMetadata` (v19) | `id: number` | `ImageMetadata` (Library Metadata panel: file, original + corrected capture time, camera, lens, exposure, size, GPS, sidecar) |
+| `auto_upright` / `autoUpright` (v19) | `id: number, mode: UprightMode, adjustments: ParametricAdjustments \| null` | `UprightResult` (solved `UprightSolution` or `null` + message; nothing saved) |
+| `render_preview_variant` / `renderPreviewVariant` (v19) | `id: number, adjustments: ParametricAdjustments, variant: PreviewVariant, options: RenderOptions` | `RenderedPreview \| null` (preset applied / panel groups reset; no save, no history; use slot `preview`) |
+| `set_project_reject_strictness` / `setProjectRejectStrictness` (v19) | `projectId: number, strictness: RejectStrictness` | `null` (kicks a rescore) |
+
+v19: `paste_settings` / `sync_settings` / `paste_previous` return `EditBatchResult` (one undoable batch, kind
+`paste`; duplicates ignored); `CaptureMeta.capturedAtMs` = corrected time + `originalCapturedAtMs` /
+`captureTimeSource`; `ParametricAdjustments.transform` + `AdjustmentField::Transform`; `AdjustmentHistory.appliedPresetId`;
+`RenderSlot::Preview`; `Project.rejectStrictness`. See "Capture time, Transform, presets (v17, IPC v19)".
 
 v18.1: `ImageQuery.pickOrigin?: PickOrigin | null` (flagged by the user / by Apply suggestions; AND with `picks`) and
 `get_filter_counts(.., metadata, pickOrigin: PickOrigin | null)`; `CullSummary.suggested{Pick,Reject,Rating}Pending`
@@ -394,6 +407,29 @@ Error kinds (`AppError.kind`; the `message` is always user-facing): `not_found` 
 4. On slider release (or debounced): `saveAdjustments(id, adj, "Exposure")` -> history entry + XMP dirty.
 - Histogram (256 bins R/G/B/luma of the 8-bit output) and `renderMs` come back with every render.
 - Slots are independent streams: `before` (before/after view), `detail` (region renders for 1:1 zoom).
+
+### Edited previews (IPC v19.1, `develop::edited`)
+- Purpose: edits visible outside Develop (grid, Loupe, filmstrip, scenes) and no flash of the unedited embedded
+  preview when switching between edited photos. `RawImageEntry.editedPreview {thumbUrl, previewUrl}` +
+  `editedPreviewChanged` event; frontend picks images through `src/lib/entryImage.ts`.
+- Files: `<cacheDir>/edited/<id>_<hash>_{p,t}.jpg` (2048 / 512 px, q82 4:2:0, orientation + crop applied), `hash` =
+  FNV-1a of an engine version + the settings JSON. One hash per image; in-memory index rebuilt by a directory scan
+  at startup; LRU by bytes (1024 MB, `SIEVE_EDITED_CACHE_MB`) evicts whole images; `DevelopCache::forget_images`
+  (remove_project) deletes files. Served by the `sieve` handler (`/edited/<id>/<hash>/{thumb,preview}.jpg`,
+  immutable caching; a miss = 404 + queued render).
+- Triggers: `repo::save_adjustments` -> `edited::notify_saved(conn, id, updated_at)` (catalog found by the
+  connection's path in a process registry), so every write path (sliders, paste / sync, presets, scene apply,
+  undo / redo / batch undo, XMP read) regenerates; the job waits (200 ms retries, up to 10 s) until
+  `adjustments.updated_at` shows the write is committed. `repo::get_image(s)` attach the cached URLs and queue a
+  render for edited photos whose preview is missing or older than their `updated_at` (self-healing after restarts,
+  evictions, pre-v19.1 edits). `prepareDevelop` neighbours are queued first (urgent).
+- Worker: one thread + a rayon pool of cores/4 (min 2), both macOS QoS utility; waits until no interactive render
+  for 250 ms. Renders via `DevelopCache::render_detached` (cached source if present, else a temporary decode not
+  inserted into the LRU; prepared inputs not cached) or reuses the last settled `main` render (full quality, whole
+  frame, >= 1536 px) whose settings hash matches. Memory: one job at a time; 2 settled frames kept (~8 MB each).
+- Measured (one 25 MB ARW, release, Apple Silicon): first edited pixels on switch, hit 3.4 ms (read + JPEG decode)
+  vs miss 375 ms (cold decode + 2048 render + decode); regeneration after a commit 465 ms cold source, 113 ms with
+  a settled render; files 157 KB + 17 KB.
 
 ### Develop source + cache
 - LibRaw `half_size` decode (camera RGB, no WB, linear, 16-bit; ~3000 px long edge for 24 MP) + as-shot multipliers,
@@ -584,6 +620,7 @@ Phase 7c (masks, IPC v10) plugs in as `ParametricAdjustments.masks` (+ field `ma
 | B&W | `ConvertToGrayscale` (True/False), `GrayMixerRed..Magenta` | signed |
 | crop | `HasCrop` (True/False), `CropTop/Left/Bottom/Right` (0..1, un-oriented frame), `CropAngle` | plain |
 | profile | `CameraProfile` + `<crs:Look>` struct (`Name, Amount, UUID, Parameters`) | see `crs::CAMERA_PROFILE` |
+| transform (v19) | `PerspectiveUpright` (0 off, 1 auto, 2 full, 3 level, 4 vertical, 5 guided), `PerspectiveVertical/Horizontal/Aspect` (-100..100), `PerspectiveRotate` (-10..10, 1 decimal), `PerspectiveScale` (50..150), `PerspectiveX/Y` (-100..100, 2 decimals), `CropConstrainToWarp` (0/1), `UprightFourSegmentsCount` + `UprightFourSegments_0..3` (guides); `UprightVersion`, `UprightTransform_*`, `UprightTransformCount`, `UprightFocal*`, `UprightCenter*`, `UprightPreview`, `Upright*DependentDigest` kept verbatim in `transform.solution.crs` | signed integers / decimals as listed; to be implemented in `xmp/crs.rs` (rust-engine-dev) |
 
 Write rules: every owned scalar is written on every develop write (Lightroom accepts the full set); curves need
 `rdf:Seq` create/replace in `packet` (rust-engine-dev: `crs::encode_curves` is ready); the profile is written only
@@ -752,16 +789,16 @@ migrations tracked by `PRAGMA user_version`.
 | Table | Purpose |
 |---|---|
 | `catalog_meta` | `shoot_type` (default for new projects), `burst_window_ms`, `auto_analyze`, `xmp_auto_sync` (+ `xmp_auto_sync_user_set`, v12), `keeper_rule` (JSON `KeeperRule`, v12; `mode` since v16), `cull_thresholds.<shoot_type>` (JSON), `ui_prefs` (JSON `UiPrefs`) |
-| `projects` | one shoot (v12): name, `cover_image_id` (NULL = automatic), `shoot_type`, `workflow_step`, `created_at`, `last_opened_at` |
+| `projects` | one shoot (v12): name, `cover_image_id` (NULL = automatic), `shoot_type`, `workflow_step`, `created_at`, `last_opened_at`, `reject_strictness` (v17) |
 | `folders` | imported roots; `project_id` (v12, every folder in exactly one project; cascade on project delete) |
-| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF, rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity) |
+| `images` | one row per image (RAW or, since v9, JPEG/HEIC/TIFF/PNG): identity, `format`, camera, EXIF (`captured_at_ms` = corrected capture time since v17, `exif_captured_at_ms` = the file's own, `capture_time_source` exif/sidecar/user), rating/pick/label, burst group, XMP sync state (`xmp_dirty`, `meta_updated_at`, `xmp_synced_at`, `xmp_mtime_ms`, `xmp_error`), `scene_id`, `scene_anchor`, `companion_path` (paired camera JPEG/HEIC), `develop_warnings` (JSON `DevelopWarning[]` from the last XMP read), `masks_pending_import` (v10: sidecar masks not imported yet), `missing_since_ms` (v11: original found missing, see below), `pick_origin` (v16: `user` / `auto` = who set the flag, see Culling clarity), `camera_serial` / `camera_serial_read` (v18: body serial from EXIF; `read = 0` = imported before v18, filled by the background `db::camera_serial::backfill`) |
 | `thumbnails` | status pending/ready/failed, `path` (512 px), `preview_path` (2048 px), dims, `error` (pixels are files, not blobs) |
 | `image_tags` | `(image_id, tag)` PK, source auto/user, confidence, suppressed |
 | `quality_scores` | culling-engine scores per image + `suggested_rating` / `suggested_pick` (derived; rewritten on rescore) + `reasons_json` (v16, JSON `SuggestionReason[]`) |
 | `image_analysis` | per-image analysis status (queued/done/failed), model version, error, `phash` (u64 as i64), `faces_json` (`FaceInfo[]`), `metrics_json` (`ml::ImageMetrics`) |
 | `burst_groups` | time/similarity clusters, optional keeper |
 | `burst_keeper_pins` | images the user chose as burst keepers (survive regrouping) |
-| `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused |
+| `adjustments` | `ParametricAdjustments` JSON + process version, `neutral`, `history_entry_id` (cursor); `xmp_synced_at` unused; v17: `applied_preset_id` + `applied_preset_json` (last applied preset and the settings right after it) |
 | `adjustment_history` | per-image snapshots (label, params JSON, created/updated); v13: `source` (who produced it) and `batch_id` (edit batch that wrote it) |
 | `presets` | `group_id` (style group, v12), name (unique per group, NOCASE), params JSON, fields JSON, `source_format`, `settings_json` + `setting_keys_json` (imported crs: settings), `supports_amount`, `warnings_json` |
 | `style_groups` / `style_profiles` | style library (v12): groups per imported source folder + built-ins 1 "User Presets" / 2 "LUTs"; looks / DCPs (read in place) / LUTs (library copies) |
@@ -863,6 +900,39 @@ text after the last dot of `file_name`, lower-cased (pure SQL); blank lens / mod
 and aperture compare at 0.1 (the facet's rounding); range bounds get 1e-6 relative slack; capture days are the
 floor of the naive capture ms; has sidecar = `xmp_mtime_ms IS NOT NULL` (a sidecar existed at the last write /
 read; import reads existing sidecars); edited = a non-neutral `adjustments` row (`hasEdits`).
+
+### Capture time, Transform, presets (v17, IPC v19)
+Capture time: `images.captured_at_ms` is the corrected time and the only column queries read (sort, bursts, scenes,
+filters, export naming, project ranges); `exif_captured_at_ms` is the file's time; `capture_time_source` says which
+one applies. `db::capture_time::edit` (Lightroom's Edit Capture Time: shift / set exact / sync two cameras from a
+reference pair / revert) and `restore` (undo by snapshots) write it, mark the sidecar dirty and refresh scene
+bounds; the command kicks a rescore so bursts regroup. Extraction never overwrites a correction. Sidecars: the XMP
+read path applies `exif:DateTimeOriginal` (else `photoshop:DateCreated`) through `apply_sidecar_time` (source
+`sidecar` when it differs from EXIF); the writer writes the corrected time back when the source is not `exif`.
+
+Camera bodies (v18, IPC v19.2): `images.camera_serial` (EXIF `BodySerialNumber`, else DNG `CameraSerialNumber`;
+written by extraction, backfilled for older imports on a background thread at startup). `CameraInfo.serial`,
+`MetadataFilter.bodies` / `MetadataFilterOptions.bodies` (make + model + serial), and `sync_cameras` scopes
+`body` / `model` (`db::capture_time::camera_scope_ids`: every photo of the target's project with that camera,
+regardless of the grid's filters).
+
+Auto Sync (IPC v19.2): `develop::sync_delta` finds the groups an edit changed (`before` vs `after`, never crop /
+masks / transform), writes `after` to the source and the change to each target (exposure added, white balance
+shifted in mireds + tint added, as-shot sides resolved through `DevelopCache::info`; other groups copied), all in
+one `edit_batches` row of kind `sync`, so one `undo_edit_batch` reverts every photo.
+
+Transform: `ParametricAdjustments.transform` (Upright mode + guides, manual sliders, constrain crop, solved
+`UprightSolution` = 3x3 homography in the sensor frame plus Lightroom's own Upright crs values kept verbatim).
+Render order: Upright solution (while its mode is current) -> manual sliders -> crop. Mapping in the crs table above.
+
+Applied preset: `apply_preset` stores `(applied_preset_id, applied_preset_json)`; `history::applied_preset` reports
+it while the preset's `fields` still equal that snapshot, so any owned change (or undo past the apply) clears the
+highlight without hooking each writer. Temporary previews (`render_preview_variant`, slot `preview`) resolve the
+variant with `styles::resolve_preview_variant` and render through the normal ticketed path.
+
+Batches: Paste / Sync / Paste from Previous go through `batches::apply_fields_recorded` (kind `paste`), so a paste to
+any selection is one `undo_edit_batch` step. Reject strictness is per project
+(`projects::reject_strictness_of_image` for the scorer).
 
 ## Keeping the contract in sync
 - `cargo run`/`pnpm tauri dev` (debug) regenerates `src/ipc/bindings.ts`.

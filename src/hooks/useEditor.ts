@@ -4,7 +4,10 @@
 // answers superseded ones with `null`. Sending one render per input event therefore starves the display during
 // a drag (every render is cancelled by the next). So: at most ONE `renderPreview` is in flight per (image, slot);
 // when it settles and the adjustments changed meanwhile, the latest are sent immediately. While a drag is active
-// the main slot is requested at draft size; on release (or after 150 ms without input) at full quality.
+// the main slot is requested at draft size; on release (or after 300 ms without input) at full quality.
+// Input is decoupled from React (Phase 8d): `edit` updates `adjRef` and schedules the render immediately, while the
+// React `adj` state is pushed at most once per animation frame (and synchronously on release / non-live changes).
+// Finished renders are decoded off-screen before they are swapped in, so the main thread never decodes at paint.
 // Results that are `null` or older than the last shown `seq` for their (image, slot) are ignored;
 // `saveAdjustments` runs once on release.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,6 +16,7 @@ import {
   unwrap,
   completeAdjustments,
   defaultAdjustments,
+  type SyncDeltaResult,
   type AdjustmentHistory,
   type CompleteAdjustments,
   type DevelopInfo,
@@ -24,6 +28,7 @@ import {
   type RenderSlot,
 } from "../ipc";
 import { labelWithValue, neutralAdjustments } from "../lib/adjust";
+import { changedFields } from "../lib/fieldGroups";
 
 export interface RenderView {
   imageId: number;
@@ -48,10 +53,19 @@ export interface EditorOptions {
   onChanged: (id: number) => void;
   /** A user commit / undo / redo wrote history (not a plain reload): batch Undo offers become unsafe. */
   onCommitted?: (id: number) => void;
+  /**
+   * Auto Sync (v19.2 `sync_delta`): the other photos to sync to, or null / empty when it is off. A commit that changed a synced group is then
+   * saved through `sync_delta(id, before, after, targets)` (one batch that includes this photo, exposure / white balance relative) instead of `save_adjustments`.
+   */
+  autoSyncTargets?: (id: number) => number[] | null;
+  /** The result of such a commit (refresh the other photos, offer the batch Undo). */
+  onSynced?: (id: number, targets: number[], r: SyncDeltaResult) => Promise<void> | void;
   /** Source format of the image (selects the neutral defaults); RAW when unknown. */
   format?: ImageFormat;
   /** Render the full, uncropped frame (crop tool active). */
   uncropped?: boolean;
+  /** Render without the Transform (Upright / manual): the Guided tool draws on the sensor frame. */
+  untransformed?: boolean;
 }
 
 export interface Editor {
@@ -64,6 +78,8 @@ export interface Editor {
   detail: RenderView | null;
   before: RenderView | null;
   histogram: Histogram | null;
+  /** URL for the Navigator: the last settled (non-draft) main render, frozen while a drag is in progress. */
+  navUrl: string | null;
   loading: boolean;
   /** Live edit (slider input): updates state and schedules a render. `label` names the history entry. */
   edit: (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string) => void;
@@ -88,12 +104,24 @@ export interface Editor {
 const warnKey = (a: CompleteAdjustments) =>
   JSON.stringify([a.profile, a.masks.flatMap((g) => g.components.map((c) => (c.shape.kind === "ai" ? (c.shape.digest ?? "") : "")))]);
 
+/** Without input for this long mid-drag, the full-quality render is requested. */
+const DRAFT_IDLE_MS = 300;
+
+/** Decode an image off-screen so the later <img> swap paints from the decoded cache (never rejects). */
+function decodeUrl(url: string): Promise<void> {
+  const img = new Image();
+  img.src = url;
+  const timeout = new Promise<void>((r) => setTimeout(r, 400));
+  return Promise.race([img.decode().catch(() => undefined), timeout]);
+}
+
 export function useEditor(id: number | null, opts: EditorOptions): Editor {
   const [adj, setAdj] = useState<CompleteAdjustments>(() => neutralAdjustments(opts.format));
   const [history, setHistory] = useState<AdjustmentHistory | null>(null);
   const [info, setInfo] = useState<DevelopInfo | null>(null);
-  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null, mask: null, navigator: null });
+  const [views, setViews] = useState<Record<RenderSlot, RenderView | null>>({ main: null, before: null, detail: null, mask: null, navigator: null, preview: null });
   const [histogram, setHistogram] = useState<Histogram | null>(null);
+  const [navUrl, setNavUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const optsRef = useRef(opts);
@@ -102,13 +130,17 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
   idRef.current = id;
   const adjRef = useRef(adj);
   const lastProfile = useRef("");
+  /** Settings as last loaded / saved: the next commit is diffed against it. */
+  const baseRef = useRef<CompleteAdjustments | null>(null);
   const pending = useRef<{ id: number; label: string } | null>(null);
   const lastSeq = useRef(new Map<string, number>());
-  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false, navigator: false });
+  const want = useRef<Record<RenderSlot, boolean>>({ main: false, before: false, detail: false, mask: false, navigator: false, preview: false });
   const inflight = useRef(new Set<string>());
   const nullStreak = useRef(new Map<string, number>());
   const draft = useRef(false);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const adjRaf = useRef(0);
+  const lastHist = useRef(0);
   const chain = useRef<Promise<unknown>>(Promise.resolve());
   const historyRef = useRef<AdjustmentHistory | null>(null);
   historyRef.current = history;
@@ -131,7 +163,10 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     inflight.current.add(key);
     const cropOff = !!o.uncropped && slot !== "before";
     const base = slot === "before" ? neutralAdjustments(o.format) : adjRef.current;
-    const a: ParametricAdjustments = cropOff ? { ...base, crop: { ...base.crop, enabled: false } } : base;
+    const flat = !!o.untransformed && slot !== "before";
+    // While cropping, show the whole warped frame: the crop is off and Constrain Crop (auto-crop inside the warp) too (R1-3).
+    let a: ParametricAdjustments = cropOff || flat ? { ...base, crop: { ...base.crop, enabled: false }, ...(cropOff ? { transform: { ...base.transform, constrainCrop: false } } : {}) } : base;
+    if (flat) a = { ...a, transform: neutralAdjustments(o.format).transform };
     const full = Math.min(2048, Math.max(64, Math.round(o.maxEdge)));
     const edge = draft.current && slot === "main" ? Math.max(256, Math.min(1024, Math.round(o.maxEdge / 2))) : full;
     const options = { maxEdge: Math.min(edge, full), slot, region: slot === "detail" ? o.region : null };
@@ -146,12 +181,21 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
         }
         nullStreak.current.delete(key);
         if (r.imageId !== idRef.current) return; // image changed
-        const k = `${r.imageId}:${r.slot}`;
-        if (r.seq <= (lastSeq.current.get(k) ?? -1)) return; // older than what is shown
-        lastSeq.current.set(k, r.seq);
-        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing, uncropped: cropOff || !base.crop.enabled };
-        setViews((prev) => ({ ...prev, [r.slot]: v }));
-        if (r.slot === "main") setHistogram(r.histogram);
+        const wasDraft = draft.current && r.slot === "main";
+        const v: RenderView = { imageId: r.imageId, url: r.url, width: r.width, height: r.height, seq: r.seq, renderMs: r.renderMs, lutMissing: r.lutMissing, uncropped: cropOff || flat || !base.crop.enabled };
+        // Decode off the display path (not awaited: the next render may start meanwhile), then swap in.
+        void decodeUrl(r.url).then(() => {
+          if (r.imageId !== idRef.current) return;
+          const k = `${r.imageId}:${r.slot}`;
+          if (r.seq <= (lastSeq.current.get(k) ?? -1)) return; // older than what is shown
+          lastSeq.current.set(k, r.seq);
+          const now = performance.now();
+          const withHist = r.slot === "main" && (!draft.current || now - lastHist.current >= 120);
+          if (withHist) lastHist.current = now;
+          setViews((prev) => ({ ...prev, [r.slot]: v }));
+          if (withHist) setHistogram(r.histogram);
+          if (r.slot === "main" && !wasDraft && !draft.current) setNavUrl(r.url);
+        });
       })
       .catch((e) => optsRef.current.onError(e))
       .finally(() => {
@@ -176,24 +220,52 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     schedule("main");
   }, [schedule]);
 
-  const setAdjBoth = useCallback((a0: ParametricAdjustments) => {
-    const a = completeAdjustments(a0, optsRef.current.format);
-    adjRef.current = a;
-    lastProfile.current ||= warnKey(a);
-    setAdj(a);
+  /** Push the live adjustments into React state now (cancels a pending frame push). */
+  const flushAdj = useCallback(() => {
+    if (adjRaf.current) {
+      cancelAnimationFrame(adjRaf.current);
+      adjRaf.current = 0;
+    }
+    setAdj(adjRef.current);
   }, []);
+
+  const setAdjBoth = useCallback(
+    (a0: ParametricAdjustments, live = false) => {
+      const a = completeAdjustments(a0, optsRef.current.format);
+      adjRef.current = a;
+      lastProfile.current ||= warnKey(a);
+      if (!live) return flushAdj();
+      // Live input: React state at most once per frame; renders already read `adjRef`.
+      adjRaf.current ||= requestAnimationFrame(() => {
+        adjRaf.current = 0;
+        setAdj(adjRef.current);
+      });
+    },
+    [flushAdj],
+  );
 
   const commitPending = useCallback(() => {
     const p = pending.current;
     if (!p) return;
     pending.current = null;
+    flushAdj();
     endDraft();
     const snapshot = adjRef.current;
+    const prev = baseRef.current;
+    baseRef.current = snapshot;
     enqueue(async () => {
-      const h = await unwrap(commands.saveAdjustments(p.id, snapshot, labelWithValue(p.label, snapshot)));
+      const label = labelWithValue(p.label, snapshot);
+      const targets = prev && changedFields(prev, snapshot).length > 0 ? (optsRef.current.autoSyncTargets?.(p.id) ?? []).filter((x) => x !== p.id) : [];
+      let h: AdjustmentHistory;
+      let synced: SyncDeltaResult | null = null;
+      if (targets.length > 0 && prev) {
+        synced = await unwrap(commands.syncDelta(p.id, prev, snapshot, targets, { label }));
+        h = synced.history;
+      } else h = await unwrap(commands.saveAdjustments(p.id, snapshot, label));
       if (idRef.current === p.id) setHistory(h);
       optsRef.current.onChanged(p.id);
       optsRef.current.onCommitted?.(p.id);
+      if (synced) await optsRef.current.onSynced?.(p.id, targets, synced);
       // Profile / look availability warnings depend on the saved settings.
       const pk = warnKey(snapshot);
       if (pk !== lastProfile.current && idRef.current === p.id) {
@@ -201,15 +273,16 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
         setInfo(await unwrap(commands.getDevelopInfo(p.id)));
       }
     });
-  }, [enqueue, endDraft]);
+  }, [enqueue, endDraft, flushAdj]);
 
   // Load on image change; persist a pending edit of the previous image first.
   useEffect(() => {
     if (id == null) return;
     let stale = false;
     setLoading(true);
-    setViews({ main: null, before: null, detail: null, mask: null, navigator: null });
+    setViews({ main: null, before: null, detail: null, mask: null, navigator: null, preview: null });
     setHistogram(null);
+    setNavUrl(null);
     setInfo(null);
     setHistory(null);
     lastProfile.current = "";
@@ -217,6 +290,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
       .then(([a, h, i]) => {
         if (stale) return;
         setAdjBoth(a);
+        baseRef.current = adjRef.current;
         setHistory(h);
         setInfo(i);
         setLoading(false);
@@ -241,28 +315,38 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     if (id != null && opts.wantBefore) schedule("before");
   }, [id, opts.wantBefore, schedule]);
   const uncropped = !!opts.uncropped;
+  const untransformed = !!opts.untransformed;
   useEffect(() => {
     if (id != null) schedule("main");
-  }, [id, uncropped, schedule]);
+  }, [id, uncropped, untransformed, schedule]);
   const regionKey = opts.region ? JSON.stringify(opts.region) : "";
   useEffect(() => {
     if (id != null && regionKey) schedule("detail");
     else setViews((v) => (v.detail ? { ...v, detail: null } : v));
   }, [id, regionKey, schedule]);
 
-  useEffect(() => () => clearTimeout(draftTimer.current), []);
+  useEffect(
+    () => () => {
+      clearTimeout(draftTimer.current);
+      cancelAnimationFrame(adjRaf.current);
+    },
+    [],
+  );
 
   const applyEdit = useCallback(
     (mutate: (a: CompleteAdjustments) => ParametricAdjustments, label: string, isDraft: boolean) => {
       const cur = idRef.current;
       if (cur == null) return;
       if (pending.current && pending.current.label !== label) commitPending();
-      setAdjBoth(mutate(adjRef.current));
+      // The first edit of a gesture reaches React at once (callers select / create things in the same tick);
+      // its continuation (same label, pending release) is coalesced to one state push per frame.
+      const continuation = pending.current?.label === label;
+      setAdjBoth(mutate(adjRef.current), isDraft && continuation);
       pending.current = { id: cur, label };
       if (isDraft) {
         draft.current = true;
         clearTimeout(draftTimer.current);
-        draftTimer.current = setTimeout(endDraft, 150);
+        draftTimer.current = setTimeout(endDraft, DRAFT_IDLE_MS);
       }
       schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
     },
@@ -283,6 +367,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     (s: EditState, forId: number) => {
       if (idRef.current !== forId) return;
       setAdjBoth(s.adjustments);
+      baseRef.current = adjRef.current;
       setHistory(s.history);
       schedule("main", ...(optsRef.current.region ? (["detail"] as const) : []));
       optsRef.current.onChanged(forId);
@@ -318,6 +403,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
     const [a, h, i] = await Promise.all([unwrap(commands.getAdjustments(cur)), unwrap(commands.getHistory(cur)), unwrap(commands.getDevelopInfo(cur))]);
     if (idRef.current !== cur) return;
     setAdjBoth(a);
+    baseRef.current = adjRef.current;
     setHistory(h);
     setInfo(i);
     setLoading(false);
@@ -335,7 +421,7 @@ export function useEditor(id: number | null, opts: EditorOptions): Editor {
 
   const defaults = useMemo(() => defaultAdjustments(opts.format), [opts.format]);
   return useMemo(
-    () => ({ adj, defaults, history, info, main: views.main, detail: views.detail, before: views.before, histogram, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
-    [adj, defaults, history, info, views, histogram, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
+    () => ({ adj, defaults, history, info, main: views.main, detail: views.detail, before: views.before, histogram, navUrl, loading, edit, commit: commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo }),
+    [adj, defaults, history, info, views, histogram, navUrl, loading, edit, commitPending, flush, change, undo, redo, goto, reload, lastCommitAt, canRedo],
   );
 }

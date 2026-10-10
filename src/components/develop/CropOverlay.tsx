@@ -17,11 +17,27 @@ import {
   saveCropAspect,
   type AspectId,
   type Handle,
+  type OverlayId,
   type Rect,
+  FULL,
+  rectArea,
 } from "../../lib/crop";
+import { ORIENT_TRANSFORM, overlayShapes } from "../../lib/overlays";
 
 export interface CropTool {
   rect: Rect;
+  /**
+   * The rectangle the user intends (set by start / resize / move / aspect / reset). With "constrain to image" the shown
+   * `rect` is always derived from it for the current angle, so turning back toward 0 grows the crop back (Lightroom).
+   */
+  base: Rect;
+  /** Lightroom "Constrain to image" (default on): the rectangle never leaves the rotated image. */
+  constrain: boolean;
+  overlay: OverlayId;
+  /** Shift+O: orientation 0..3 of the asymmetric overlays. */
+  overlayOrient: number;
+  /** The angle tool is armed: the next drag draws a line along the horizon. */
+  angleTool?: boolean;
   /** Straighten angle in degrees (`crs:CropAngle`), applied on commit. */
   angle: number;
   aspect: AspectId;
@@ -31,25 +47,85 @@ export interface CropTool {
   customRatio?: number;
   /** True while the angle is being dragged (slider, rotate-by-drag): the fine grid shows. */
   rotating?: boolean;
+  /** The user changed the crop since the tool was seeded (R2-2): only then does an implicit exit commit it. */
+  dirty?: boolean;
+}
+
+/** Did the user-meaningful crop state change (rect, angle, aspect, lock, constrain), ignoring transient flags and the overlay? */
+export const cropChanged = (a: CropTool, b: CropTool): boolean =>
+  JSON.stringify([a.rect, a.base, a.angle, a.aspect, a.flip, a.customRatio, a.constrain]) !== JSON.stringify([b.rect, b.base, b.angle, b.aspect, b.flip, b.customRatio, b.constrain]);
+
+/** Warped image outline (v19.3 `validQuad`): 4 points, fractions of the corrected frame, clockwise on screen. */
+export type Quad = [number, number][];
+
+/** All four corners of `r` inside the convex polygon `q` (either winding). */
+export function insideQuad(r: Rect, q: Quad, eps = 1e-6): boolean {
+  let area = 0;
+  for (let i = 0; i < q.length; i++) {
+    const [x0, y0] = q[i];
+    const [x1, y1] = q[(i + 1) % q.length];
+    area += x0 * y1 - x1 * y0;
+  }
+  const sgn = area >= 0 ? 1 : -1;
+  for (const [px, py] of [[r.l, r.t], [r.r, r.t], [r.r, r.b], [r.l, r.b]]) {
+    for (let i = 0; i < q.length; i++) {
+      const [x0, y0] = q[i];
+      const [x1, y1] = q[(i + 1) % q.length];
+      if (sgn * ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) < -eps) return false;
+    }
+  }
+  return true;
+}
+
+/** Inside the rotated frame and (when the image is warped) inside the warp outline. */
+const validRect = (r: Rect, aspect: number, rot: number, quad: Quad | null) => (!rot || insideRotated(r, aspect, rot)) && (!quad || insideQuad(r, quad));
+
+/** Largest scaling of `rect` (same ratio, about the outline's centroid) that is valid for the rotated frame and the warp outline. */
+function fitValid(rect: Rect, aspect: number, rot: number, quad: Quad): Rect {
+  const first = rot ? fitInsideRotated(rect, aspect, rot) : rect;
+  if (insideQuad(first, quad)) return first;
+  const cx = quad.reduce((a, p) => a + p[0], 0) / quad.length;
+  const cy = quad.reduce((a, p) => a + p[1], 0) / quad.length;
+  const at = (k: number): Rect => ({ l: cx + (first.l - cx) * k, r: cx + (first.r - cx) * k, t: cy + (first.t - cy) * k, b: cy + (first.b - cy) * k });
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 30; i++) {
+    const m = (lo + hi) / 2;
+    if (validRect(at(m), aspect, rot, quad)) lo = m;
+    else hi = m;
+  }
+  return at(Math.max(0, lo - 1e-6));
 }
 
 /** Keeps the tool's rectangle inside the straightened (rotated) image: Lightroom "constrain to image". */
-export function constrainTool(tool: CropTool, imageAspect: number, orientation: number): CropTool {
-  const rot = previewRotation(tool.angle, orientation);
-  if (!rot) return tool;
-  const rect = fitInsideRotated(tool.rect, imageAspect, rot);
-  return rect === tool.rect ? tool : { ...tool, rect };
+export function constrainTool(tool: CropTool, imageAspect: number, orientation: number, quad: Quad | null = null): CropTool {
+  const rot = tool.constrain ? previewRotation(tool.angle, orientation) : 0;
+  const rect = tool.constrain && quad ? fitValid(tool.base, imageAspect, rot, quad) : rot ? fitInsideRotated(tool.base, imageAspect, rot) : tool.base;
+  return rectEq(rect, tool.rect) ? tool : { ...tool, rect };
 }
 
+const rectEq = (a: Rect, b: Rect) => a.l === b.l && a.t === b.t && a.r === b.r && a.b === b.b;
+
+/** A fresh tool: `rect` is both the shown and the intended rectangle. */
+export function newTool(rect: Rect, angle: number, aspect: AspectId, overlay: OverlayId): CropTool {
+  return { rect, base: rect, angle, aspect, flip: false, constrain: true, overlay, overlayOrient: 0 };
+}
+
+/** Sets the intended rectangle (the shown one follows via `constrainTool`). */
+export const withBase = (tool: CropTool, rect: Rect): CropTool => ({ ...tool, rect, base: rect });
+
+/** Reset: full frame, no angle, locked to Original (the overlay choice and Constrain stay). */
+export const resetTool = (tool: CropTool): CropTool => ({ ...tool, rect: FULL, base: FULL, angle: 0, aspect: "original", flip: false, customRatio: undefined, rotating: false, angleTool: false });
+
 /** Largest step from `from` (valid) towards `to` that keeps the rect inside the rotated image (bisection; keeps a locked ratio). */
-function approach(from: Rect, to: Rect, aspect: number, rot: number): Rect {
-  if (!rot || insideRotated(to, aspect, rot)) return to;
+function approach(from: Rect, to: Rect, aspect: number, rot: number, quad: Quad | null = null): Rect {
+  if ((!rot && !quad) || validRect(to, aspect, rot, quad)) return to;
   const at = (t: number): Rect => ({ l: from.l + (to.l - from.l) * t, t: from.t + (to.t - from.t) * t, r: from.r + (to.r - from.r) * t, b: from.b + (to.b - from.b) * t });
   let lo = 0;
   let hi = 1;
   for (let i = 0; i < 20; i++) {
     const m = (lo + hi) / 2;
-    if (insideRotated(at(m), aspect, rot)) lo = m;
+    if (validRect(at(m), aspect, rot, quad)) lo = m;
     else hi = m;
   }
   return at(lo);
@@ -58,14 +134,18 @@ function approach(from: Rect, to: Rect, aspect: number, rot: number): Rect {
 /** Fraction-unit ratio (w / h) that the tool's aspect preset locks the rect to, or null when free. */
 export function lockRatio(tool: Pick<CropTool, "aspect" | "flip" | "customRatio">, imageAspect: number): number | null {
   if (tool.aspect === "free") return null;
-  const base = tool.aspect === "original" ? imageAspect : tool.aspect === "custom" ? (tool.customRatio ?? imageAspect) : ASPECTS.find((a) => a.id === tool.aspect)!.ratio!;
+  const base = tool.aspect === "original" || tool.aspect === "asShot" ? imageAspect : tool.aspect === "custom" ? (tool.customRatio ?? imageAspect) : ASPECTS.find((a) => a.id === tool.aspect)!.ratio!;
   return fractionRatio(tool.flip ? 1 / base : base, imageAspect);
 }
 
 /** Re-fits the rectangle to the tool's locked ratio (no-op when free). */
-export function refit(tool: CropTool, imageAspect: number): CropTool {
+export function refit(tool: CropTool, imageAspect: number, prev?: Pick<CropTool, "aspect" | "flip" | "customRatio">): CropTool {
   const fr = lockRatio(tool, imageAspect);
-  return fr == null ? tool : { ...tool, rect: fitRatio(tool.rect, fr) };
+  if (fr == null) return tool;
+  // A rectangle that was the largest of the previous ratio re-maximises (so X twice returns to the same crop).
+  const pfr = prev ? lockRatio(prev, imageAspect) : null;
+  const wasMax = pfr != null && rectArea(tool.base) >= 0.98 * rectArea(fitRatio(FULL, pfr)) && !tool.angle;
+  return withBase(tool, fitRatio(wasMax ? FULL : tool.base, fr));
 }
 
 /** X / the swap button: landscape <-> portrait. A free rectangle is first locked to its current ratio. */
@@ -75,13 +155,30 @@ export function swapTool(tool: CropTool, imageAspect: number): CropTool {
     const ratio = ((r.r - r.l) / (r.b - r.t)) * imageAspect;
     return refit({ ...tool, aspect: "custom", customRatio: ratio, flip: true }, imageAspect);
   }
-  return refit({ ...tool, flip: !tool.flip }, imageAspect);
+  return refit({ ...tool, flip: !tool.flip }, imageAspect, tool);
+}
+
+/** Aspect preset chosen from the list. Custom starts from the current rectangle's pixel ratio (editable as W : H). */
+export function setAspectTool(tool: CropTool, id: AspectId, imageAspect: number): CropTool {
+  saveCropAspect(id);
+  if (id === "custom") {
+    const r = tool.rect;
+    const ratio = tool.aspect === "custom" ? (tool.customRatio ?? imageAspect) : ((r.r - r.l) / (r.b - r.t)) * imageAspect;
+    return refit({ ...tool, aspect: "custom", flip: false, customRatio: ratio }, imageAspect, tool);
+  }
+  return refit({ ...tool, aspect: id, customRatio: undefined }, imageAspect, tool);
+}
+
+/** Custom W : H entered by the user (pixel ratio). */
+export function setCustomRatio(tool: CropTool, w: number, h: number, imageAspect: number): CropTool {
+  if (!(w > 0) || !(h > 0)) return tool;
+  return refit({ ...tool, aspect: "custom", flip: false, customRatio: w / h }, imageAspect);
 }
 
 /** A: Free <-> the last locked aspect (Original by default). */
 export function toggleLockTool(tool: CropTool, imageAspect: number): CropTool {
   if (tool.aspect === "free") {
-    return refit({ ...tool, aspect: lastLockedAspect(), customRatio: undefined }, imageAspect);
+    return refit({ ...tool, aspect: lastLockedAspect(), customRatio: undefined }, imageAspect, tool);
   }
   saveCropAspect(tool.aspect);
   saveCropAspect("free");
@@ -96,6 +193,11 @@ interface Props {
   /** EXIF orientation of the photo (a mirrored one flips the sense of the straighten rotation). */
   orientation?: number;
   onChange: (t: CropTool) => void;
+  /**
+   * Seam for the Upright / Transform warp outline (v19.3, R1-3): the valid image area as 4 points, fractions of the corrected
+   * frame (clockwise), or null / undefined = the rotated frame only. "Constrain to image" and the paper fill will use it.
+   */
+  validQuad?: Quad | null;
 }
 
 const HANDLE_POS: Record<Handle, { x: number; y: number; cursor: string }> = {
@@ -113,19 +215,35 @@ const ROTATE_CURSOR = `url("data:image/svg+xml;utf8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="black" stroke-width="4" d="M20 12a8 8 0 1 1-2.5-5.8M20 3v4.5h-4.5"/><path stroke="white" stroke-width="2" d="M20 12a8 8 0 1 1-2.5-5.8M20 3v4.5h-4.5"/></svg>',
 )}") 12 12, crosshair`;
 
+/** Alt-drag on a handle: the opposite side mirrors the dragged one about the centre. */
+function resizeCentred(rect: Rect, handle: Handle, px: number, py: number, fr: number | null): Rect {
+  const cx = (rect.l + rect.r) / 2;
+  const cy = (rect.t + rect.b) / 2;
+  const hx = handle.includes("w") ? -1 : handle.includes("e") ? 1 : 0;
+  const hy = handle.includes("n") ? -1 : handle.includes("s") ? 1 : 0;
+  const ax = hx < 0 ? rect.r : hx > 0 ? rect.l : cx;
+  const ay = hy < 0 ? rect.b : hy > 0 ? rect.t : cy;
+  const n = resizeRect(rect, handle, hx ? ax + 2 * (px - cx) : px, hy ? ay + 2 * (py - cy) : py, fr);
+  const w = n.r - n.l;
+  const h = n.b - n.t;
+  const s = Math.min(1, (2 * Math.min(cx, 1 - cx)) / w, (2 * Math.min(cy, 1 - cy)) / h);
+  return { l: cx - (w * s) / 2, r: cx + (w * s) / 2, t: cy - (h * s) / 2, b: cy + (h * s) / 2 };
+}
+
 const deg = (rad: number) => (rad * 180) / Math.PI;
 /** Folds an angle difference into (-180, 180]. */
 const wrap = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 
 type P = { x: number; y: number };
 
-export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange }: Props) {
+export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange, validQuad = null }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const layer = useRef<HTMLDivElement>(null);
   const drag = useRef<{ kind: Handle | "move"; x: number; y: number; rect: Rect } | null>(null);
-  const spin = useRef<{ mode: "rotate" | "line"; a0: number; rot0: number; start: P } | null>(null);
+  const spin = useRef<{ mode: "rotate" | "line"; a0: number; rot0: number; start: P; c: P } | null>(null);
   const [line, setLine] = useState<{ a: P; b: P } | null>(null);
   const [meta, setMeta] = useState(false);
+  const armed = !!tool.angleTool;
   // While Cmd / Ctrl is held the hit layer moves above the crop rectangle, so a straighten line can start anywhere.
   useEffect(() => {
     const sync = (e: KeyboardEvent) => setMeta(e.metaKey || e.ctrlKey);
@@ -165,8 +283,10 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     const d = drag.current;
     if (!d) return;
     const [x, y] = frac(e);
-    const next = d.kind === "move" ? moveRect(d.rect, x - d.x, y - d.y) : resizeRect(d.rect, d.kind, x, y, fr);
-    onChange({ ...tool, rect: approach(d.rect, next, imageAspect, rot) });
+    // Lightroom modifiers: Alt resizes about the centre, Shift keeps the current ratio of a free crop for this drag.
+    const keep = e.shiftKey && fr == null ? ((d.rect.r - d.rect.l) / Math.max(1e-6, d.rect.b - d.rect.t)) : fr;
+    const next = d.kind === "move" ? moveRect(d.rect, x - d.x, y - d.y) : e.altKey ? resizeCentred(d.rect, d.kind, x, y, keep) : resizeRect(d.rect, d.kind, x, y, keep);
+    onChange(withBase(tool, approach(d.rect, next, imageAspect, tool.constrain ? rot : 0, tool.constrain ? validQuad : null)));
   };
   const up = () => {
     drag.current = null;
@@ -184,19 +304,18 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
   };
   const setRotation = (r: number, rotating: boolean) => {
     const angle = Math.round(Math.max(-45, Math.min(45, angleFromRotation(r, orientation))) * 100) / 100;
-    const t = { ...tool, angle, rotating };
-    onChange({ ...t, rect: fitInsideRotated(t.rect, imageAspect, previewRotation(angle, orientation)) });
+    onChange({ ...tool, angle, rotating }); // the shown rect is re-derived from `base` by the caller (constrainTool)
   };
   const spinDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     const p = lp(e);
-    if (e.metaKey || e.ctrlKey) {
-      spin.current = { mode: "line", a0: 0, rot0: rot, start: p };
+    if (e.metaKey || e.ctrlKey || armed) {
+      spin.current = { mode: "line", a0: 0, rot0: rot, start: p, c: p };
       setLine({ a: p, b: p });
     } else {
       const c = rectCentre();
-      spin.current = { mode: "rotate", a0: deg(Math.atan2(p.y - c.y, p.x - c.x)), rot0: rot, start: p };
+      spin.current = { mode: "rotate", a0: deg(Math.atan2(p.y - c.y, p.x - c.x)), rot0: rot, start: p, c };
       onChange({ ...tool, rotating: true });
     }
   };
@@ -212,7 +331,7 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     const p = lp(e);
     if (s.mode === "line") setLine({ a: s.start, b: p });
     else {
-      const c = rectCentre();
+      const c = s.c; // fixed at drag start: the rect centre slides while the crop re-fits
       setRotation(s.rot0 + wrap(deg(Math.atan2(p.y - c.y, p.x - c.x)) - s.a0), true);
     }
   };
@@ -223,20 +342,24 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
     if (!s) return;
     const p = lp(e);
     if (s.mode === "line") {
-      if (Math.hypot(p.x - s.start.x, p.y - s.start.y) >= 6) setRotation(levelRotation(s.start, p, s.rot0), false);
+      if (Math.hypot(p.x - s.start.x, p.y - s.start.y) >= 6) {
+        const r = levelRotation(s.start, p, s.rot0);
+        const angle = Math.round(Math.max(-45, Math.min(45, angleFromRotation(r, orientation))) * 100) / 100;
+        onChange({ ...tool, angle, rotating: false, angleTool: false });
+      } else if (armed) onChange({ ...tool, angleTool: false });
     } else onChange({ ...tool, rotating: false });
   };
 
   const pct = (v: number) => `${v * 100}%`;
   const dim = "pointer-events-none absolute bg-black/60";
-  const grid = tool.rotating ? [1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => i / 10) : [1 / 3, 2 / 3];
+  const grid = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => i / 10);
   return (
-    <div className="pointer-events-none absolute inset-0 z-10" data-testid="crop-overlay" data-rotation={rot.toFixed(2)}>
+    <div className="pointer-events-none absolute inset-0 z-10" data-testid="crop-overlay" data-rotation={rot.toFixed(2)} data-valid-quad={validQuad ? JSON.stringify(validQuad) : undefined}>
       <div
         ref={layer}
         className="pointer-events-auto absolute -inset-6 touch-none"
-        style={{ cursor: meta ? "crosshair" : ROTATE_CURSOR, zIndex: meta ? 30 : 0 }}
-        data-cmd={meta}
+        style={{ cursor: meta || armed ? "crosshair" : ROTATE_CURSOR, zIndex: meta || armed ? 30 : 0 }}
+        data-cmd={meta || armed}
         data-testid="crop-rotate-layer"
         onPointerDown={spinDown}
         onPointerMove={spinMove}
@@ -250,6 +373,7 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
         </svg>
       )}
       <div ref={box} className="pointer-events-none absolute" style={{ left, top, width: iw, height: ih }} data-testid="crop-frame">
+        {!tool.constrain && rot !== 0 && <PaperFill iw={iw} ih={ih} rot={rot} />}
         <div className={dim} style={{ left: 0, top: 0, width: "100%", height: pct(rect.t) }} />
         <div className={dim} style={{ left: 0, top: pct(rect.b), width: "100%", height: pct(1 - rect.b) }} />
         <div className={dim} style={{ left: 0, top: pct(rect.t), width: pct(rect.l), height: pct(rect.b - rect.t) }} />
@@ -265,12 +389,16 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
           onPointerCancel={up}
           onDoubleClick={(e) => e.stopPropagation()}
         >
-          {grid.map((f) => (
-            <div key={f} data-testid={tool.rotating ? "crop-grid-line" : undefined}>
-              <div className={`pointer-events-none absolute inset-y-0 w-px ${tool.rotating ? "bg-white/45" : "bg-white/30"}`} style={{ left: pct(f) }} />
-              <div className={`pointer-events-none absolute inset-x-0 h-px ${tool.rotating ? "bg-white/45" : "bg-white/30"}`} style={{ top: pct(f) }} />
-            </div>
-          ))}
+          {tool.rotating ? (
+            grid.map((f) => (
+              <div key={f} data-testid="crop-grid-line">
+                <div className="pointer-events-none absolute inset-y-0 w-px bg-white/45" style={{ left: pct(f) }} />
+                <div className="pointer-events-none absolute inset-x-0 h-px bg-white/45" style={{ top: pct(f) }} />
+              </div>
+            ))
+          ) : (
+            <Guide id={tool.overlay} orient={tool.overlayOrient} pa={(iw * (rect.r - rect.l)) / Math.max(1, ih * (rect.b - rect.t))} />
+          )}
           {HANDLES.map((h) => (
             <div
               key={h}
@@ -286,5 +414,45 @@ export function CropOverlay({ tool, size, imageAspect, orientation = 1, onChange
         </div>
       </div>
     </div>
+  );
+}
+
+/** The composition guide inside the crop rectangle (vector, non-scaling 1px strokes). */
+function Guide({ id, orient, pa }: { id: OverlayId; orient: number; pa: number }) {
+  const { lines, paths } = overlayShapes(id, pa);
+  return (
+    <svg className="pointer-events-none absolute inset-0 size-full" viewBox="0 0 1 1" preserveAspectRatio="none" data-testid="crop-guide" data-overlay={id} data-orient={orient}>
+      <g transform={ORIENT_TRANSFORM[orient % 4]} stroke="rgba(255,255,255,0.55)" strokeWidth={1} fill="none" vectorEffect="non-scaling-stroke">
+        {lines.map((l, i) => (
+          <line key={i} x1={l[0]} y1={l[1]} x2={l[2]} y2={l[3]} vectorEffect="non-scaling-stroke" />
+        ))}
+        {paths.map((d, i) => (
+          <path key={i} d={d} vectorEffect="non-scaling-stroke" />
+        ))}
+      </g>
+    </svg>
+  );
+}
+
+/**
+ * "Constrain to image" off: the part of the frame the rotated photo does not cover is white, as in the render
+ * (the backend fills the gap white). Frame rectangle minus the rotated photo quad (even-odd).
+ */
+function PaperFill({ iw, ih, rot }: { iw: number; ih: number; rot: number }) {
+  const a = (rot * Math.PI) / 180;
+  const cos = Math.cos(a);
+  const sin = Math.sin(a);
+  const quad = [
+    [-iw / 2, -ih / 2],
+    [iw / 2, -ih / 2],
+    [iw / 2, ih / 2],
+    [-iw / 2, ih / 2],
+  ]
+    .map(([x, y]) => `${(iw / 2 + x * cos - y * sin).toFixed(2)},${(ih / 2 + x * sin + y * cos).toFixed(2)}`)
+    .join(" L");
+  return (
+    <svg className="pointer-events-none absolute inset-0 size-full" viewBox={`0 0 ${iw} ${ih}`} data-testid="crop-paper">
+      <path fillRule="evenodd" fill="white" d={`M0,0 H${iw} V${ih} H0 Z M${quad} Z`} />
+    </svg>
   );
 }

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditBatchInfo, type EditPlan, type ImageEditState, type KeeperRule, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
 import { describeError } from "../lib/errors";
 import type { ToastApi } from "../components/Toasts";
+import { flushEdits } from "../lib/editFlush";
 
 /** What the checklist shows for a scene (the backend status plus "auto edited, not reviewed yet"). */
 export type SceneUi = "todo" | "auto" | "edited" | "applied" | "stale" | "reset";
@@ -65,6 +66,16 @@ export function styleGate(s: StyleModelStatus | null): StyleGate {
     };
   if (s.state === "failed") return { kind: "failed", tip: s.error ?? "The last training failed" };
   return { kind: "learn", tip: "Sieve learns your style from the photos you edited first" };
+}
+
+/** What an apply does per frame vs. copies, in words (the toast after Apply to scene). */
+export function describeApply(o: SceneApplyOptions | null): string {
+  const m = (o ?? (DEFAULT_SCENE_APPLY_OPTIONS as unknown as SceneApplyOptions)).matchOptions;
+  const matched = [m.matchExposure && "exposure", m.matchWhiteBalance && "white balance", m.matchTone && "tone"].filter(Boolean) as string[];
+  const copied = m.copyFields.length;
+  const list = matched.length > 1 ? `${matched.slice(0, -1).join(", ")} and ${matched[matched.length - 1]}` : (matched[0] ?? "");
+  const head = matched.length > 0 ? `${list[0].toUpperCase()}${list.slice(1)} matched per photo` : "Nothing matched per photo";
+  return copied > 0 ? `${head}; everything else copied (grain, clarity, HSL, curves…)` : head;
 }
 
 interface Deps {
@@ -407,13 +418,43 @@ export function useWorkflow(d: Deps) {
     return b;
   };
 
+  /**
+   * A paste / sync batch (`EditBatchResult`): refresh what changed and offer one Undo that reverts the whole batch.
+   * Returns false when nothing changed.
+   */
+  const reportBatch = useCallback(
+    async (r: { batchId: number | null; label: string; changedIds: number[] }, text: string, attempted: number, soft = false): Promise<boolean> => {
+      if (r.batchId == null || r.changedIds.length === 0) {
+        toasts.push(`${text}: no change (${plural(attempted, "photo")} already matched)`);
+        return false;
+      }
+      const b = remember(r.batchId, r.label, [], r.changedIds);
+      // `soft`: the caller (Develop) already refreshed its own photos; a full `onChanged` would remount the Develop view.
+      if (soft) await fetchPlan().catch(() => {});
+      else await afterChange(r.changedIds);
+      const tid = toasts.push(`${text} to ${plural(r.changedIds.length, "photo")}${attempted > r.changedIds.length ? ` (${attempted - r.changedIds.length} already matched)` : ""}`, {
+        action: b ? { label: "Undo", testid: "paste-undo-batch", onClick: () => void undoBatch(b) } : undefined,
+      });
+      bindToast(b, tid);
+      return true;
+    },
+    [afterChange, fetchPlan, toasts, undoBatch],
+  );
+
   // ---- apply ----
   const applyScene = useCallback(
-    async (sceneId: number, opts: "match" | "exact" | SceneApplyOptions = "match", onReview?: (sceneId: number, ids?: number[]) => void) => {
+    async (
+      sceneId: number,
+      opts: "match" | "exact" | SceneApplyOptions = "match",
+      onReview?: (sceneId: number, ids?: number[]) => void,
+      onShowIds?: (ids: number[], label: string) => void,
+    ) => {
       if (busyRef.current) return;
       setBusy({ kind: "scene", sceneId, done: 0, total: 0 });
       setCancelling(false);
       try {
+        // The representative is read from the catalog: store the slider edit still in flight first.
+        await flushEdits();
         const options: SceneApplyOptions | null =
           opts === "exact"
             ? ({ ...(DEFAULT_SCENE_APPLY_OPTIONS as unknown as SceneApplyOptions), matchOptions: { ...(DEFAULT_SCENE_APPLY_OPTIONS.matchOptions as unknown as SceneApplyOptions["matchOptions"]), matchExposure: false, matchWhiteBalance: false } } as SceneApplyOptions)
@@ -434,10 +475,21 @@ export function useWorkflow(d: Deps) {
           bindToast(b, tid);
           return;
         }
-        const tid = toasts.push(`Applied ${label} to ${plural(n, "photo")}${need > 0 ? ` · ${need} need a look` : ""}`, {
-          action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
-          secondary: need > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(sceneId, out?.notConvergedIds) } : undefined,
-        });
+        const skippedIds = out?.skippedIds ?? [];
+        const sk = skippedIds.length;
+        const tid = toasts.push(
+          `Applied ${label} to ${plural(n, "photo")}. ${describeApply(options)}.${sk > 0 ? ` ${sk} skipped because you edited them.` : ""}${need > 0 ? ` ${need} ${need === 1 ? "needs" : "need"} a look.` : ""}`,
+          {
+            action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
+            secondary:
+              sk > 0 && onShowIds
+                ? { label: "Show", testid: "apply-skipped-show-photos", onClick: () => onShowIds(skippedIds, `${plural(sk, "photo")} you edited (skipped by Apply)`) }
+                : need > 0 && onReview
+                  ? { label: "Review", testid: "apply-review", onClick: () => onReview(sceneId, out?.notConvergedIds) }
+                  : undefined,
+            third: sk > 0 && need > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(sceneId, out?.notConvergedIds) } : undefined,
+          },
+        );
         bindToast(b, tid);
       } catch (e) {
         onError(e);
@@ -450,11 +502,12 @@ export function useWorkflow(d: Deps) {
   );
 
   const applyAll = useCallback(
-    async (onReview?: (sceneId: number, ids?: number[]) => void, onShow?: (sceneId: number) => void) => {
+    async (onReview?: (sceneId: number, ids?: number[]) => void, onShow?: (sceneId: number) => void, onShowIds?: (ids: number[], label: string) => void) => {
       if (projectId == null || busyRef.current) return;
       setBusy({ kind: "all", done: 0, total: 0 });
       setCancelling(false);
       try {
+        await flushEdits();
         const r = await unwrap(commands.applyAllEditedScenes(projectId, null));
         const skipped = r.skippedScenes ?? [];
         const noteSkipped = () => {
@@ -476,10 +529,20 @@ export function useWorkflow(d: Deps) {
         const b = remember(r.batch.batchId, `Apply ${plural(r.scenes.length, "scene")}`, r.scenes.map((s) => s.sceneId), r.batch.changedIds);
         await afterChange(r.batch.changedIds);
         const head = r.cancelled ? `Stopped after ${plural(r.scenes.length, "scene")} (${plural(n, "photo")})` : `Applied ${plural(r.scenes.length, "scene")} to ${plural(n, "photo")}`;
-        const tid = toasts.push(`${head}${needN > 0 ? ` · ${needN} need a look` : ""}`, {
-          action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
-          secondary: needN > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId, need[0].notConvergedIds) } : undefined,
-        });
+        const skippedAll = r.scenes.flatMap((s) => s.skippedIds);
+        const tid = toasts.push(
+          `${head}. ${describeApply(null)}.${skippedAll.length > 0 ? ` ${skippedAll.length} skipped because you edited them.` : ""}${needN > 0 ? ` ${needN} ${needN === 1 ? "needs" : "need"} a look.` : ""}`,
+          {
+            action: b ? { label: "Undo", testid: "apply-undo-batch", onClick: () => void undoBatch(b) } : undefined,
+            secondary:
+              skippedAll.length > 0 && onShowIds
+                ? { label: "Show", testid: "apply-skipped-show-photos", onClick: () => onShowIds(skippedAll, `${plural(skippedAll.length, "photo")} you edited (skipped by Apply)`) }
+                : needN > 0 && onReview
+                  ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId, need[0].notConvergedIds) }
+                  : undefined,
+            third: skippedAll.length > 0 && needN > 0 && onReview ? { label: "Review", testid: "apply-review", onClick: () => onReview(need[0].sceneId, need[0].notConvergedIds) } : undefined,
+          },
+        );
         bindToast(b, tid);
         noteSkipped();
       } catch (e) {
@@ -646,6 +709,7 @@ export function useWorkflow(d: Deps) {
     runAuto,
     applyScene,
     applyAll,
+    reportBatch,
     undoBatch,
     undoLast,
     setRepresentative,

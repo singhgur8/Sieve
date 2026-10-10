@@ -1,5 +1,5 @@
 // Develop left panel: Navigator, Presets, Snapshots, History and the sticky Copy… / Paste bar (docs/ux-spec-8b.md 5.3).
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Folder, Loader2, Plus, Redo2, Trash2, Undo2, User } from "lucide-react";
 import { hint } from "../../lib/keymap";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
@@ -8,6 +8,7 @@ import type { Copied } from "../../lib/clipboard";
 import { useSnapshots } from "../../hooks/useDevelopV14";
 import { Menu, menuItem } from "../Menu";
 import type { Zoom } from "./Viewer";
+import { ZOOM_PRESETS, type ZoomPreset } from "../../lib/zoom";
 
 const GROUPS_KEY = "sieve.presetGroups.v1";
 
@@ -30,6 +31,8 @@ interface Props {
   onHoverPreset: (p: StylePreset | null) => void;
   /** Hover preview shown in the Navigator instead of the photo (label `Preview: <name>`). */
   navPreview: { url: string; label: string } | null;
+  /** The preset the photo currently carries (`AdjustmentHistory.appliedPresetId`); highlighted in the list. */
+  appliedPresetId?: number | null;
   history: AdjustmentHistory | null;
   imageId: number | null;
   onApplyPreset: (p: StylePreset) => void;
@@ -45,6 +48,9 @@ interface Props {
   zoom: Zoom;
   region: NormRect | null;
   onZoom: (z: Zoom) => void;
+  /** Navigator zoom presets. */
+  onPreset: (p: ZoomPreset) => void;
+  activePreset: ZoomPreset | null;
   /** Copy… (Alt held: copy with the remembered fields, no dialog). */
   onCopy: (alt: boolean) => void;
   onPaste: () => void;
@@ -55,7 +61,7 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   const [open, setOpen] = useState(defaultOpen);
   return (
     <section className="border-b border-neutral-800 px-3 py-2" data-testid={`section-${id}`} data-open={open}>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <button className="flex items-center gap-1 font-semibold uppercase tracking-wide text-neutral-300" aria-expanded={open} onClick={() => setOpen(!open)} data-testid={`section-toggle-${id}`}>
           {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
           {title}
@@ -67,7 +73,7 @@ function Section({ id, title, defaultOpen = true, action, children }: { id: stri
   );
 }
 
-export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onCopy, onPaste, copied }: Props) {
+export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverPreset, navPreview, appliedPresetId = null, history, imageId, onApplyPreset, onSavePreset, onDeletePreset, onUndo, onRedo, onGoto, targetCount = 1, navUrl, zoom, region, onZoom, onPreset, activePreset, onCopy, onPaste, copied }: Props) {
   const [confirming, setConfirming] = useState<number | null>(null);
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>(loadGroups);
   const [removingGroup, setRemovingGroup] = useState<number | null>(null);
@@ -84,6 +90,11 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
       /* not remembered */
     }
   };
+  // Bring the applied preset into view (its group is shown open above) when it changes.
+  const appliedRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    appliedRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [appliedPresetId, groups]);
   const pasting = useActivityRunning("paste_sync");
   const pasteTitle = pasting ? BUSY_WHY.paste_sync : copied
     ? `Paste ${copied.fields.length} settings${copied.fromName ? ` from ${copied.fromName.replace(/\.[^.]+$/, "")}` : ""} to ${targetCount} photo${targetCount === 1 ? "" : "s"}${hint("paste")}`
@@ -96,13 +107,21 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           id="navigator"
           title="Navigator"
           action={
-            <span className="flex gap-2 text-[11px]">
-              <button className={!zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => zoom.on && onZoom({ on: false, cx: 0.5, cy: 0.5 })} data-testid="nav-fit" aria-pressed={!zoom.on}>
-                FIT
-              </button>
-              <button className={zoom.on ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"} onClick={() => !zoom.on && onZoom({ on: true, cx: 0.5, cy: 0.5 })} data-testid="nav-100" aria-pressed={zoom.on}>
-                100%
-              </button>
+            <span className="flex shrink-0 gap-1.5 text-[11px]" role="group" aria-label="Zoom presets">
+              {ZOOM_PRESETS.filter((z) => z.id !== 50 && z.id !== 400).map((z) => (
+                <button
+                  key={String(z.id)}
+                  className={activePreset === z.id ? "text-neutral-100" : "text-neutral-400 hover:text-neutral-300"}
+                  onMouseDown={(e) => e.preventDefault()}
+                  tabIndex={-1}
+                  onClick={() => onPreset(z.id)}
+                  title={z.title}
+                  data-testid={z.id === "fit" ? "nav-fit" : `nav-${z.id}`}
+                  aria-pressed={activePreset === z.id}
+                >
+                  {z.label}
+                </button>
+              ))}
             </span>
           }
         >
@@ -161,7 +180,7 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
           )}
           <div data-testid="preset-list">
             {shown.map((g) => {
-              const open = groupOpen[g.id] ?? g.kind === "user";
+              const open = groupOpen[g.id] ?? (g.kind === "user" || (appliedPresetId != null && g.presets.some((x) => x.id === appliedPresetId)));
               return (
                 <div key={g.id} data-testid={`preset-group-${g.id}`} data-open={open} data-kind={g.kind}>
                   <div className="group/g flex h-6 items-center">
@@ -200,8 +219,14 @@ export function LeftPanel({ groups, importing, onImport, onRemoveGroup, onHoverP
                   {open && (
                     <ul>
                       {g.presets.map((p) => (
-                        <li key={p.id} className="group flex h-6 items-center justify-between rounded pl-5 pr-1 hover:bg-neutral-800" onMouseEnter={() => onHoverPreset(p)} onMouseLeave={() => onHoverPreset(null)}>
-                          <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name}`}>
+                        <li
+                          key={p.id}
+                          ref={p.id === appliedPresetId ? appliedRef : undefined}
+                          data-applied={p.id === appliedPresetId}
+                          aria-current={p.id === appliedPresetId ? "true" : undefined}
+                          className={`group flex h-6 items-center justify-between rounded pl-5 pr-1 ${p.id === appliedPresetId ? "bg-sky-900/60 text-sky-100 hover:bg-sky-900/80" : "hover:bg-neutral-800"}`}
+                          onMouseEnter={() => onHoverPreset(p)} onMouseLeave={() => onHoverPreset(null)}>
+                          <button className="min-w-0 flex-1 truncate text-left" onClick={() => onApplyPreset(p)} data-testid={`preset-${p.id}`} title={`Apply ${p.name} (hover to preview it on the photo)`}>
                             {p.name}
                           </button>
                           {p.warnings.length > 0 && (
@@ -325,7 +350,7 @@ function Navigator({ url, label, zoom, region, onZoom }: { url: string | null; l
   const pan = (e: React.PointerEvent) => {
     const r = box.current?.getBoundingClientRect();
     if (!r || !zoom.on) return;
-    onZoom({ on: true, cx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), cy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) });
+    onZoom({ ...zoom, on: true, cx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), cy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) });
   };
   // The frame (3:2) is filled by the image at its own aspect: percentages keep the region overlay exact.
   const wPct = aspect >= 1.5 ? 100 : (aspect / 1.5) * 100;
