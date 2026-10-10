@@ -19,23 +19,29 @@ documented in "Segmentation models" at the end of this file.
 | `2d106det.onnx` | 106-point 2D face landmarks (insightface `buffalo_l`), used for EAR blink detection | 5,030,888 B | `f001b856447c413801ef5c42091ed0cd516fcd21f2d6b79635b1e733a7109dbf` |
 | `open_closed_eye.onnx` | Eye-state CNN (OpenVINO OMZ `open-closed-eye-0001`, Apache-2.0) | 46,164 B | `4daa100034482525a26c9afb9297c16580a531189e66e3d2b2ac7d32becfd593` |
 | `face_landmarks_detector_1x3x256x256.onnx` | MediaPipe FaceMesh V2, 478 3D landmarks (Apache-2.0; PINTO ONNX export) for head pose | 4,955,225 B | `70fe4e14169ca084b03b8103077a4051296e07939a19c1fdfd1f18b3792b4048` |
+| `w600k_r50.onnx` | ArcFace R50 face embedding, 512-d (insightface `buffalo_l`, WebFace600K), face identity for target culling | 174,383,860 B | `4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43` |
 
 Source: HuggingFace mirror `public-data/insightface`, pinned to revision
 `33c1063c49c785b7652d3fd529f86fa4f149392b`:
 
 - `https://huggingface.co/public-data/insightface/resolve/33c1063c49c785b7652d3fd529f86fa4f149392b/models/buffalo_l/det_10g.onnx`
 - `https://huggingface.co/public-data/insightface/resolve/33c1063c49c785b7652d3fd529f86fa4f149392b/models/buffalo_l/2d106det.onnx`
+- `https://huggingface.co/public-data/insightface/resolve/33c1063c49c785b7652d3fd529f86fa4f149392b/models/buffalo_l/w600k_r50.onnx`
 
-These are the files of the official insightface v0.7 `buffalo_l` pack (not byte-compared against the zip)
-(upstream zip: `https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`,
-~280 MB, which also contains the recognition/gender models we do not need).
+These are the files of the official insightface v0.7 `buffalo_l` pack
+(upstream zip: `https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`, 288,621,354 B,
+SHA-256 `80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f`, which also contains the 3D-landmark and
+gender/age models we do not need). Byte-compared 2026-10-10: `det_10g.onnx` and `2d106det.onnx` in the zip have the
+checksums above (= the mirror's); `w600k_r50.onnx` was taken from the zip (the mirror was unreachable from the cloud
+container that day), so its checksum is the zip member's.
 
 ## License
 
 The insightface pretrained models are released **for non-commercial research purposes only**
 (see https://github.com/deepinsight/insightface#license). Accepted for personal use; see
 `docs/decisions.md` (2026-09-29). They must be replaced with permissively licensed models before any
-commercial distribution. The insightface *code* is MIT; the restriction is on the weights.
+commercial distribution. The insightface *code* is MIT; the restriction is on the weights. This covers
+`w600k_r50.onnx` too (same pack, same terms; decisions.md 2026-10-10).
 
 ---
 
@@ -171,6 +177,46 @@ it runs on CPU, and only for frontal faces whose EAR < 0.3.
 Tried and rejected for the closed-vs-downcast problem (no separation on the labeled faces): lid-arc /
 brow / lower-lid geometry from the 106-pt model, FaceMesh iris position, MediaPipe Blendshape V2
 (`eyeBlink*` vs `eyeLookDown*`, driven by the same landmarks), a 5-keypoint pitch proxy.
+
+## `w600k_r50.onnx` — ArcFace R50 face embedding (face identity, Phase 9)
+
+insightface `buffalo_l` recognition model: IResNet-50 trained with ArcFace loss on WebFace600K; ONNX opset 11.
+Used by `ml::identity` (people clustering for target culling), not by the per-image analysis.
+
+| | Name | Shape | Type |
+|---|---|---|---|
+| Input | `input.1` | `[N, 3, 112, 112]` (batch dim named `"None"`, pinned to 1) | float32 |
+| Output | `683` | `[N, 512]` | float32 (not normalised; we L2-normalise) |
+
+**Preprocessing** (insightface `ArcFaceONNX.get` + `face_align.norm_crop`):
+
+1. Similarity transform (rotation + uniform scale + translation, least squares / Umeyama) from the 5 SCRFD keypoints
+   to the ArcFace template in the 112x112 crop:
+   `(38.2946, 51.6963) (73.5318, 51.5014) (56.0252, 71.7366) (41.5493, 92.3655) (70.7299, 92.2041)`
+   (left eye, right eye, nose, left / right mouth corner; image left / right). Bilinear warp, outside = 0.
+   Faces larger than ~2x the crop are box-downsampled first (no aliasing from the bilinear warp).
+2. **RGB**, `x = (pixel - 127.5) / 127.5`, NCHW. Cosine similarity of L2-normalised outputs.
+
+The analysis stores only the eye centres, so `ml::identity` re-runs SCRFD (640 px, same as the analysis) on the
+2048 px preview for the keypoints and matches faces by box IoU >= 0.45.
+
+**Accuracy** (`cargo test --lib ml::identity::tests::real -- --ignored --nocapture`, 10 LFW identities x 10 photos,
+downloaded for the test and deleted afterwards): same-person cosine p1 0.43 / p5 0.58 / median 0.70; different people
+median 0.01 / p99 0.16 / max 0.22. Clustering purity 1.000 for assignment thresholds 0.25-0.55 (0 identities split,
+0 clusters merged); at 0.55 one face is left unassigned. With the same 100 photos added at 1/3 size (~33 px faces,
+weak faces that can only join): purity 1.000, none unassigned. Near-duplicates (JPEG q40, +25 % brightness,
+12 px shift, mirror, half size) stay at cosine >= 0.95.
+
+**Speed**: Linux cloud VM (4 vCPU Xeon 2.1 GHz, CPU EP, 1 intra-op thread per session): 265-270 ms per face,
+SCRFD at 640 ~500 ms per 2048 px preview (debug build; ORT itself is optimised). On Apple Silicon both run on
+CoreML (MLProgram, `"None"` pinned to 1); expected a few ms each, not measured yet (no Mac in this container).
+Shoot-size backfill (`tests::real::end_to_end_main_pair_and_timing`, `SIEVE_E2E_PHOTOS=2500`): 2,500 synthetic
+2048 px previews (LFW composites, 5,449 faces, 5,394 embedded) took 1,082 s on that VM with 4 worker threads
+(433 ms/photo, 201 ms/face wall); single-thread per photo: decode 46 ms, SCRFD + resize 523 ms, ~265 ms per face.
+Purity 1.000 (4,166 labelled faces), the couple found as the main pair, the parent asked about; a re-run with nothing
+to embed takes 1.9 s (clustering 5,394 faces, debug build). Clustering alone at 6,000 faces / 300 people + 1,500
+one-off guests (512-d synthetic): 107 s in a debug build (leader clustering is O(faces x clusters); release is
+several times faster - re-measure on the Mac).
 
 ## Rust integration (measured)
 

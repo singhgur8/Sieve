@@ -978,6 +978,13 @@ between stages):
    by centroid (`PersonDraft.prior_id`) so ids and the user's answers (`user_role`) survive. Main subject = the most
    frequent pair appearing together (portrait: one face); other recurring people get `ask` = the "Is this person
    important?" questions (`PeopleOverview.questions`); `set_person_role` answers, applied at the next run.
+   Implementation (vision-ml-dev): model `w600k_r50.onnx` (ArcFace R50, 512-d, `EMBED_MODEL_VERSION`
+   `arcface-w600k_r50@1`); backfill at the start of each run for faces without a current embedding (re-detect SCRFD
+   on the preview for the 5 keypoints, ArcFace alignment to 112 px, 4 threads), faces below identity quality 0.15
+   skipped; clustering + roles in `ml::identity::{cluster_people, suggest_roles}` (decisions.md 2026-10-10). The
+   later stages read people per face with `ml::identity::image_people(conn, project) -> HashMap<ImageId,
+   Vec<FacePerson { face_index, person_id, role }>>` (effective role) or `db::target::people_roles`. No model ->
+   `people: None` with "Face recognition is not installed" and the run continues without people.
 2. **Moments** (`ml::moments::detect_moments`): time gap + visual similarity + same people, across bursts and scenes,
    never across projects; shot type per frame and per moment (couple / group / detail / candid / other) plus per-frame
    signals (visible face, back of head, detail focus).
@@ -1026,7 +1033,8 @@ unflagged); `restore_target_snapshot` undoes them (rows + flags). Re-runs pass l
   (`target/<profile>/{deps,examples}`) resolve the same rpath. No `/opt/homebrew` load command remains in the
   bundle. Homebrew bottles set the minimum OS (currently 15.0 = `minimumSystemVersion`).
 - **ONNX Runtime** is statically linked by `ort` (no dylib); the CoreML EP works from the bundle.
-- **Models**: the culling models (~27 MB: SCRFD, 2d106, open/closed eye, FaceMesh) are staged by build.rs into
+- **Models**: the culling models (~27 MB: SCRFD, 2d106, open/closed eye, FaceMesh; plus the 174 MB ArcFace
+  `w600k_r50.onnx` for face identity since Phase 9) are staged by build.rs into
   `target/sieve-stage/models/` and bundled as `Contents/Resources/models` (resource map in tauri.conf.json;
   release bundle builds fail if they are missing). The AI-mask models (~560 MB) are not bundled: release builds
   read them from `<app_data_dir>/models` (`~/Library/Application Support/com.sieve.app/models`), where

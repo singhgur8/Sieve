@@ -135,7 +135,7 @@ fn base_builder() -> Result<SessionBuilder, String> {
 }
 
 /// CoreML first (unless `SIEVE_ML_CPU=1`), CPU fallback.
-fn build(path: &Path, dim: (&str, i64)) -> Result<(Session, Provider), String> {
+pub(crate) fn build(path: &Path, dim: (&str, i64)) -> Result<(Session, Provider), String> {
     if !path.is_file() {
         return Err(format!("model not found: {} (run scripts/fetch-models.sh)", path.display()));
     }
@@ -303,7 +303,7 @@ impl Models {
     }
 }
 
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+pub(crate) fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let ix = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
     let iy = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
     let inter = ix * iy;

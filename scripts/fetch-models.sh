@@ -6,11 +6,11 @@
 # aborts with a non-zero exit code and the bad file is removed.
 #
 # Usage: scripts/fetch-models.sh [--force] [--culling] [--dest DIR]
-#   --culling   only the culling models bundled into the app (~27 MB; `pnpm tauri build` runs this)
+#   --culling   only the culling models bundled into the app (~200 MB; `pnpm tauri build` runs this)
 #   --dest DIR  install into DIR instead of src-tauri/models (e.g. the app's data dir,
 #               ~/Library/Application Support/com.sieve.app/models, to pre-seed AI-mask models)
 #
-# Licenses: the insightface model zoo weights (det_10g, 2d106det) are released for NON-COMMERCIAL
+# Licenses: the insightface model zoo weights (det_10g, 2d106det, w600k_r50) are released for NON-COMMERCIAL
 # research use only (see src-tauri/models/README.md and docs/decisions.md).
 set -euo pipefail
 
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 # Bundled with the app (keep in sync with BUNDLED_MODELS in src-tauri/build.rs).
-CULLING_MODELS=" det_10g.onnx 2d106det.onnx open_closed_eye.onnx face_landmarks_detector_1x3x256x256.onnx "
+CULLING_MODELS=" det_10g.onnx 2d106det.onnx open_closed_eye.onnx face_landmarks_detector_1x3x256x256.onnx w600k_r50.onnx "
 
 # Pinned HuggingFace revision of public-data/insightface (mirror of the
 # insightface buffalo_l model pack, v0.7 release).
@@ -63,6 +63,7 @@ SEG_PARTS="$HF/senty-au/selfie_multiclass_256x256-ONNX/resolve/6db8421a7150ac205
 MODELS=(
   "det_10g.onnx|$HF_REPO/$HF_REV/models/buffalo_l/det_10g.onnx"
   "2d106det.onnx|$HF_REPO/$HF_REV/models/buffalo_l/2d106det.onnx"
+  "w600k_r50.onnx|$HF_REPO/$HF_REV/models/buffalo_l/w600k_r50.onnx"
   "open_closed_eye.onnx|$OMZ_EYE"
   "face_landmarks_detector_1x3x256x256.onnx|$PINTO_MESH|face_landmarks_detector_1x3x256x256.onnx"
   "birefnet_lite.onnx|$SEG_SUBJECT"

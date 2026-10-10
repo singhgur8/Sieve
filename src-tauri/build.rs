@@ -6,10 +6,16 @@ use std::process::Command;
 /// Staging area for bundle inputs (under the manifest's `target/`, gitignored). Paths are
 /// referenced statically from `tauri.conf.json` (`bundle.macOS.frameworks`, `bundle.resources`).
 const STAGE_DIR: &str = "target/sieve-stage";
-/// ONNX models shipped inside the app (culling engine, ~27 MB). The segmentation models
-/// (~560 MB) are downloaded on first use into the app data dir (see `model_fetch.rs`).
-const BUNDLED_MODELS: &[&str] =
-    &["det_10g.onnx", "2d106det.onnx", "open_closed_eye.onnx", "face_landmarks_detector_1x3x256x256.onnx"];
+/// ONNX models shipped inside the app (culling engine ~27 MB + face identity 174 MB). The
+/// segmentation models (~560 MB) are downloaded on first use into the app data dir (see
+/// `model_fetch.rs`).
+const BUNDLED_MODELS: &[&str] = &[
+    "det_10g.onnx",
+    "2d106det.onnx",
+    "open_closed_eye.onnx",
+    "face_landmarks_detector_1x3x256x256.onnx",
+    "w600k_r50.onnx",
+];
 
 fn main() {
     let macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
