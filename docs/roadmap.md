@@ -358,7 +358,7 @@ User rules (2026-10-09/10, verbatim intent):
 - Blur: creative blur competes like any frame of its moment; it doesn't get kept just for being intentional.
 - Review: pass 1 = the picked set, each with a strip of the alternatives from its moment (add / swap with one key);
   pass 2 = Not sure + Set aside, fast, each showing "already kept a similar one: DSC0412" (skip / swap / add both).
-- [ ] **Contract v20** (architect): people (face identity clusters per project: id, sample faces, photo count,
+- [x] **Contract v20** (architect): people (face identity clusters per project: id, sample faces, photo count,
   role main / important / other / unknown, user-confirmed), "important people" questions; moments (cross-shoot
   groups of the same scene + people, with shot type couple / group / detail / candid / other); per-image selection
   state for a target run (deliver / alternative-of(id) / not sure / set aside, with reason + rank) and a "covered by"
