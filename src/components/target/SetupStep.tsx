@@ -104,7 +104,7 @@ export const SetupStep = forwardRef<StageRef, { ctx: TargetCtx; shootType: Shoot
           <button
             className="flex h-9 items-center gap-2 rounded-md bg-sky-700 px-4 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-40"
             data-testid="target-run"
-            title={valid ? `Choose the best ${num(n)} of ${num(photoCount)} photos. Your keeps, swaps and adds are flagged as you make them. Apply flags the rest` : "Enter a number between 1 and 100,000"}
+            title={valid ? `Choose the best ${num(n)} of ${num(photoCount)} photos. Your keeps, swaps, adds and set-asides are flagged as you make them. Apply flags the rest` : "Enter a number between 1 and 100,000"}
             disabled={!valid}
             onClick={() => void start()}
           >

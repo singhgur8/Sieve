@@ -186,10 +186,12 @@ test.describe("Pick the best N", () => {
     // Each photo: shot type, moment label and a reason.
     await expect(page.getByTestId("target-cur-shot")).toHaveAttribute("data-shot", /couple|group|detail|candid/);
     await expect(page.getByTestId("target-cur-moment")).toContainText(/frame \d+ of \d+/);
-    await expect(page.getByTestId("target-reasons")).toBeVisible();
+    await expect(page.getByTestId("target-cur").getByTestId("target-reasons")).toBeVisible();
 
     // Walk to the first photo with at least two alternatives.
     const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
+    // (Past the first photo, so moving on has marked at least one reviewed.)
+    await page.keyboard.press("ArrowRight");
     for (let i = 0; i < 12 && (await strip.count()) < 2; i++) await page.keyboard.press("ArrowRight");
     expect(await strip.count()).toBeGreaterThanOrEqual(2);
     await expect(page.getByTestId("target-strip")).toContainText(/This moment: \d+ picked · \d+ alternatives?/);
@@ -309,7 +311,7 @@ test.describe("Pick the best N", () => {
     };
 
     await stepTo(true);
-    await expect(page.getByTestId("target-covered-text")).toHaveText(/^Already kept a similar one: DSC\d+$/);
+    await expect(page.getByTestId("target-covered-text")).toHaveText(/^(Almost identical to|Similar to|Same moment as|Looks like) DSC\d+ \((kept|you added it)(, another moment)?\)$/);
     await expect(page.getByTestId("target-similarity")).toContainText(/\d+% similar/);
     await expect(page.getByTestId("target-covered-pic").locator("img").last()).toBeVisible();
     await shot(page, "t-08-pass2");
@@ -335,36 +337,50 @@ test.describe("Pick the best N", () => {
     expect((await selOf(page, curId)).choice).toBe("deliver");
     await expect.poll(cur).not.toBe(curId);
 
-    // Nothing similar kept: plain keep / skip.
-    await stepTo(false);
-    await expect(noCover).toContainText("No similar photo is kept");
-    await expect(page.getByTestId("target-second-keep")).toBeVisible();
-    await expect(page.getByTestId("target-second-swap")).toHaveCount(0);
-    curId = await cur();
+    // Prefetch: the next photos' selections and covered-by were fetched ahead.
+    expect((await calls(page, "get_covered_by")).length).toBeGreaterThan(2);
+    // Nothing similar kept (the backend now gives every Not sure photo a covered-by): the plain keep lives in the Weaker pile.
+    await page.getByTestId("target-pile-weaker").click();
+    await expect(page.locator('[data-testid^="target-cell-"]').first()).toBeVisible();
+    curId = Number(await page.getByTestId("target-second").getAttribute("data-current"));
     await clearCalls(page);
     await page.keyboard.press("a");
     await expect.poll(async () => (await calls(page, "set_target_choice")).length).toBe(1);
     expect((await calls(page, "set_target_choice"))[0].args).toMatchObject({ ids: [curId], choice: "deliver" });
-    await expect.poll(cur).not.toBe(curId);
 
     // Undo the keep.
     await page.keyboard.press("Control+z");
     await expect.poll(async () => (await selOf(page, curId)).choice).not.toBe("deliver");
-    // Prefetch: the next photos' selections and covered-by were fetched ahead.
-    expect((await calls(page, "get_covered_by")).length).toBeGreaterThan(2);
   });
 
-  test("apply writes flags, then offers the picks as keepers", async ({ page }) => {
+  test("apply: exact counts from the plan, optional rejects, undo, then offers the picks as keepers", async ({ page }) => {
     await openTarget(page, "&target=answered");
-    const run = await inv<{ counts: { deliver: number } }>(page, "get_target_run", { projectId: 1 });
+    type Plan = { picks: number; rejects: number; rejectable: number; unflags: number; unchanged: number; userFlagged: number };
+    const planOn = await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } });
+    const planOff = await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: false } });
     await page.getByTestId("target-apply").click();
-    await expect(page.getByTestId("target-apply-text")).toContainText(`${run.counts.deliver} picked photos`);
-    await expect(page.getByTestId("target-apply-text")).toContainText("never changed");
+    const text = page.getByTestId("target-apply-text");
+    await expect(text).toHaveAttribute("data-loading", "false");
+    await expect(page.getByTestId("target-apply-picks")).toHaveAttribute("data-n", String(planOn.picks));
+    await expect(page.getByTestId("target-apply-rejects")).toBeChecked();
+    await expect(page.getByTestId("target-apply-rejects-label")).toHaveAttribute("data-n", String(planOn.rejectable));
+    await expect(page.getByTestId("target-apply-note")).toContainText("XMP sidecars");
+    await expect(page.getByTestId("target-apply-note")).toContainText("stay as they are");
+    const n = (p: Plan) => p.picks + p.rejects + p.unflags;
+    await expect(page.getByTestId("target-apply-confirm")).toHaveText(`Apply to ${n(planOn)} photos`);
     await shot(page, "t-09-apply");
+    // Unticking the defects follows the plan without rejects.
+    await page.getByTestId("target-apply-rejects").uncheck();
+    await expect(page.getByTestId("target-apply-confirm")).toHaveText(`Apply to ${n(planOff)} photos`);
+    await page.getByTestId("target-apply-rejects").check();
+    await expect(page.getByTestId("target-apply-confirm")).toHaveText(`Apply to ${n(planOn)} photos`);
     await clearCalls(page);
     await page.getByTestId("target-apply-confirm").click();
-    await expect(page.getByTestId("target-apply-result")).toContainText("as Picked");
-    expect(await calls(page, "apply_target_selection")).toHaveLength(1);
+    const result = page.getByTestId("target-apply-result");
+    await expect(result).toContainText(`Picked ${planOn.picks.toLocaleString("en-US")} · Rejected ${planOn.rejects.toLocaleString("en-US")} · Unflagged ${planOn.unflags}`);
+    const applied = await calls(page, "apply_target_selection");
+    expect(applied).toHaveLength(1);
+    expect(applied[0].args).toMatchObject({ projectId: 1, opts: { rejects: true } });
     await expect(page.getByTestId("target-keeper-offer")).toBeVisible();
     await expect(page.getByTestId("target-keeper-explain")).toContainText("just the picks");
     await shot(page, "t-10-keeper-offer");
@@ -372,6 +388,11 @@ test.describe("Pick the best N", () => {
     await expect(page.getByTestId("target-keeper-done")).toBeVisible();
     const rule = (await calls(page, "set_keeper_rule")).at(-1)!;
     expect(rule.args.rule).toEqual({ mode: "picks_and_ratings", minRating: 1, useSuggestions: false });
+    // Undo restores every flag the apply wrote (the plan is back to where it was).
+    await page.getByTestId("target-apply-undo").click();
+    await expect(result).toContainText("back as they were");
+    expect(await calls(page, "restore_cull_snapshot")).toHaveLength(1);
+    expect(await inv<Plan>(page, "plan_target_apply", { projectId: 1, opts: { rejects: true } })).toEqual(planOn);
     await page.getByTestId("target-continue-edit").click();
     await expect(page.getByTestId("plan-view")).toBeVisible();
   });
@@ -842,4 +863,21 @@ test.describe("Pick the best N: UX review 9", () => {
     await expect(notice).toHaveCount(1); // the newest replaces the older one
     await expect(notice).toBeHidden({ timeout: 5000 }); // gone after about 3 s
   });
+});
+
+test("P1-3: swap on photo 1, Cmd+Z returns to photo 1 (the swapped-in id is no longer delivered)", async ({ page }) => {
+  await openTarget(page, "&target=answered");
+  await tab(page, "review");
+  await page.keyboard.press("Home");
+  const first = await attr(page, "target-review", "data-current");
+  const total = await attr(page, "target-review", "data-total");
+  const strip = page.locator('[data-testid^="target-alt-"][data-rank]');
+  await expect(strip.first()).toBeVisible();
+  const alt = Number((await strip.first().getAttribute("data-testid"))!.replace("target-alt-", ""));
+  await page.keyboard.press("s");
+  await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(alt));
+  await page.keyboard.press("Control+z");
+  await expect.poll(async () => (await selOf(page, alt)).choice).toBe("alternative");
+  await expect(page.getByTestId("target-review")).toHaveAttribute("data-current", String(first));
+  await expect(page.getByTestId("target-review")).toHaveAttribute("data-total", String(total));
 });

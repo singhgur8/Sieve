@@ -6,7 +6,7 @@ import { LayoutGrid } from "lucide-react";
 import { commands, DEFAULT_QUERY, unwrap, type CoveredBy, type ImageSelection, type Moment, type RawImageEntry } from "../../ipc";
 import { previewSrc } from "../../lib/entryImage";
 import { hint } from "../../lib/keymap";
-import { isUserAdded, loadReviewed, num, ordinal, type Pile, PILE_HINT, PILE_LABEL, pileOf, PILES, saveReviewed, stemOf, type Pass } from "../../lib/target";
+import { loadReviewed, num, ordinal, type Pile, PILE_HINT, PILE_LABEL, pileOf, PILES, saveReviewed, stemOf, type Pass } from "../../lib/target";
 import { ActionButton, Pic, Reasons, ShotBadge, useSyncedZoom, ZoomPic } from "./bits";
 import type { StageRef } from "./SetupStep";
 import type { TargetCtx } from "./types";
@@ -87,7 +87,6 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const [revNS, setRevNS] = useState(() => loadReviewed(projectId, "second"));
   const [revSim, setRevSim] = useState(() => loadReviewed(projectId, "second_similar"));
   const [info, setInfo] = useState<Map<number, Info>>(new Map());
-  const [keptSel, setKeptSel] = useState<Map<number, ImageSelection>>(new Map());
   const [flash, setFlash] = useState(false);
   const zoom = useSyncedZoom();
   const loading = useRef(new Set<number>());
@@ -100,10 +99,11 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
     let stale = false;
     void (async () => {
       try {
-        const ids = await unwrap(commands.listImageIds({ ...DEFAULT_QUERY, projectId, targetChoices: ["not_sure", "set_aside"] }));
+        const ids = await unwrap(commands.listImageIds({ ...DEFAULT_QUERY, projectId, targetChoices: ["not_sure", "set_aside"], sort: "target_moment" }));
         const [rows, ms] = await Promise.all([selectionsOf(ids), unwrap(commands.listMoments(projectId))]);
         if (stale) return;
-        initial.current = new Map(rows.map((r) => [r.imageId, r]));
+        const byId = new Map(rows.map((r) => [r.imageId, r]));
+        initial.current = new Map(ids.filter((i) => byId.has(i)).map((i) => [i, byId.get(i)!]));
         setSels(new Map(initial.current));
         setMoments(ms);
         setLoaded(true);
@@ -127,9 +127,8 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const piles = useMemo(() => {
     const out: Record<Pile, number[]> = { not_sure: [], similar: [], weaker: [], defects: [] };
     const rows = [...initial.current.values()];
-    const start = (r: ImageSelection) => momentOf.get(r.imageId)?.startedAtMs ?? Number.MAX_SAFE_INTEGER;
-    rows.sort((a, b) => start(a) - start(b) || (a.momentId ?? 1e12) - (b.momentId ?? 1e12) || b.score - a.score || a.imageId - b.imageId);
-    rows.forEach((r) => out[pileOf(r)].push(r.imageId));
+    // The backend orders by moment, then score (sort "target_moment") and assigns the pile.
+    rows.forEach((r) => out[r.pile ?? pileOf(r)].push(r.imageId));
     return out;
   }, [loaded, momentOf]); // eslint-disable-line react-hooks/exhaustive-deps
   const list = piles[pile];
@@ -283,19 +282,11 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
   const cov = here?.cov ?? null;
   const curMoment = cur != null ? momentOf.get(cur) : undefined;
   const keptIds = curMoment?.deliveredIds ?? [];
-  const keptKey = keptIds.join(",");
+  const userIds = new Set(curMoment?.userDeliveredIds ?? []);
   useEffect(() => {
-    if (keptIds.length === 0) return;
     entries.need(keptIds);
-    let stale = false;
-    unwrap(commands.getImageSelections(keptIds))
-      .then((rows) => !stale && setKeptSel(new Map(rows.map((r) => [r.imageId, r]))))
-      .catch(ctx.onError);
-    return () => {
-      stale = true;
-    };
-  }, [keptKey, ctx.rev]); // eslint-disable-line react-hooks/exhaustive-deps
-  const addedIds = keptIds.filter((i) => i !== cur && isUserAdded(keptSel.get(i)));
+  }, [keptIds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+  const addedIds = keptIds.filter((i) => i !== cur && userIds.has(i));
 
   const entry = cur != null ? entries.get(cur) : undefined;
   const covEntry = cov ? entries.get(cov.coveredById) : undefined;
@@ -602,7 +593,7 @@ export const SecondStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Seco
               ) : (
                 <ul className="flex gap-2 overflow-x-auto pb-1">
                   {keptIds.map((k) => {
-                    const added = isUserAdded(keptSel.get(k));
+                    const added = userIds.has(k);
                     return (
                       <li key={k} className="shrink-0" data-testid={`target-kept-${k}`} data-added={added} title={`${stemOf(entries.get(k), k)}: ${added ? "you added this" : "kept by Sieve"}`}>
                         <Pic entry={entries.get(k)} className={`h-12 w-16 rounded ${added ? "ring-2 ring-sky-400" : "ring-1 ring-emerald-700"}`} />

@@ -120,14 +120,11 @@ export const isUserAdded = (sel: { choice: string; reasons: { kind: string }[] }
 
 // ---- Reviewed picks are locked at a re-run (P1-4) ----
 /**
- * Locks picks the user approved by moving past them so a re-run keeps them (`Forced::Locked`). Uses the dedicated lock command
- * once the backend has it (it must not write XMP flags, which `set_target_choice` does); until then it does nothing.
+ * Locks picks the user approved by moving past them so a re-run keeps them (`Forced::Locked`); writes no flags.
  */
 export async function lockReviewedPicks(ids: number[]): Promise<boolean> {
   if (ids.length === 0) return false;
-  const fn = (commands as unknown as Record<string, ((ids: number[]) => Promise<unknown>) | undefined>).lockTargetChoices;
-  if (!fn) return false;
-  await unwrap(fn(ids) as Promise<never>);
+  await unwrap(commands.lockTargetChoices(ids));
   return true;
 }
 /** Keeps only the reviewed ids that are still in `keep` (after a re-run). */

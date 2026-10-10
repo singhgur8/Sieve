@@ -692,7 +692,7 @@ export function installMockBackend(count: number) {
       if (q.missingOnly && r.missingSinceMs == null) return false;
       if (q.keepersOnly && !keeper(r)) return false;
       if (q.suggested != null && !pendingOk(r, q.suggested)) return false;
-      if (!target.choiceOk(r.id, q.targetChoices)) return false;
+      if (!target.queryOk(r.id, q)) return false;
       if (!metaOk(r, q.metadata)) return false;
       return true;
     });
@@ -702,6 +702,7 @@ export function installMockBackend(count: number) {
       quality: (r) => r.quality?.overall ?? 0,
       rating: (r) => -r.rating,
     };
+    if (q.sort === "target_moment") return target.sortByMoment(out.map((r) => r.id), q.sortDescending);
     const k = key[q.sort];
     out = [...out].sort((a, b) => (k(a) < k(b) ? -1 : k(a) > k(b) ? 1 : a.id - b.id));
     if (q.sortDescending) out.reverse();

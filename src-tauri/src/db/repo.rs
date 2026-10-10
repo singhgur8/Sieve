@@ -837,6 +837,19 @@ fn query_filter_skip(
     if !q.target_choices.is_empty() {
         clauses.push(crate::db::target::choices_clause(&q.target_choices, "i."));
     }
+    if !q.target_reason_kinds.is_empty() {
+        let ph = text_list(&q.target_reason_kinds, &mut args, TargetReasonKind::as_str);
+        clauses.push(format!(
+            "i.id IN (SELECT image_id FROM target_selection WHERE json_extract(reasons_json, '$[0].kind') IN ({ph}))"
+        ));
+    }
+    if !q.target_piles.is_empty() {
+        let ph = text_list(&q.target_piles, &mut args, TargetPile::as_str);
+        clauses.push(format!(
+            "i.id IN (SELECT s.image_id FROM target_selection s WHERE ({}) IN ({ph}))",
+            crate::db::target::PILE_SQL
+        ));
+    }
     metadata_clauses(&q.metadata, "i.", skip, &mut clauses, &mut args)?;
     if let Some(folder) = q.folder_id {
         clauses.push("i.folder_id = ?".into());
@@ -858,6 +871,9 @@ struct SortRow {
     file_name: String,
     rating: i64,
     overall: Option<f64>,
+    /// `target_moment` sort only: (moment start, moment id) and the selection score.
+    moment: Option<(Option<i64>, i64)>,
+    score: f64,
 }
 
 /// Orders `rows` like the SQL `ORDER BY` of `q`'s sort (always ending with a unique key):
@@ -907,6 +923,17 @@ fn sort_rows(rows: &mut [SortRow], sort: ImageSort, descending: bool) {
         }),
         (ImageSort::Rating, false) => rows.sort_unstable_by(|a, b| b.rating.cmp(&a.rating).then_with(|| capture(a, b))),
         (ImageSort::Rating, true) => rows.sort_unstable_by(|a, b| a.rating.cmp(&b.rating).then_with(|| capture(a, b))),
+        (ImageSort::TargetMoment, desc) => rows.sort_unstable_by(|a, b| {
+            let moment = |x: &(Option<i64>, i64), y: &(Option<i64>, i64)| {
+                x.0.is_none().cmp(&y.0.is_none()).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1))
+            };
+            let by_moment = match (&a.moment, &b.moment) {
+                (Some(x), Some(y)) if desc => moment(y, x),
+                (Some(x), Some(y)) => moment(x, y),
+                (x, y) => x.is_none().cmp(&y.is_none()),
+            };
+            by_moment.then(b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)).then_with(|| capture(a, b))
+        }),
     }
 }
 
@@ -932,8 +959,18 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
     } else {
         ("i.file_name", "NULL", "")
     };
-    let sql =
-        format!("SELECT i.id, i.captured_at_ms, {name_col}, i.rating, {overall_col} FROM images i{join}{where_sql}");
+    let (moment_cols, moment_join) = if q.sort == ImageSort::TargetMoment {
+        (
+            "mo.started_at_ms, mo.id, COALESCE(ts.score, 0)",
+            " LEFT JOIN target_selection ts ON ts.image_id = i.id LEFT JOIN moments mo ON mo.id = ts.moment_id",
+        )
+    } else {
+        ("NULL, NULL, 0", "")
+    };
+    let sql = format!(
+        "SELECT i.id, i.captured_at_ms, {name_col}, i.rating, {overall_col}, {moment_cols}
+         FROM images i{join}{moment_join}{where_sql}"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt
         .query_map(params_from_iter(args.iter()), |r| {
@@ -943,6 +980,11 @@ pub fn list_image_ids(conn: &Connection, q: &ImageQuery) -> AppResult<Vec<ImageI
                 file_name: r.get(2)?,
                 rating: r.get(3)?,
                 overall: r.get(4)?,
+                moment: match r.get::<_, Option<i64>>(6)? {
+                    Some(id) => Some((r.get(5)?, id)),
+                    None => None,
+                },
+                score: r.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1997,6 +2039,7 @@ mod tests {
                 "i.rating DESC, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id"
             }
             (ImageSort::Rating, true) => "i.rating, i.captured_at_ms IS NULL, i.captured_at_ms, i.file_name, i.id",
+            (ImageSort::TargetMoment, _) => unreachable!("not compared here"),
         };
         // The pre-Phase-8 filter formulation.
         let legacy_where = |q: &ImageQuery| {

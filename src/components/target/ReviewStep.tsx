@@ -24,6 +24,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
   const busy = useRef(false);
   const first = useRef(true);
   const pending = useRef<number | null>(null);
+  const [pendTick, setPendTick] = useState(0);
   const stamp = ctx.run?.finishedAtMs ?? 0;
 
   const markReviewed = useCallback(
@@ -51,6 +52,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
         if (resume != null) first.current = false;
         setCur((prev) => {
           if (resume != null) return resume;
+          if (pending.current != null && list.includes(pending.current)) return pending.current; // undo: back on the photo
           const want = prefer ?? prev;
           if (want != null && list.includes(want)) return want;
           return list[Math.min(idx.current, list.length - 1)] ?? null; // a set-aside photo: the next one slides in
@@ -87,6 +89,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
   useEffect(() => {
     if (ctx.focus && ctx.focus.stage === "review") {
       pending.current = ctx.focus.id;
+      setPendTick((n) => n + 1);
       ctx.focusDone();
     }
   }, [ctx.focus]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -96,7 +99,7 @@ export const ReviewStep = forwardRef<StageRef, { ctx: TargetCtx }>(function Revi
       setAltIdx(0);
       pending.current = null;
     }
-  }, [ids, ctx.rev]);
+  }, [ids, ctx.rev, pendTick]);
 
   // The alternatives strip of the current photo.
   useEffect(() => {

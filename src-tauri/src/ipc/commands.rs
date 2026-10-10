@@ -2923,8 +2923,9 @@ pub async fn add_alternative(
 }
 
 /// Moves photos to `deliver` / `not_sure` / `set_aside` (locked; `alternative` ->
-/// `invalid_argument`). Joining the delivery set picks a photo, leaving it unflags a pick;
-/// set aside never rejects. Undo: `restore_target_snapshot(result.previous)`.
+/// `invalid_argument`). The flag follows at once, as the user's, also when the choice is
+/// unchanged (Keep): `deliver` picks, the others unflag a pick; set aside never rejects.
+/// Undo: `restore_target_snapshot(result.previous)`.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_target_choice(
@@ -2958,10 +2959,25 @@ pub async fn restore_target_snapshot(
     Ok(changed)
 }
 
-/// Writes the selection to the flags: delivered -> pick, the rest -> the scorer's suggestion
-/// without its pick (confident-defect rejects stay), for photos that are unflagged or flagged
-/// by Sieve (origin `auto`); the user's flags and all stars are left alone. Same result type as
-/// `apply_suggestions`. Unknown project -> `not_found`.
+/// Dry run of `apply_target_selection` with the same options (v20.1): exact counts of picks,
+/// rejects (and the rejects available with `rejects: true`), unflags, unchanged photos and the
+/// user's flags it would skip. Nothing is written. Unknown project -> `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn plan_target_apply(
+    catalog: State<'_, Catalog>,
+    project_id: ProjectId,
+    opts: TargetApplyOptions,
+) -> AppResult<TargetApplyPlan> {
+    catalog.run(move |c| target::plan_apply(c, project_id, opts)).await
+}
+
+/// Writes the selection to the flags (v20.1 options + result): delivered -> pick, the rest ->
+/// the scorer's suggestion without its pick (confident-defect rejects only with
+/// `opts.rejects`), for photos that are unflagged or flagged by Sieve (origin `auto`); the
+/// user's flags (incl. target edits) and all stars are left alone. Flags go to the catalog and
+/// the XMP sidecars (auto-sync notified). Undo: `restore_cull_snapshot(result.previous)`.
+/// Unknown project -> `not_found`.
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_target_selection(
@@ -2969,10 +2985,21 @@ pub async fn apply_target_selection(
     catalog: State<'_, Catalog>,
     xmp: State<'_, XmpSync>,
     project_id: ProjectId,
-) -> AppResult<ApplySuggestionsResult> {
-    let result = catalog.run(move |c| target::apply(c, project_id)).await?;
-    if result.applied > 0 {
+    opts: TargetApplyOptions,
+) -> AppResult<TargetApplyResult> {
+    let result = catalog.run(move |c| target::apply(c, project_id, opts)).await?;
+    if !result.changed.is_empty() {
         xmp.notify(&app);
     }
     Ok(result)
+}
+
+/// Locks the selection rows of `ids` as they are (no flag, choice or reason change; not an
+/// undoable edit), so a re-run keeps them: call it with the delivered photos the user reviewed
+/// before `run_target_selection` (v20.1). Ids without a row are ignored; unknown image ->
+/// `not_found`. Returns the ids newly locked.
+#[tauri::command]
+#[specta::specta]
+pub async fn lock_target_choices(catalog: State<'_, Catalog>, ids: Vec<ImageId>) -> AppResult<Vec<ImageId>> {
+    catalog.run(move |c| target::lock(c, &ids)).await
 }
