@@ -438,3 +438,80 @@ The three skips are acceptable. There are 8 new P2s.**
 ### Open P0 / P1 after Re-check 1
 - **P1-7a** Cmd+Enter is dead on a flagged photo you just fixed (frontend-dev, `App.tsx` `baselineLooksGood` + `EditContextBar`).
 - No open P0. Nothing needs the architect.
+
+## Re-check 2 (2026-10-10)
+
+Branch `phase-10-baseline-edit` at 555566a (frontend fixes a73acb9 merged). Evidence: mock backend (`vite --port 1470`),
+throwaway Playwright walks at 1280×800 and 1440×900. `?baseline=1`: Plan → Baseline edit (result) → Show the 7 → D on
+DSC00011 → Exposure +1.2 → Cmd+Enter ×7 → "All 7 checked" → Back to the baseline → Cmd+Z → `Undo the rest (41)` → Esc to
+the Plan. `?baseline=presets`: ←/→ across the preset tiles → Warm Matte → Next → Next → Exposure 2 → `Start from Auto` (×2).
+`tests/ui/baseline-edit.spec.ts`: 33/33 pass (includes the new P1-7a, N1/N2, N5–N8 tests). Screenshots were deleted
+afterwards.
+
+**Summary: P1-7a and N1–N8 are all fixed. No new P0 and nothing new from Phase 10. One P1 that was already there
+(not a Phase 10 regression) turned up at 1440: the top bar pushes Help and More actions off-screen. Three new P2s.**
+
+### Verdict per item
+
+| Item | Verdict | Evidence / note |
+|---|---|---|
+| P1-7a Cmd+Enter on a fixed photo | **Fixed** | Same result at both sizes. Before the edit, the chip reads "Needs a look: dark on purpose…" and the bar "7 of 7 left". After Exposure +1.2 the chip turns emerald: "Fixed · was: dark on purpose: kept darker than Auto", and the bar reads "6 of 7 left". `Next to review ›` has the title "Next photo that needs a look (Cmd+Enter or N)". No representative hint. Cmd+Enter #1 opens the next flagged photo (still "6 of 7"), and #2–#7 count down 5 → 0. After #7 the toast "All 7 checked" appears with `Back to the baseline`. 7 key presses for 7 photos, one of them fixed. |
+| N1 two "finished" notices | **Fixed** | The activity corner skips a finished `baseline_edit` (spec test on a live run). No "Edited 42 photos" in the corner in the walk. |
+| N2 finish toast over the review controls | **Fixed** | Opening the flagged filter dismisses the finish toast (spec test). Undo is still in the result and on Cmd+Z. |
+| N3 flagged representative shows no reason | **Fixed** | Every one of the 6 remaining flagged photos, the scene 2 representative included, showed the amber reason chip and `Looks good`. The representative fact is in the chip title. |
+| N4 Auto edit live in the flagged review | **Fixed** | `edit-auto` is absent while the needs-a-look filter is on. |
+| N5 undo copy | **Fixed** | (a) Cmd+Z in the view: "You changed 1 photo after the baseline. Use Undo the rest (41) to put the others back". (b) The result and the Plan banner: "Undone for 41 photos. DSC00011.ARW keeps your change." (c) `Look fine` / `Need a look` chips are hidden when undone. (d) `Undo the rest` is neutral grey (`bg-neutral-800`). |
+| N6 Start from Auto drops the preset's light | **Fixed** | Warm Matte opens at "+0.2 EV". Exposure 2 gives "+2.0 EV" (the readout updates about 1 s after the change, acceptable). `Start from Auto` brings back "+0.2 EV" (Exposure 0.25), and a second click is stable. History gets "Baseline: start from Auto". The tooltip says "…plus the preset's own light. The preset's colours stay". |
+| N7 preset arrow keys work once | **Fixed** | None → 1 → 2 → 3 → 3 (clamped at the end) → 2 → 1. Focus stays on the selected tile. |
+| N8 Finish shows only the first folder | **Fixed** (by code reading for several folders) | One folder: "The sidecars are in:" + path + Reveal / Copy. Several folders: the heading "The sidecars are in these folders:" and one row per folder, each with its own Reveal / Copy (`FinishStep.tsx`). The mock project has only one folder, so the multi-folder view was not rendered. |
+
+### New P1 (already there before Phase 10)
+
+#### R2-1 At 1440–1579 px wide, the top bar pushes Help and More actions off-screen
+- **Where**: `src/components/TopBar.tsx`, `const labelHide = "max-[1439px]:hidden"` (also the `Sieve` h1 and the Import label).
+- **What**: from 1440 px the toolbar buttons show text labels (Plan, Grid, Loupe, Compare, Develop, Info…). Measured
+  button left edges past the window edge, in every view (Plan, Baseline view, Grid, Develop):
+  - 1440 with a baseline run: `Help and FAQ` at x 1436 and `More actions` at x 1515.
+  - 1440 without a run: `Photo info` at x 1376, plus Help at x 1450 and More at x 1528.
+  - 1536: `More actions` at x 1528.
+  - 1580 and 1600: nothing is off-screen. At 1280 the labels are hidden and everything fits.
+  1440×900 is a common MacBook Air window. At that width the overflow menu and the Help button can only be reached by
+  their keys, and the right edge looks broken (half a button is cut off). This is not a Phase 10 regression: it happens
+  without a baseline run too. It is a cheap fix, so do it in this phase.
+- **Fix**:
+  1. Change the label breakpoint from 1440 to 1600: `labelHide = "max-[1599px]:hidden"`, and the same for the `Sieve`
+     h1 and the Import label. From 1440 to 1599 the buttons show icons with their existing titles, as at 1280.
+  2. Guard against overflow: give the right-hand button group `shrink-0` and the centre step bar `min-w-0`, and let the
+     step-pill counts ("· 43 keepers", "· baseline ✓") truncate first (`max-[1599px]:hidden` on the count span) rather
+     than the buttons.
+  3. Add a Playwright check at 1280, 1440, 1536 and 1600 widths in Plan and Develop: no button whose top is above 44 px
+     has `getBoundingClientRect().right > innerWidth`.
+- **Acceptance**: at 1440×900 and 1536×960, `Help and FAQ` and `More actions` are fully visible with 12 px right padding.
+  At 1600 and wider the labels still show.
+
+### New P2
+- **R2-2 Repeated Cmd+Enter stacks "All 7 checked" toasts.** Each press after the last photo pushes another identical
+  persistent toast (two copies in the walk). One of them stays on the Plan after the user has gone back and undone,
+  with a stale `Back to the baseline`. Fix: give the toast a fixed key (`baseline-all-checked`) so a new one replaces
+  the old one. Dismiss it when the needs-a-look filter is turned off or the Baseline view opens.
+- **R2-3 The last checked photo falls back to the scene-flow hint.** After `Looks good` on the 7th photo, the context bar
+  reads "Not the representative · Make it the representative (Shift+A)" while the review bar says "0 of 7 left". Fix:
+  in `EditContextBar`, use the same branch as `wasFlagged` for photos that were marked reviewed. Show an emerald chip
+  `Checked · was: <reason>` (title "You marked this photo Looks good"), and `Back to the result (Cmd+Alt+B)` instead of
+  `Next to review ›` when none are left.
+- **R2-4 The review bar at 0 left.** "Needs a look: 0 of 7 left" reads as a stuck counter. When 0 are left, show
+  `Baseline · All 7 checked · Back to the result (Cmd+Alt+B)` in emerald instead of amber.
+- Code nit (no UX effect): in `useBaseline.ts` the doc comment "The project's latest baseline run…" now sits above
+  `undoneText` instead of `useBaselineRun`.
+
+### Keyboard map changes since Re-check 1
+| Action | Re-check 1 | Now |
+|---|---|---|
+| Cmd+Enter in the flagged review | did nothing after an edit (P1-7a) | goes to the next flagged photo, then "All N checked" |
+| ←/→ on preset tiles | worked once (N7) | works, clamped at the ends |
+No conflicts were added.
+
+### Open P0 / P1 after Re-check 2
+- **R2-1** At 1440–1579 px the top bar pushes Help and More actions off-screen (frontend-dev, `TopBar.tsx` label breakpoint).
+  Not a Phase 10 regression. It is cheap and should be fixed before the phase gate.
+- No open P0. All Phase 10 P0 / P1 items (P0-1, P0-2, P1-1…P1-7, P1-7a) are fixed. Nothing needs the architect.
