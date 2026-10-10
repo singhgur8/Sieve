@@ -1,6 +1,6 @@
 // Baseline edit, step 2: choose the anchor, the one photo you adjust by hand. A good keeper with the subject in
 // reasonable light works best (a couple photo); the strip lists one keeper per scene.
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Check } from "lucide-react";
 import type { Library } from "../../hooks/useLibrary";
 import { Thumb } from "../edit/bits";
@@ -8,14 +8,21 @@ import { Thumb } from "../edit/bits";
 interface Props {
   lib: Library;
   candidates: number[];
+  /** Every keeper, for "Show all keepers". */
+  allIds: number[];
   anchorId: number;
   activeId: number | null;
   onPick: (id: number) => void;
 }
 
-export function AnchorStep({ lib, candidates, anchorId, activeId, onPick }: Props) {
+export function AnchorStep({ lib, candidates, allIds, anchorId, activeId, onPick }: Props) {
   const { ensure } = lib;
-  const ids = candidates.includes(anchorId) ? candidates : [anchorId, ...candidates];
+  const [all, setAll] = useState(false);
+  const [shown, setShown] = useState(120);
+  const base = all ? allIds : candidates;
+  const full = base.includes(anchorId) ? base : [anchorId, ...base];
+  // Big shoots: the grid grows 120 photos at a time, only those are loaded.
+  const ids = all ? full.slice(0, shown) : full;
   useEffect(() => ensure(ids), [ensure, ids.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="baseline-step-anchor">
@@ -23,7 +30,17 @@ export function AnchorStep({ lib, candidates, anchorId, activeId, onPick }: Prop
         <span>Pick the photo you will adjust by hand. Its light and white balance are the example for the rest, so choose a good keeper in typical light.</span>
         <button
           type="button"
-          className="ml-auto shrink-0 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 py-1 hover:bg-neutral-700 disabled:opacity-40"
+          className="ml-auto shrink-0 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 py-1 hover:bg-neutral-700"
+          data-testid="baseline-anchor-all"
+          aria-pressed={all}
+          title={all ? "Only the best keeper of each scene" : "List every keeper, not just one per scene"}
+          onClick={() => setAll((v) => !v)}
+        >
+          {all ? "One per scene" : `Show all keepers (${allIds.length})`}
+        </button>
+        <button
+          type="button"
+          className="shrink-0 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 py-1 hover:bg-neutral-700 disabled:opacity-40"
           data-testid="baseline-anchor-current"
           disabled={activeId == null}
           title={activeId == null ? "Open or select a photo first" : "Use the photo you have selected as the anchor"}
@@ -55,6 +72,11 @@ export function AnchorStep({ lib, candidates, anchorId, activeId, onPick }: Prop
             );
           })}
         </div>
+        {all && shown < full.length && (
+          <button type="button" className="mt-3 h-7 rounded-md bg-neutral-800 px-3 text-xs hover:bg-neutral-700" data-testid="baseline-anchor-more" title="Show more keepers" onClick={() => setShown((n) => n + 120)}>
+            Show more ({full.length - shown} left)
+          </button>
+        )}
       </div>
     </div>
   );

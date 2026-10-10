@@ -60,6 +60,8 @@ export type ActionId =
   | "autoEdit"
   | "baselineEdit"
   | "baselineClose"
+  | "baselineLooksGood"
+  | "baselineNext"
   | "before"
   | "split"
   | "crop"
@@ -197,6 +199,7 @@ export const KEYMAP: KeyDef[] = [
   { id: "selectBurst", group: "Scenes", label: "Select the active photo's burst", chords: [c("b", { mod: true, shift: true })], modes: ALL, display: ["Cmd+Shift+B"], where: "Everywhere" },
 
   // ---- workflow (steps of a project) ----
+  { id: "baselineEdit", group: "Workflow", label: "Baseline edit: preset + one photo -> the rest", chords: [c("b", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+B"], where: "Edit step: Plan, Develop" },
   { id: "stepCull", group: "Workflow", label: "Step 1: Cull", chords: [c("1", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+1"], where: "Project open" },
   { id: "stepEdit", group: "Workflow", label: "Step 2: Edit (again: Plan)", chords: [c("2", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+2"], where: "Project open" },
   { id: "stepExport", group: "Workflow", label: "Step 3: Export keepers", chords: [c("3", { mod: true, alt: true })], modes: ALL, display: ["Cmd+Alt+3"], where: "Project open" },
@@ -206,7 +209,6 @@ export const KEYMAP: KeyDef[] = [
   { id: "planSkip", group: "Workflow", label: "Skip / include the focused scene", chords: [], modes: ALL, display: ["S"], where: "Edit step: Plan", external: true },
   { id: "capsAdvance", group: "Culling", label: "Auto-advance while Caps Lock is on", chords: [], modes: ALL, display: ["Caps Lock"], where: "Everywhere", external: true },
   { id: "planStop", group: "Workflow", label: "Stop applying", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Plan (while applying)", external: true },
-  { id: "baselineEdit", group: "Workflow", label: "Baseline edit: preset + one photo -> the rest", chords: [c("b", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+B"], where: "Edit step: Plan, Develop" },
   { id: "baselineClose", group: "Workflow", label: "Leave the Baseline edit (not while it is running)", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Baseline edit", external: true },
   { id: "autoEdit", group: "Workflow", label: "Auto edit (my style)", chords: [c("u", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+U"], where: "Edit step: Plan, Develop" },
 
@@ -319,6 +321,10 @@ export const KEYMAP: KeyDef[] = [
   { id: "targetOpen", group: TARGET_GROUP, label: "Open Pick the best N (at the stage with unfinished work)", chords: [c("b")], modes: ["grid", "loupe"], display: ["B"], where: "Cull step" },
   { id: "targetUndo", group: TARGET_GROUP, label: "Undo the last change", chords: [c("z", { mod: true })], modes: ALL, display: ["Cmd+Z"], where: "Pick the best N", external: true },
   { id: "targetClose", group: TARGET_GROUP, label: "Back to the grid", chords: [c("Escape")], modes: ALL, display: ["Esc"], where: "Pick the best N", external: true },
+
+  // ---- baseline edit (its own group, last: the Workflow column of the cheat sheet has no room left) ----
+  { id: "baselineLooksGood", group: "Baseline edit", label: "Baseline edit: Looks good, next photo that needs a look", chords: [c("Enter", { mod: true })], modes: ["grid", "develop"], display: ["Cmd+Enter"], where: "Edit step: photos the baseline flagged" },
+  { id: "baselineNext", group: "Baseline edit", label: "Baseline edit view: next step; Cmd+Enter Edit N photos / Finish; Cmd+Z undo; hold \\ for Before", chords: [], modes: ALL, display: ["Enter", "Cmd+Enter"], where: "Edit step: Baseline edit", external: true },
 ];
 
 /** Keys of the "Pick the best N" overlay, by stage (the overlay passes its stage; `null` = the key does not apply there). */

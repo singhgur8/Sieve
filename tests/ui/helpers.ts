@@ -70,7 +70,7 @@ async function routeImages(page: Page) {
     const lut = u.searchParams.get("lut");
     const W = u.searchParams.get("p") ? 800 : 1200;
     const H = u.searchParams.get("p") ? 1200 : 800;
-    const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${m[2] === "before" ? 200 : hue},50%,${m[2] === "before" ? 40 : light}%)"/><stop offset="1" stop-color="hsl(${(hue + 60) % 360},55%,${light * 0.5}%)"/></linearGradient></defs><rect width="${W}" height="${H}" fill="url(#g)"/><text x="50%" y="55%" text-anchor="middle" font-family="Helvetica" font-size="90" fill="white" fill-opacity="0.9">${m[1]} ${m[2]} EV ${e}${lut ? " " + lut : ""}</text></svg>`;
+    const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${hue},50%,${m[2] === "before" ? 40 : light}%)"/><stop offset="1" stop-color="hsl(${(hue + 60) % 360},55%,${light * 0.5}%)"/></linearGradient></defs><rect width="${W}" height="${H}" fill="url(#g)"/><text x="50%" y="55%" text-anchor="middle" font-family="Helvetica" font-size="90" fill="white" fill-opacity="0.9">${m[1]} ${m[2]} EV ${e}${lut ? " " + lut : ""}</text></svg>`;
     return route.fulfill({ contentType: "image/svg+xml", body });
   });
 }

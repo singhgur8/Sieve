@@ -1,7 +1,7 @@
 // Baseline edit (IPC v21) helpers: the session (preset + anchor) the user is building, the project's latest run, the
 // anchor's offset from its own Auto (for the Develop bar) and the plain-language text for it.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { commands, events, unwrap, type BaselineAnchor, type BaselineRun, type BaselineScope, type BaselineSettings, type LightOffset } from "../ipc";
+import { commands, events, unwrap, type BaselineAnchor, type BaselineRun, type BaselineScope, type BaselineSettings, type HistoryEntry, type LightOffset, type LightValues, type ParametricAdjustments } from "../ipc";
 
 /** What the user chose so far. `stage: "rest"` = they adjusted the anchor and pressed "Edit the rest". */
 export interface BaselineSession {
@@ -11,6 +11,10 @@ export interface BaselineSession {
   stage: "setup" | "rest";
   /** `anchorId:presetId` the preset was applied to in Develop already (never applied twice over the user's edits). */
   appliedKey?: string;
+  /** The preset applied to the anchor in this session (null = none), for replacing it when the choice changes. */
+  appliedPresetId?: number | null;
+  /** The preset's own light values (exposure .. blacks), added to the anchor's Auto when it starts from Auto. */
+  presetLight?: Partial<Pick<LightValues, "exposure" | "contrast" | "highlights" | "shadows" | "whites" | "blacks">>;
 }
 
 export const EMPTY_SESSION: BaselineSession = { presetId: null, presetName: null, anchorId: null, stage: "setup" };
@@ -28,7 +32,8 @@ const sign = (n: number, digits = 0) => `${n > 0 ? "+" : n < 0 ? "-" : ""}${Math
 export function describeOffset(o: LightOffset | null | undefined): string {
   if (!o) return "";
   const parts: string[] = [];
-  if (Math.abs(o.exposure) >= 0.05) parts.push(`${sign(Math.round(o.exposure * 10) / 10, 1)} EV`);
+  const ev = Math.round(o.exposure * 10) / 10;
+  if (ev !== 0) parts.push(`${sign(ev, 1)} EV`);
   if (Math.abs(o.temperatureMired) >= 4) parts.push(`${o.temperatureMired < 0 ? "warmer" : "cooler"} than Auto`);
   if (Math.abs(o.tint) >= 3) parts.push(`${o.tint > 0 ? "more magenta" : "more green"}`);
   const others: [string, number][] = [
@@ -67,6 +72,12 @@ export function useBaselineRun(projectId: number | null) {
     setRun(null);
     setLoaded(false);
     void refresh();
+  }, [refresh]);
+  // The run's batch can be undone from elsewhere (Cmd+Z in the Plan, a toast, the scene menu): read it again on focus.
+  useEffect(() => {
+    const f = () => void refresh();
+    window.addEventListener("focus", f);
+    return () => window.removeEventListener("focus", f);
   }, [refresh]);
   useEffect(() => {
     let off: (() => void) | undefined;
@@ -108,3 +119,93 @@ export function useAnchorOffset(projectId: number | null, anchorId: number | nul
   }, [projectId, anchorId, presetId, tick]);
   return { anchor, error };
 }
+
+const LIGHT_SIMPLE = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"] as const;
+const clampTo = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+export const START_LABEL = "Baseline: start from Auto";
+const OWN_ENTRY = /^(Original|Preset:|Baseline)/;
+const LIGHT_LABEL = /^(Exposure|Contrast|Highlights|Shadows|Whites|Blacks|Temp|Tint|White Balance|Auto|Reset Basic)/i;
+
+/** What the user changed by hand (every entry that is not the original, a preset or a baseline step). */
+export const userEntries = (entries: HistoryEntry[]) => entries.filter((e) => !OWN_ENTRY.test(e.label));
+/** The user set light by hand: it must never be replaced by Auto. */
+export const lightEditedByUser = (entries: HistoryEntry[]) => userEntries(entries).length > 0;
+/** The user changed colour / look settings by hand (light edits do not count). */
+export const lookEditedAfterPreset = (entries: HistoryEntry[]) => userEntries(entries).some((e) => !LIGHT_LABEL.test(e.label));
+
+/**
+ * True when the anchor's light is still untouched and has not started from Auto since its last preset: it may start
+ * from Auto now. Never overwrites light the user set by hand.
+ */
+export function anchorLightUntouched(entries: HistoryEntry[]): boolean {
+  if (lightEditedByUser(entries)) return false;
+  let last = -1;
+  entries.forEach((e, i) => e.label.startsWith("Preset:") && (last = i));
+  return !entries.slice(last + 1).some((e) => e.label === START_LABEL);
+}
+
+/** The light the anchor starts from: its own Auto plus the preset's light values (a preset white balance stays absolute). */
+export function startLight(auto: LightValues, presetLight: BaselineSession["presetLight"], keepWb: ParametricAdjustments["whiteBalance"] | null): LightValues {
+  const out: LightValues = { ...auto };
+  for (const k of LIGHT_SIMPLE) out[k] = clampTo(Math.round((auto[k] + (presetLight?.[k] ?? 0)) * 100) / 100, k === "exposure" ? -5 : -100, k === "exposure" ? 5 : 100);
+  if (keepWb && keepWb.mode === "custom") {
+    out.temperatureK = keepWb.temperatureK;
+    out.tint = keepWb.tint;
+  }
+  return out;
+}
+
+/** The preset's own light values: what its apply left on the (untouched) anchor in the six simple light sliders. */
+export function lightOfAdjustments(a: ParametricAdjustments): NonNullable<BaselineSession["presetLight"]> {
+  const o: NonNullable<BaselineSession["presetLight"]> = {};
+  for (const k of LIGHT_SIMPLE) o[k] = a[k];
+  return o;
+}
+
+/**
+ * Step 3 opens: the anchor's light starts at its own Auto (+ the preset's light values), so "same as Auto" is the
+ * zero point. Returns the preset's light values for the "Start from Auto" button. One history entry.
+ */
+export async function startAnchorFromAuto(projectId: number, anchorId: number, presetId: number | null, presetHasWb: boolean): Promise<NonNullable<BaselineSession["presetLight"]> | null> {
+  const h = await unwrap(commands.getHistory(anchorId));
+  const cur = await unwrap(commands.getAdjustments(anchorId));
+  const presetLight = lightOfAdjustments(cur);
+  if (!anchorLightUntouched(h.entries)) return null;
+  const pv = await unwrap(commands.previewBaseline(projectId, baselineSettings(anchorId, presetId), { sampleCount: 1, imageIds: null }));
+  const l = startLight(pv.anchor.auto, presetLight, presetHasWb ? cur.whiteBalance : null);
+  await unwrap(
+    commands.saveAdjustments(
+      anchorId,
+      { ...cur, exposure: l.exposure, contrast: l.contrast, highlights: l.highlights, shadows: l.shadows, whites: l.whites, blacks: l.blacks, whiteBalance: { mode: "custom", temperatureK: l.temperatureK, tint: l.tint } },
+      START_LABEL,
+    ),
+  );
+  return presetLight;
+}
+
+/** Ids (of `ids`) whose settings are still exactly what a baseline run wrote (`get_baseline_provenance` state `on_baseline`). */
+export function useOnBaselineIds(ids: number[], tick: unknown): Set<number> {
+  const [set, setSet] = useState<Set<number>>(new Set());
+  const key = ids.join(",");
+  useEffect(() => {
+    if (ids.length === 0) return void setSet((s) => (s.size === 0 ? s : new Set()));
+    let dead = false;
+    unwrap(commands.getBaselineProvenance(ids))
+      .then((r) => !dead && setSet(new Set(r.filter((x) => x.state === "on_baseline").map((x) => x.imageId))))
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [key, tick]); // eslint-disable-line react-hooks/exhaustive-deps
+  return set;
+}
+
+/**
+ * `undo_edit_batch(batchId, { keepLaterEdits })` (architect, pending) restores the photos still on the batch's entry and
+ * leaves the ones edited since. The generated wrapper takes a second argument once the contract has it; until then the
+ * "Undo the rest" button is not offered.
+ */
+export const KEEP_LATER_SUPPORTED = commands.undoEditBatch.length >= 2;
+type UndoWithOptions = (batchId: number, options: { keepLaterEdits: boolean } | null) => ReturnType<typeof commands.undoEditBatch>;
+export const undoEditBatchWith = (batchId: number, options: { keepLaterEdits: boolean } | null) => (commands.undoEditBatch as unknown as UndoWithOptions)(batchId, options);

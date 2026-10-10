@@ -3,6 +3,7 @@
 // Markers ("needs a look", "auto edited", "applied", skipped) come from the persisted plan (IPC v15), never from session state.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { commands, DEFAULT_SCENE_APPLY_OPTIONS, events, isEditPlanDone, unwrap, type EditBatchInfo, type EditPlan, type ImageEditState, type KeeperRule, type SceneApplyOptions, type SceneEditEntry, type StyleModelStatus } from "../ipc";
+import { undoEditBatchWith } from "./useBaseline";
 import { describeError } from "../lib/errors";
 import type { ToastApi } from "../components/Toasts";
 import { flushEdits } from "../lib/editFlush";
@@ -381,9 +382,9 @@ export function useWorkflow(d: Deps) {
 
   // ---- undo ----
   const undoBatch = useCallback(
-    async (batch: Pick<LastBatch, "batchId" | "label">) => {
+    async (batch: Pick<LastBatch, "batchId" | "label">, opts?: { keepLaterEdits?: boolean }) => {
       try {
-        const r = await unwrap(commands.undoEditBatch(batch.batchId));
+        const r = await unwrap(opts?.keepLaterEdits ? undoEditBatchWith(batch.batchId, { keepLaterEdits: true }) : commands.undoEditBatch(batch.batchId));
         setBatchStack((st) => st.filter((b) => b.batchId !== batch.batchId));
         const tid = batchToast.current.get(batch.batchId);
         if (tid != null) {

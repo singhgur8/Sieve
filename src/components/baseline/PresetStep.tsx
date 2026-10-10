@@ -2,7 +2,7 @@
 // (`renderPreviewVariant`, slot `preview`, one at a time and only for tiles in view), plus "No preset".
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Search } from "lucide-react";
-import { commands, unwrap, type ParametricAdjustments, type StyleGroup, type StylePreset } from "../../ipc";
+import { BASELINE_LOOK_FIELDS, commands, copyAdjustmentFields, defaultAdjustments, unwrap, type ParametricAdjustments, type StyleGroup, type StylePreset } from "../../ipc";
 
 // One render at a time: all tiles share the anchor's `preview` slot, a newer request would supersede an older one.
 let chain: Promise<unknown> = Promise.resolve();
@@ -101,7 +101,8 @@ export function PresetStep({ groups, anchorId, anchorName, presetId, onPick, onC
     let dead = false;
     setAdj(null);
     unwrap(commands.getAdjustments(anchorId))
-      .then((a) => !dead && setAdj(a))
+      // The tiles show each preset on the anchor with its look reset to neutral (light stays), never on top of an earlier preset.
+      .then((a) => !dead && setAdj(copyAdjustmentFields(a, defaultAdjustments(), BASELINE_LOOK_FIELDS)))
       .catch(onError);
     return () => {
       dead = true;
@@ -142,14 +143,29 @@ export function PresetStep({ groups, anchorId, anchorName, presetId, onPick, onC
           </button>
         </span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-4" data-testid="baseline-preset-grid">
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
+      <div
+        className="min-h-0 flex-1 overflow-y-auto p-4"
+        data-testid="baseline-preset-grid"
+        onKeyDown={(e) => {
+          // Arrow keys move between the tiles (and choose them); Enter then goes to the next step.
+          const dir = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+          if (!dir) return;
+          const tiles = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('button[data-testid^="baseline-preset-"]')];
+          const at = tiles.indexOf(document.activeElement as HTMLButtonElement);
+          const next = tiles[Math.min(tiles.length - 1, Math.max(0, (at < 0 ? tiles.findIndex((t) => t.dataset.selected === "true") : at) + dir))];
+          if (!next) return;
+          e.preventDefault();
+          next.focus();
+          next.click();
+        }}
+      >
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
           {!needle && <Tile testid="baseline-preset-none" imageId={anchorId} adj={adj} preset={null} label="No preset" sub="your photo as it is" selected={presetId == null} onPick={() => onPick(null)} />}
         </div>
         {list.map(({ g, presets }) => (
           <section key={g.id} className="mt-4" data-testid={`baseline-preset-group-${g.id}`}>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">{g.name}</h3>
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
               {presets.map((p) => (
                 <Tile key={p.id} testid={`baseline-preset-${p.id}`} imageId={anchorId} adj={adj} preset={p} label={p.name} sub={g.name} selected={presetId === p.id} onPick={() => onPick(p)} />
               ))}

@@ -3,10 +3,10 @@
 // rest, 5 Finish in Lightroom.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, Layers } from "lucide-react";
-import { commands, unwrap, type BaselineRun, type StylePreset } from "../../ipc";
+import { BASELINE_LIGHT_FIELDS, BASELINE_LOOK_FIELDS, commands, copyAdjustmentFields, defaultAdjustments, unwrap, type BaselineRun, type StylePreset } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import { useStyleLibrary } from "../../hooks/useDevelopV14";
-import type { BaselineSession } from "../../hooks/useBaseline";
+import { lightEditedByUser, lookEditedAfterPreset, startAnchorFromAuto, type BaselineSession } from "../../hooks/useBaseline";
 import { modalCount } from "../../lib/modal";
 import { HelpLink } from "../HelpLink";
 import { PresetStep } from "./PresetStep";
@@ -41,7 +41,14 @@ interface Props {
   run: BaselineRun | null;
   onRunStarted: (r: BaselineRun) => void;
   onApplied: (r: BaselineRun) => void;
-  onUndo: (batch: { batchId: number; label: string }) => Promise<void>;
+  onUndo: (batch: { batchId: number; label: string }, opts?: { keepLaterEdits: boolean }) => Promise<void>;
+  /** Read the run (and whether its batch can still be undone) again. */
+  onRefresh: () => void;
+  /** Flagged photos the user has not marked "Looks good" yet. */
+  reviewLeft: Set<number>;
+  projectName: string;
+  /** The project's folders (the sidecars are written next to the RAWs). */
+  folders: string[];
   onClose: () => void;
   /** Step 3: open Develop on the anchor (the preset has been applied to it). */
   onDevelop: (anchorId: number) => void;
@@ -54,6 +61,7 @@ export function BaselineView(p: Props) {
   const { session, setSession, run } = p;
   const [step, setStep] = useState<BaselineStepId>(p.initialStep);
   const [preparing, setPreparing] = useState(false);
+  const [confirm, setConfirm] = useState<{ from: string; to: string } | null>(null);
   const styles = useStyleLibrary(p.onError);
   const anchorId = session.anchorId ?? p.defaultAnchor;
   const anchorName = anchorId != null ? (p.lib.getEntry(anchorId)?.fileName ?? `#${anchorId}`) : "";
@@ -71,6 +79,27 @@ export function BaselineView(p: Props) {
     const name = styles.groups.flatMap((g) => g.presets).find((x) => x.id === session.presetId)?.name;
     if (name) setSession((s) => ({ ...s, presetName: name }));
   }, [styles.groups, session.presetId, session.presetName, setSession]);
+  // Opened straight on "Edit the rest" with no session: the preset is the run's, else the one the anchor carries.
+  useEffect(() => {
+    if (p.initialStep < 4 || session.presetId != null || session.appliedKey || anchorId == null) return;
+    const fromRun = run && run.settings.anchorId === anchorId ? run.settings.presetId : null;
+    if (fromRun != null) return void setSession((x) => (x.presetId == null ? { ...x, presetId: fromRun } : x));
+    let dead = false;
+    unwrap(commands.getHistory(anchorId))
+      .then((h) => !dead && h.appliedPresetId != null && setSession((x) => (x.presetId == null && !x.appliedKey ? { ...x, presetId: h.appliedPresetId ?? null } : x)))
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [anchorId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The window title tells projects apart in Mission Control and the Window menu.
+  useEffect(() => {
+    const before = document.title;
+    document.title = `${p.projectName} · Baseline edit · Sieve`;
+    return () => {
+      document.title = before;
+    };
+  }, [p.projectName]);
   // A finished run refreshes the library once (not for the run that was already finished when this view opened).
   const seen = useRef<number | null>(run?.state === "finished" ? run.id : null);
   useEffect(() => {
@@ -80,32 +109,92 @@ export function BaselineView(p: Props) {
     }
   }, [run]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const confirmRef = useRef(confirm);
+  confirmRef.current = confirm;
+  const stepRef = useRef(step);
+  stepRef.current = step;
+  // The key handler is registered ONCE and reads the changing values through refs. Re-registering it on every render
+  // (it used to depend on `onClose`, a new function each App render) lost a keypress now and then: another capture
+  // listener's setState (App's Caps Lock sync) lets React flush the pending passive effects in the microtask between two
+  // listeners of the same keydown, which removes this handler before it is reached and adds the new one too late to be
+  // called for that event (a removed listener is skipped, a listener added during dispatch is not run for it).
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const closeRef = useRef(p.onClose);
+  closeRef.current = p.onClose;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || running || modalCount() > 0 || document.querySelector('[role="dialog"], [role="menu"]')) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      p.onClose();
+      const running = runningRef.current;
+      const overlay = modalCount() > 0 || document.querySelector('[role="dialog"], [role="menu"]');
+      if (e.key === "Escape") {
+        if (running || overlay) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (confirmRef.current) return void setConfirm(null);
+        return closeRef.current();
+      }
+      if (e.key !== "Enter" || e.altKey || e.shiftKey || running || overlay) return;
+      // Enter = the next step; Cmd+Enter = the primary action of the step (Edit N photos / Finish in Lightroom).
+      const t = e.target as HTMLElement | null;
+      const mod = e.metaKey || e.ctrlKey;
+      const onTile = !!t?.closest("button[data-selected]");
+      if (!mod && !onTile && t && t.closest("button, a, input, select, textarea, [role='radio']")) return;
+      const click = (id: string) => {
+        const el = document.querySelector<HTMLButtonElement>(`[data-testid="${id}"]`);
+        if (!el || el.disabled) return false;
+        e.preventDefault();
+        e.stopPropagation();
+        el.click();
+        return true;
+      };
+      const st = stepRef.current;
+      if (st === 1 || st === 2) void click("baseline-next");
+      else if (st === 4 && mod) void (click("baseline-apply") || click("baseline-to-finish"));
+      else if (st === 4) void click("baseline-to-finish");
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [running, p.onClose]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   const pickPreset = useCallback(
     (pr: StylePreset | null) => setSession((s) => ({ ...s, presetId: pr?.id ?? null, presetName: pr?.name ?? null })),
     [setSession],
   );
 
-  const goDevelop = async () => {
+  // Changing the preset after one was applied: the look goes back to neutral first (confirmed when the user changed it).
+  const goDevelop = async (confirmed = false) => {
     if (anchorId == null) return;
     setPreparing(true);
     try {
       const key = `${anchorId}:${session.presetId}`;
-      if (session.presetId != null && session.appliedKey !== key) {
+      const all = styles.groups.flatMap((g) => g.presets);
+      const preset = session.presetId != null ? all.find((x) => x.id === session.presetId) : undefined;
+      let presetLight = session.presetLight;
+      let appliedPresetId = session.appliedPresetId;
+      if (session.appliedKey !== key) {
         const h = await unwrap(commands.getHistory(anchorId));
-        if (h.appliedPresetId !== session.presetId) await unwrap(commands.applyPreset([anchorId], session.presetId));
+        const sameAnchor = session.appliedKey?.startsWith(`${anchorId}:`) ?? false;
+        const prev = (sameAnchor ? session.appliedPresetId : undefined) ?? h.appliedPresetId ?? null;
+        if (session.presetId == null ? prev != null : h.appliedPresetId !== session.presetId) {
+          if (prev != null && prev !== session.presetId) {
+            if (!confirmed && lookEditedAfterPreset(h.entries)) {
+              setConfirm({ from: all.find((x) => x.id === prev)?.name ?? "the earlier preset", to: session.presetName ?? "no preset" });
+              return;
+            }
+            const cur = await unwrap(commands.getAdjustments(anchorId));
+            // The user's own light stays; untouched light goes back to neutral so the new preset's values start clean.
+            const fields = lightEditedByUser(h.entries) ? [...BASELINE_LOOK_FIELDS] : [...BASELINE_LOOK_FIELDS, ...BASELINE_LIGHT_FIELDS];
+            await unwrap(commands.saveAdjustments(anchorId, copyAdjustmentFields(cur, defaultAdjustments(), fields), `Baseline preset: ${session.presetName ?? "none"}`));
+          }
+          if (session.presetId != null) await unwrap(commands.applyPreset([anchorId], session.presetId));
+        }
+        appliedPresetId = session.presetId;
+        // The light starts at the anchor's own Auto (+ the preset's light values), so "same as Auto" is the zero point.
+        const pl = await startAnchorFromAuto(p.projectId, anchorId, session.presetId, !!preset?.fields.includes("white_balance"));
+        if (pl) presetLight = pl;
       }
-      setSession((s) => ({ ...s, anchorId, stage: "setup", appliedKey: s.presetId != null ? key : undefined }));
+      setConfirm(null);
+      setSession((s) => ({ ...s, anchorId, stage: "setup", appliedKey: key, appliedPresetId, presetLight }));
       p.onDevelop(anchorId);
     } catch (e) {
       p.onError(e);
@@ -162,7 +251,7 @@ export function BaselineView(p: Props) {
         <PresetStep groups={styles.groups} anchorId={anchorId} anchorName={anchorName} presetId={session.presetId} onPick={pickPreset} onChangeAnchor={() => setStep(2)} onError={p.onError} />
       )}
       {step === 2 && anchorId != null && (
-        <AnchorStep lib={p.lib} candidates={p.candidates} anchorId={anchorId} activeId={p.activeId} onPick={(id) => setSession((s) => ({ ...s, anchorId: id }))} />
+        <AnchorStep lib={p.lib} candidates={p.candidates} allIds={p.keeperIds} anchorId={anchorId} activeId={p.activeId} onPick={(id) => setSession((s) => ({ ...s, anchorId: id }))} />
       )}
       {step === 4 && anchorId != null && (
         <RestStep
@@ -176,14 +265,30 @@ export function BaselineView(p: Props) {
           sceneLabel={p.sceneLabel}
           run={run}
           onRunStarted={p.onRunStarted}
-          onUndo={() => (run?.batch ? p.onUndo({ batchId: run.batch.batchId, label: "Baseline Edit" }) : Promise.resolve())}
+          reviewLeft={p.reviewLeft}
+          onRefresh={p.onRefresh}
+          onUndo={(o) => (run?.batch ? p.onUndo({ batchId: run.batch.batchId, label: "Baseline Edit" }, o) : Promise.resolve())}
           onShowFlagged={p.onShowFlagged}
           onFinish={() => setStep(5)}
           onError={p.onError}
         />
       )}
-      {step === 5 && <FinishStep onExport={p.onExport} onPlan={p.onClose} onError={p.onError} />}
+      {step === 5 && <FinishStep folders={p.folders} anchorId={anchorId} onExport={p.onExport} onPlan={p.onClose} onError={p.onError} />}
       {anchorId == null && <p className="p-8 text-center text-sm text-neutral-400" data-testid="baseline-no-anchor">There are no keepers to use as the anchor yet. Pick photos in Cull first.</p>}
+
+      {confirm && (
+        <div className="flex shrink-0 items-center gap-3 border-t border-amber-900 bg-amber-950 px-4 py-2 text-xs text-amber-100" role="alert" data-testid="baseline-replace-confirm">
+          <span>
+            Replace {confirm.from} and your colour changes on {anchorName} with {confirm.to}? Your light and white balance stay.
+          </span>
+          <button type="button" className="ml-auto h-7 rounded-md bg-amber-700 px-3 font-medium text-white hover:bg-amber-600" data-testid="baseline-replace-ok" title="Replace the look on the anchor photo; you can still undo each step in Develop" onClick={() => void goDevelop(true)}>
+            Replace
+          </button>
+          <button type="button" className="h-7 rounded-md bg-neutral-800 px-3 hover:bg-neutral-700" data-testid="baseline-replace-cancel" title="Keep the look the anchor has now (Esc)" onClick={() => setConfirm(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
 
       {(step === 1 || step === 2) && anchorId != null && (
         <footer className="flex h-14 shrink-0 items-center gap-3 border-t border-neutral-800 px-4 text-xs">

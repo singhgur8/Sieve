@@ -50,6 +50,12 @@ interface Props {
   /** Baseline edit (Phase 10): the main path of the Edit step. */
   onBaseline?: () => void;
   baselineRun?: BaselineRun | null;
+  /** Representatives whose settings are still what a baseline run wrote (`get_baseline_provenance`): nothing to apply from them. */
+  onBaselineIds?: Set<number>;
+  /** Flagged photos the user has not marked "Looks good" yet (null = no baseline result). */
+  flaggedLeft?: number | null;
+  /** Banner: open the baseline view straight on "Finish in Lightroom". */
+  onBaselineFinish?: () => void;
 }
 
 export function PlanView(p: Props) {
@@ -62,7 +68,11 @@ export function PlanView(p: Props) {
   const counts = wf.plan?.counts;
   const todo = rows.filter((r) => (r.ui === "todo" || r.ui === "reset") && !r.skipped);
   // Scenes the "Apply" button handles: edited ones, and applied ones that gained keepers since.
-  const pending = rows.filter((r) => !r.skipped && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
+  const onBase = p.onBaselineIds;
+  const isOnBase = (r: SceneRow) => !!onBase?.has(r.entry.representativeId);
+  const pending = rows.filter((r) => !r.skipped && !isOnBase(r) && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || (r.ui === "applied" && r.unapplied.length > 0)));
+  const bRun = p.baselineRun;
+  const baselineDone = bRun?.state === "finished" && bRun.batch != null && bRun.batch.undoneAtMs == null;
   const pendingTargets = pending.reduce((a, r) => a + (r.ui === "applied" ? r.unapplied.length : r.targets), 0);
   const allDone = wf.done;
   const visible = wf.layout.visible;
@@ -188,8 +198,8 @@ export function PlanView(p: Props) {
                   <span className="h-full bg-emerald-500" style={{ width: `${((counts?.applied ?? 0) / rows.length) * 100}%` }} />
                   <span className="h-full bg-sky-500" style={{ width: `${(((counts?.edited ?? 0) + (counts?.outdated ?? 0)) / rows.length) * 100}%` }} />
                 </span>
-                <span className="min-w-0 truncate whitespace-nowrap" data-testid="plan-counts">
-                  {(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · {counts?.applied ?? 0} applied · {counts?.toEdit ?? 0} to do{(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}
+                <span className="min-w-0 truncate whitespace-nowrap" data-testid="plan-counts" data-kind={baselineDone ? "baseline" : "scenes"}>
+                  {baselineDone && bRun ? `Baseline: ${bRun.counts.applied + bRun.counts.flagged} of ${keeperCount} keepers${(p.flaggedLeft ?? bRun.counts.flagged) > 0 ? ` · ${p.flaggedLeft ?? bRun.counts.flagged} need a look` : ""}` : `${(counts?.edited ?? 0) + (counts?.outdated ?? 0)} edited · ${counts?.applied ?? 0} applied · ${counts?.toEdit ?? 0} to do${(counts?.skipped ?? 0) > 0 ? ` · ${counts?.skipped} skipped` : ""}`}
                 </span>
               </div>
             )}
@@ -217,7 +227,7 @@ export function PlanView(p: Props) {
             <button className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600" data-testid="plan-continue-export" onClick={p.onContinueExport}>
               Continue to Export <ArrowRight className="size-3.5" /> {keeperCount}
             </button>
-          ) : (pending.length === 0 && (counts?.toEdit ?? 0) === 0) || (pending.length === 0 && rows.some((r) => r.ui === "applied" || r.ui === "reset")) ? null : (
+          ) : (pending.length === 0 && baselineDone) || (pending.length === 0 && (counts?.toEdit ?? 0) === 0) || (pending.length === 0 && rows.some((r) => r.ui === "applied" || r.ui === "reset")) ? null : (
             <div className="flex shrink-0 items-center gap-2 max-[1439px]:flex-col-reverse max-[1439px]:items-end max-[1439px]:gap-0.5" data-testid="plan-apply-block">
             {pending.length === 0 && busy == null && !applying && (
               <ApplyWhy
@@ -275,7 +285,7 @@ export function PlanView(p: Props) {
         </div>
       </header>
 
-      {p.onBaseline && !wf.grouping && wf.plan && wf.plan.keeperIds.length > 0 && <BaselineBanner run={p.baselineRun ?? null} onOpen={p.onBaseline} />}
+      {p.onBaseline && !wf.grouping && wf.plan && wf.plan.keeperIds.length > 0 && <BaselineBanner run={p.baselineRun ?? null} flaggedLeft={p.flaggedLeft ?? null} onOpen={p.onBaseline} onFinish={p.onBaselineFinish} />}
 
       {p.summary && !wf.grouping && (
         <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-2 border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="plan-keeper-formula">
@@ -368,7 +378,8 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
   const { wf, lib } = p;
   const e = r.entry;
   const id = e.sceneId;
-  const line = statusLine(r);
+  const onBase = !!p.onBaselineIds?.has(e.representativeId);
+  const line = onBase && !r.skipped ? { text: "On baseline", cls: "text-emerald-300", extra: r.review.length > 0 ? ` · ${r.review.length} need a look` : undefined } : statusLine(r);
   const t = p.sceneTimes(id);
   const repEntry = lib.getEntry(e.representativeId);
   const others = e.imageIds.filter((i) => i !== e.representativeId);
@@ -401,6 +412,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
     <article
       data-testid={`plan-scene-${id}`}
       data-status={r.ui}
+      data-on-baseline={onBase}
       data-focused={focused}
       onClick={() => p.onFocus(id)}
       data-skipped={r.skipped}
@@ -440,7 +452,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
           )}
           {!busyHere && line.extra && <span className="text-amber-300">{line.extra}</span>}
         </p>
-        {!busyHere && !(r.ui === "todo" && !r.skipped) && (
+        {!busyHere && !onBase && !(r.ui === "todo" && !r.skipped) && (
           <ApplyWhy
             block={applyBlock(r)}
             testid={`plan-apply-why-${id}`}
@@ -470,7 +482,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         )}
       </div>
       <div className="flex shrink-0 items-center justify-end gap-2" onClick={(ev) => ev.stopPropagation()}>
-        {!r.skipped && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || newKeepers > 0) && (
+        {!r.skipped && !onBase && (r.ui === "edited" || r.ui === "auto" || r.ui === "stale" || newKeepers > 0) && (
           <button
             className="h-7 whitespace-nowrap rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
             data-testid={`plan-apply-${id}`}
@@ -541,11 +553,14 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
 }
 
 /** The obvious way to edit: one preset + one adjusted photo -> the rest. Scene by scene (below) stays for refinements. */
-function BaselineBanner({ run, onOpen }: { run: BaselineRun | null; onOpen: () => void }) {
-  const finished = run?.state === "finished" && run.batch != null && run.batch.undoneAtMs == null;
+function BaselineBanner({ run, flaggedLeft, onOpen, onFinish }: { run: BaselineRun | null; flaggedLeft: number | null; onOpen: () => void; onFinish?: () => void }) {
   const running = run?.state === "running";
+  const undone = run?.state === "finished" && run.batch?.undoneAtMs != null;
+  const finished = run?.state === "finished" && run.batch != null && run.batch.undoneAtMs == null;
+  const left = flaggedLeft ?? run?.counts.flagged ?? 0;
+  const checked = Math.max(0, (run?.counts.flagged ?? 0) - left);
   return (
-    <div className="flex shrink-0 items-center gap-3 border-b border-emerald-900 bg-emerald-950/60 px-3 py-2 text-xs" data-testid="plan-baseline-banner" data-state={running ? "running" : finished ? "done" : "new"}>
+    <div className="flex shrink-0 items-center gap-3 border-b border-emerald-900 bg-emerald-950/60 px-3 py-2 text-xs" data-testid="plan-baseline-banner" data-state={running ? "running" : finished ? "done" : undone ? "undone" : "new"}>
       <Layers className="size-5 shrink-0 text-emerald-400" aria-hidden />
       <div className="min-w-0 flex-1 text-neutral-200">
         <div className="text-sm font-semibold text-emerald-100">Baseline edit</div>
@@ -553,17 +568,24 @@ function BaselineBanner({ run, onOpen }: { run: BaselineRun | null; onOpen: () =
           {running
             ? "Running now…"
             : finished
-              ? `${run!.message ?? "Done"}. Open it to review the result, undo it or finish in Lightroom.`
-              : "Pick a preset, adjust one photo, and Sieve edits the rest of the shoot the same way, each photo with its own light. Then finish in Lightroom."}
+              ? `${run!.counts.applied + run!.counts.flagged} edited${left > 0 ? ` · ${left} need a look` : ""}${checked > 0 ? ` · ${checked} checked` : ""}. Open it to review the result, undo it or finish in Lightroom.`
+              : undone
+                ? "Undone. The photos are back to how they were."
+                : "Pick a preset, adjust one photo, and Sieve edits the rest of the shoot the same way, each photo with its own light. Then finish in Lightroom."}
         </div>
       </div>
+      {finished && onFinish && (
+        <button className="flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-neutral-800 px-3 text-xs font-medium text-neutral-100 hover:bg-neutral-700" data-testid="plan-baseline-finish" title="Make sure the sidecars are saved and open the edit in Lightroom" onClick={onFinish}>
+          Finish in Lightroom <ArrowRight className="size-3.5" />
+        </button>
+      )}
       <button
         className="flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-4 text-sm font-semibold text-white hover:bg-emerald-600"
         data-testid="plan-baseline"
         title="Start here: pick a preset, adjust one photo, then edit the rest of the shoot in one step (Cmd+Alt+B). Editing scene by scene below is for refinements"
         onClick={onOpen}
       >
-        {finished || running ? "Open baseline edit" : "Start baseline edit"} <ArrowRight className="size-4" />
+        {finished || running ? "Open baseline edit" : undone ? "Run again" : "Start baseline edit"} <ArrowRight className="size-4" />
       </button>
     </div>
   );

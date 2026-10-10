@@ -62,6 +62,8 @@ export interface AutoApi {
   slider: (key: "temp" | "tint" | SimpleKey) => void;
   /** The white balance is the one Auto produced (the WB select reads "Auto" until Temp / Tint are touched). */
   wbIsAuto: boolean;
+  /** Baseline edit set-up: Auto leaves Vibrance / Saturation (the preset's colours) alone. */
+  lightOnly?: boolean;
 }
 
 interface Props {
@@ -298,7 +300,7 @@ export function AdjustPanel({ editor, styleVersion, importing, onImportStyles, h
                     className="flex h-6 items-center gap-1 rounded bg-sky-800 px-3 text-xs font-medium text-sky-50 hover:bg-sky-700 disabled:opacity-60"
                     disabled={auto.busy}
                     onClick={auto.all}
-                    title={`Auto: set exposure, contrast, highlights, shadows and white balance from this photo's analysis. Works on any photo, no learned style needed. Not the same as "Auto edit (my style)", which applies your own editing style to a whole scene.`}
+                    title={auto.lightOnly ? "Auto light and white balance (the preset's colours are kept during the baseline edit)" : `Auto: set exposure, contrast, highlights, shadows and white balance from this photo's analysis. Works on any photo, no learned style needed. Not the same as "Auto edit (my style)", which applies your own editing style to a whole scene.`}
                     data-testid="auto-all"
                   >
                     {auto.busy ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} Auto

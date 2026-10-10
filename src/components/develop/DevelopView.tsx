@@ -91,6 +91,8 @@ export interface DevelopHandle {
   /** Cmd+U / Cmd+Shift+U: Lightroom Auto tone / Auto white balance for the active photo. */
   autoTone: () => void;
   autoWb: () => void;
+  /** Baseline edit: set the light keys (exposure .. blacks, custom white balance) of the open photo, one history entry. */
+  setLight: (light: { exposure: number; contrast: number; highlights: number; shadows: number; whites: number; blacks: number; temperatureK: number; tint: number }, label: string) => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -132,6 +134,8 @@ interface Props {
   filterSummary?: { text: string; onEdit: () => void };
   /** Edit step: the context bar shown above the workspace. */
   topSlot?: React.ReactNode;
+  /** Baseline edit set-up (the Baseline bar is shown): Auto changes light and white balance only, never Vibrance / Saturation. */
+  lightOnlyAuto?: boolean;
   /** Edit step: per-cell filmstrip markers (representative ring, applied check, needs-a-look). */
   filmBadge?: (id: number) => React.ReactNode;
   /** Edit step: "This scene only" chip in the filmstrip header. */
@@ -175,7 +179,7 @@ function useWide(): boolean {
   return wide;
 }
 
-export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ autoSync = false, onToolActive, onAutoSync, onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, filmBadge, sceneOnly }, ref) {
+export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView({ autoSync = false, onToolActive, onAutoSync, onCommitted, lib, sel, onError, onNotice, onUndoToast, onBatch, onLocate, compare = null, onFocusPane, onCandidate, onSwap, onMakeSelect, onToggleCompare, onRate, onFlag, onLabel, filterSummary, topSlot, lightOnlyAuto = false, filmBadge, sceneOnly }, ref) {
   const id = compare ? compare[compare.focus] : sel.active;
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   const [zoom, setZoom] = useState<Zoom>({ on: false, cx: 0.5, cy: 0.5 });
@@ -720,12 +724,15 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
           const [v, w] = await Promise.all([unwrap(commands.autoTone(id, cur, null)), unwrap(commands.autoWhiteBalance(id, cur))]);
           editor.change((a) => {
             const t = applyAutoTone(a, v);
-            return { ...t, whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } };
+            return { ...t, ...(lightOnlyAuto ? { vibrance: a.vibrance, saturation: a.saturation } : {}), whiteBalance: { mode: "custom", temperatureK: w.temperatureK, tint: w.tint } };
           }, "Auto");
           setAutoWb({ id, t: w.temperatureK, tint: w.tint });
         } else if (what === "tone" || what === "key") {
           const v = await unwrap(commands.autoTone(id, cur, what === "key" && key ? [key] : null));
-          editor.change((a) => applyAutoTone(a, v), label ?? "Auto Tone");
+          editor.change((a) => {
+            const t = applyAutoTone(a, v);
+            return lightOnlyAuto && what === "tone" ? { ...t, vibrance: a.vibrance, saturation: a.saturation } : t;
+          }, label ?? "Auto Tone");
         } else {
           const w = await unwrap(commands.autoWhiteBalance(id, cur));
           editor.change(
@@ -745,7 +752,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         setAutoBusy(false);
       }
     },
-    [id, autoBusy, editor, info, onError],
+    [id, autoBusy, editor, info, onError, lightOnlyAuto],
   );
   const wbNow = editor.adj.whiteBalance;
   const auto: AutoApi = {
@@ -754,6 +761,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
     tone: () => void runAuto("tone"),
     wb: () => void runAuto("wb"),
     slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
+    lightOnly: lightOnlyAuto,
     wbIsAuto: !!autoWb && autoWb.id === id && wbNow.mode === "custom" && wbNow.temperatureK === autoWb.t && wbNow.tint === autoWb.tint,
   };
   const autoRef = useRef(auto);
@@ -999,6 +1007,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       savePreset: () => setDialog({ kind: "preset" }),
       autoTone: () => autoRef.current.tone(),
       autoWb: () => autoRef.current.wb(),
+      setLight: (l, label) => {
+        editorRef.current.change((a) => ({ ...a, exposure: l.exposure, contrast: l.contrast, highlights: l.highlights, shadows: l.shadows, whites: l.whites, blacks: l.blacks, whiteBalance: { mode: "custom", temperatureK: l.temperatureK, tint: l.tint } }), label);
+      },
     }),
     [revertTool, commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],
   );

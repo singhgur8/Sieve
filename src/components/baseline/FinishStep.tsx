@@ -1,17 +1,21 @@
 // Baseline edit, step 5: finish in Lightroom. The sidecars carry everything as standard Lightroom settings; this panel
 // makes sure they are written and spells out how Lightroom picks them up.
 import { useCallback, useEffect, useState } from "react";
-import { CheckCircle2, CloudUpload, Loader2 } from "lucide-react";
-import { commands, unwrap, type XmpStatus } from "../../ipc";
+import { AlertTriangle, CheckCircle2, CloudUpload, Loader2 } from "lucide-react";
+import { commands, unwrap, type ParametricAdjustments, type XmpStatus } from "../../ipc";
 import { HelpLink } from "../HelpLink";
 
 interface Props {
+  /** The project's folders (where the .xmp sidecars are). */
+  folders: string[];
+  /** The anchor: its LUT / imported profile do not travel to Lightroom. */
+  anchorId: number | null;
   onExport: () => void;
   onPlan: () => void;
   onError: (e: unknown) => void;
 }
 
-export function FinishStep({ onExport, onPlan, onError }: Props) {
+export function FinishStep({ folders, anchorId, onExport, onPlan, onError }: Props) {
   const [xmp, setXmp] = useState<XmpStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const poll = useCallback(async () => {
@@ -37,6 +41,22 @@ export function FinishStep({ onExport, onPlan, onError }: Props) {
       setSaving(false);
     }
   };
+  const [anchorAdj, setAnchorAdj] = useState<ParametricAdjustments | null>(null);
+  useEffect(() => {
+    if (anchorId == null) return;
+    let dead = false;
+    unwrap(commands.getAdjustments(anchorId))
+      .then((a) => !dead && setAnchorAdj(a))
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [anchorId]);
+  const lutName = anchorAdj?.lut?.id ?? null;
+  const camProfile = anchorAdj?.profile?.cameraProfile ?? null;
+  const lookName = anchorAdj?.profile?.look?.name ?? null;
+  const importedProfile = camProfile && !/^(Adobe|Camera)\b/i.test(camProfile) ? camProfile : lookName && !/^Adobe\b/i.test(lookName) ? lookName : null;
+  const folder = folders[0] ?? null;
   const dirty = xmp?.dirty ?? 0;
   const failed = xmp?.failed ?? 0;
   const saved = xmp != null && dirty === 0 && failed === 0 && !xmp.running;
@@ -58,6 +78,7 @@ export function FinishStep({ onExport, onPlan, onError }: Props) {
               {saving ? "Saving…" : "Save now"}
             </button>
           )}
+          {!saved && failed === 0 && <span className="ml-2 text-xs text-neutral-400">(Save, Cmd+S)</span>}
           {xmp && !xmp.autoSync && <p className="mt-2 text-xs text-amber-300">Auto-save to sidecars is off, so use Save now before you switch.</p>}
         </section>
         <section className="rounded-lg bg-neutral-900 p-4" data-testid="baseline-lr-steps">
@@ -65,12 +86,26 @@ export function FinishStep({ onExport, onPlan, onError }: Props) {
             <span className="flex size-5 items-center justify-center rounded-full bg-neutral-800 text-xs">2</span>
             Open the edit in Lightroom
           </h3>
+          {folder && (
+            <p className="mb-2 flex flex-wrap items-center gap-2 text-xs text-neutral-300" data-testid="baseline-folder">
+              <span>The sidecars are in:</span>
+              <code className="rounded bg-neutral-950 px-1.5 py-0.5 font-mono text-neutral-100" data-testid="baseline-folder-path">
+                {folder}
+              </code>
+              <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid="baseline-folder-reveal" title="Show the folder in Finder" onClick={() => void unwrap(commands.revealInFinder(folder)).catch(onError)}>
+                Reveal in Finder
+              </button>
+              <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid="baseline-folder-copy" title="Copy the folder path" onClick={() => void navigator.clipboard?.writeText(folder).catch(() => undefined)}>
+                Copy path
+              </button>
+            </p>
+          )}
           <ul className="space-y-2 text-sm text-neutral-300">
             <li data-testid="baseline-lr-existing">
-              <b className="text-neutral-100">Photos already in a Lightroom catalog:</b> select them in the Library, then choose <b>Metadata &gt; Read Metadata from Files</b>.
+              <b className="text-neutral-100">Photos already in a Lightroom catalog:</b> in the Library module select them (Cmd+A selects the folder), then choose <b>Metadata &gt; Read Metadata from Files</b> and confirm. This replaces any changes made to them in Lightroom since.
             </li>
             <li data-testid="baseline-lr-new">
-              <b className="text-neutral-100">A new import:</b> import the folder as usual. Lightroom reads the sidecars by itself, so the edit is already there.
+              <b className="text-neutral-100">A new import:</b> import the folder as usual, with <b>Apply During Import &gt; Develop Settings: None</b>. Otherwise Lightroom puts its preset over the baseline. Lightroom reads the sidecars by itself.
             </li>
           </ul>
         </section>
@@ -80,8 +115,24 @@ export function FinishStep({ onExport, onPlan, onError }: Props) {
             Finish the edit there
           </h3>
           <p className="text-sm text-neutral-300">
-            Every photo now has the preset&apos;s look and its own corrected light and white balance, stored as standard Lightroom settings. Crop, straighten and masks are not touched: Sieve leaves what each photo already has.
+            Every edited photo now has the anchor&apos;s look and its own Auto-based light and white balance, as standard Lightroom settings in its .xmp sidecar. Crop, straighten, masks, spot removal and lens corrections are as they were.
           </p>
+          {lutName && (
+            <p className="mt-2 flex items-start gap-2 text-sm text-amber-300" data-testid="baseline-lut-warning">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
+              <span>
+                Your look uses the LUT <b>{lutName}</b>. Lightroom cannot read Sieve LUTs, so it will look different there. Use a Lightroom profile instead, or export from Sieve.
+              </span>
+            </p>
+          )}
+          {importedProfile && (
+            <p className="mt-2 flex items-start gap-2 text-sm text-amber-300" data-testid="baseline-profile-warning">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
+              <span>
+                Lightroom needs the profile <b>{importedProfile}</b> installed.
+              </span>
+            </p>
+          )}
           <HelpLink id="baseline-edit" label="How the baseline edit works" title="Open the Help entry for the baseline edit" className="mt-2" />
         </section>
         <div className="flex items-center gap-2">

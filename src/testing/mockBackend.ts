@@ -2393,7 +2393,7 @@ export function installMockBackend(count: number) {
           return applyScenes(due, o, "Apply to Scene", true);
         }
         case "list_styles": {
-          const user: StylePreset[] = presets.map((p) => ({
+          const user: StylePreset[] = presets.filter((p) => (p as { sourceFormat?: string }).sourceFormat !== "xmp_preset").map((p) => ({
             id: p.id,
             groupId: 1,
             name: p.name,

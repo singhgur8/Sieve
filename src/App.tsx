@@ -36,8 +36,8 @@ import { StyleDialogs } from "./components/edit/StyleDialogs";
 import { useWorkflow } from "./hooks/useWorkflow";
 import { BaselineView, type BaselineStepId } from "./components/baseline/BaselineView";
 import { BaselineBar } from "./components/baseline/BaselineBar";
-import { BaselineFlagBar } from "./components/baseline/BaselineFlagBar";
-import { EMPTY_SESSION, useBaselineRun, type BaselineSession } from "./hooks/useBaseline";
+import { BaselineFlagBar, BaselineReviewBar, useFlaggedRows } from "./components/baseline/BaselineFlagBar";
+import { EMPTY_SESSION, START_LABEL, useBaselineRun, useOnBaselineIds, type BaselineSession } from "./hooks/useBaseline";
 import { MatchPanel } from "./components/scenes/MatchPanel";
 import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -1145,6 +1145,58 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   // ---- Baseline edit (Phase 10) ----
   const baselineRun = useBaselineRun(projectId);
+  // The batch can be undone from anywhere (Cmd+Z in the Plan, a toast, a scene menu): every plan refresh reads the run again.
+  const refreshBaselineRun = baselineRun.refresh;
+  useEffect(() => {
+    if (projectId != null) void refreshBaselineRun();
+  }, [wf.plan]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Scenes whose representative is still exactly what the baseline wrote: the old "Apply to scene" has nothing to add there
+  // (until the backend reports the scene state itself).
+  const bRepIds = useMemo(() => (baselineRun.run ? wf.rows.map((r) => r.entry.representativeId) : []), [baselineRun.run?.id, wf.rows]); // eslint-disable-line react-hooks/exhaustive-deps
+  const provOnBase = useOnBaselineIds(bRepIds, wf.plan);
+  // The anchor itself is never written by a run (no provenance): it counts as on the baseline until it is edited again.
+  const bRun = baselineRun.run;
+  const bRunLive = bRun?.state === "finished" && bRun.batch != null && bRun.batch.undoneAtMs == null ? bRun : null;
+  const [anchorRefined, setAnchorRefined] = useState(true);
+  useEffect(() => {
+    if (!bRunLive) return void setAnchorRefined(true);
+    let dead = false;
+    unwrap(commands.getHistory(bRunLive.settings.anchorId))
+      .then((h) => !dead && setAnchorRefined(h.entries.some((e) => e.label !== "Original" && e.createdAtMs > (bRunLive.finishedAtMs ?? 0))))
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [bRunLive?.id, bRunLive?.batch?.batchId, wf.plan]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onBaselineIds = useMemo(() => (bRunLive && !anchorRefined ? new Set([...provOnBase, bRunLive.settings.anchorId]) : provOnBase), [provOnBase, bRunLive?.id, anchorRefined]); // eslint-disable-line react-hooks/exhaustive-deps
+  const flaggedRows = useFlaggedRows(baselineRun.run?.state === "finished" ? projectId : null, baselineRun.run?.id);
+  const flaggedLeft = baselineRun.run?.state === "finished" ? flaggedRows.filter((r) => wf.needsReviewSet.has(r.imageId)).length : null;
+  const flaggedReview = !!query.baselineOutcomes?.includes("flagged");
+  // The finish toast: one Undo for the whole baseline.
+  const seenRunning = useRef<number | null>(null);
+  useEffect(() => {
+    const r = baselineRun.run;
+    if (!r) return;
+    if (r.state === "running") seenRunning.current = r.id;
+    else if (r.state === "finished" && seenRunning.current === r.id) {
+      seenRunning.current = null;
+      const b = r.batch;
+      const n = r.counts.applied + r.counts.flagged;
+      push(`Edited ${n} photo${n === 1 ? "" : "s"}${r.counts.flagged > 0 ? ` · ${r.counts.flagged} need a look` : ""}`, {
+        action: b ? { label: "Undo", testid: "baseline-undo-toast", onClick: () => void wf.undoBatch({ batchId: b.batchId, label: "Baseline Edit" }) } : undefined,
+      });
+    }
+  }, [baselineRun.run]); // eslint-disable-line react-hooks/exhaustive-deps
+  /** Cmd+Z inside the Baseline view: undo the whole baseline when it can be, else say why not. */
+  const baselineUndoKey = useCallback(() => {
+    const r = baselineRun.run;
+    const b = r?.batch;
+    if (r?.state === "running") return;
+    if (!r || r.state !== "finished" || !b) return void push("Nothing to undo yet. Cmd+Z undoes the whole baseline after it has run");
+    if (b.undoneAtMs != null) return void push("The baseline is already undone");
+    if (!b.undoable) return void push(`Later edits on ${b.conflictCount} photo${b.conflictCount === 1 ? "" : "s"}. Undo those first`);
+    void wf.undoBatch({ batchId: b.batchId, label: "Baseline Edit" });
+  }, [baselineRun.run, wf, push]);
   useEffect(() => {
     setBSession(EMPTY_SESSION);
     setBaselineOpen(null);
@@ -1170,14 +1222,19 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     let st: BaselineStepId = 1;
     if (typeof force === "number") st = force;
     else if (bSession.stage === "rest" && bSession.anchorId != null) st = 4;
-    else if (bSession.anchorId == null && r && (r.state === "finished" || r.state === "running")) {
+    else if (bBar && bSession.anchorId != null) {
+      // Cmd+Alt+B during step 3 is "Edit the rest" (what the Baseline bar promises), not a restart at the preset.
+      setBSession((x) => ({ ...x, stage: "rest" }));
+      st = 4;
+    }
+    else if (!bSession.appliedKey && r && (r.state === "finished" || r.state === "running")) {
       setBSession({ anchorId: r.settings.anchorId, presetId: r.settings.presetId, presetName: null, stage: "rest" });
       st = 4;
     }
     openPlan();
     setBBar(false);
     setBaselineOpen(st);
-  }, [projectId, step, baselineRun.run, bSession.stage, bSession.anchorId, openPlan]);
+  }, [projectId, step, baselineRun.run, bBar, bSession.stage, bSession.anchorId, openPlan]);
   const baselineToDevelop = useCallback(
     async (anchorId: number) => {
       await rawLib.refresh([anchorId]).catch(reportError);
@@ -1279,6 +1336,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (baselineOpen != null) {
       // The Baseline edit view has its own controls; only help and the step shortcuts stay global.
       const d = matchKey(e, "grid");
+      if (d && (d.id === "undoCull" || d.id === "undoAdj")) {
+        e.preventDefault();
+        return baselineUndoKey();
+      }
       if (!d || !["cheatSheet", "help", "stepEdit", "stepCull", "stepExport", "saveXmp"].includes(d.id)) return;
       e.preventDefault();
       return runKey(d, e);
@@ -1310,7 +1371,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     }
     const def = matchKey(e, mode, { cropping: mode === "develop" && !!develop.current?.isCropping(), comparing: cmp != null });
     if (!def) return;
-    const PLAN_INERT = ["pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste", "copyAll", "pasteAll"];
+    const PLAN_INERT = ["baselineLooksGood", "pick", "reject", "unflag", "rate", "label", "keeper", "keeperSet", "anchor", "selectBurst", "navH", "navV", "gridJump", "toggleLoupe", "gridLoupe", "zoomLoupe", "selectAll", "selectNone", "filterBar", "scenesToggle", "develop", "compare", "paste", "copyAll", "pasteAll"];
     if (planOpen && PLAN_INERT.includes(def.id)) return;
     e.preventDefault();
     // Leaving the crop tool any way but Esc / Cancel applies it first (Lightroom), then the key does its job.
@@ -1348,6 +1409,21 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       }
       case "baselineEdit":
         return step === "edit" ? leave(() => openBaseline()) : undefined;
+      case "baselineLooksGood": {
+        // Mark the photo reviewed and go to the next one the baseline flagged; at the end, a toast with the way back.
+        if (step !== "edit" || planOpen || active == null) return;
+        if (!wf.needsReviewSet.has(active)) return setNotice("This photo is not marked as needing a look");
+        const order = new Map((wf.plan?.keeperIds ?? []).map((id, i) => [id, i]));
+        const at = order.get(active) ?? -1;
+        const rest = (wf.plan?.needsReviewIds ?? []).filter((id) => id !== active);
+        const next = rest.find((id) => (order.get(id) ?? -1) > at) ?? rest[0];
+        const total = baselineRun.run?.counts.flagged ?? 0;
+        void wf.markReviewed([active]).then(() => {
+          if (next != null) return sel.set([next], next);
+          push(`All ${total || 1} checked`, { action: { label: "Back to the baseline", testid: "baseline-looks-good-back", onClick: () => openBaseline() } });
+        });
+        return;
+      }
       case "autoEdit": {
         if (step !== "edit") return;
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
@@ -1634,6 +1710,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               editSub={
                 wf.grouping
                   ? "Grouping…"
+                  : bRunLive
+                    ? "baseline ✓"
                   : wf.rows.length > 0
                     ? wf.done
                       ? "All scenes applied"
@@ -1758,7 +1836,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         </div>
       )}
       {!planOpen && !targetOpen && mode === "grid" && projectId != null && query.baselineOutcomes?.includes("flagged") && (
-        <BaselineFlagBar projectId={projectId} activeId={active ?? null} onClear={() => setQuery((q) => ({ ...q, baselineOutcomes: [] }))} onOpenBaseline={() => openBaseline()} />
+        <BaselineFlagBar projectId={projectId} activeId={active ?? null} reviewLeft={wf.needsReviewSet} tick={baselineRun.run?.id} onClear={() => setQuery((q) => ({ ...q, baselineOutcomes: [] }))} onOpenBaseline={() => openBaseline()} />
       )}
       {planOpen || targetOpen ? null : mode === "grid" ? (
         catalogEmpty ? null : (
@@ -1932,6 +2010,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               summary={cullSum.summary}
               onBaseline={() => openBaseline()}
               baselineRun={baselineRun.run}
+              onBaselineIds={onBaselineIds}
+              flaggedLeft={flaggedLeft}
+              onBaselineFinish={() => openBaseline(5)}
             />
           </ErrorBoundary>
         )}
@@ -1956,10 +2037,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 void changedRef.current([]);
                 void wf.loadPlan(false);
               }}
-              onUndo={async (b) => {
-                await wf.undoBatch(b);
+              onUndo={async (b, o) => {
+                await wf.undoBatch(b, o);
                 await baselineRun.refresh();
               }}
+              onRefresh={() => void baselineRun.refresh()}
+              reviewLeft={wf.needsReviewSet}
+              projectName={project.name}
+              folders={project.folders.map((f) => f.path)}
               onClose={() => setBaselineOpen(null)}
               onDevelop={(id) => void baselineToDevelop(id)}
               onShowFlagged={showBaselineFlagged}
@@ -1975,6 +2060,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             ref={develop}
             autoSync={autoSync}
             onToolActive={setDevTool}
+            lightOnlyAuto={bBar}
             onAutoSync={setAutoSync}
             lib={lib}
             sel={sel}
@@ -2014,6 +2100,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                     activeId={active ?? null}
                     anchorName={lib.getEntry(bSession.anchorId)?.fileName ?? `#${bSession.anchorId}`}
                     tick={bTick}
+                    onStartFromAuto={(l) => develop.current?.setLight(l, START_LABEL)}
                     onGoAnchor={() => sel.set([bSession.anchorId!], bSession.anchorId!)}
                     onClose={() => setBBar(false)}
                     onRest={() =>
@@ -2024,7 +2111,11 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                     }
                   />
                 )}
+                {!bBar && flaggedReview && projectId != null && <BaselineReviewBar projectId={projectId} reviewLeft={wf.needsReviewSet} tick={baselineRun.run?.id} onBack={() => leave(() => openBaseline())} />}
                 <EditContextBar
+                  baselineBar={bBar}
+                  onBaseline={onBaselineIds}
+                  flaggedReview={flaggedReview && !bBar}
                   wf={wf}
                   rows={wf.rows}
                   activeId={active ?? null}

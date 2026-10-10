@@ -20,6 +20,12 @@ interface Props {
   /** "Show" on the apply toast: the photos Apply skipped because the user edited them. */
   onShowIds: (ids: number[], label: string) => void;
   onNextReview: () => void;
+  /** The Baseline bar is shown above (step 3 of the baseline edit): the old scene flow (Apply / Auto edit) stays out of the way. */
+  baselineBar?: boolean;
+  /** Representatives whose settings are still what a baseline run wrote: nothing to apply from them. */
+  onBaseline?: Set<number>;
+  /** Reviewing the photos the baseline flagged: Apply to scene is a neutral, explained action. */
+  flaggedReview?: boolean;
 }
 
 const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
@@ -44,6 +50,9 @@ export function EditContextBar(p: Props) {
   // Opening the representative is pointless while it is the photo on screen.
   const block = block0 && !block0.soft ? (isRep && block0.fix === "open" ? { ...block0, fix: undefined } : block0) : null;
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
+  const repOnBaseline = !!row && !!p.onBaseline?.has(row.entry.representativeId);
+  const sceneFlow = !p.baselineBar;
+  const showApply = sceneFlow && !repOnBaseline;
 
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
   let hintText: string | null = null;
@@ -51,12 +60,17 @@ export function EditContextBar(p: Props) {
     const num = row.number;
     if (isRep) {
       const c = REP_CHIP[row.ui];
-      chip = (
+      chip = repOnBaseline ? (
+        <span className="rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="rep">
+          On baseline · representative
+        </span>
+      ) : (
         <span className={`rounded-full px-2 py-0.5 text-xs ${c.cls}`} data-testid="edit-chip" data-kind="rep">
           {c.text}
         </span>
       );
-      if (row.ui === "reset") hintText = "Edit this photo first";
+      if (!sceneFlow || repOnBaseline) hintText = null;
+      else if (row.ui === "reset") hintText = "Edit this photo first";
       else if (row.ui === "todo" || row.ui === "edited") hintText = `Edit this photo, then apply it to the other ${row.targets}.`;
     } else if (wf.needsReviewSet.has(p.activeId)) {
       const reason = wf.stateById.get(p.activeId)?.reviewReason;
@@ -65,10 +79,10 @@ export function EditContextBar(p: Props) {
           <span className="max-w-[420px] truncate rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-200" data-testid="edit-chip" data-kind="review" title={reason ?? undefined}>
             Needs a look: {reason ? reason.charAt(0).toLowerCase() + reason.slice(1) : "exposure did not match"}
           </span>
-          <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-emerald-200 hover:bg-neutral-700" onClick={() => void wf.markReviewed([p.activeId!])} data-testid="edit-looks-good" title="Keep the settings and clear the mark">
+          <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-emerald-200 hover:bg-neutral-700" onClick={() => void wf.markReviewed([p.activeId!])} data-testid="edit-looks-good" title="Keep the settings and clear the mark. Cmd+Enter does this and goes to the next photo that needs a look">
             Looks good
           </button>
-          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review">
+          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (N)">
             Next to review ›
           </button>
         </>
@@ -153,32 +167,36 @@ export function EditContextBar(p: Props) {
             </button>
           </span>
         )}
-        <AutoEditButton
-          style={wf.style}
-          testid="edit-auto"
-          label="Auto edit (my style)"
-          disabled={!row || busy}
-          onClick={() => row && wf.requestAutoEdit([row.entry.sceneId])}
-        />
-        <ApplyWhy
-          block={block && !applying ? block : null}
-          testid="edit-apply-why"
-          className="max-w-[300px]"
-          onFix={(fix) => row && (fix === "open" ? p.onJump(row.entry.sceneId) : void wf.setSkipped(row.entry.sceneId, false))}
-        />
-        <div className="flex">
+        {sceneFlow && (
+          <AutoEditButton
+            style={wf.style}
+            testid="edit-auto"
+            label="Auto edit (my style)"
+            disabled={!row || busy}
+            onClick={() => row && wf.requestAutoEdit([row.entry.sceneId])}
+          />
+        )}
+        {showApply && (
+          <ApplyWhy
+            block={block && !applying ? block : null}
+            testid="edit-apply-why"
+            className="max-w-[300px]"
+            onFix={(fix) => row && (fix === "open" ? p.onJump(row.entry.sceneId) : void wf.setSkipped(row.entry.sceneId, false))}
+          />
+        )}
+        {showApply && <div className="flex">
           <button
-            className="flex h-6 items-center whitespace-nowrap rounded-l-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+            className={`flex h-6 items-center whitespace-nowrap rounded-l-md px-3 text-xs font-medium text-white disabled:opacity-40 ${p.flaggedReview ? "bg-neutral-700 hover:bg-neutral-600" : "bg-emerald-700 hover:bg-emerald-600"}`}
             data-testid="edit-apply"
             disabled={!canApply || busy}
-            title={applying ? BUSY_WHY.apply_scene : row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
+            title={p.flaggedReview ? "Copies this photo's edit over its scene and replaces the baseline light of those photos" : applying ? BUSY_WHY.apply_scene : row?.ui === "reset" ? "Edit this photo first" : row?.ui === "todo" ? "Edit this photo or auto edit it first" : `Apply this scene's edit to the other keepers, matching exposure and white balance${hint("applyScene")}`}
             onClick={() => row && void wf.applyScene(row.entry.sceneId, "match", p.onReview, p.onShowIds)}
           >
             {newKeepers > 0 ? `Apply to ${newKeepers} new` : `Apply to scene${row ? ` (${row.targets})` : ""}`}
           </button>
           <Menu
             trigger={<ChevronDown className="size-3.5" />}
-            triggerClass="flex h-6 items-center rounded-r-md border-l border-emerald-800 bg-emerald-700 px-1.5 text-white hover:bg-emerald-600 disabled:opacity-40"
+            triggerClass={`flex h-6 items-center rounded-r-md border-l px-1.5 text-white disabled:opacity-40 ${p.flaggedReview ? "border-neutral-600 bg-neutral-700 hover:bg-neutral-600" : "border-emerald-800 bg-emerald-700 hover:bg-emerald-600"}`}
             triggerTestId="edit-apply-menu"
             title="More ways to apply"
             align="right"
@@ -208,7 +226,7 @@ export function EditContextBar(p: Props) {
               );
             }}
           </Menu>
-        </div>
+        </div>}
         <button className="flex h-6 items-center gap-1 rounded bg-neutral-800 px-2 text-xs hover:bg-neutral-700" onClick={p.onPlan} data-testid="edit-plan" title="Back to the plan (G)">
           <ListChecks className="size-3.5" /> Plan
         </button>
