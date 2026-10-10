@@ -262,3 +262,149 @@ There are no conflicts inside a stage: N = Skip only in Second look and No only 
 - The couple confirmation card, and the Y / N answer flow with auto-advance to the next open card.
 - Picked (green) vs Alternative (sky) colour coding and the per-reason captions. They match the engine texts in `selection.rs`.
 - The keeper offer after apply (except P2-8). The cheat sheet groups "Pick the best N" first while the overlay is open, and the Help entry is reachable from the overlay header.
+
+---
+
+## Re-check 1 (2026-10-10)
+
+Branch `phase-9-target-cull` at c4d2e18 (IPC v20.1 + the frontend fixes). I used the mock backend (`vite --port 1465`) with throwaway Playwright drivers at 1280×800 and 1440×900, on `?mock=5000` with `&target=answered`, `&target=1` and no switch.
+I deleted the screenshots afterwards (`test-data/ux-review-9r1/`).
+
+Mock run: 2,500 photos, target 800, **534 picked**, 437 alternatives, 327 Not sure, 1,202 set aside.
+The piles are Not sure 327 · Similar 406 (124 moments) · Weaker 228 · Defects 568. They add up to 1,529 = notSure + setAside.
+There are 282 moments in the pick list, about 1.9 picks per moment.
+
+### The user's two questions
+- **Does pass 2 stop them re-adding near-duplicates?** In the **Not sure** pile, yes. I pressed A on DSC00033, then moved to DSC00035 (same moment).
+  - The "Kept from this moment (3)" strip shows 33 with a sky ring and "you added".
+  - The caption reads "You already added DSC00033 from this moment. Already kept: DSC00034 (92 %)".
+  - The button turned amber: "Add a 4th from this moment".
+  - `get_covered_by` now follows the user's adds (backend `refresh_covers`, covered by the v20.1 spec).
+
+  The **Similar** pile does not give the same warning yet (R1-3). Its kept column also hides the 3rd and later kept photos.
+
+  Overall the Second look went from 1,488 single photos to 327 photos (Shift+Space skips the rest of a moment, 93 moments) plus 124 rows. That is review-by-exception.
+- **Can they review 800 picks by moment quickly?** It is faster:
+  - It resumes where they stopped ("Photo 20 of 534" after 19 reviewed).
+  - "Moment k of 282" shows where they are.
+  - Shift+Right accepted a 3-pick moment in one key (reviewed +3), so about 282 presses instead of 534.
+
+  The judgment itself is still per photo. The moment's other picks are 80×56 px thumbnails, too small to tell whether two picks are near-identical. A careful user will still press Right through every pick (R1-2).
+
+### Verdict per item
+| Item | Verdict | Evidence |
+|---|---|---|
+| P0-1 Second look piles | **Resolved** | Four piles with counts. Opens on Not sure (`data-total` 327). Not sure is ordered by moment then score. Shift+Space jumps to the next moment (33 → 55). Similar is a windowed moment grid. Weaker and Defects are plain grids with the note "Defects are rejected when you apply. Weaker frames stay unflagged." Pile rules are computed in the backend (`PILE_SQL`). |
+| P0-2 Apply honesty + undo | **Resolved** | The dialog shows "482 photos get the Picked flag", a ticked "Also reject 362 photos with clear defects", "Your own flags (360)…", and the button "Apply to 844 photos". The result reads "Picked 482 · Rejected 362 · Unflagged 0". The `Undo` button gave "The flags are back as they were". The apply is also on the Cull undo stack. Small copy gap: R1-6. |
+| P0-3 Covered-by after adds | **Resolved** (Not sure). Similar pile: see R1-3 | As above. The backend recomputes whole moments after every edit, and undo snapshots whole moments. |
+| P1-1 Moment view in pass 1 | **Resolved as specced**. Follow-up R1-2 | The strip shows the moment's other picks (green) and then the alternatives. "This moment: 3 picked · 2 alternatives". "Moment 1 of 282". Shift+Right / Shift+Z and the `Next moment ⇧→` button. |
+| P1-2 Resume | **Resolved** | Reopening went to the 20th pick. ] / [, Home / End and the "All N picks reviewed" bar are present. |
+| P1-3 Undo navigates back | **Resolved** | Review: X on 70, Right ×3, Cmd+Z → back on 70, total back to 534. Second look: Cmd+Z after Add → back on 33 with its reviewed mark removed. |
+| P1-4 Re-run keeps reviewed picks | **Resolved** | Moved past 5 picks, answered N, re-ran: all 5 are `deliver`, `locked: true`. Reviewed ids that drop out are pruned. Footer copy updated. |
+| P1-5 "Set aside", not "Reject" | **Resolved** | Button, keymap and Help copy. |
+| P1-6 Enter no longer swaps | **Resolved** | Enter = Keep and next in Review (65 → 70), Skip in Second look. S is the only swap key. The strip tooltip says double-click also swaps. |
+| P1-7 Synced zoom | **Resolved** | Space in Review puts both panes at 100% (`data-zoom` 100 / 100), and zoom survives Right. Second look: click zooms both. |
+| P1-8 People layout | **Resolved** | At 1280×800 all four cards show Yes / No above the footer. Faces are 144 px, 4 columns, with scroll-into-view. |
+| P1-9 Best N row, B, labels | **Resolved** | The row reads "Best 800: 534 picked · reviewed 19 of 534 · second look 0 of 327 · not applied yet" with `Continue review` and `Apply flags…`. B opens the stage with unfinished work (setup on a fresh shoot). The toolbar is labelled `Best 534` at 1280. The Suggestions chip says "(from Best 800)". The offer now shows below 5 % flagged. |
+| P1-10 Shortfall copy | **Resolved** | "266 short of 800: only 534 photos qualify under the rules. The 327 Not sure are the closest; add the ones you like in the Second look." Buttons: `Review the 534 picks`, `Second look · 327 not sure`. Overshoot copy is present too. |
+| P1-11 Toast placement | **Resolved**, with a P2 follow-up (R1-4) | Top right under the header, one at a time, 3 s. It no longer covers the strip or the photo. |
+| P2-1 Number format | **Partly** | `num()` is used in most places, but `plural()` does not format: "1656 photos left as they were" (Apply result), "1667 photos" (People). See R1-5. |
+| P2-2 State chip | Done | |
+| P2-3 People undo | Done | Toast: "Change an answer with Y / N". |
+| P2-4 Re-run diff | Not done (still optional) | |
+| P2-5 X in Second look | Done | |
+| P2-6 Stars in the passes | Not done (still optional) | |
+| P2-7 Best N grid segment | Not done (the Best N row covers most of it) | |
+| P2-8 Keeper count in the offer | Not done (still optional) | |
+| P2-9 Moment label without the type | Done | "02:00 PM · frame 2 of 8" next to the badge. |
+| P2-10 No-cover pane | Done | Full-width photo plus the kept strip. See R1-1 for the weak-cover case. |
+| P2-11 Empty-alternatives flash | Done | |
+
+### New findings
+
+#### R1-1 (P1) A weak cover from another moment takes half the screen and offers a swap that empties that moment
+- **Where**: `target/SecondStep.tsx`, Not sure pile (`cov &&` right pane, `target-second-swap`, `target-second-add`). Seen at 1440×900 on DSC00055: "Looks like DSC00045 (kept, another moment) · 50% similar".
+- **What**: 97 of the 327 Not sure photos (30 %) have an `another_moment` cover, some as low as 50 %.
+  - Half the screen goes to a photo that is not a near-duplicate.
+  - S is offered as "Swap: keep this instead of DSC00045". That swap removes DSC00045, which may be the only pick of its own moment, so a whole moment can drop out of the delivery.
+  - A reads "Add both", as if the two were duplicates.
+- **Why**: the photographer judges this frame on its own merits, so it should get the full width. A one-key swap that silently loses another moment's only photo is a delivery risk; it can be undone, but the user does not see it happen.
+- **Fix** (frontend only):
+  1. Show the right-hand pane only when `cov.sameMoment || cov.similarity >= SIMILARITY_VERY_SIMILAR (0.7)`. Otherwise the photo gets the full width, and the caption row adds a 48×32 thumb of the cover with the text `Looks like DSC00045 (kept, another moment) · 50%`. Clicking the thumb shows the two panes.
+  2. Disable S for `cov.tier === "another_moment"`. Pressing S flashes the hint "DSC00045 is the pick of another moment. A keeps this one too".
+  3. With an `another_moment` cover, A is labelled `Keep` (keys A, Z), not `Add both`.
+- **Acceptance**: on a Not sure photo whose cover is `another_moment` at < 0.7:
+  - `target-covered` is absent and `target-second-pic` spans the content width.
+  - S changes nothing and flashes the hint.
+  - The keep button reads "Keep".
+
+#### R1-2 (P1) Pass 1: the moment's picks are too small to compare, so per-photo review remains
+- **Where**: `target/ReviewStep.tsx` strip (`target-pick-*`, thumbnails `h-14 w-20` = 80×56). Screenshots at 1280×800 / 1440×900 of moments with 3 picks (DSC00002 + 3 + 4; DSC00041 + 45 + 48).
+- **What**: Shift+Right accepts a moment, but before pressing it the user sees one pick large and the others at 80×56. The duplicate this pass exists to catch is two near-identical picks in one moment, and that cannot be judged at that size. So users go back to Right per photo: 534 presses, not 282.
+  - The current pick is also missing from the strip, so its place among the moment's picks is not visible.
+- **Fix**: a **Moment grid** toggle in Review (key **G**, as Lightroom's Grid; G is free in the overlay keymap). Button `Moment grid G` in the action bar, `Two-up G` while the grid is shown.
+  - Layout: reuse `Windowed` from `SecondStep`, one row per moment in list order.
+    - Left: the moment's picks at 240×160 with a green `Picked` chip and the file stem.
+    - A divider.
+    - Right: the alternatives at 160×112 with a sky `#rank` and the first reason, clamped to 1 line.
+    - Row height 200 px. The row header line shows `Moment 12 of 282 · 02:00 PM · Couple · 3 picked · 2 alternatives`.
+    - Rows already reviewed are drawn at 60 % opacity.
+  - Keys:
+    - Arrows move the focus. Up / Down change the row.
+    - **Shift+Right** or **Shift+Down** marks the row's picks reviewed and moves to the next row (Shift+Left goes back).
+    - **X** sets the focused pick aside.
+    - **A** adds the focused alternative.
+    - **Enter** or **G** opens the focused cell in the two-up view, where S swaps.
+    - The grid opens on the first unreviewed moment.
+  - Focus ring: `outline outline-2 outline-offset-2 outline-sky-400` (not a box-shadow ring; see R1-3).
+  - In the two-up strip, also show the current pick, first, with a white ring and the label "Showing". The strip header stays.
+- **Acceptance**:
+  - G toggles `data-view="grid"` on `target-review`.
+  - Shift+Right on a row with 3 picks adds 3 to `data-reviewed` and focuses the next row.
+  - Enter on a pick returns to two-up with `data-current` set to that pick.
+  - At 1280×800, at least 3 full rows are visible.
+
+#### R1-3 (P1) Similar pile: the focused frame is hard to see, and the kept column hides kept photos and the user's adds
+- **Where**: `SecondStep.tsx` Similar rows (`target-sim-frame-*` uses `ring-2` inside a `overflow-x-auto` container; the kept column is `keptHere.slice(0, 2)`).
+- **What**:
+  1. The focus ring is clipped by the scrolling row. On the first frame only a 2 px sliver on the right edge shows. A and S act on that frame, so the user can add the wrong one.
+  2. The kept column shows at most 2 kept photos with no "+N". In the mock, 95 of 313 moments have 3 kept photos. A photo the user added is often the one hidden.
+  3. Kept photos are not marked "you added", there is no "You already added …" line, and A never turns amber. So the near-duplicate guard from P0-3 is missing in this pile.
+- **Fix**:
+  1. Give the frames container `px-1 py-1`. On the focused frame use `outline outline-2 outline-offset-2 outline-sky-400` and a `bg-sky-950` caption.
+  2. Kept column: show up to 3 kept photos at 160×112. When there are more, add a 160×112 tile `+N more`; hovering or clicking it shows all kept photos as 64 px thumbs. User-added photos (`moment.userDeliveredIds`) get `ring-2 ring-sky-400` and a "you added" label, as in the Not sure strip.
+  3. When the focused frame's moment has a user-added photo, the action bar shows the amber line "You already added DSC00018 from this moment", and `Add it too` becomes amber `Add a 4th from this moment` (same rule and testids as the Not sure pile, `data-amber="true"`).
+  4. When a row has 2 or more kept photos, the per-frame label names the nearest one: `88% · like DSC00023` (from `coveredBy` / `coveredSimilarity`, already refreshed after edits).
+- **Acceptance**:
+  - The focused frame's outline is fully visible on row 1 (all 4 sides).
+  - A moment with 3 kept photos shows 3 kept tiles.
+  - After A on a frame, the next frame in the same row shows the amber button and the kept tile with "you added".
+
+#### P2
+- **R1-4 Toast over the sub-header buttons**: at 1280 the top-right toast (x 868–1268, y 100–138) covers `Show in grid` / `Second look →` for 3 s. Fix: while `target-view` is open, anchor toasts bottom right above the action bar (`bottom: 64px; right: 12px; max-width: 360px`). The strips are left-aligned, so the right third is empty in practice. Keep: 1 visible, 3 s.
+- **R1-5 Number format**: make `plural()` in `src/lib/target.ts` format with `num()` ("1,656 photos left as they were", "1,667 photos"). Use "92%" (no space) in the Not sure "Already kept" caption, to match "92% similar".
+- **R1-6 Apply: picks vs header**: the header says "Picked 535" but the dialog says "482 photos get the Picked flag". Append "(the other 53 picks already have it)" when `run.counts.deliver - plan.picks > 0`.
+- **R1-7 Shift+Z in Second look** means "skip the rest of the moment", while Z there means Keep. Remove Shift+Z from the `second` stage. Keep Shift+Space and Shift+Right there; Shift+Z stays in Review, where it accepts the rest of the moment.
+- **R1-8 Setup focus**: opening Pick the best N with B or the offer leaves focus nowhere, so the next step is a mouse click. When Setup opens, focus and select the count input, so B → type → Enter works.
+- **R1-9 Similar pile: no large view**: thumbnails are 160×112 and the photo cannot be seen bigger without leaving. **E** (Lightroom Loupe) toggles the Not sure two-pane layout for the focused frame against its nearest kept photo, with click-to-zoom. E or Esc returns to the row.
+- Mock fidelity, not a UI bug: the Defects grid shows "Intentional blur (kept)" as a reason. That is the mock's cull-tag text (`mockBackend.ts`), not engine copy.
+
+### Keymap changes since the review
+| Action | Now | Proposed |
+|---|---|---|
+| Moment grid / two-up (Review) | – | **G** (R1-2) |
+| Large view of the focused frame (Similar pile) | – | **E** (R1-9) |
+| Next moment (Second look) | Shift+Right, Shift+Space, Shift+Z | Shift+Right, Shift+Space (drop Shift+Z, R1-7) |
+| Swap (Not sure, cover from another moment) | S | disabled, with a hint (R1-1) |
+
+Everything else in the proposed keymap above has landed. There are no conflicts: G and E are unused in the overlay, and B is Cull-only.
+
+### Needs no change after Re-check 1
+- The Apply dialog and its result/undo (except the R1-6 copy).
+- The Best N row, the B shortcut, and the toolbar label.
+- Resume, undo navigation, and the re-run lock.
+- The People layout and the shortfall/overshoot copy.
+- The Not sure pile when the cover is from the same moment: two panes, kept strip, amber add, Skip moment.
+- The Defects and Weaker grids.
+
+**Open P0 / P1 after Re-check 1: P0 none · P1 3 (R1-1 weak cross-moment cover and its swap, R1-2 pass 1 moment grid, R1-3 Similar pile focus and kept column).**
