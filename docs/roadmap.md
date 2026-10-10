@@ -368,18 +368,18 @@ User rules (2026-10-09/10, verbatim intent):
   per-project clustering into people, main subject = the most frequent couple of faces (heuristics: frequency, size,
   centrality, appearing together), list of other recurring people to ask about. Acceptance: synthetic / public sample
   faces cluster correctly (purity ≥ 0.9 on a labelled sample set), main pair found, timings recorded.
-- [ ] **Moments and shot types** (vision-ml-dev): group frames into moments across the shoot (time gap + visual
+- [x] **Moments and shot types** (vision-ml-dev): group frames into moments across the shoot (time gap + visual
   similarity + same people), classify shot type (group = ≥3 faces posed, couple = the main pair dominant, detail = no
   face, sharp salient object, candid = faces not posed); "visible face" score (frontal, size, eyes) and back-of-head
   / no-face penalty; detail focus check (sharpest region on the salient object). Acceptance: unit tests on synthetic
   metrics; labelled fixtures for each shot type.
-- [ ] **Target selection engine** (vision-ml-dev): fill the target by priority — couple variations (many, near-
+- [x] **Target selection engine** (vision-ml-dev): fill the target by priority — couple variations (many, near-
   duplicates collapsed), one per group setup (most faces looking, main subject looking; activity frames as extra
   variations), one per detail, candids with visible faces, then next-best until the target; important people
   boosted; result = deliver / alternatives (ranked per moment) / not sure / set aside with reasons; "covered by"
   for every non-delivered frame. Acceptance: deterministic tests on synthetic shoots; target respected ±10% when
   enough frames qualify; every rule above has a test.
-- [ ] **Target cull UI** (frontend-dev): step 1 "Pick the best N" (count + shoot type, progress); people
+- [x] **Target cull UI** (frontend-dev): step 1 "Pick the best N" (count + shoot type, progress); people
   confirmation (faces grid: "Is this person important?" yes / no, main couple shown for confirmation); pass 1 review
   of the delivery set with an alternatives strip (add alternative / swap / reject, keyboard first); pass 2 quick
   review of Not sure + Set aside with the "already kept a similar one" thumbnail and skip / swap / add both; counts
