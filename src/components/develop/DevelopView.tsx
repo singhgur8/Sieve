@@ -2,6 +2,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Columns2, Columns3, Flag, SplitSquareHorizontal, X } from "lucide-react";
 import { usePrefetchNeighbours } from "../../hooks/usePrefetch";
+import { startLight, type BaselineSession } from "../../hooks/useBaseline";
 import { applyAutoTone, applyLightValues, commands, convertFileSrc, unwrap, type AdjustmentField, type ColorLabel, type FaceInfo, type ImportStyleReport, type NormRect, type ParametricAdjustments, type StyleGroup, type StylePreset, type SyncDeltaResult } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import type { SelectionApi } from "../../hooks/useSelection";
@@ -92,7 +93,7 @@ export interface DevelopHandle {
   autoTone: () => void;
   autoWb: () => void;
   /** v21.1 light-only Auto (`auto_light`) for the active photo, one history entry (baseline edit: Auto / "Start from Auto"). */
-  autoLight: (label?: string) => void;
+  autoLight: (label?: string, presetLight?: BaselineSession["presetLight"]) => void;
 }
 
 type Dialog = { kind: "copy" | "sync" | "preset" } | null;
@@ -715,7 +716,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   // v21.1: generic Auto = the light-only `auto_light` (WB, then the six tone sliders, the same numbers a baseline run
   // uses) + vibrance / saturation from `auto_tone` on the merged settings; "light" = `auto_light` alone (baseline edit).
   const runAuto = useCallback(
-    async (what: "all" | "light" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string) => {
+    async (what: "all" | "light" | "tone" | "wb" | "temp" | "tint" | "key", key?: AdjustmentField, label?: string, presetLight?: BaselineSession["presetLight"]) => {
       if (id == null || autoBusy) return;
       setAutoBusy(true);
       try {
@@ -723,7 +724,9 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
         const cur = editor.adj;
         if (what === "all" || what === "light") {
           // Generic Auto (works without a learned style): light + white balance from this photo, one history entry.
-          const { light } = await unwrap(commands.autoLight(id, cur));
+          const { light: auto0 } = await unwrap(commands.autoLight(id, cur));
+          // "Start from Auto" keeps the preset's own light on top of Auto.
+          const light = presetLight ? startLight(auto0, presetLight, null) : auto0;
           const lit = applyLightValues(cur, light);
           const presence = what === "all" ? await unwrap(commands.autoTone(id, lit, ["vibrance", "saturation"])) : null;
           editor.change((a) => {
@@ -762,7 +765,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
   const auto: AutoApi = {
     busy: autoBusy,
     all: () => void runAuto("all"),
-    light: (label?: string) => void runAuto("light", undefined, label),
+    light: (label?: string, presetLight?: BaselineSession["presetLight"]) => void runAuto("light", undefined, label, presetLight),
     tone: () => void runAuto("tone"),
     wb: () => void runAuto("wb"),
     slider: (k) => (k === "temp" ? void runAuto("temp", undefined, "Auto: Temp") : k === "tint" ? void runAuto("tint", undefined, "Auto: Tint") : void runAuto("key", k, `Auto: ${k[0].toUpperCase()}${k.slice(1)}`)),
@@ -1011,7 +1014,7 @@ export const DevelopView = forwardRef<DevelopHandle, Props>(function DevelopView
       pastePrevious,
       savePreset: () => setDialog({ kind: "preset" }),
       autoTone: () => autoRef.current.tone(),
-      autoLight: (label?: string) => autoRef.current.light(label),
+      autoLight: (label?: string, presetLight?: BaselineSession["presetLight"]) => autoRef.current.light(label, presetLight),
       autoWb: () => autoRef.current.wb(),
     }),
     [revertTool, commitPendingTool, toggleZoom, doPaste, doReset, syncTargets.length, syncTo, onNotice, editor.undo, editor.redo, editor.lastCommitAt, editor.canRedo, commitCrop, cancelCrop, startCrop, toggleGuided, maskKey, escape, toggleBw, togglePicker, faceZoom, pastePrevious],

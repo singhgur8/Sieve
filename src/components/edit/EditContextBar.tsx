@@ -1,5 +1,6 @@
 // 32 px bar under the TopBar while Developing in the Edit step: which scene, its state, and Auto edit / Apply to scene.
 import { ChevronDown, ChevronLeft, ChevronRight, ListChecks, X } from "lucide-react";
+import type { BaselinePhotoResult } from "../../ipc";
 import type { SceneRow, Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
 import { BUSY_WHY, useActivityRunning } from "../../lib/activity";
@@ -24,6 +25,8 @@ interface Props {
   baselineBar?: boolean;
   /** Reviewing the photos the baseline flagged: Apply to scene is a neutral, explained action. */
   flaggedReview?: boolean;
+  /** Photos the latest baseline run flagged, with the reason (so a fixed photo can still say what was wrong). */
+  flaggedRows?: BaselinePhotoResult[];
 }
 
 const REP_CHIP: Record<SceneRow["ui"], { text: string; cls: string }> = {
@@ -51,13 +54,43 @@ export function EditContextBar(p: Props) {
   const newKeepers = row && row.ui === "applied" ? row.unapplied.length : 0;
   const repOnBaseline = row?.ui === "baseline";
   const sceneFlow = !p.baselineBar;
+  const autoEditShown = sceneFlow && !p.flaggedReview;
   const showApply = sceneFlow && !repOnBaseline;
 
+  const flaggedRow = p.activeId != null ? p.flaggedRows?.find((r) => r.imageId === p.activeId) : undefined;
+  const wasFlagged = !!flaggedRow && p.activeId != null && !wf.needsReviewSet.has(p.activeId) && wf.stateById.get(p.activeId)?.editSource !== "baseline";
+  const wasText = flaggedRow?.reasons[0]?.text ?? "needs a look";
   let chip: React.ReactNode = <span className="rounded-full bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">Not in a scene</span>;
   let hintText: string | null = null;
   if (row && p.activeId != null) {
     const num = row.number;
-    if (isRep) {
+    if (wf.needsReviewSet.has(p.activeId)) {
+      const reason = wf.stateById.get(p.activeId)?.reviewReason;
+      chip = (
+        <>
+          <span className="max-w-[420px] truncate rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-200" data-testid="edit-chip" data-kind="review" title={isRep ? `${reason ?? "Needs a look"} (this is also the scene's representative)` : (reason ?? undefined)}>
+            Needs a look: {reason ? reason.charAt(0).toLowerCase() + reason.slice(1) : "exposure did not match"}
+          </span>
+          <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-emerald-200 hover:bg-neutral-700" onClick={() => void wf.markReviewed([p.activeId!])} data-testid="edit-looks-good" title="Keep the settings and clear the mark. Cmd+Enter does this and goes to the next photo that needs a look">
+            Looks good
+          </button>
+          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (N)">
+            Next to review ›
+          </button>
+        </>
+      );
+    } else if (wasFlagged) {
+      chip = (
+        <>
+          <span className="max-w-[420px] truncate rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="fixed" title="You changed this photo, so it no longer needs a look">
+            Fixed · was: {wasText.charAt(0).toLowerCase() + wasText.slice(1)}
+          </span>
+          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (Cmd+Enter or N)">
+            Next to review ›
+          </button>
+        </>
+      );
+    } else if (isRep) {
       const c = REP_CHIP[row.ui];
       chip = repOnBaseline ? (
         <span className="rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="rep">
@@ -71,21 +104,6 @@ export function EditContextBar(p: Props) {
       if (!sceneFlow || repOnBaseline) hintText = null;
       else if (row.ui === "reset") hintText = "Edit this photo first";
       else if (row.ui === "todo" || row.ui === "edited") hintText = `Edit this photo, then apply it to the other ${row.targets}.`;
-    } else if (wf.needsReviewSet.has(p.activeId)) {
-      const reason = wf.stateById.get(p.activeId)?.reviewReason;
-      chip = (
-        <>
-          <span className="max-w-[420px] truncate rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-200" data-testid="edit-chip" data-kind="review" title={reason ?? undefined}>
-            Needs a look: {reason ? reason.charAt(0).toLowerCase() + reason.slice(1) : "exposure did not match"}
-          </span>
-          <button className="rounded bg-neutral-800 px-2 py-0.5 text-xs text-emerald-200 hover:bg-neutral-700" onClick={() => void wf.markReviewed([p.activeId!])} data-testid="edit-looks-good" title="Keep the settings and clear the mark. Cmd+Enter does this and goes to the next photo that needs a look">
-            Looks good
-          </button>
-          <button className="text-xs text-sky-300 hover:underline" onClick={p.onNextReview} data-testid="edit-next-review" title="Next photo that needs a look (N)">
-            Next to review ›
-          </button>
-        </>
-      );
     } else if (row.entry.appliedIds.includes(p.activeId)) {
       chip = (
         <span className="rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-200" data-testid="edit-chip" data-kind="applied">
@@ -166,7 +184,7 @@ export function EditContextBar(p: Props) {
             </button>
           </span>
         )}
-        {sceneFlow && (
+        {autoEditShown && (
           <AutoEditButton
             style={wf.style}
             testid="edit-auto"

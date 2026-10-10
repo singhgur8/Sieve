@@ -39,7 +39,7 @@ export function BaselineBar({ projectId, session, activeId, anchorName, tick, on
           className="flex h-6 items-center gap-1 whitespace-nowrap rounded-md bg-neutral-800 px-2.5 text-neutral-100 hover:bg-neutral-700 disabled:opacity-40"
           data-testid="baseline-bar-auto"
           disabled={!anchor || !onAnchor}
-          title={onAnchor ? "Set exposure, contrast, highlights, shadows, whites, blacks and white balance to Auto for this photo. The preset's colours stay" : `Open the anchor photo (${anchorName}) first`}
+          title={onAnchor ? "Set exposure, contrast, highlights, shadows, whites, blacks and white balance to Auto for this photo, plus the preset's own light. The preset's colours stay" : `Open the anchor photo (${anchorName}) first`}
           onClick={onStartFromAuto}
         >
           <Wand2 className="size-3.5" aria-hidden /> Start from Auto

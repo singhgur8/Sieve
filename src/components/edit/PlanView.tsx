@@ -1,5 +1,6 @@
 // Edit step overview: keepers grouped into scenes, one representative per scene, and a checklist
 // (to do / edited / applied) with Auto edit (my style), Apply to scene and Apply all.
+import { undoneText } from "../../hooks/useBaseline";
 import { useEffect, useRef, useState } from "react";
 import { ArrowRight, ChevronDown, ChevronRight, Layers, MoreHorizontal, X } from "lucide-react";
 import type { BaselineRun, CullSummary } from "../../ipc";
@@ -53,6 +54,8 @@ interface Props {
   baselineRun?: BaselineRun | null;
   /** Flagged photos the user has not marked "Looks good" yet (null = no baseline result). */
   flaggedLeft?: number | null;
+  /** File names that kept their later change after "Undo the rest". */
+  keptNames?: string[];
   /** Banner: open the baseline view straight on "Finish in Lightroom". */
   onBaselineFinish?: () => void;
 }
@@ -282,7 +285,7 @@ export function PlanView(p: Props) {
         </div>
       </header>
 
-      {p.onBaseline && !wf.grouping && wf.plan && wf.plan.keeperIds.length > 0 && <BaselineBanner run={p.baselineRun ?? null} flaggedLeft={p.flaggedLeft ?? null} onOpen={p.onBaseline} onFinish={p.onBaselineFinish} />}
+      {p.onBaseline && !wf.grouping && wf.plan && wf.plan.keeperIds.length > 0 && <BaselineBanner kept={p.keptNames ?? []} run={p.baselineRun ?? null} flaggedLeft={p.flaggedLeft ?? null} onOpen={p.onBaseline} onFinish={p.onBaselineFinish} />}
 
       {p.summary && !wf.grouping && (
         <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-2 border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="plan-keeper-formula">
@@ -552,7 +555,7 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
 }
 
 /** The obvious way to edit: one preset + one adjusted photo -> the rest. Scene by scene (below) stays for refinements. */
-function BaselineBanner({ run, flaggedLeft, onOpen, onFinish }: { run: BaselineRun | null; flaggedLeft: number | null; onOpen: () => void; onFinish?: () => void }) {
+function BaselineBanner({ run, flaggedLeft, onOpen, onFinish, kept }: { kept: string[]; run: BaselineRun | null; flaggedLeft: number | null; onOpen: () => void; onFinish?: () => void }) {
   const running = run?.state === "running";
   const undone = run?.state === "finished" && run.batch?.undoneAtMs != null;
   const finished = run?.state === "finished" && run.batch != null && run.batch.undoneAtMs == null;
@@ -569,7 +572,7 @@ function BaselineBanner({ run, flaggedLeft, onOpen, onFinish }: { run: BaselineR
             : finished
               ? `${run!.counts.applied + run!.counts.flagged} edited${left > 0 ? ` · ${left} need a look` : ""}${checked > 0 ? ` · ${checked} checked` : ""}. Open it to review the result, undo it or finish in Lightroom.`
               : undone
-                ? "Undone. The photos are back to how they were."
+                ? undoneText(kept, run?.batch?.imageCount ?? 0)
                 : "Pick a preset, adjust one photo, and Sieve edits the rest of the shoot the same way, each photo with its own light. Then finish in Lightroom."}
         </div>
       </div>
