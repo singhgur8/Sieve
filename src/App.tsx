@@ -34,6 +34,10 @@ import { PlanView } from "./components/edit/PlanView";
 import { EditContextBar } from "./components/edit/EditContextBar";
 import { StyleDialogs } from "./components/edit/StyleDialogs";
 import { useWorkflow } from "./hooks/useWorkflow";
+import { BaselineView, type BaselineStepId } from "./components/baseline/BaselineView";
+import { BaselineBar } from "./components/baseline/BaselineBar";
+import { BaselineFlagBar } from "./components/baseline/BaselineFlagBar";
+import { EMPTY_SESSION, useBaselineRun, type BaselineSession } from "./hooks/useBaseline";
 import { MatchPanel } from "./components/scenes/MatchPanel";
 import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -105,6 +109,11 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   // Edit step overview (the plan) replaces the grid while open; a project that was left in the Edit step reopens on it.
   const [planOpen, setPlanOpen] = useState(projectProp?.workflowStep === "edit");
   const [planFocus, setPlanFocus] = useState<number | null>(null);
+  // Baseline edit (Phase 10): the overlay, what the user chose so far, and a counter that re-measures the anchor offset.
+  const [baselineOpen, setBaselineOpen] = useState<BaselineStepId | null>(null);
+  const [bSession, setBSession] = useState<BaselineSession>(EMPTY_SESSION);
+  const [bTick, setBTick] = useState(0);
+  const [bBar, setBBar] = useState(false);
   // "Pick the best N" (target-count culling) overlay of the Cull step; the value is the stage it opened on.
   const [targetOpen, setTargetOpen] = useState<TargetStage | null>(null);
   const [targetApply, setTargetApply] = useState(false);
@@ -172,7 +181,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   const active = mode === "compare" && cmp ? cmp[cmp.focus] : sel.active;
   const membershipSensitive =
-    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || (query.targetChoices?.length ?? 0) > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
+    query.picks.length > 0 || query.pickOrigin != null || query.suggested != null || (query.targetChoices?.length ?? 0) > 0 || (query.baselineOutcomes?.length ?? 0) > 0 || query.minRating != null || query.maxRating != null || query.colorLabels.length > 0 || query.sort === "rating" || query.metadata?.edited != null || query.metadata?.hasSidecar != null;
 
   // Caps Lock acts as auto-advance while on (Lightroom).
   useEffect(() => {
@@ -765,6 +774,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     (s: WorkflowStep) => {
       if (projectId == null) return;
       setTargetOpen(null);
+      setBaselineOpen(null);
+      setBBar(false);
       if (s === "cull") {
         void setStep("cull");
         setQuery((q) => (q.sceneId == null ? q : { ...q, sceneId: null }));
@@ -787,6 +798,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
 
   /** G / Esc: back to the overview of the step (the Plan in the Edit step, the Grid otherwise). */
   const goOverview = useCallback(() => {
+    setBaselineOpen(null);
     if (projectId != null && step === "edit") openPlan();
     else changeMode("grid");
   }, [projectId, step, openPlan, changeMode]);
@@ -1131,6 +1143,64 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     [sel],
   );
 
+  // ---- Baseline edit (Phase 10) ----
+  const baselineRun = useBaselineRun(projectId);
+  useEffect(() => {
+    setBSession(EMPTY_SESSION);
+    setBaselineOpen(null);
+    setBBar(false);
+  }, [projectId]);
+  useEffect(() => {
+    if (!planOpen) setBaselineOpen(null);
+  }, [planOpen]);
+  const keeperIdsB = wf.plan?.keeperIds;
+  const baselineCandidates = useMemo(() => {
+    const reps = wf.rows.map((r) => r.entry.representativeId);
+    return reps.length > 0 ? reps : (keeperIdsB ?? []).slice(0, 24);
+  }, [wf.rows, keeperIdsB]);
+  // Default anchor: the open photo if it is a keeper, else a keeper the user already edited, else the first scene's photo.
+  const baselineDefaultAnchor = useMemo(() => {
+    if (active != null && keeperIdsB?.includes(active)) return active;
+    const edited = wf.plan?.editStates.find((e) => e.editSource === "user" || e.editSource === "sidecar");
+    return edited?.imageId ?? baselineCandidates[0] ?? keeperIdsB?.[0] ?? null;
+  }, [active, keeperIdsB, wf.plan?.editStates, baselineCandidates]);
+  const openBaseline = useCallback((force?: BaselineStepId) => {
+    if (projectId == null || step !== "edit") return;
+    const r = baselineRun.run;
+    let st: BaselineStepId = 1;
+    if (typeof force === "number") st = force;
+    else if (bSession.stage === "rest" && bSession.anchorId != null) st = 4;
+    else if (bSession.anchorId == null && r && (r.state === "finished" || r.state === "running")) {
+      setBSession({ anchorId: r.settings.anchorId, presetId: r.settings.presetId, presetName: null, stage: "rest" });
+      st = 4;
+    }
+    openPlan();
+    setBBar(false);
+    setBaselineOpen(st);
+  }, [projectId, step, baselineRun.run, bSession.stage, bSession.anchorId, openPlan]);
+  const baselineToDevelop = useCallback(
+    async (anchorId: number) => {
+      await rawLib.refresh([anchorId]).catch(reportError);
+      setQuery((q) => (q.sceneId == null && !q.baselineOutcomes?.length ? q : { ...q, sceneId: null, baselineOutcomes: [] }));
+      setBBar(true);
+      setBaselineOpen(null);
+      setCmp(null);
+      sel.set([anchorId], anchorId);
+      setPlanOpen(false);
+      setMode("develop");
+      setBTick((t) => t + 1);
+    },
+    [rawLib, reportError, sel],
+  );
+  const showBaselineFlagged = useCallback(() => {
+    setBaselineOpen(null);
+    setPlanOpen(false);
+    setCmp(null);
+    setIdFilter(null);
+    setMode("grid");
+    setQuery((q) => ({ ...q, baselineOutcomes: ["flagged"] }));
+  }, []);
+
   /** "Edit all in scene": the whole scene selected, Develop on `startId`. Auto Sync is on. */
   const editAllInScene = useCallback(
     (sceneIds: number[], startId: number) => {
@@ -1206,6 +1276,13 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       e.preventDefault();
       return runKey(d, e);
     }
+    if (baselineOpen != null) {
+      // The Baseline edit view has its own controls; only help and the step shortcuts stay global.
+      const d = matchKey(e, "grid");
+      if (!d || !["cheatSheet", "help", "stepEdit", "stepCull", "stepExport", "saveXmp"].includes(d.id)) return;
+      e.preventDefault();
+      return runKey(d, e);
+    }
     const inPlan = planOpen && projectId != null && step === "edit";
     if (inPlan && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       // Plan: Up / Down move the row focus, Enter / D open the representative.
@@ -1269,6 +1346,8 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
         if (row.skipped) return setNotice("This scene is skipped. Include it first (S in the Plan)");
         return void wf.applyScene(row.entry.sceneId, "match", reviewFrames, showIds);
       }
+      case "baselineEdit":
+        return step === "edit" ? leave(() => openBaseline()) : undefined;
       case "autoEdit": {
         if (step !== "edit") return;
         const row = planOpen ? rowOfScene(planFocus ?? -1) : active != null ? rowOfImage.get(active) : undefined;
@@ -1678,6 +1757,9 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
           </button>
         </div>
       )}
+      {!planOpen && !targetOpen && mode === "grid" && projectId != null && query.baselineOutcomes?.includes("flagged") && (
+        <BaselineFlagBar projectId={projectId} activeId={active ?? null} onClear={() => setQuery((q) => ({ ...q, baselineOutcomes: [] }))} onOpenBaseline={() => openBaseline()} />
+      )}
       {planOpen || targetOpen ? null : mode === "grid" ? (
         catalogEmpty ? null : (
         <>
@@ -1848,6 +1930,41 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               onContinueExport={() => goStep("export")}
               onRegroup={() => void wf.regroup()}
               summary={cullSum.summary}
+              onBaseline={() => openBaseline()}
+              baselineRun={baselineRun.run}
+            />
+          </ErrorBoundary>
+        )}
+        {baselineOpen != null && planOpen && project && step === "edit" && (
+          <ErrorBoundary view="Baseline edit" overlay onExit={() => setBaselineOpen(null)}>
+            <BaselineView
+              projectId={project.id}
+              lib={lib}
+              initialStep={baselineOpen}
+              keeperIds={wf.plan?.keeperIds ?? []}
+              candidates={baselineCandidates}
+              defaultAnchor={baselineDefaultAnchor}
+              activeId={active ?? null}
+              selectedIds={[...sel.selected]}
+              totalPhotos={project.photoCount}
+              sceneLabel={(id) => (id == null ? "No scene" : `Scene ${scenes.number(id) || id}`)}
+              session={bSession}
+              setSession={setBSession}
+              run={baselineRun.run}
+              onRunStarted={baselineRun.setRun}
+              onApplied={() => {
+                void changedRef.current([]);
+                void wf.loadPlan(false);
+              }}
+              onUndo={async (b) => {
+                await wf.undoBatch(b);
+                await baselineRun.refresh();
+              }}
+              onClose={() => setBaselineOpen(null)}
+              onDevelop={(id) => void baselineToDevelop(id)}
+              onShowFlagged={showBaselineFlagged}
+              onExport={() => goStep("export")}
+              onError={reportError}
             />
           </ErrorBoundary>
         )}
@@ -1863,7 +1980,10 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             sel={sel}
             onError={reportError}
             onNotice={setNotice}
-            onCommitted={wf.noteCommit}
+            onCommitted={(ids) => {
+              wf.noteCommit(ids);
+              setBTick((t) => t + 1);
+            }}
             onUndoToast={(msg, undo) => push(msg, { action: { label: "Undo", testid: "batch-undo", onClick: undo } })}
             onBatch={wf.reportBatch}
             onBack={() => changeMode("grid")}
@@ -1886,6 +2006,24 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
             onLabel={labelPhoto}
             topSlot={
               project && step === "edit" ? (
+                <>
+                {bBar && bSession.anchorId != null && (
+                  <BaselineBar
+                    projectId={project.id}
+                    session={bSession}
+                    activeId={active ?? null}
+                    anchorName={lib.getEntry(bSession.anchorId)?.fileName ?? `#${bSession.anchorId}`}
+                    tick={bTick}
+                    onGoAnchor={() => sel.set([bSession.anchorId!], bSession.anchorId!)}
+                    onClose={() => setBBar(false)}
+                    onRest={() =>
+                      leave(() => {
+                        setBSession((x) => ({ ...x, stage: "rest" }));
+                        openBaseline(4);
+                      })
+                    }
+                  />
+                )}
                 <EditContextBar
                   wf={wf}
                   rows={wf.rows}
@@ -1900,6 +2038,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                   onReview={reviewFrames}
                   onNextReview={() => leave(nextReview)}
                 />
+                </>
               ) : undefined
             }
             sceneOnly={

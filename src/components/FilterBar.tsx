@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Filter, FolderSearch, Layers, ListFilter, RotateCcw, Unplug, X } from "lucide-react";
-import { commands, unwrap, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type MetadataFilter, type PickFlag, type PickOrigin, type TargetChoice } from "../ipc";
+import { commands, unwrap, type BaselineOutcome, type CatalogState, type ColorLabel, type CullTag, type FilterCounts, type MetadataFilter, type PickFlag, type PickOrigin, type TargetChoice } from "../ipc";
 import type { Query } from "../hooks/useLibrary";
 import { ALL_TAGS, LABEL_COLOR, tagName, TAG_STYLE } from "../lib/format";
 import { BASE_QUERY } from "../hooks/useLibrary";
@@ -29,6 +29,9 @@ const rowClass = "flex h-8 shrink-0 items-center gap-x-3 overflow-x-auto overflo
 
 /** Names of the "Pick the best N" choices as filter text ("Pick the best N: Picks, Not sure"). */
 export const TARGET_CHOICE_TEXT: Record<TargetChoice, string> = { deliver: "Picks", alternative: "Alternatives", not_sure: "Not sure", set_aside: "Set aside" };
+/** Names of the baseline edit outcomes as filter text ("Baseline edit: needs a look"). */
+export const BASELINE_OUTCOME_TEXT: Record<BaselineOutcome, string> = { applied: "edited", flagged: "needs a look", skipped_edited: "already edited, skipped", anchor: "anchor", failed: "could not be read" };
+export const baselineOutcomesText = (o: BaselineOutcome[] | undefined) => (o ?? []).map((x) => BASELINE_OUTCOME_TEXT[x]).join(", ");
 export const targetChoicesText = (c: TargetChoice[] | undefined) => (c ?? []).map((x) => TARGET_CHOICE_TEXT[x]).join(", ");
 
 export function isFiltered(q: Query): boolean {
@@ -39,6 +42,7 @@ export function isFiltered(q: Query): boolean {
     q.pickOrigin != null ||
     q.suggested != null ||
     (q.targetChoices?.length ?? 0) > 0 ||
+    (q.baselineOutcomes?.length ?? 0) > 0 ||
     q.minRating != null ||
     q.maxRating != null ||
     q.colorLabels.length > 0 ||
@@ -174,6 +178,16 @@ export function FilterBar({ query, setQuery, counts, onLocate }: Props) {
             className={`${chip} flex items-center gap-1 bg-sky-800 text-sky-100 ring-1 ring-white/30`}
           >
             Best N: {targetChoicesText(query.targetChoices)} <X className="size-3" aria-label="Remove" />
+          </button>
+        )}
+        {(query.baselineOutcomes?.length ?? 0) > 0 && (
+          <button
+            data-testid="filter-baseline"
+            onClick={() => setQuery((q) => ({ ...q, baselineOutcomes: [] }))}
+            title={`Only photos the last Baseline edit marked as: ${baselineOutcomesText(query.baselineOutcomes)}. Click to show every photo`}
+            className={`${chip} flex items-center gap-1 bg-amber-800 text-amber-50 ring-1 ring-white/30`}
+          >
+            Baseline: {baselineOutcomesText(query.baselineOutcomes)} <X className="size-3" aria-label="Remove" />
           </button>
         )}
         {query.pickOrigin != null && (
@@ -321,6 +335,7 @@ export function describeFilters(q: Query, sceneNumber?: (id: number) => number):
   q.excludeTags.forEach((t) => parts.push(`no ${tagName(t)}`));
   if (q.suggested) parts.push(q.suggested === "reject" ? "suggested rejects" : q.suggested === "pick" ? "suggested picks" : "suggested stars");
   if ((q.targetChoices?.length ?? 0) > 0) parts.push(`Pick the best N: ${targetChoicesText(q.targetChoices)}`);
+  if ((q.baselineOutcomes?.length ?? 0) > 0) parts.push(`Baseline edit: ${baselineOutcomesText(q.baselineOutcomes)}`);
   const origin = originLabel(q);
   if (origin) parts.push(origin);
   else q.picks.forEach((p) => parts.push(PICKS.find((x) => x.key === p)?.label ?? p));

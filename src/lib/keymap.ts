@@ -58,6 +58,8 @@ export type ActionId =
   | "planSkip"
   | "planStop"
   | "autoEdit"
+  | "baselineEdit"
+  | "baselineClose"
   | "before"
   | "split"
   | "crop"
@@ -204,6 +206,8 @@ export const KEYMAP: KeyDef[] = [
   { id: "planSkip", group: "Workflow", label: "Skip / include the focused scene", chords: [], modes: ALL, display: ["S"], where: "Edit step: Plan", external: true },
   { id: "capsAdvance", group: "Culling", label: "Auto-advance while Caps Lock is on", chords: [], modes: ALL, display: ["Caps Lock"], where: "Everywhere", external: true },
   { id: "planStop", group: "Workflow", label: "Stop applying", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Plan (while applying)", external: true },
+  { id: "baselineEdit", group: "Workflow", label: "Baseline edit: preset + one photo -> the rest", chords: [c("b", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+B"], where: "Edit step: Plan, Develop" },
+  { id: "baselineClose", group: "Workflow", label: "Leave the Baseline edit (not while it is running)", chords: [], modes: ALL, display: ["Esc"], where: "Edit step: Baseline edit", external: true },
   { id: "autoEdit", group: "Workflow", label: "Auto edit (my style)", chords: [c("u", { mod: true, alt: true })], modes: ["grid", "develop"], display: ["Cmd+Alt+U"], where: "Edit step: Plan, Develop" },
 
   // ---- navigation ----

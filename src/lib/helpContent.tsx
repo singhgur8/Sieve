@@ -289,6 +289,26 @@ export const HELP: HelpEntry[] = [
     ],
   },
   {
+    id: "baseline-edit",
+    title: "Baseline edit",
+    keywords: "baseline preset anchor edit the rest whole shoot lightroom finish auto light white balance undo needs a look flagged",
+    blocks: [
+      { p: "The fast way to get a good starting edit for a whole shoot, then finish it in Lightroom. In the Edit step choose Start baseline edit (Cmd+Alt+B)." },
+      {
+        ul: [
+          "1. Preset: pick a look from your library. Each tile is the anchor photo rendered with that preset. Search by name or filter by group, or choose No preset.",
+          "2. Anchor photo: the one photo you adjust by hand. Pick a good keeper in typical light.",
+          "3. Adjust it in Develop, light and white balance first. The Baseline bar shows how your photo differs from its own Auto, for example +0.3 EV, warmer than Auto. Press Edit the rest when you are happy.",
+          "4. Edit the rest: choose keepers, all photos or the selection, and whether to skip or replace photos you already edited. The preview shows before and after for about twelve photos across your scenes. Edit applies it with progress, a Stop button and one Undo for the whole batch.",
+          "5. Finish in Lightroom: make sure the sidecars are saved, then in Lightroom select the photos and choose Metadata > Read Metadata from Files (a new import reads the sidecars by itself).",
+          "The preset's look (colors, curves, grain and so on) is copied as it is. Each photo keeps its own exposure and white balance, shifted by the same amount you shifted the anchor from its Auto, so a dark church and a sunny park both come out well exposed. Frames of one burst or scene get matching values.",
+          "Photos that are dark on purpose, silhouettes, or where Auto failed are edited too but marked Needs a look. Use Show the photos that need a look to list them with the reason.",
+          "Crop, straighten and masks are never touched. Scene by scene editing (Apply to scene) is still there in the Plan for refinements.",
+        ],
+      },
+    ],
+  },
+  {
     id: "editing",
     title: "Editing basics",
     keywords: "develop sliders exposure scene apply copy paste sync auto edit export type value arrow keys blue dot preset preview highlight",
@@ -296,7 +316,7 @@ export const HELP: HelpEntry[] = [
       {
         ul: [
           "Press D to open Develop. Sliders (Exposure, Contrast, Highlights, Shadows, White balance, ...) are non-destructive and saved to the sidecar. Double-click a slider's name to reset it.",
-          "In the Edit step, keepers are grouped into scenes by lighting. Edit one photo per scene, then Apply to scene copies that edit to the others, matched for exposure and white balance.",
+          "In the Edit step, the quickest start is Baseline edit (one preset + one adjusted photo for the whole shoot). To refine scene by scene: keepers are grouped into scenes by lighting; edit one photo per scene, then Apply to scene copies that edit to the others, matched for exposure and white balance.",
           "Auto edit (my style) edits a scene's photo with your learned style. Review it, then apply.",
           "Copy, Paste and Sync move settings between photos. Cmd+C (or Ctrl+C) copies every setting, Cmd+V (Ctrl+V) pastes them as one undoable step. Cmd+Shift+C picks which settings to copy.",
           "Type a slider value: click the number, type, Enter applies, Esc cancels, Tab moves to the next slider. Hover a slider and press Up / Down to nudge it (Shift = x10, Alt = fine). Left / Right still move between photos unless a slider has focus.",

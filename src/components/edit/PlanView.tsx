@@ -1,8 +1,8 @@
 // Edit step overview: keepers grouped into scenes, one representative per scene, and a checklist
 // (to do / edited / applied) with Auto edit (my style), Apply to scene and Apply all.
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, ChevronDown, ChevronRight, MoreHorizontal, X } from "lucide-react";
-import type { CullSummary } from "../../ipc";
+import { ArrowRight, ChevronDown, ChevronRight, Layers, MoreHorizontal, X } from "lucide-react";
+import type { BaselineRun, CullSummary } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
 import { rowInTab, type PlanTab, type SceneRow, type Workflow } from "../../hooks/useWorkflow";
 import { hint } from "../../lib/keymap";
@@ -47,6 +47,9 @@ interface Props {
   onRegroup: () => void;
   /** Cull summary of the project: the keeper formula under the header. */
   summary?: CullSummary | null;
+  /** Baseline edit (Phase 10): the main path of the Edit step. */
+  onBaseline?: () => void;
+  baselineRun?: BaselineRun | null;
 }
 
 export function PlanView(p: Props) {
@@ -224,7 +227,7 @@ export function PlanView(p: Props) {
               />
             )}
             <button
-              className="flex h-7 items-center gap-1.5 rounded-md bg-emerald-700 px-3 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+              className="flex h-7 items-center gap-1.5 rounded-md bg-neutral-800 px-3 text-xs font-medium text-neutral-100 hover:bg-neutral-700 disabled:opacity-40"
               data-testid="plan-apply-all"
               disabled={pending.length === 0 || busy != null || applying}
               title={applying ? BUSY_WHY.apply_scene : pending.length === 0 ? "Edit or auto edit a scene first" : "Copies each edited scene's edit to the rest of its scene, matching exposure and white balance per photo"}
@@ -271,6 +274,8 @@ export function PlanView(p: Props) {
           </Menu>
         </div>
       </header>
+
+      {p.onBaseline && !wf.grouping && wf.plan && wf.plan.keeperIds.length > 0 && <BaselineBanner run={p.baselineRun ?? null} onOpen={p.onBaseline} />}
 
       {p.summary && !wf.grouping && (
         <div className="flex min-h-7 shrink-0 flex-wrap items-center gap-x-2 border-b border-neutral-800 px-3 py-1 text-xs text-neutral-300" data-testid="plan-keeper-formula">
@@ -532,5 +537,34 @@ function SceneRowView({ r, p, memberShown, focused }: { r: SceneRow; p: Props; m
         </Menu>
       </div>
     </article>
+  );
+}
+
+/** The obvious way to edit: one preset + one adjusted photo -> the rest. Scene by scene (below) stays for refinements. */
+function BaselineBanner({ run, onOpen }: { run: BaselineRun | null; onOpen: () => void }) {
+  const finished = run?.state === "finished" && run.batch != null && run.batch.undoneAtMs == null;
+  const running = run?.state === "running";
+  return (
+    <div className="flex shrink-0 items-center gap-3 border-b border-emerald-900 bg-emerald-950/60 px-3 py-2 text-xs" data-testid="plan-baseline-banner" data-state={running ? "running" : finished ? "done" : "new"}>
+      <Layers className="size-5 shrink-0 text-emerald-400" aria-hidden />
+      <div className="min-w-0 flex-1 text-neutral-200">
+        <div className="text-sm font-semibold text-emerald-100">Baseline edit</div>
+        <div className="truncate text-neutral-300" data-testid="plan-baseline-text">
+          {running
+            ? "Running now…"
+            : finished
+              ? `${run!.message ?? "Done"}. Open it to review the result, undo it or finish in Lightroom.`
+              : "Pick a preset, adjust one photo, and Sieve edits the rest of the shoot the same way, each photo with its own light. Then finish in Lightroom."}
+        </div>
+      </div>
+      <button
+        className="flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-emerald-700 px-4 text-sm font-semibold text-white hover:bg-emerald-600"
+        data-testid="plan-baseline"
+        title="Start here: pick a preset, adjust one photo, then edit the rest of the shoot in one step (Cmd+Alt+B). Editing scene by scene below is for refinements"
+        onClick={onOpen}
+      >
+        {finished || running ? "Open baseline edit" : "Start baseline edit"} <ArrowRight className="size-4" />
+      </button>
+    </div>
   );
 }
