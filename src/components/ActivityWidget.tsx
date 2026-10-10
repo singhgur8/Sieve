@@ -67,7 +67,8 @@ function Row({ a }: { a: ActivityEvent }) {
  * elsewhere (`hideKinds`: export while a job card is listed, analysis / import while their top bar is visible) are skipped.
  */
 export function ActivityWidget({ children, hasChildren = false, hideKinds = [], behindDialogs = false }: { children?: ReactNode; hasChildren?: boolean; hideKinds?: ActivityKind[]; behindDialogs?: boolean }) {
-  const list = useActivities().filter((a) => !hideKinds.includes(a.kind));
+  // A finished baseline edit is announced by its own toast (with Undo): no second notice in the corner.
+  const list = useActivities().filter((a) => !hideKinds.includes(a.kind) && !(a.kind === "baseline_edit" && a.state === "finished"));
   if (list.length === 0 && !hasChildren) return null;
   return (
     <div className={`pointer-events-none fixed bottom-3 right-3 ${behindDialogs ? "z-40" : "z-[65]"} flex w-[min(384px,92vw)] flex-col items-stretch gap-2`} data-testid="activity-widget" aria-live="polite">

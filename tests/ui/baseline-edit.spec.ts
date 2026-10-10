@@ -486,7 +486,7 @@ test.describe("baseline edit UI", () => {
     await expect(page.getByTestId("baseline-undo-blocked")).toContainText("Undo the rest puts the other");
     // Cmd+Z in the view explains instead of staying silent.
     await page.keyboard.press("Control+z");
-    await expect(page.getByText(/Later edits on 1 photo/)).toBeVisible();
+    await expect(page.getByText(/You changed 1 photo after the baseline\. Use Undo the rest \(\d+\)/)).toBeVisible();
     // Undo the rest: everything else goes back, the changed photo keeps its edit.
     const total = Number((await inv<{ batch: { imageCount: number } }>(page, "get_baseline_run", { projectId: 1 })).batch.imageCount);
     await expect(page.getByTestId("baseline-undo-rest")).toContainText(`Undo the rest (${total - 1})`);
@@ -703,5 +703,108 @@ test.describe("baseline edit UI", () => {
     expect(sel).toBe(0);
     await page.getByRole("button", { name: /Soft Film/ }).first().click();
     await expect(page.locator('button[data-testid^="baseline-preset-"][data-selected="true"]')).toHaveCount(1);
+  });
+
+  test("P1-7a: Cmd+Enter on a flagged photo you just fixed goes to the next marked photo; the Fixed chip names the old reason; then All N checked", async ({ page }) => {
+    await openEdit(page, "1");
+    await page.getByTestId("plan-baseline").click();
+    const total = Number((await page.getByTestId("baseline-count-flagged").locator("b").textContent()) ?? 0);
+    await page.getByTestId("baseline-show-flagged").click();
+    await page.locator('[data-testid^="cell-"]').first().click();
+    await page.keyboard.press("d");
+    await expect(page.getByTestId("develop-view")).toBeVisible();
+    // N4: the scene-wide Auto edit is not offered while reviewing the flagged photos.
+    await expect(page.getByTestId("edit-auto")).toHaveCount(0);
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("data-kind", "review");
+    const slider = page.getByTestId("slider-exposure");
+    const cur = Number(await slider.inputValue());
+    await slider.fill(String(Math.round((cur + 1.2) * 10) / 10));
+    await slider.evaluate((el) => (el as HTMLElement).blur());
+    await expect(page.getByTestId("baseline-review-left")).toContainText(`${total - 1} of ${total} left`);
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("data-kind", "fixed");
+    await expect(page.getByTestId("edit-chip")).toContainText(/Fixed · was: \S+/);
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("title", "You changed this photo, so it no longer needs a look");
+    await expect(page.getByTestId("edit-next-review")).toHaveAttribute("title", "Next photo that needs a look (Cmd+Enter or N)");
+    await expect(page.getByTestId("edit-make-rep")).toHaveCount(0);
+    await page.keyboard.press("Control+Enter");
+    await expect(page.getByTestId("edit-chip")).toHaveAttribute("data-kind", "review");
+    await expect(page.getByTestId("baseline-review-left")).toContainText(`${total - 1} of ${total} left`);
+    // N3: a flagged photo shows its reason and Looks good even when it is a scene's representative.
+    for (let left = total - 1; left > 0; left--) {
+      await expect(page.getByTestId("edit-chip")).toHaveAttribute("data-kind", "review");
+      await expect(page.getByTestId("edit-looks-good")).toBeVisible();
+      await page.keyboard.press("Control+Enter");
+    }
+    await expect(page.getByText(`All ${total} checked`)).toBeVisible();
+    await expect(page.getByTestId("baseline-looks-good-back")).toBeVisible();
+  });
+
+  test("N1 / N2: a finished run is announced once; opening the flagged photos drops the finish toast", async ({ page }) => {
+    await openEdit(page, "anchor", 100);
+    await page.getByTestId("plan-baseline").click();
+    await page.getByTestId("baseline-step-4").click();
+    await expect(page.locator('figure[data-testid^="baseline-sample-"]').first()).toBeVisible();
+    await page.getByTestId("baseline-apply").click();
+    await expect(page.getByTestId("baseline-result")).toBeVisible();
+    await expect(page.getByTestId("baseline-undo-toast")).toBeVisible();
+    await expect(page.getByTestId("activity-widget").getByText(/^Edited \d+ photos/)).toHaveCount(0);
+    await page.getByTestId("baseline-show-flagged").click();
+    await expect(page.getByTestId("baseline-undo-toast")).toHaveCount(0);
+  });
+
+  test("N5: Undo the rest is neutral, the copy names the photo that kept its change, and the counts go away", async ({ page }) => {
+    await openEdit(page, "1");
+    await page.getByTestId("plan-baseline").click();
+    await page.getByTestId("baseline-show-flagged").click();
+    await page.locator('[data-testid^="cell-"]').first().click();
+    await page.keyboard.press("d");
+    const slider = page.getByTestId("slider-exposure");
+    await slider.fill("1.7");
+    await slider.evaluate((el) => (el as HTMLElement).blur());
+    await expect.poll(async () => (await calls(page, "save_adjustments")).length).toBeGreaterThan(0);
+    await page.keyboard.press("Control+Alt+b");
+    await expect(page.getByTestId("baseline-undo-rest")).toHaveClass(/bg-neutral-800/);
+    await expect(page.getByTestId("baseline-undo-rest")).not.toHaveClass(/bg-amber/);
+    await page.getByTestId("baseline-undo-rest").click();
+    await expect(page.getByTestId("baseline-result-message")).toContainText(/Undone for \d+ photos?\. \S+ keeps your change\./);
+    await expect(page.getByTestId("baseline-count-applied")).toHaveCount(0);
+    await expect(page.getByTestId("baseline-count-flagged")).toHaveCount(0);
+  });
+
+  test("N6: Start from Auto keeps the preset's own light", async ({ page }) => {
+    await openEdit(page, "presets");
+    await toDevelop(page, /Warm Matte/);
+    await expect(page.getByTestId("baseline-bar-offset")).toContainText("+0.2 EV");
+    await expect(page.getByTestId("baseline-bar-auto")).toHaveAttribute("title", /plus the preset's own light/);
+    const slider = page.getByTestId("slider-exposure");
+    await slider.fill("2");
+    await slider.evaluate((el) => (el as HTMLElement).blur());
+    await expect(page.getByTestId("baseline-bar-offset")).not.toContainText("+0.2 EV");
+    await page.getByTestId("baseline-bar-auto").click();
+    await expect(page.getByTestId("baseline-bar-offset")).toContainText("+0.2 EV");
+  });
+
+  test("N7: arrow keys keep working across several presets (focus stays on the selected tile)", async ({ page }) => {
+    await openEdit(page, "presets");
+    await page.getByTestId("plan-baseline").click();
+    await page.getByTestId("baseline-preset-none").click();
+    const selected = page.locator('button[data-testid^="baseline-preset-"][data-selected="true"]');
+    const seen: (string | null)[] = [await selected.getAttribute("data-testid")];
+    for (let i = 0; i < 3; i++) {
+      await page.keyboard.press("ArrowRight");
+      await expect.poll(async () => selected.getAttribute("data-testid")).not.toBe(seen[seen.length - 1]);
+      const id = await selected.getAttribute("data-testid");
+      seen.push(id);
+      await expect.poll(async () => page.evaluate(() => document.activeElement?.getAttribute("data-testid"))).toBe(id);
+    }
+    expect(new Set(seen).size).toBe(4);
+  });
+
+  test("N8: Finish lists the folder(s) the sidecars are in", async ({ page }) => {
+    await openEdit(page, "1");
+    await page.getByTestId("plan-baseline").click();
+    await page.getByTestId("baseline-to-finish").click();
+    await expect(page.getByTestId("baseline-folder")).toContainText("The sidecars are in");
+    await expect(page.getByTestId("baseline-folder-path")).toContainText("/");
   });
 });

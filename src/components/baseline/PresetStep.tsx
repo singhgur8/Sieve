@@ -118,6 +118,15 @@ export function PresetStep({ groups, anchorId, anchorName, presetId, onPick, onC
         .filter((x) => x.presets.length > 0),
     [shown, group, needle],
   );
+  // Arrow-key navigation: the tiles re-render when the selection changes, so put focus back on the selected one.
+  const gridRef = useRef<HTMLDivElement>(null);
+  const keyNav = useRef(false);
+  useEffect(() => {
+    if (!keyNav.current) return;
+    const g = gridRef.current;
+    const sel = g?.querySelector<HTMLButtonElement>('button[data-testid^="baseline-preset-"][data-selected="true"]');
+    if (g && sel && !g.contains(document.activeElement)) sel.focus();
+  });
   const total = list.reduce((n, x) => n + x.presets.length, 0);
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="baseline-step-preset">
@@ -146,6 +155,7 @@ export function PresetStep({ groups, anchorId, anchorName, presetId, onPick, onC
       <div
         className="min-h-0 flex-1 overflow-y-auto p-4"
         data-testid="baseline-preset-grid"
+        ref={gridRef}
         onKeyDown={(e) => {
           // Arrow keys move between the tiles (and choose them); Enter then goes to the next step.
           const dir = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
@@ -155,6 +165,7 @@ export function PresetStep({ groups, anchorId, anchorName, presetId, onPick, onC
           const next = tiles[Math.min(tiles.length - 1, Math.max(0, (at < 0 ? tiles.findIndex((t) => t.dataset.selected === "true") : at) + dir))];
           if (!next) return;
           e.preventDefault();
+          keyNav.current = true;
           next.focus();
           next.click();
         }}

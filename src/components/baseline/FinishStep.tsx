@@ -56,7 +56,6 @@ export function FinishStep({ folders, anchorId, onExport, onPlan, onError }: Pro
   const camProfile = anchorAdj?.profile?.cameraProfile ?? null;
   const lookName = anchorAdj?.profile?.look?.name ?? null;
   const importedProfile = camProfile && !/^(Adobe|Camera)\b/i.test(camProfile) ? camProfile : lookName && !/^Adobe\b/i.test(lookName) ? lookName : null;
-  const folder = folders[0] ?? null;
   const dirty = xmp?.dirty ?? 0;
   const failed = xmp?.failed ?? 0;
   const saved = xmp != null && dirty === 0 && failed === 0 && !xmp.running;
@@ -86,19 +85,26 @@ export function FinishStep({ folders, anchorId, onExport, onPlan, onError }: Pro
             <span className="flex size-5 items-center justify-center rounded-full bg-neutral-800 text-xs">2</span>
             Open the edit in Lightroom
           </h3>
-          {folder && (
-            <p className="mb-2 flex flex-wrap items-center gap-2 text-xs text-neutral-300" data-testid="baseline-folder">
-              <span>The sidecars are in:</span>
-              <code className="rounded bg-neutral-950 px-1.5 py-0.5 font-mono text-neutral-100" data-testid="baseline-folder-path">
-                {folder}
-              </code>
-              <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid="baseline-folder-reveal" title="Show the folder in Finder" onClick={() => void unwrap(commands.revealInFinder(folder)).catch(onError)}>
-                Reveal in Finder
-              </button>
-              <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid="baseline-folder-copy" title="Copy the folder path" onClick={() => void navigator.clipboard?.writeText(folder).catch(() => undefined)}>
-                Copy path
-              </button>
-            </p>
+          {folders.length > 0 && (
+            <div className="mb-2 space-y-1 text-xs text-neutral-300" data-testid="baseline-folder">
+              <div>{folders.length === 1 ? "The sidecars are in:" : "The sidecars are in these folders:"}</div>
+              {folders.map((folder, i) => {
+                const sfx = i === 0 ? "" : `-${i}`;
+                return (
+                  <p key={folder} className="flex flex-wrap items-center gap-2" data-testid={`baseline-folder-row${sfx}`}>
+                    <code className="rounded bg-neutral-950 px-1.5 py-0.5 font-mono text-neutral-100" data-testid={`baseline-folder-path${sfx}`}>
+                      {folder}
+                    </code>
+                    <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid={`baseline-folder-reveal${sfx}`} title="Show the folder in Finder" onClick={() => void unwrap(commands.revealInFinder(folder)).catch(onError)}>
+                      Reveal in Finder
+                    </button>
+                    <button type="button" className="rounded bg-neutral-800 px-2 py-0.5 hover:bg-neutral-700" data-testid={`baseline-folder-copy${sfx}`} title="Copy the folder path" onClick={() => void navigator.clipboard?.writeText(folder).catch(() => undefined)}>
+                      Copy path
+                    </button>
+                  </p>
+                );
+              })}
+            </div>
           )}
           <ul className="space-y-2 text-sm text-neutral-300">
             <li data-testid="baseline-lr-existing">

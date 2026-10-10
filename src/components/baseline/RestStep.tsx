@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowRight, Loader2, Undo2, X } from "lucide-react";
 import { commands, events, unwrap, type BaselinePhotoResult, type BaselinePreview, type BaselineRun, type BaselineScope, type ParametricAdjustments } from "../../ipc";
 import type { Library } from "../../hooks/useLibrary";
-import { baselineSettings, describeOffset, KEEP_LATER_SUPPORTED, type BaselineSession } from "../../hooks/useBaseline";
+import { baselineSettings, describeOffset, KEEP_LATER_SUPPORTED, undoneText, type BaselineSession } from "../../hooks/useBaseline";
 import { Thumb } from "../edit/bits";
 
 type ScopeKind = BaselineScope["kind"];
@@ -217,7 +217,7 @@ export function RestStep(p: Props) {
   const undone = batch?.undoneAtMs != null;
   const conflicts = !undone ? (batch?.conflictCount ?? 0) : 0;
   useEffect(() => {
-    if (!done || conflicts === 0) return void setLater([]);
+    if (!done || (conflicts === 0 && !undone)) return void setLater([]);
     let dead = false;
     void (async () => {
       try {
@@ -234,7 +234,7 @@ export function RestStep(p: Props) {
     return () => {
       dead = true;
     };
-  }, [done, runId, conflicts, projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [done, runId, conflicts, undone, projectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const apply = async () => {
     setStarting(true);
@@ -364,14 +364,14 @@ export function RestStep(p: Props) {
         {p.run && p.run.state !== "running" && !starting && (p.run.state !== "finished" || done) && (
           <div className={`rounded-lg p-3 ${p.run.state === "finished" ? "bg-neutral-900 ring-1 ring-emerald-800" : "bg-amber-950 ring-1 ring-amber-800"}`} data-testid="baseline-result" data-state={p.run.state}>
             <p className="text-sm font-medium text-neutral-100" data-testid="baseline-result-message">
-              {p.run.state === "cancelled" ? "Stopped. Nothing was changed." : p.run.state === "failed" ? `The run failed: ${p.run.message ?? "unknown error"}` : undone ? "Undone. The photos are back to how they were." : (p.run.message ?? "Done")}
+              {p.run.state === "cancelled" ? "Stopped. Nothing was changed." : p.run.state === "failed" ? `The run failed: ${p.run.message ?? "unknown error"}` : undone ? undoneText(later.map(nm), batch?.imageCount ?? 0) : (p.run.message ?? "Done")}
             </p>
             {p.run.state === "finished" && stubEngine && !undone && (
               <p className="mt-1 text-xs text-amber-300" data-testid="baseline-stub-note">
                 Preview engine: light is plain Auto for now (your anchor&apos;s offset is not applied yet).
               </p>
             )}
-            {p.run.state === "finished" && (
+            {p.run.state === "finished" && !undone && (
               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                 <span className="rounded bg-emerald-950 px-2 py-0.5 text-emerald-200" data-testid="baseline-count-applied" title="Photos edited with the baseline that look fine">
                   Look fine <b>{p.run.counts.applied}</b>
@@ -403,7 +403,7 @@ export function RestStep(p: Props) {
                 </button>
               )}
               {conflicts > 0 && KEEP_LATER_SUPPORTED && (
-                <button type="button" className="flex h-7 items-center gap-1.5 rounded-md bg-amber-800 px-3 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-40" data-testid="baseline-undo-rest" disabled={undoing} title={`Put the other ${plural(restCount, "photo")} back and keep the ${plural(later.length, "change")} you made since`} onClick={() => void undo(true)}>
+                <button type="button" className="flex h-7 items-center gap-1.5 rounded-md bg-neutral-800 px-3 text-xs font-medium hover:bg-neutral-700 disabled:opacity-40" data-testid="baseline-undo-rest" disabled={undoing} title={`Put the other ${plural(restCount, "photo")} back and keep the ${plural(later.length, "change")} you made since`} onClick={() => void undo(true)}>
                   <Undo2 className="size-3.5" /> Undo the rest ({restCount})
                 </button>
               )}

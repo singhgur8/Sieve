@@ -52,6 +52,38 @@ export function describeOffset(o: LightOffset | null | undefined): string {
 }
 
 /** The project's latest baseline run, kept fresh by `baseline-run-finished`. */
+/** "Undone for 41 photos. DSC00011.ARW keeps your change." when some photos kept a later edit. */
+export function undoneText(kept: string[], total: number): string {
+  if (kept.length === 0) return "Undone. The photos are back to how they were.";
+  const n = Math.max(0, total - kept.length);
+  const names = kept.slice(0, 2).join(", ") + (kept.length > 2 ? ` and ${kept.length - 2} more` : "");
+  return `Undone${n > 0 ? ` for ${n} photo${n === 1 ? "" : "s"}` : ""}. ${names} ${kept.length === 1 ? "keeps" : "keep"} your change.`;
+}
+
+/** After "Undo the rest": the photos that kept the user's later change (the run's batch reads undone, these stay user-edited). */
+export function useKeptAfterUndo(projectId: number | null, run: BaselineRun | null): number[] {
+  const [ids, setIds] = useState<number[]>([]);
+  const undone = run?.state === "finished" && run.batch?.undoneAtMs != null;
+  const runId = run?.id;
+  useEffect(() => {
+    if (projectId == null || !undone) return void setIds([]);
+    let dead = false;
+    void (async () => {
+      try {
+        const all = await unwrap(commands.getBaselineResults(projectId, null));
+        const prov = await unwrap(commands.getBaselineProvenance(all.map((x) => x.imageId)));
+        if (!dead) setIds(prov.filter((x) => x.state === "user_edited").map((x) => x.imageId));
+      } catch {
+        if (!dead) setIds([]);
+      }
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [projectId, undone, runId]);
+  return ids;
+}
+
 export function useBaselineRun(projectId: number | null) {
   const [run, setRun] = useState<BaselineRun | null>(null);
   const [loaded, setLoaded] = useState(false);

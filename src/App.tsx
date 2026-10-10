@@ -36,8 +36,8 @@ import { StyleDialogs } from "./components/edit/StyleDialogs";
 import { useWorkflow } from "./hooks/useWorkflow";
 import { BaselineView, type BaselineStepId } from "./components/baseline/BaselineView";
 import { BaselineBar } from "./components/baseline/BaselineBar";
-import { BaselineFlagBar, BaselineReviewBar } from "./components/baseline/BaselineFlagBar";
-import { EMPTY_SESSION, START_LABEL, useBaselineRun, type BaselineSession } from "./hooks/useBaseline";
+import { BaselineFlagBar, BaselineReviewBar, useFlaggedRows } from "./components/baseline/BaselineFlagBar";
+import { EMPTY_SESSION, START_LABEL, useBaselineRun, useKeptAfterUndo, type BaselineSession } from "./hooks/useBaseline";
 import { MatchPanel } from "./components/scenes/MatchPanel";
 import { IssueBanner, Toasts, useToasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -1154,8 +1154,18 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
   const bRunLive = wf.plan?.baseline ?? null;
   const flaggedLeft = bRunLive ? bRunLive.needsLook : null;
   const flaggedReview = !!query.baselineOutcomes?.includes("flagged");
+  const keptAfterUndo = useKeptAfterUndo(projectId ?? null, baselineRun.run);
+  const flaggedRows = useFlaggedRows(baselineRun.run ? (projectId ?? null) : null, baselineRun.run?.id);
   // The finish toast: one Undo for the whole baseline.
   const seenRunning = useRef<number | null>(null);
+  const finishToast = useRef<number | null>(null);
+  // Opening the flagged photos puts Looks good / Next to review where the toast sits: drop it (Undo stays in the result and on Cmd+Z).
+  useEffect(() => {
+    if (flaggedReview && finishToast.current != null) {
+      toasts.dismiss(finishToast.current);
+      finishToast.current = null;
+    }
+  }, [flaggedReview]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const r = baselineRun.run;
     if (!r) return;
@@ -1164,7 +1174,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       seenRunning.current = null;
       const b = r.batch;
       const n = r.counts.applied + r.counts.flagged;
-      push(`Edited ${n} photo${n === 1 ? "" : "s"}${r.counts.flagged > 0 ? ` · ${r.counts.flagged} need a look` : ""}`, {
+      finishToast.current = push(`Edited ${n} photo${n === 1 ? "" : "s"}${r.counts.flagged > 0 ? ` · ${r.counts.flagged} need a look` : ""}`, {
         action: b ? { label: "Undo", testid: "baseline-undo-toast", onClick: () => void wf.undoBatch({ batchId: b.batchId, label: "Baseline Edit" }) } : undefined,
       });
     }
@@ -1176,7 +1186,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
     if (r?.state === "running") return;
     if (!r || r.state !== "finished" || !b) return void push("Nothing to undo yet. Cmd+Z undoes the whole baseline after it has run");
     if (b.undoneAtMs != null) return void push("The baseline is already undone");
-    if (!b.undoable) return void push(`Later edits on ${b.conflictCount} photo${b.conflictCount === 1 ? "" : "s"}. Undo those first`);
+    if (!b.undoable) return void push(`You changed ${b.conflictCount} photo${b.conflictCount === 1 ? "" : "s"} after the baseline. Use Undo the rest (${Math.max(0, b.imageCount - b.conflictCount)}) to put the others back`);
     void wf.undoBatch({ batchId: b.batchId, label: "Baseline Edit" });
   }, [baselineRun.run, wf, push]);
   useEffect(() => {
@@ -1394,13 +1404,14 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
       case "baselineLooksGood": {
         // Mark the photo reviewed and go to the next one the baseline flagged; at the end, a toast with the way back.
         if (step !== "edit" || planOpen || active == null) return;
-        if (!wf.needsReviewSet.has(active)) return setNotice("This photo is not marked as needing a look");
         const order = new Map((wf.plan?.keeperIds ?? []).map((id, i) => [id, i]));
         const at = order.get(active) ?? -1;
+        const marked = wf.needsReviewSet.has(active);
         const rest = (wf.plan?.needsReviewIds ?? []).filter((id) => id !== active);
         const next = rest.find((id) => (order.get(id) ?? -1) > at) ?? rest[0];
-        const total = baselineRun.run?.counts.flagged ?? 0;
-        void wf.markReviewed([active]).then(() => {
+        const total = baselineRun.run?.counts.flagged ?? flaggedRows.length;
+        if (!marked && next == null && !(flaggedReview || flaggedRows.some((r) => r.imageId === active))) return setNotice("This photo is not marked as needing a look");
+        void (marked ? wf.markReviewed([active]) : Promise.resolve()).then(() => {
           if (next != null) return sel.set([next], next);
           push(`All ${total || 1} checked`, { action: { label: "Back to the baseline", testid: "baseline-looks-good-back", onClick: () => openBaseline() } });
         });
@@ -1992,6 +2003,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
               summary={cullSum.summary}
               onBaseline={() => openBaseline()}
               baselineRun={baselineRun.run}
+              keptNames={keptAfterUndo.map((id) => lib.getEntry(id)?.fileName ?? `#${id}`)}
               flaggedLeft={flaggedLeft}
               onBaselineFinish={() => openBaseline(5)}
             />
@@ -2081,7 +2093,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                     activeId={active ?? null}
                     anchorName={lib.getEntry(bSession.anchorId)?.fileName ?? `#${bSession.anchorId}`}
                     tick={bTick}
-                    onStartFromAuto={() => develop.current?.autoLight(START_LABEL)}
+                    onStartFromAuto={() => develop.current?.autoLight(START_LABEL, bSession.presetLight)}
                     onGoAnchor={() => sel.set([bSession.anchorId!], bSession.anchorId!)}
                     onClose={() => setBBar(false)}
                     onRest={() =>
@@ -2096,6 +2108,7 @@ export default function App({ project: projectProp, onHome, onOpenProject }: App
                 <EditContextBar
                   baselineBar={bBar}
                   flaggedReview={flaggedReview && !bBar}
+                  flaggedRows={flaggedRows}
                   wf={wf}
                   rows={wf.rows}
                   activeId={active ?? null}
